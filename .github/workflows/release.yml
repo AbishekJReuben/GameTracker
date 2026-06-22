@@ -1,0 +1,49 @@
+name: Release
+
+# Build, sign, and publish a GitHub Release whenever a version tag is pushed
+# (e.g. `git tag v3.1.0 && git push origin v3.1.0`). tauri-action produces the
+# NSIS installer, the signed updater artifact, and `latest.json` — which the app
+# polls from the "latest" release for silent in-place updates.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The updater private key generated with `tauri signer generate`.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Online metadata keys, baked into the binary at build time (see .env.example).
+          RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          STEAMGRIDDB_API_KEY: ${{ secrets.STEAMGRIDDB_API_KEY }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Tracker ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
+          # Emit latest.json (the updater manifest) alongside the installer.
+          includeUpdaterJson: true
