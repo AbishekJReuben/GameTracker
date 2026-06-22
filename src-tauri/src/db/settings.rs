@@ -1,0 +1,76 @@
+use crate::db::DbPool;
+use crate::error::AppResult;
+use std::collections::HashMap;
+
+/// (key, default) pairs. Defaults are seeded lazily on read.
+pub const DEFAULTS: &[(&str, &str)] = &[
+    ("idle_minutes", "5"),
+    ("min_session_seconds", "30"),
+    ("tracking_paused", "false"),
+    ("start_with_windows", "true"),
+    ("online_metadata_enabled", "true"),
+    ("onboarded", "false"),
+    ("accent", "violet"),
+    ("theme", "dark"),
+    ("close_to_tray", "true"),
+    ("notify_sessions", "true"),
+    ("daily_goal_minutes", "0"),
+    ("break_reminder_minutes", "0"),
+    ("auto_screenshots_enabled", "true"),
+    ("screenshot_interval_minutes", "1"),
+    ("theme_music_enabled", "true"),
+];
+
+fn default_for(key: &str) -> Option<&'static str> {
+    DEFAULTS.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+pub fn get(pool: &DbPool, key: &str) -> AppResult<Option<String>> {
+    let conn = pool.get()?;
+    let v: Option<String> = conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .ok();
+    Ok(v.or_else(|| default_for(key).map(|s| s.to_string())))
+}
+
+pub fn get_bool(pool: &DbPool, key: &str) -> AppResult<bool> {
+    Ok(get(pool, key)?
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false))
+}
+
+pub fn get_i64(pool: &DbPool, key: &str, fallback: i64) -> AppResult<i64> {
+    Ok(get(pool, key)?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(fallback))
+}
+
+pub fn set(pool: &DbPool, key: &str, value: &str) -> AppResult<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Returns the full settings map (defaults merged with stored values).
+pub fn all(pool: &DbPool) -> AppResult<HashMap<String, String>> {
+    let mut map: HashMap<String, String> = DEFAULTS
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (k, v) = row?;
+        map.insert(k, v);
+    }
+    Ok(map)
+}

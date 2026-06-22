@@ -1,0 +1,260 @@
+mod autostart;
+mod commands;
+mod content_audit;
+mod content_repair;
+mod db;
+mod detect;
+mod embed;
+mod error;
+mod icons;
+mod importer;
+mod hltb;
+mod suggestions;
+mod metadata;
+mod state;
+mod system;
+mod tracking;
+mod tray;
+mod util;
+
+#[cfg(test)]
+mod audit_regression;
+
+use state::AppState;
+use std::sync::Arc;
+use system::SystemShared;
+use tauri::{Listener, Manager};
+use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_updater::UpdaterExt;
+use tracking::TrackingShared;
+
+/// How often to re-check GitHub Releases for a newer build while running.
+const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Poll GitHub Releases for a newer signed build and install it silently — once
+/// on launch, then every 30 minutes. Any failure (offline, no update, unsigned)
+/// is ignored; the loop keeps the app current even across long uptime in the tray.
+/// A background OS thread drives the timer (no async-runtime time feature needed)
+/// and blocks on each async check in turn.
+fn spawn_update_check(handle: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        check_for_update_once(&handle);
+        std::thread::sleep(UPDATE_CHECK_INTERVAL);
+    });
+}
+
+fn check_for_update_once(handle: &tauri::AppHandle) {
+    let handle = handle.clone();
+    tauri::async_runtime::block_on(async move {
+        let updater = match handle.updater() {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        if let Ok(Some(update)) = updater.check().await {
+            if update
+                .download_and_install(|_chunk, _total| {}, || {})
+                .await
+                .is_ok()
+            {
+                handle.restart();
+            }
+        }
+    });
+}
+
+/// If a backup restore was staged, swap it into place before the pool opens.
+fn apply_pending_restore(data_dir: &std::path::Path, db_path: &std::path::Path) {
+    let pending = data_dir.join("pending_restore.db");
+    if pending.is_file() {
+        for suffix in ["", "-wal", "-shm"] {
+            let p = std::path::PathBuf::from(format!("{}{}", db_path.to_string_lossy(), suffix));
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::rename(&pending, db_path);
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::show_main(app);
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            let handle = app.handle();
+            let data_dir = handle.path().app_local_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let db_path = data_dir.join("gametracker.db");
+            let media_dir = data_dir.join("media");
+
+            apply_pending_restore(&data_dir, &db_path);
+
+            let pool = db::init_pool(&db_path)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            let shared = Arc::new(TrackingShared::new());
+            let sys_shared = Arc::new(SystemShared::new());
+
+            app.manage(AppState {
+                pool: pool.clone(),
+                shared: shared.clone(),
+                sys: sys_shared.clone(),
+                data_dir,
+                media_dir: media_dir.clone(),
+                db_path,
+            });
+
+            tray::build(handle)?;
+
+            // Keep the tray tooltip in sync with live tracking state.
+            let tip_handle = handle.clone();
+            handle.listen("tracking://state", move |event| {
+                if let Ok(st) = serde_json::from_str::<tracking::TrackingState>(event.payload()) {
+                    if let Some(tray) = tip_handle.tray_by_id(tray::TRAY_ID) {
+                        let tip = tray_tooltip(&st);
+                        let _ = tray.set_tooltip(Some(&tip));
+                    }
+                }
+            });
+
+            tracking::spawn(handle.clone(), pool.clone(), shared, media_dir);
+
+            // Background system monitor (CPU/GPU/RAM/disk + the sensor sidecar).
+            system::spawn(pool, sys_shared, None);
+
+            // Silently check GitHub Releases for a newer signed build and install
+            // it in the background (no prompt). The app already runs elevated, so
+            // the perMachine NSIS update applies without a second UAC prompt.
+            spawn_update_check(handle.clone());
+
+            // Honor --minimized (startup launch): stay in tray.
+            let minimized = std::env::args().any(|a| a == "--minimized");
+            if minimized {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let close_to_tray = app
+                    .try_state::<AppState>()
+                    .map(|s| db::settings::get_bool(&s.pool, "close_to_tray").unwrap_or(true))
+                    .unwrap_or(true);
+                if close_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_settings,
+            commands::set_setting,
+            commands::complete_onboarding,
+            commands::list_games,
+            commands::get_game,
+            commands::save_game,
+            commands::delete_game,
+            commands::set_game_status,
+            commands::set_game_cover,
+            commands::fetch_cover,
+            commands::fetch_game_info,
+            commands::search_games_online,
+            commands::check_for_updates,
+            commands::install_update,
+            commands::fetch_hltb,
+            commands::add_from_path,
+            commands::add_app_from_path,
+            commands::fetch_app_info,
+            commands::detect_games,
+            commands::detect_apps,
+            commands::import_detected,
+            commands::import_detected_apps,
+            commands::import_games_csv,
+            commands::default_csv_path,
+            commands::list_screenshots,
+            commands::delete_screenshot,
+            commands::list_sessions,
+            commands::dashboard,
+            commands::apps_overview,
+            commands::heatmap,
+            commands::hour_of_day,
+            commands::catalog_analytics,
+            commands::insights,
+            commands::fetch_steam_reviews,
+            commands::fetch_metacritic_reviews,
+            commands::audit_online_content,
+            commands::repair_library_content,
+            commands::fetch_game_stats,
+            commands::launch_game,
+            embed::open_embed,
+            embed::set_embed_bounds,
+            embed::set_embed_visible,
+            embed::close_embed,
+            commands::tag_analytics,
+            commands::list_tags,
+            commands::suggest_games,
+            commands::add_suggested_game,
+            commands::set_suggested_excluded_tags,
+            commands::tracking_state,
+            commands::set_paused,
+            commands::system_specs,
+            commands::system_live,
+            commands::system_history,
+            commands::autostart_enabled,
+            commands::set_autostart,
+            commands::export_sessions_csv,
+            commands::export_data_json,
+            commands::write_text_file,
+            commands::write_text_file,
+            commands::backup_db,
+            commands::restore_db,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building Tracker")
+        .run(|handle, event| {
+            // Flush before the process goes away (tray Quit, real window close, or
+            // Windows shutdown/logoff): end open sessions and persist their focus
+            // and window-activity spans so nothing is lost. Continuous 2s accrual
+            // already saves most data; this closes the final open session cleanly.
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                if let Some(state) = handle.try_state::<AppState>() {
+                    let _ = db::sessions::close_orphans(&state.pool);
+                }
+            }
+        });
+}
+
+fn tray_tooltip(st: &tracking::TrackingState) -> String {
+    fn fmt(secs: i64) -> String {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if h > 0 {
+            format!("{h}h {m}m")
+        } else {
+            format!("{m}m")
+        }
+    }
+    if st.paused {
+        return "Tracker — paused".to_string();
+    }
+    // Games take priority in the tooltip; fall back to app usage when nothing is playing.
+    if let (Some(name), true) = (&st.game_name, st.is_playing) {
+        return format!("Playing {name} · {} today", fmt(st.today_active_seconds));
+    }
+    if let (Some(name), true) = (&st.app_name, st.app_is_active) {
+        return format!("Using {name} · {} apps today", fmt(st.app_today_active_seconds));
+    }
+    format!("Tracker · {} today", fmt(st.today_active_seconds))
+}
