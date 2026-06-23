@@ -12,12 +12,29 @@ import { useApp, useMotionEnabled } from "@/store/app";
 import { GameScores, hasAnyScore } from "./GameScores";
 import { pulseGlow, staggerTransition } from "@/lib/motion";
 
+/** Neighbours in the grid arrive from alternating edges for a lively,
+ *  "assembling" entrance (cycles up → left → right → down). */
+function cardEntrance(i: number): { x?: number; y?: number } {
+  switch (i % 4) {
+    case 0:
+      return { y: 24 };
+    case 1:
+      return { x: 30 };
+    case 2:
+      return { x: -30 };
+    default:
+      return { y: -24 };
+  }
+}
+
 export function GameCard({ game, index = 0 }: { game: Game; index?: number }) {
   const openGameModal = useApp((s) => s.openGameModal);
   const pushToast = useApp((s) => s.pushToast);
+  const liveGameId = useApp((s) => (s.tracking?.isPlaying ? s.tracking.gameId : null));
+  const isLive = liveGameId === game.id;
   const launchable = canLaunchGame(game);
   const enabled = useMotionEnabled();
-  const color = statusColor(game.status);
+  const color = isLive ? "#34d399" : statusColor(game.status);
   const playtime = game.totalRuntimeSeconds;
   const cardRef = useRef<HTMLDivElement>(null);
 
@@ -41,8 +58,8 @@ export function GameCard({ game, index = 0 }: { game: Game; index?: number }) {
     <motion.div
       ref={cardRef}
       layout
-      initial={enabled ? { opacity: 0, y: 20 } : false}
-      animate={{ opacity: 1, y: 0 }}
+      initial={enabled ? { opacity: 0, ...cardEntrance(index) } : false}
+      animate={{ opacity: 1, x: 0, y: 0 }}
       transition={staggerTransition(index, 0.035, 0.35)}
       className="group relative [perspective:900px]"
       onMouseMove={onMove}
@@ -80,6 +97,16 @@ export function GameCard({ game, index = 0 }: { game: Game; index?: number }) {
             />
           )}
 
+          {/* Live "now playing" ring — this game is running right now. */}
+          {isLive && (
+            <motion.div
+              className="pointer-events-none absolute inset-0 z-20 rounded-2xl"
+              style={{ boxShadow: "inset 0 0 0 2px #34d399, 0 0 26px -2px #34d399" }}
+              animate={enabled ? { opacity: [0.5, 1, 0.5] } : { opacity: 0.9 }}
+              transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
+            />
+          )}
+
           <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-transparent" />
           <div
             className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover:opacity-100"
@@ -97,16 +124,16 @@ export function GameCard({ game, index = 0 }: { game: Game; index?: number }) {
                 <motion.span
                   className="h-1.5 w-1.5 rounded-full"
                   style={{ background: color }}
-                  {...pulseGlow(color)}
+                  {...pulseGlow(color, (index % 12) * 0.2)}
                 />
               ) : (
                 <span className="h-1.5 w-1.5 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
               )}
-              <span className="capitalize">{game.status}</span>
+              <span className="capitalize">{isLive ? "Playing now" : game.status}</span>
             </span>
           </div>
 
-          <GameScores game={game} variant="badge" />
+          <GameScores game={game} variant="badge" index={index} />
 
           <div className="absolute inset-x-0 bottom-0 p-3">
             <div className="truncate text-[13px] font-800 text-white">{game.displayName || "Untitled"}</div>

@@ -90,7 +90,9 @@ export function staggerTransition(i: number, step = 0.03, max = 0.3) {
   return { delay: Math.min(i * step, max), duration: 0.35, ease: easeOut };
 }
 
-export const pulseGlow = (color: string) => ({
+/** Breathing glow. `delay` offsets the cycle so a grid of dots ripples instead
+ *  of pulsing in unison (stagger by item position). */
+export const pulseGlow = (color: string, delay = 0) => ({
   animate: {
     boxShadow: [
       `0 0 4px ${color}`,
@@ -98,10 +100,47 @@ export const pulseGlow = (color: string) => ({
       `0 0 4px ${color}`,
     ],
   },
-  transition: { duration: 2.4, repeat: Infinity, ease: "easeInOut" as const },
+  transition: { duration: 2.4, repeat: Infinity, ease: "easeInOut" as const, delay },
 });
 
 export const ctaPulse = {
   animate: { scale: [1, 1.03, 1] },
   transition: { duration: 2.2, repeat: Infinity, ease: "easeInOut" as const },
 };
+
+/* —— Directional swoop-ins (elements arrive from different edges) —— */
+
+export const swoopUp = {
+  hidden: { opacity: 0, y: 28, filter: "blur(8px)" },
+  show: { opacity: 1, y: 0, filter: "blur(0px)", transition: { duration: 0.5, ease: easeOut } },
+};
+export const swoopDown = {
+  hidden: { opacity: 0, y: -28, filter: "blur(8px)" },
+  show: { opacity: 1, y: 0, filter: "blur(0px)", transition: { duration: 0.5, ease: easeOut } },
+};
+export const swoopLeft = {
+  hidden: { opacity: 0, x: 40, filter: "blur(8px)" },
+  show: { opacity: 1, x: 0, filter: "blur(0px)", transition: { duration: 0.5, ease: easeOut } },
+};
+export const swoopRight = {
+  hidden: { opacity: 0, x: -40, filter: "blur(8px)" },
+  show: { opacity: 1, x: 0, filter: "blur(0px)", transition: { duration: 0.5, ease: easeOut } },
+};
+
+/** Snappy 3D arrival — content tips in from below with a slight tilt. */
+export const tiltIn = {
+  hidden: { opacity: 0, y: 32, rotateX: -10, transformPerspective: 900 },
+  show: { opacity: 1, y: 0, rotateX: 0, transition: springSoft },
+};
+
+export const popIn = {
+  hidden: { opacity: 0, scale: 0.86 },
+  show: { opacity: 1, scale: 1, transition: springSnappy },
+};
+
+const SWOOPS = [swoopUp, swoopLeft, swoopRight, swoopDown] as const;
+/** Deterministically pick a swoop direction by index — neighbours arrive from
+ *  alternating edges for a lively, "assembling" grid entrance. */
+export function swoopByIndex(i: number) {
+  return SWOOPS[i % SWOOPS.length];
+}

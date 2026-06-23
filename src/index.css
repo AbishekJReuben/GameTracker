@@ -73,6 +73,10 @@
   --animate-glow-pulse: glow-pulse 3.2s ease-in-out infinite;
   --animate-shimmer-sweep: shimmer-sweep 2.4s ease-in-out infinite;
   --animate-float-slow: float-slow 9s ease-in-out infinite;
+  --animate-swoop-up: swoop-up 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-swoop-down: swoop-down 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-swoop-left: swoop-left 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-swoop-right: swoop-right 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* Accent presets — JS sets [data-accent] on <html>; only these three vars change. */
@@ -220,6 +224,54 @@
     transform: translateY(-10px) rotate(2deg);
   }
 }
+@keyframes swoop-up {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 26px, 0);
+    filter: blur(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+@keyframes swoop-down {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -26px, 0);
+    filter: blur(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+@keyframes swoop-left {
+  0% {
+    opacity: 0;
+    transform: translate3d(38px, 0, 0);
+    filter: blur(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+@keyframes swoop-right {
+  0% {
+    opacity: 0;
+    transform: translate3d(-38px, 0, 0);
+    filter: blur(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
 
 /* -------------------------------------------------------------------- base */
 @layer base {
@@ -272,6 +324,10 @@
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012));
     backdrop-filter: blur(18px);
     box-shadow: var(--shadow-card);
+    transition: border-color 0.25s, box-shadow 0.25s;
+  }
+  .card:hover {
+    border-color: color-mix(in srgb, var(--accent-1) 22%, var(--color-line));
   }
   .glass {
     border: 1px solid var(--color-line);
@@ -365,21 +421,40 @@
     font-weight: 700;
     transition: transform 0.12s, background 0.18s, color 0.18s, box-shadow 0.18s, border-color 0.18s;
   }
+  .btn:hover {
+    transform: translateY(-1px);
+  }
   .btn:active {
-    transform: scale(0.97);
+    transform: scale(0.96);
   }
   .btn:disabled {
     opacity: 0.4;
     pointer-events: none;
+    transform: none;
   }
   .btn-primary {
+    position: relative;
+    overflow: hidden;
     color: #fff;
     background: linear-gradient(120deg, var(--accent-1), var(--accent-2) 55%, var(--accent-3) 120%);
     box-shadow: var(--shadow-glow);
   }
+  /* Sheen sweep on hover — a glint travels across the primary CTA. */
+  .btn-primary::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(105deg, transparent 40%, rgba(255, 255, 255, 0.28) 50%, transparent 60%);
+    transform: translateX(-130%);
+    transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+    pointer-events: none;
+  }
+  .btn-primary:hover::after {
+    transform: translateX(130%);
+  }
   .btn-primary:hover {
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-1) 45%, transparent),
-      0 14px 50px -10px color-mix(in srgb, var(--accent-1) 70%, transparent);
+      0 16px 54px -10px color-mix(in srgb, var(--accent-1) 75%, transparent);
   }
   .btn-ghost {
     border: 1px solid var(--color-line);

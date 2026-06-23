@@ -11,6 +11,8 @@ mod importer;
 mod hltb;
 mod suggestions;
 mod metadata;
+#[cfg(windows)]
+mod registry;
 mod state;
 mod system;
 mod tracking;

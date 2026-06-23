@@ -32,6 +32,7 @@ import {
   Timer,
   RefreshCw,
   Music2,
+  Compass,
 } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Card, SectionTitle, Segmented } from "@/components/ui";
@@ -254,6 +255,9 @@ export default function SettingsPage() {
                 </option>
               ))}
             </select>
+          </SettingRow>
+          <SettingRow icon={<Compass className="h-4 w-4" />} title="Suggested tab" desc="Show the game recommendations tab in the sidebar.">
+            <SpringToggle checked={prefs.showSuggested} onChange={(v) => setPref("showSuggested", v)} />
           </SettingRow>
           <SettingRow icon={<CalendarRange className="h-4 w-4" />} title="Default timeline range" desc="Starting zoom for timeline views.">
             <Segmented

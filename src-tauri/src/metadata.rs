@@ -332,16 +332,70 @@ pub struct GameSuggestion {
     pub source: String,
 }
 
-/// Build autosuggest results for a typed query (keyless Steam store search).
-/// Each suggestion carries the exact appid + a cover thumbnail URL.
+/// Build autosuggest results for a typed query. Steam store hits come first
+/// (they carry an exact appid + portrait thumbnail), then RAWG results fill in
+/// the long tail — Riot, Battle.net, console-first and other non-Steam titles
+/// that the keyless Steam search alone never surfaces. Deduped by name.
 pub fn search_game_suggestions(query: &str, max: usize) -> Vec<GameSuggestion> {
-    search_steam_games(query, max)
+    let mut out: Vec<GameSuggestion> = search_steam_games(query, max)
         .into_iter()
         .map(|(appid, name)| GameSuggestion {
             name,
             steam_app_id: Some(appid),
             cover_url: Some(steam_header_url(appid)),
             source: "Steam".to_string(),
+        })
+        .collect();
+
+    let mut seen: std::collections::HashSet<String> =
+        out.iter().map(|s| normalize_name(&s.name)).collect();
+    for sug in rawg_search_games(query, max) {
+        if out.len() >= max {
+            break;
+        }
+        if seen.insert(normalize_name(&sug.name)) {
+            out.push(sug);
+        }
+    }
+    out
+}
+
+/// RAWG title search for the autosuggest (needs `RAWG_API_KEY`). RAWG's catalog
+/// spans every storefront, so this is what lets non-Steam games autocomplete.
+fn rawg_search_games(term: &str, max: usize) -> Vec<GameSuggestion> {
+    let term = term.trim();
+    if term.is_empty() || max == 0 {
+        return Vec::new();
+    }
+    let Some(key) = rawg_key() else {
+        return Vec::new();
+    };
+    let q = encode(term);
+    let Some(json) = get_json(&format!(
+        "https://api.rawg.io/api/games?key={key}&search={q}&page_size={max}"
+    )) else {
+        return Vec::new();
+    };
+    let Some(arr) = json.get("results").and_then(|r| r.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|g| {
+            let name = g.get("name")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let cover_url = g
+                .get("background_image")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .filter(|s| !s.trim().is_empty());
+            Some(GameSuggestion {
+                name,
+                steam_app_id: None,
+                cover_url,
+                source: "RAWG".to_string(),
+            })
         })
         .collect()
 }

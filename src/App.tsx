@@ -3,7 +3,7 @@ import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-
 import { motion, AnimatePresence } from "motion/react";
 import { Sidebar } from "./components/Sidebar";
 import { TitleBar } from "./components/TitleBar";
-import { AmbientShell, LottieIdle } from "./components/animations";
+import { AmbientShell, LottieIdle, PageTransitionFX } from "./components/animations";
 import { AnimatedOutlet } from "./components/AnimatedOutlet";
 import { Toasts } from "./components/Toasts";
 import { ProgressDock } from "./components/ProgressDock";
@@ -53,6 +53,7 @@ function AppShell() {
         <Sidebar />
         <main className="relative isolate min-w-0 flex-1 overflow-hidden">
           <AnimatedOutlet />
+          <PageTransitionFX />
         </main>
       </div>
 

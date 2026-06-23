@@ -1,13 +1,12 @@
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { motion, useMotionValue, useSpring, useTransform } from "motion/react";
 import { Gamepad2, Moon, Zap, Clock, Play } from "lucide-react";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { api, type Session, TrackingState } from "@/lib/api";
 import { useDashboard, useGames } from "@/lib/queries";
-import { buildHeroSlides } from "@/lib/heroSlides";
 import { GameArt } from "./GameArt";
-import { ShaderSlideshow } from "./animations/ShaderSlideshow";
+import { CoverMarquee } from "./CoverMarquee";
 import { clockString, dur, relativeTime } from "@/lib/format";
 
 export function NowPlaying() {
@@ -20,7 +19,6 @@ export function NowPlaying() {
   const idle = !!tracking?.isIdle;
 
   const lastGame = dashboard?.recentSessions.find((s) => s.kind !== "app") ?? null;
-  const heroSlides = useMemo(() => buildHeroSlides(games ?? []), [games]);
 
   const [tick, setTick] = useState(0);
   useEffect(() => {
@@ -132,9 +130,9 @@ export function NowPlaying() {
         </div>
         </div>
 
-        <ShaderSlideshow
-          slides={heroSlides}
-          className="hidden h-auto min-h-[148px] lg:block lg:w-[min(40%,420px)] lg:shrink-0 lg:self-stretch"
+        <CoverMarquee
+          games={games ?? []}
+          className="hidden min-h-[148px] lg:block lg:w-[min(40%,420px)] lg:shrink-0 lg:self-stretch"
           dimmed={playing}
         />
       </div>

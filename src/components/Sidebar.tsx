@@ -25,6 +25,9 @@ export function Sidebar() {
   const tracking = useApp((s) => s.tracking);
   const live = tracking?.isPlaying && !tracking?.paused;
   const motionOn = useMotionEnabled();
+  const showSuggested = useApp((s) => s.prefs.showSuggested);
+  // The Suggested tab is opt-in (default off) — hide it from nav unless enabled.
+  const nav = NAV.filter((item) => item.to !== "/suggested" || showSuggested);
 
   return (
     <aside className="z-10 flex w-[244px] shrink-0 flex-col gap-2 border-r border-line bg-bg-900/50 px-3 pb-4 pt-2 backdrop-blur-xl">
@@ -49,7 +52,7 @@ export function Sidebar() {
       </div>
 
       <nav className="flex flex-col gap-1">
-        {NAV.map((item) => {
+        {nav.map((item) => {
           const active = item.end
             ? location.pathname === item.to
             : item.matchGame

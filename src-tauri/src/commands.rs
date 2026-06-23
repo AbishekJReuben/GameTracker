@@ -196,7 +196,7 @@ pub fn search_games_online(query: String) -> AppResult<Vec<metadata::GameSuggest
     if query.trim().len() < 2 {
         return Ok(Vec::new());
     }
-    Ok(metadata::search_game_suggestions(query.trim(), 8))
+    Ok(metadata::search_game_suggestions(query.trim(), 10))
 }
 
 /// Persist a fetched `GameMetadata` onto a game row (fields, media, appid, theme).

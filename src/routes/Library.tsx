@@ -99,6 +99,7 @@ export default function LibraryPage() {
   const view = useApp((s) => s.prefs.libraryView);
   const setPref = useApp((s) => s.setPref);
   const motionOn = useMotionEnabled();
+  const liveGameId = useApp((s) => (s.tracking?.isPlaying ? s.tracking.gameId : null));
   const coverJob = useProgress((s) => s.getJob("covers"));
   const infoJob = useProgress((s) => s.getJob("game-info"));
   const hltbJob = useProgress((s) => s.getJob("hltb"));
@@ -151,8 +152,16 @@ export default function LibraryPage() {
         return new Date(b.lastPlayedUtc ?? b.createdAt).getTime() - new Date(a.lastPlayedUtc ?? a.createdAt).getTime();
       },
     };
-    return [...list].sort(by[sort]);
-  }, [games, onlyGames, q, status, sort, trackedOnly, tag]);
+    // The game running right now floats to the very top, then anything marked
+    // "playing", then everything else ordered by the chosen sort.
+    const rank = (g: Game) => (liveGameId && g.id === liveGameId ? 0 : g.status === "playing" ? 1 : 2);
+    return [...list].sort((a, b) => {
+      const ra = rank(a);
+      const rb = rank(b);
+      if (ra !== rb) return ra - rb;
+      return by[sort](a, b);
+    });
+  }, [games, onlyGames, q, status, sort, trackedOnly, tag, liveGameId]);
 
   const importCsv = async () => {
     const path = (await api.defaultCsvPath()) ?? (await open({ multiple: false, filters: [{ name: "CSV", extensions: ["csv"] }] }));

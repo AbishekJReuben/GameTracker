@@ -254,12 +254,27 @@ fn scan_launchers() -> Vec<Candidate> {
     out
 }
 
+/// Path fragments that mark a running process as living under a game install
+/// root (any storefront/launcher we know about). Used to surface running games.
+const GAME_PATH_ROOTS: &[&str] = &[
+    "steamapps\\common",
+    "epic games",
+    "gog galaxy\\games",
+    "\\gog games\\",
+    "\\games\\",
+    "riot games",
+    "\\battle.net\\",
+    "\\rockstar games\\",
+    "ubisoft\\ubisoft game launcher\\games",
+    "\\origin games\\",
+    "\\ea games\\",
+    "\\ea\\",
+    "\\xboxgames\\",
+];
+
 fn looks_like_game_path(path: &str) -> bool {
     let p = path.to_lowercase();
-    p.contains("steamapps\\common")
-        || p.contains("epic games")
-        || p.contains("gog galaxy\\games")
-        || p.contains("\\games\\")
+    GAME_PATH_ROOTS.iter().any(|root| p.contains(root))
 }
 
 fn scan_running() -> Vec<Candidate> {
@@ -289,6 +304,276 @@ fn scan_running() -> Vec<Candidate> {
         }
     }
     out
+}
+
+// ---------- Launcher / publisher registry detection ----------
+
+/// Friendly title from an install-folder path (its last path component).
+fn name_from_folder(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.trim_end_matches(['\\', '/']).to_string())
+}
+
+/// Riot installs every title under `C:\Riot Games\<Game>` (alongside the shared
+/// "Riot Client"). There's no per-game manifest like Steam's, so we enumerate
+/// that root directly — and honor a relocated root recorded in
+/// `%ProgramData%\Riot Games\RiotClientInstalls.json`.
+fn scan_riot() -> Vec<Candidate> {
+    let mut roots: Vec<PathBuf> = vec![PathBuf::from("C:\\Riot Games")];
+    if let Some(pf) = env_path("ProgramFiles") {
+        roots.push(pf.join("Riot Games"));
+    }
+    if let Some(pd) = env_path("ProgramData") {
+        let manifest = pd.join("Riot Games").join("RiotClientInstalls.json");
+        if let Ok(text) = std::fs::read_to_string(&manifest) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(obj) = json.get("associated_client").and_then(|v| v.as_object()) {
+                    // Keys are game install dirs, e.g. "C:/Riot Games/VALORANT/".
+                    for key in obj.keys() {
+                        let p = PathBuf::from(key.replace('/', "\\"));
+                        if let Some(parent) = p.parent() {
+                            roots.push(parent.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for root in roots {
+        let entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(folder) = dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if folder.eq_ignore_ascii_case("Riot Client") {
+                continue;
+            }
+            let path = dir.to_string_lossy().to_string();
+            if !seen.insert(util::normalize_path(&path)) {
+                continue;
+            }
+            out.push(Candidate {
+                name: riot_title(folder),
+                install_folder: Some(path),
+                exe_path: None,
+                source: "Riot".to_string(),
+                steam_app_id: None,
+            });
+        }
+    }
+    out
+}
+
+/// Map Riot install-folder names to their proper display titles.
+fn riot_title(folder: &str) -> String {
+    match folder.to_lowercase().as_str() {
+        "valorant" => "VALORANT".to_string(),
+        "league of legends" => "League of Legends".to_string(),
+        "lor" | "legends of runeterra" => "Legends of Runeterra".to_string(),
+        "2xko" => "2XKO".to_string(),
+        _ => folder.to_string(),
+    }
+}
+
+/// Ubisoft Connect records every installed title under
+/// `…\Ubisoft\Launcher\Installs\<id>` with an `InstallDir` value — its
+/// authoritative installed-games list.
+#[cfg(windows)]
+fn scan_ubisoft_registry() -> Vec<Candidate> {
+    use crate::registry::{self, Hive};
+    let mut out = Vec::new();
+    for base in [
+        "SOFTWARE\\WOW6432Node\\Ubisoft\\Launcher\\Installs",
+        "SOFTWARE\\Ubisoft\\Launcher\\Installs",
+    ] {
+        for id in registry::subkeys(Hive::Lm, base) {
+            let path = format!("{base}\\{id}");
+            let Some(dir) = registry::read_string(Hive::Lm, &path, "InstallDir") else {
+                continue;
+            };
+            let dir = dir.replace('/', "\\");
+            if !Path::new(&dir).is_dir() {
+                continue;
+            }
+            out.push(Candidate {
+                name: name_from_folder(&dir),
+                install_folder: Some(dir),
+                exe_path: None,
+                source: "Ubisoft".to_string(),
+                steam_app_id: None,
+            });
+        }
+    }
+    out
+}
+#[cfg(not(windows))]
+fn scan_ubisoft_registry() -> Vec<Candidate> {
+    Vec::new()
+}
+
+/// Rockstar Games Launcher writes each title to `…\Rockstar Games\<Game>` with
+/// an `InstallFolder` value.
+#[cfg(windows)]
+fn scan_rockstar_registry() -> Vec<Candidate> {
+    use crate::registry::{self, Hive};
+    let mut out = Vec::new();
+    for base in ["SOFTWARE\\WOW6432Node\\Rockstar Games", "SOFTWARE\\Rockstar Games"] {
+        for sub in registry::subkeys(Hive::Lm, base) {
+            if sub.eq_ignore_ascii_case("Launcher")
+                || sub.eq_ignore_ascii_case("Rockstar Games Social Club")
+            {
+                continue;
+            }
+            let path = format!("{base}\\{sub}");
+            let dir = registry::read_string(Hive::Lm, &path, "InstallFolder")
+                .or_else(|| registry::read_string(Hive::Lm, &path, "InstallLocation"));
+            let Some(dir) = dir.filter(|d| Path::new(d).is_dir()) else {
+                continue;
+            };
+            out.push(Candidate {
+                name: sub,
+                install_folder: Some(dir),
+                exe_path: None,
+                source: "Rockstar".to_string(),
+                steam_app_id: None,
+            });
+        }
+    }
+    out
+}
+#[cfg(not(windows))]
+fn scan_rockstar_registry() -> Vec<Candidate> {
+    Vec::new()
+}
+
+/// Publisher substrings that mark an Uninstall entry as a game, mapped to a
+/// friendly source label. Matched (lowercased) against the entry's `Publisher`.
+const GAME_PUBLISHERS: &[(&str, &str)] = &[
+    ("blizzard", "Battle.net"),
+    ("activision", "Battle.net"),
+    ("riot games", "Riot"),
+    ("rockstar", "Rockstar"),
+    ("electronic arts", "EA"),
+    ("ubisoft", "Ubisoft"),
+    ("bethesda", "Bethesda"),
+    ("cd projekt", "GOG"),
+    ("xbox game studios", "Xbox"),
+    ("square enix", "Installed"),
+    ("bandai namco", "Installed"),
+    ("capcom", "Installed"),
+    ("sega", "Installed"),
+    ("2k ", "Installed"),
+    ("take-two", "Installed"),
+    ("devolver", "Installed"),
+    ("fromsoftware", "Installed"),
+    ("from software", "Installed"),
+    ("hoyoverse", "Installed"),
+    ("cognosphere", "Installed"),
+    ("mihoyo", "Installed"),
+    ("kurogame", "Installed"),
+    ("krafton", "Installed"),
+    ("nexon", "Installed"),
+    ("paradox", "Installed"),
+    ("warner bros", "Installed"),
+    ("deep silver", "Installed"),
+];
+
+/// Names that pass the publisher filter but are tooling/redistributables.
+const UNINSTALL_NAME_DENY: &[&str] = &[
+    "redistributable",
+    "redist",
+    "runtime",
+    "directx",
+    "visual c++",
+    "vcredist",
+    ".net",
+    "driver",
+    "framework",
+    "uninstall",
+    "anticheat",
+    "easyanticheat",
+    "battleye",
+    "sdk",
+    "dedicated server",
+];
+
+/// Decide whether an Uninstall entry is a game, and under which source label.
+fn classify_uninstall(publisher: &str, install: &str) -> Option<&'static str> {
+    let pub_l = publisher.to_lowercase();
+    for (needle, source) in GAME_PUBLISHERS {
+        if pub_l.contains(needle) {
+            return Some(source);
+        }
+    }
+    // Otherwise only accept it if it sits under a known game install root.
+    looks_like_game_path(install).then_some("Installed")
+}
+
+/// Generic Windows Uninstall-registry scan. Surfaces games whose publisher we
+/// recognize (this is what catches Blizzard / Battle.net titles, which don't
+/// expose a Steam-style manifest) or that install under a known game root.
+/// Deliberately conservative to avoid listing ordinary applications.
+#[cfg(windows)]
+fn scan_uninstall_registry() -> Vec<Candidate> {
+    use crate::registry::{self, Hive};
+    let hives: [(Hive, &str); 3] = [
+        (Hive::Lm, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+        (Hive::Lm, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+        (Hive::Cu, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+    ];
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (hive, base) in hives {
+        for sub in registry::subkeys(hive, base) {
+            let path = format!("{base}\\{sub}");
+            let Some(name) = registry::read_string(hive, &path, "DisplayName") else {
+                continue;
+            };
+            let install = match registry::read_string(hive, &path, "InstallLocation") {
+                Some(p) if Path::new(&p).is_dir() => p,
+                _ => continue,
+            };
+            let name_l = name.to_lowercase();
+            if UNINSTALL_NAME_DENY.iter().any(|d| name_l.contains(d)) {
+                continue;
+            }
+            let publisher = registry::read_string(hive, &path, "Publisher").unwrap_or_default();
+            let Some(source) = classify_uninstall(&publisher, &install) else {
+                continue;
+            };
+            if !seen.insert(util::normalize_path(&install)) {
+                continue;
+            }
+            out.push(Candidate {
+                name,
+                install_folder: Some(install),
+                exe_path: None,
+                source: source.to_string(),
+                steam_app_id: None,
+            });
+        }
+    }
+    out
+}
+#[cfg(not(windows))]
+fn scan_uninstall_registry() -> Vec<Candidate> {
+    Vec::new()
 }
 
 // ---------- App / software detection ----------
@@ -464,6 +749,10 @@ pub fn detect(pool: &DbPool) -> AppResult<Vec<Candidate>> {
     let mut all = Vec::new();
     all.extend(scan_steam());
     all.extend(scan_launchers());
+    all.extend(scan_riot());
+    all.extend(scan_ubisoft_registry());
+    all.extend(scan_rockstar_registry());
+    all.extend(scan_uninstall_registry());
     all.extend(scan_running());
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -512,6 +801,33 @@ mod tests {
         assert!(parse_epic_item(no_install).is_none());
         let not_json = "not json";
         assert!(parse_epic_item(not_json).is_none());
+    }
+
+    #[test]
+    fn riot_titles_are_prettified() {
+        assert_eq!(riot_title("VALORANT"), "VALORANT");
+        assert_eq!(riot_title("League of Legends"), "League of Legends");
+        assert_eq!(riot_title("LoR"), "Legends of Runeterra");
+        assert_eq!(riot_title("Some Game"), "Some Game");
+    }
+
+    #[test]
+    fn name_from_folder_takes_last_component() {
+        assert_eq!(name_from_folder("C:\\Games\\Far Cry 6"), "Far Cry 6");
+        assert_eq!(name_from_folder("D:/Riot Games/VALORANT/"), "VALORANT");
+    }
+
+    #[test]
+    fn classify_uninstall_recognizes_blizzard_and_path() {
+        assert_eq!(classify_uninstall("Blizzard Entertainment", "C:\\X"), Some("Battle.net"));
+        assert_eq!(classify_uninstall("Riot Games, Inc.", "C:\\X"), Some("Riot"));
+        // Unknown publisher but a Steam install path still counts.
+        assert_eq!(
+            classify_uninstall("Some Studio", "D:\\SteamLibrary\\steamapps\\common\\Game"),
+            Some("Installed")
+        );
+        // Unknown publisher + ordinary path → not a game.
+        assert_eq!(classify_uninstall("Acme Software", "C:\\Program Files\\Acme"), None);
     }
 
     #[test]

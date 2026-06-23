@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.0.6"
+version = "3.0.8"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -58,6 +58,7 @@ windows = { version = "0.58", features = [
   "Win32_UI_Shell",
   "Win32_Storage_FileSystem",
 ] }
+winreg = "0.52"
 
 [profile.release]
 panic = "abort"

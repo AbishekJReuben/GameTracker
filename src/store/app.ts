@@ -30,6 +30,8 @@ export interface Prefs {
   weekStart: WeekStart;
   scanlines: boolean;
   libraryView: LibraryView;
+  /** Show the "Suggested" recommendations tab in the sidebar. Default off. */
+  showSuggested: boolean;
   /** Mute the per-game theme player. Defaults muted (autoplay needs it). */
   themeMuted: boolean;
   widgets: {
@@ -51,6 +53,7 @@ const DEFAULT_PREFS: Prefs = {
   weekStart: "mon",
   scanlines: true,
   libraryView: "grid",
+  showSuggested: false,
   themeMuted: true,
   widgets: { goal: true, secondary: true, patterns: true, heatmap: true },
 };

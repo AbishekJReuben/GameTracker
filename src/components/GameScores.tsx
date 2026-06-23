@@ -22,10 +22,14 @@ export function GameScores({
   game,
   variant = "inline",
   className,
+  index = 0,
 }: {
   game: ScoreGame;
   variant?: Variant;
   className?: string;
+  /** Grid position — staggers the badge's shimmer sweep so a wall of cards
+   *  ripples instead of flashing in unison. */
+  index?: number;
 }) {
   const { rating, metacritic } = game;
   const hasMine = rating != null;
@@ -62,7 +66,7 @@ export function GameScores({
   }
 
   if (variant === "badge") {
-    return <ScoreBadge rating={rating} metacritic={metacritic} hasMine={hasMine} hasMeta={hasMeta} game={game} className={className} />;
+    return <ScoreBadge rating={rating} metacritic={metacritic} hasMine={hasMine} hasMeta={hasMeta} game={game} className={className} index={index} />;
   }
 
   // inline
@@ -84,6 +88,13 @@ export function GameScores({
   );
 }
 
+// Shimmer cycle = sweep duration + the idle gap before it repeats. The initial
+// delay is spread across this whole period so neighbouring cards are out of
+// phase and the sweeps ripple across the grid rather than firing together.
+const SHIMMER_DURATION = 1.8;
+const SHIMMER_GAP = 4;
+const SHIMMER_PERIOD = SHIMMER_DURATION + SHIMMER_GAP;
+
 function ScoreBadge({
   rating,
   metacritic,
@@ -91,6 +102,7 @@ function ScoreBadge({
   hasMeta,
   game,
   className,
+  index = 0,
 }: {
   rating: number | null;
   metacritic: number | null;
@@ -98,8 +110,10 @@ function ScoreBadge({
   hasMeta: boolean;
   game: ScoreGame;
   className?: string;
+  index?: number;
 }) {
   const enabled = useMotionEnabled();
+  const shimmerDelay = 0.3 + ((index * 0.22) % SHIMMER_PERIOD);
   return (
     <motion.div
       className={cn("absolute right-2.5 top-2.5 flex flex-col items-end gap-0.5 overflow-hidden rounded-xl bg-black/45 px-2 py-1 text-[10px] font-800 text-white backdrop-blur-md", className)}
@@ -113,7 +127,7 @@ function ScoreBadge({
           className="pointer-events-none absolute inset-0 bg-gradient-to-r from-transparent via-white/25 to-transparent"
           initial={{ x: "-120%" }}
           animate={{ x: "220%" }}
-          transition={{ duration: 1.8, delay: 0.4, ease: "easeInOut", repeat: Infinity, repeatDelay: 4 }}
+          transition={{ duration: SHIMMER_DURATION, delay: shimmerDelay, ease: "easeInOut", repeat: Infinity, repeatDelay: SHIMMER_GAP }}
         />
       )}
       {hasMine && (

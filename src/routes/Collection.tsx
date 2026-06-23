@@ -28,6 +28,7 @@ import { RadarChart } from "@/components/Charts";
 import { Reveal } from "@/components/Reveal";
 import { GameArt } from "@/components/GameArt";
 import { GameScores } from "@/components/GameScores";
+import { CoverMarquee } from "@/components/CoverMarquee";
 import { InsightsContent } from "./Insights";
 import { useCatalog, useGames } from "@/lib/queries";
 import { useMotionEnabled } from "@/store/app";
@@ -130,6 +131,18 @@ export default function CollectionPage() {
   return (
     <Page title="Collection" subtitle={`${data.totalCompleted} games completed`}>
       <div className="space-y-6">
+        {/* Cover-wall hero — gives the screen imagery before the stat panels. */}
+        <Reveal>
+          <CollectionHero
+            games={games ?? []}
+            totalCompleted={data.totalCompleted}
+            avgMyScore={data.avgMyScore}
+            playtimeSeconds={data.totalPlaytimeSeconds}
+            perfectScores={data.perfectScores}
+            scoredCount={data.scoredCount}
+          />
+        </Reveal>
+
         {/* Gauges */}
         <Reveal>
         <Card>
@@ -225,6 +238,10 @@ export default function CollectionPage() {
           </Card>
           </Reveal>
         )}
+
+        <Reveal delay={0.09}>
+          <RecentlyCompletedRail games={completed} />
+        </Reveal>
 
         <Reveal delay={0.1}>
         <div className="grid gap-6 lg:grid-cols-2">
@@ -355,7 +372,7 @@ export default function CollectionPage() {
                     <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} className="absolute inset-0 h-full w-full" rounded="rounded-xl" />
                     <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
                     <div className="absolute right-1.5 top-1.5">
-                      <GameScores game={g} variant="badge" className="static rounded-full px-1.5 py-0.5 text-[9px]" />
+                      <GameScores game={g} variant="badge" index={i} className="static rounded-full px-1.5 py-0.5 text-[9px]" />
                     </div>
                     {i === 0 && <div className="absolute left-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-amber text-[10px] font-900 text-black">1</div>}
                     <div className="absolute inset-x-0 bottom-0 truncate p-1.5 text-[10px] font-700 text-white">{g.displayName}</div>
@@ -374,6 +391,120 @@ export default function CollectionPage() {
         </div>
       </div>
     </Page>
+  );
+}
+
+function CollectionHero({
+  games,
+  totalCompleted,
+  avgMyScore,
+  playtimeSeconds,
+  perfectScores,
+  scoredCount,
+}: {
+  games: Game[];
+  totalCompleted: number;
+  avgMyScore: number;
+  playtimeSeconds: number;
+  perfectScores: number;
+  scoredCount: number;
+}) {
+  return (
+    <div className="relative h-[200px] overflow-hidden rounded-3xl border border-line bg-bg-900/70 shadow-card">
+      {/* Drifting cover wall (shared marquee) */}
+      <CoverMarquee
+        games={games}
+        fade={false}
+        className="absolute inset-0 rounded-3xl border-0 bg-transparent shadow-none"
+      />
+
+      {/* Scrims so the foreground text stays readable over the art */}
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-bg-base via-bg-base/65 to-bg-base/85" />
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-bg-base via-transparent to-bg-base/30" />
+
+      {/* Foreground: title + headline stat chips */}
+      <div className="relative flex h-full flex-col justify-center px-6">
+        <div className="flex items-center gap-2 text-[11px] font-800 uppercase tracking-[0.22em] text-accent-3">
+          <Trophy className="h-4 w-4" /> Collection
+        </div>
+        <h2 className="mt-1 font-display text-[26px] font-900 leading-tight text-ink glow-text">
+          Your hall of games
+        </h2>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <HeroChip icon={<Trophy className="h-3.5 w-3.5" />} value={String(totalCompleted)} label="completed" />
+          <HeroChip icon={<Star className="h-3.5 w-3.5" />} value={avgMyScore.toFixed(1)} label="avg score" />
+          <HeroChip icon={<Clock className="h-3.5 w-3.5" />} value={`${hours(playtimeSeconds, 1)}h`} label="played" />
+          {perfectScores > 0 && (
+            <HeroChip icon={<Sparkle className="h-3.5 w-3.5" />} value={String(perfectScores)} label="perfect" />
+          )}
+          <HeroChip icon={<BookOpen className="h-3.5 w-3.5" />} value={`${scoredCount}/${totalCompleted}`} label="scored" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RecentlyCompletedRail({ games }: { games: Game[] }) {
+  // Newest finishes first, by completion date (year/month/day).
+  const recent = useMemo(() => {
+    const key = (g: Game) =>
+      (g.completedYear ?? 0) * 10000 + (g.completedMonth ?? 0) * 100 + (g.completedDay ?? 0);
+    return [...games]
+      .filter((g) => g.coverPath || g.iconPath)
+      .sort((a, b) => key(b) - key(a))
+      .slice(0, 18);
+  }, [games]);
+
+  if (recent.length === 0) return null;
+
+  return (
+    <Card>
+      <SectionTitle
+        title="Recently completed"
+        subtitle="Your latest finishes, newest first"
+        right={<Sparkles className="h-4 w-4 text-ink-dim" />}
+      />
+      <div className="-mx-1 mt-1 flex gap-3 overflow-x-auto px-1 pb-2 [scrollbar-width:thin]">
+        {recent.map((g, i) => (
+          <Link
+            key={g.id}
+            to={`/game/${g.id}`}
+            className="group relative w-[116px] shrink-0"
+            style={{ scrollSnapAlign: "start" }}
+          >
+            <div className="relative aspect-[3/4] overflow-hidden rounded-xl border border-line transition duration-300 group-hover:-translate-y-1 group-hover:border-line-strong group-hover:shadow-float">
+              <GameArt
+                id={g.id}
+                name={g.displayName}
+                cover={g.coverPath}
+                icon={g.iconPath}
+                accent={g.accentColor}
+                className="absolute inset-0 h-full w-full"
+                rounded="rounded-xl"
+              />
+              <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/10 to-transparent" />
+              <div className="absolute right-1.5 top-1.5">
+                <GameScores game={g} variant="badge" index={i} className="static rounded-full px-1.5 py-0.5 text-[9px]" />
+              </div>
+              <div className="absolute inset-x-0 bottom-0 p-2">
+                <div className="truncate text-[11px] font-800 text-white">{g.displayName}</div>
+                {g.completedYear && <div className="text-[10px] font-600 text-white/60">{g.completedYear}</div>}
+              </div>
+            </div>
+          </Link>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function HeroChip({ icon, value, label }: { icon: React.ReactNode; value: string; label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-black/45 px-3 py-1 backdrop-blur-md">
+      <span className="text-accent-3">{icon}</span>
+      <span className="font-800 tabular-nums text-ink">{value}</span>
+      <span className="text-[10px] font-700 uppercase tracking-wider text-ink-dim">{label}</span>
+    </span>
   );
 }
 
