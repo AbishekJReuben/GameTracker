@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.0.4"
+version = "3.0.6"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
