@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "motion/react";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { getVersion } from "@tauri-apps/api/app";
 import { isTauri } from "@/lib/tauri";
 import {
   Power,
@@ -69,9 +70,11 @@ export default function SettingsPage() {
   const setPref = useApp((s) => s.setPref);
   const [autostart, setAutostart] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
 
   useEffect(() => {
     api.autostartEnabled().then(setAutostart).catch(() => {});
+    if (isTauri()) getVersion().then(setAppVersion).catch(() => {});
   }, []);
 
   const setVal = async (key: string, value: string) => {
@@ -387,6 +390,9 @@ export default function SettingsPage() {
             <button onClick={checkUpdates} className="btn btn-subtle h-9 min-w-[7rem]" disabled={!isTauri() || checkingUpdate}>
               {checkingUpdate ? "Checking…" : "Check now"}
             </button>
+          </SettingRow>
+          <SettingRow icon={<Sparkles className="h-4 w-4" />} title="Version" desc="The build of Tracker currently installed.">
+            <span className="text-ink-soft text-sm tabular-nums">{appVersion ? `v${appVersion}` : "—"}</span>
           </SettingRow>
         </div>
       ),
