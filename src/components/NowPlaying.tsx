@@ -1,22 +1,26 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import { Link } from "react-router-dom";
 import { motion, useMotionValue, useSpring, useTransform } from "motion/react";
 import { Gamepad2, Moon, Zap, Clock, Play } from "lucide-react";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { api, type Session, TrackingState } from "@/lib/api";
-import { useDashboard } from "@/lib/queries";
+import { useDashboard, useGames } from "@/lib/queries";
+import { buildHeroSlides } from "@/lib/heroSlides";
 import { GameArt } from "./GameArt";
+import { ShaderSlideshow } from "./animations/ShaderSlideshow";
 import { clockString, dur, relativeTime } from "@/lib/format";
 
 export function NowPlaying() {
   const tracking = useApp((s) => s.tracking);
   const pushToast = useApp((s) => s.pushToast);
   const { data: dashboard } = useDashboard();
+  const { data: games } = useGames();
   const enabled = useMotionEnabled();
   const playing = !!tracking?.isPlaying && !tracking?.paused;
   const idle = !!tracking?.isIdle;
 
   const lastGame = dashboard?.recentSessions.find((s) => s.kind !== "app") ?? null;
+  const heroSlides = useMemo(() => buildHeroSlides(games ?? []), [games]);
 
   const [tick, setTick] = useState(0);
   useEffect(() => {
@@ -64,7 +68,8 @@ export function NowPlaying() {
         </div>
       )}
 
-      <div className="relative flex flex-col gap-6 sm:flex-row sm:items-center">
+      <div className="relative flex flex-col gap-6 lg:flex-row lg:items-stretch">
+        <div className="flex min-w-0 flex-1 flex-col gap-6 sm:flex-row sm:items-center">
         <ArtBlock playing={playing} tracking={tracking} lastGame={lastGame} enabled={enabled} />
 
         <div className="min-w-0 flex-1">
@@ -125,6 +130,13 @@ export function NowPlaying() {
             </p>
           )}
         </div>
+        </div>
+
+        <ShaderSlideshow
+          slides={heroSlides}
+          className="hidden h-auto min-h-[148px] lg:block lg:w-[min(40%,420px)] lg:shrink-0 lg:self-stretch"
+          dimmed={playing}
+        />
       </div>
     </motion.div>
   );

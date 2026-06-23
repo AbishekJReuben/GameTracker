@@ -5,12 +5,13 @@ import { Page } from "@/components/Page";
 import { NowPlaying } from "@/components/NowPlaying";
 import { StatTile } from "@/components/StatTile";
 import { Heatmap } from "@/components/Heatmap";
+import { LibraryPlaytimeChart } from "@/components/LibraryPlaytimeChart";
 import { Sparkline } from "@/components/Sparkline";
 import { GameArt } from "@/components/GameArt";
 import { Timeline } from "@/components/Timeline";
 import { PolarHours, WeekdayBars } from "@/components/Charts";
 import { Card, SectionTitle, EmptyState, Skeleton } from "@/components/ui";
-import { useDashboard, useAppsOverview, useHeatmap, useHourOfDay, useSessions, useSettings } from "@/lib/queries";
+import { useDashboard, useAppsOverview, useHeatmap, useHourOfDay, useSessions, useSettings, useGames } from "@/lib/queries";
 import type { Dashboard as DashboardData } from "@/lib/api";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { dur, hours, relativeTime, timeLabel, accentFor } from "@/lib/format";
@@ -29,6 +30,7 @@ const fadeUp = {
 
 export default function Dashboard() {
   const { data, isLoading } = useDashboard();
+  const { data: games } = useGames();
   const { data: appsOverview } = useAppsOverview();
   const { data: settings } = useSettings();
   const { data: heat } = useHeatmap(182);
@@ -251,7 +253,12 @@ export default function Dashboard() {
                   </span>
                 }
               />
-              {heat ? <Heatmap data={heat} /> : <Skeleton className="h-28 w-full" />}
+              <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_minmax(200px,280px)] lg:items-stretch">
+                <div className="min-w-0">
+                  {heat ? <Heatmap data={heat} /> : <Skeleton className="h-28 w-full" />}
+                </div>
+                <LibraryPlaytimeChart games={games ?? []} />
+              </div>
             </Card>
           )}
         </motion.div>
