@@ -113,14 +113,25 @@ const STATUS_COLORS: Record<string, string> = {
   completed: "#7c5cff",
   backlog: "#3b82f6",
   dropped: "#f472b6",
+  on_hold: "#f59e0b",
+  watched: "#22d3ee",
 };
+
+const STATUS_LABELS: Record<string, string> = {
+  on_hold: "On Hold",
+  watched: "Watched",
+};
+
+export function statusLabel(status: string) {
+  return STATUS_LABELS[status] ?? status;
+}
 
 export function StatusBadge({ status }: { status: string }) {
   const color = STATUS_COLORS[status] ?? "#94a3b8";
   return (
     <Badge color={color} className="capitalize">
       <span className="h-1.5 w-1.5 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
-      {status}
+      {statusLabel(status)}
     </Badge>
   );
 }

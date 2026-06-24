@@ -145,8 +145,8 @@ export function GameCompact({ games }: { games: Game[] }) {
 
 /* ============================ ALBUM VIEW (cover shelves by status) ============================ */
 
-const SHELF_ORDER: GameStatus[] = ["playing", "backlog", "completed", "dropped"];
-const SHELF_LABEL: Record<GameStatus, string> = { playing: "Now Playing", backlog: "Up Next", completed: "Completed", dropped: "Set Aside" };
+const SHELF_ORDER: GameStatus[] = ["playing", "backlog", "on_hold", "completed", "dropped", "watched"];
+const SHELF_LABEL: Record<GameStatus, string> = { playing: "Now Playing", backlog: "Up Next", on_hold: "On Hold", completed: "Completed", dropped: "Set Aside", watched: "Watching" };
 
 export function GameAlbum({ games }: { games: Game[] }) {
   const enabled = useMotionEnabled();

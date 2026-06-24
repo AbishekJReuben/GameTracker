@@ -12,7 +12,7 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 
 // ---------- Types (mirror the Rust DTOs) ----------
 
-export type GameStatus = "playing" | "completed" | "backlog" | "dropped";
+export type GameStatus = "playing" | "completed" | "backlog" | "dropped" | "on_hold" | "watched";
 export type EntryKind = "game" | "app";
 
 export interface Game {

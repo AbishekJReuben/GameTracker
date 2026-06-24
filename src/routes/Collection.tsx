@@ -38,7 +38,7 @@ import { aggregateSteamAchievements } from "@/lib/steamAchievements";
 import { SteamAchievementBadge, SteamAchievementCollectionSection } from "@/components/SteamAchievements";
 
 const AXIS = { stroke: "#454c66", fontSize: 11 };
-const STATUS_COLORS: Record<string, string> = { playing: "#34d399", completed: "#7c5cff", backlog: "#3b82f6", dropped: "#f472b6" };
+const STATUS_COLORS: Record<string, string> = { playing: "#34d399", completed: "#7c5cff", backlog: "#3b82f6", dropped: "#f472b6", on_hold: "#f59e0b", watched: "#22d3ee" };
 
 export default function CollectionPage() {
   const { data, isLoading } = useCatalog();

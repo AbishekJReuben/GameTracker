@@ -71,8 +71,10 @@ const STATUS_OPTS: { value: StatusFilter; label: string }[] = [
   { value: "all", label: "All" },
   { value: "playing", label: "Playing" },
   { value: "backlog", label: "Backlog" },
+  { value: "on_hold", label: "On Hold" },
   { value: "completed", label: "Completed" },
   { value: "dropped", label: "Dropped" },
+  { value: "watched", label: "Watched" },
 ];
 
 const SORT_OPTS: { value: Sort; label: string }[] = [

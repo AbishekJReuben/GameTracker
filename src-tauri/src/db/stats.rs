@@ -914,7 +914,7 @@ pub fn catalog_analytics(pool: &DbPool) -> AppResult<CatalogAnalytics> {
     let mut status_counts = Vec::new();
     let mut backlog_count = 0i64;
     let mut dropped_count = 0i64;
-    for st in ["playing", "completed", "backlog", "dropped"] {
+    for st in ["playing", "completed", "backlog", "dropped", "on_hold", "watched"] {
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM games WHERE kind = 'game' AND status = ?1",
             [st],

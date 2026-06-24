@@ -13,8 +13,10 @@ import { springSoft } from "@/lib/motion";
 const STATUSES: { value: GameStatus; label: string }[] = [
   { value: "playing", label: "Playing" },
   { value: "backlog", label: "Backlog" },
+  { value: "on_hold", label: "On Hold" },
   { value: "completed", label: "Completed" },
   { value: "dropped", label: "Dropped" },
+  { value: "watched", label: "Watched" },
 ];
 
 const empty: GameInput = {

@@ -25,7 +25,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { Page } from "@/components/Page";
 import { GameArt } from "@/components/GameArt";
 import { Timeline, type TimelineRange } from "@/components/Timeline";
-import { Card, HudPanel, SectionTitle, StatusBadge, Badge, EmptyState, Skeleton, Segmented, statusColor } from "@/components/ui";
+import { Card, HudPanel, SectionTitle, StatusBadge, Badge, EmptyState, Skeleton, Segmented, statusColor, statusLabel } from "@/components/ui";
 import { useGame, useGames, useSessions, useScreenshots, useSetStatus, useRefreshAll, useSettings } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { dur, dateLabel, relativeTime, timeLabel, partialDate, formatHltbMinutes } from "@/lib/format";
@@ -45,7 +45,7 @@ import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
 import { libraryNeighbors } from "@/lib/libraryNav";
 import { SteamAchievementDetailPanel } from "@/components/SteamAchievements";
 
-const STATUSES: GameStatus[] = ["playing", "backlog", "completed", "dropped"];
+const STATUSES: GameStatus[] = ["playing", "backlog", "on_hold", "completed", "dropped", "watched"];
 const RANGE_OPTS = TIMELINE_RANGE_OPTIONS;
 
 function activityHost(url?: string | null): string | null {
@@ -399,7 +399,7 @@ export default function GameDetail() {
                     className={`rounded-lg px-2.5 py-1.5 text-xs font-800 capitalize transition ${game.status === s ? "text-white" : "text-ink-dim hover:text-ink"}`}
                     style={game.status === s ? { background: `color-mix(in srgb, ${statusColor(s)} 32%, transparent)` } : {}}
                   >
-                    {s}
+                    {statusLabel(s)}
                   </button>
                 ))}
               </div>
