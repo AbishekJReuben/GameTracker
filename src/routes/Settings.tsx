@@ -34,6 +34,7 @@ import {
   RefreshCw,
   Music2,
   Compass,
+  Gauge,
 } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Card, SectionTitle, Segmented } from "@/components/ui";
@@ -313,6 +314,9 @@ export default function SettingsPage() {
           </SettingRow>
           <SettingRow icon={<Target className="h-4 w-4" />} title="Break reminder" desc="Toast nudge after this many minutes of continuous play (0 = off).">
             <NumberInput value={settings?.break_reminder_minutes ?? "0"} onCommit={(v) => setVal("break_reminder_minutes", v)} suffix="min" />
+          </SettingRow>
+          <SettingRow icon={<Gauge className="h-4 w-4" />} title="Performance tracking" desc="Record CPU, GPU, RAM & temperatures over time for the System dashboard.">
+            <SpringToggle checked={settings ? settings.system_monitor_enabled !== "false" : true} onChange={(v) => setVal("system_monitor_enabled", v ? "true" : "false")} />
           </SettingRow>
         </div>
       ),

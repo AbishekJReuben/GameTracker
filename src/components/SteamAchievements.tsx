@@ -172,7 +172,7 @@ export function SteamAchievementDetailPanel({ game }: { game: Game }) {
         </div>
       )}
 
-      <div className="mt-4 max-h-[520px] space-y-2 overflow-y-auto pr-1">
+      <div className="mt-4 max-h-[300px] space-y-2 overflow-y-auto pr-1">
         {shown.map((a) => (
           <AchievementRow key={a.apiName} achievement={a} />
         ))}

@@ -31,7 +31,7 @@ import { Card, SectionTitle, EmptyState, Skeleton, Segmented, Badge } from "@/co
 import { SYSTEM_HISTORY_RANGES, rangeToHistoryMinutes, rangeToLookbackMs, type TimelineRange } from "@/lib/timelineZoom";
 import { RadialGauge, LevelBar } from "@/components/RadialGauge";
 import { GameArt } from "@/components/GameArt";
-import { useSystemLive, useSystemHistory, useSessions } from "@/lib/queries";
+import { useSystemLive, useSystemHistory, useSessions, useSettings } from "@/lib/queries";
 import { Timeline } from "@/components/Timeline";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { dur } from "@/lib/format";
@@ -60,11 +60,13 @@ function fmt(n: number | null | undefined, suffix = "", digits = 0) {
 }
 
 export default function SystemsPage() {
-  const { data: live, isLoading } = useSystemLive();
+  const { data: settings } = useSettings();
+  const monitorOn = settings ? settings.system_monitor_enabled !== "false" : true;
+  const { data: live, isLoading } = useSystemLive(monitorOn);
   const defaultRange = useApp((s) => s.prefs.timelineRange);
   const [range, setRange] = useState<TimelineRange>(defaultRange);
   const historyMinutes = rangeToHistoryMinutes(range);
-  const { data: history } = useSystemHistory(historyMinutes);
+  const { data: history } = useSystemHistory(historyMinutes, monitorOn);
   const [histMetric, setHistMetric] = useState<"usage" | "temp">("usage");
   const lookbackMs = rangeToLookbackMs(range);
   const fromUtc = useMemo(() => new Date(Date.now() - lookbackMs).toISOString(), [lookbackMs]);
@@ -73,6 +75,23 @@ export default function SystemsPage() {
   const specs = live?.specs;
   const samples = live?.samples ?? [];
   const latest: SystemSample | undefined = samples[samples.length - 1];
+
+  if (!monitorOn) {
+    return (
+      <Page title="System" subtitle="Hardware monitor">
+        <EmptyState
+          icon={<GaugeIcon className="h-6 w-6" />}
+          title="Performance tracking is off"
+          message="Turn on Performance tracking in Settings → Tracking to record and view live CPU, GPU, RAM and temperatures."
+          action={
+            <Link to="/settings" className="btn btn-primary">
+              Open Settings
+            </Link>
+          }
+        />
+      </Page>
+    );
+  }
 
   if (isLoading || !specs) {
     return (

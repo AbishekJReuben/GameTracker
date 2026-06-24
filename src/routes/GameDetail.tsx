@@ -389,7 +389,16 @@ export default function GameDetail() {
           )}
           <div className="absolute inset-0 bg-bg-base/82" />
         </motion.div>
-        <div className="relative flex flex-col gap-5 p-6 sm:flex-row sm:items-end">
+        {/* Screenshot marquee drifts along the hero's right edge, behind the
+            status/play controls. Masked into the backdrop for legibility. */}
+        {game.screenshots.length > 0 && (
+          <div className="pointer-events-none absolute inset-y-0 right-0 z-0 hidden w-[62%] overflow-hidden sm:block" aria-hidden>
+            <ImageMarquee images={game.screenshots} fade={false} durationSec={46} className="h-full rounded-none border-0 bg-transparent" />
+            <div className="absolute inset-0 bg-gradient-to-r from-bg-base via-bg-base/80 to-bg-base/40" />
+            <div className="absolute inset-0 bg-bg-base/25" />
+          </div>
+        )}
+        <div className="relative z-10 flex flex-col gap-5 p-6 sm:flex-row sm:items-end">
           <GameArt id={game.id} name={game.displayName} cover={game.coverPath} icon={game.iconPath} accent={game.accentColor} steamAppId={game.steamAppId} className="h-44 w-32 shrink-0 shadow-float" />
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
@@ -450,18 +459,6 @@ export default function GameDetail() {
         </div>
       </motion.div>
 
-      {/* Screenshot marquee — a drifting strip of store imagery under the hero. */}
-      {game.screenshots.length > 0 && (
-        <motion.div
-          initial={enabled ? { opacity: 0, y: 10 } : false}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4, delay: 0.1 }}
-          className="mb-6"
-        >
-          <ImageMarquee images={game.screenshots} className="h-28 sm:h-36" durationSec={46} />
-        </motion.div>
-      )}
-
       {/* Stats */}
       <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
         {isApp ? (
@@ -480,7 +477,6 @@ export default function GameDetail() {
           </>
         )}
       </div>
-      {!isApp && <SteamAchievementDetailPanel game={game} />}
       {!isApp && (game.trackedRuntimeSeconds > 0 || game.manualPlaytimeSeconds > 0) && (
         <p className="mb-6 text-sm text-ink-dim">
           Tracked: <span className="font-700 text-ink-soft">{dur(game.trackedActiveSeconds)}</span> active
@@ -585,6 +581,9 @@ export default function GameDetail() {
       )}
 
       {hasSessions && storeAndDetails("mb-6")}
+
+      {/* Achievements sit below the store imagery / posters. */}
+      {!isApp && <SteamAchievementDetailPanel game={game} />}
 
       {/* Browser & window activity — exact URL/title spans with start→end times. */}
       {sessionList.some((s) => (s.activitySpans?.length ?? 0) > 0) && (

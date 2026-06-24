@@ -271,6 +271,13 @@ fn run_loop(pool: DbPool, shared: Arc<SystemShared>) {
         tick = tick.wrapping_add(1);
         std::thread::sleep(Duration::from_secs(TICK_SECS));
 
+        // Performance monitoring can be switched off in Settings; when it is we
+        // skip sampling, recording, and the live snapshot entirely so it costs
+        // nothing. The thread stays alive and resumes the moment it's re-enabled.
+        if !crate::db::settings::get_bool(&pool, "system_monitor_enabled").unwrap_or(true) {
+            continue;
+        }
+
         sys.refresh_cpu_all();
         sys.refresh_memory();
         if tick % DISKS_EVERY == 0 {
