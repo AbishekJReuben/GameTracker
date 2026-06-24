@@ -717,6 +717,28 @@ pub fn set_steam_app_id(pool: &DbPool, id: &str, app_id: i64) -> AppResult<()> {
     Ok(())
 }
 
+/// Read the cached live-stats blob and when it was fetched (RFC3339 UTC), if any.
+pub fn get_stats_cache(pool: &DbPool, id: &str) -> AppResult<(Option<String>, Option<String>)> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT stats_json, stats_fetched_utc FROM games WHERE id = ?1")?;
+    let mut rows = stmt.query(rusqlite::params![id])?;
+    if let Some(r) = rows.next()? {
+        Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+    } else {
+        Ok((None, None))
+    }
+}
+
+/// Persist a fetched live-stats blob and its fetch timestamp on the game row.
+pub fn set_stats_cache(pool: &DbPool, id: &str, stats_json: &str, fetched_utc: &str) -> AppResult<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE games SET stats_json = ?1, stats_fetched_utc = ?2 WHERE id = ?3",
+        rusqlite::params![stats_json, fetched_utc, id],
+    )?;
+    Ok(())
+}
+
 pub fn clear_steam_app_id(pool: &DbPool, id: &str) -> AppResult<()> {
     let conn = pool.get()?;
     conn.execute(

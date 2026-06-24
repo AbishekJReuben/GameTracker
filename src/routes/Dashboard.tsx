@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { Link } from "react-router-dom";
-import { Zap, Flame, CalendarDays, Library as LibraryIcon, Plus, TrendingUp, TrendingDown, ArrowUpRight, Clock, Target, Focus, Layers, Gamepad2, Sparkles, AppWindow } from "lucide-react";
+import { Zap, Flame, CalendarDays, Library as LibraryIcon, Plus, TrendingUp, TrendingDown, ArrowUpRight, Clock, Target, Focus, Layers, Gamepad2, Sparkles } from "lucide-react";
 import { Page } from "@/components/Page";
 import { NowPlaying } from "@/components/NowPlaying";
 import { StatTile } from "@/components/StatTile";
@@ -10,10 +10,13 @@ import { Sparkline } from "@/components/Sparkline";
 import { GameArt } from "@/components/GameArt";
 import { Timeline } from "@/components/Timeline";
 import { PolarHours, WeekdayBars } from "@/components/Charts";
+import { VerticalCoverMarquee } from "@/components/VerticalCoverMarquee";
+import { AppsTodayMarquee } from "@/components/AppsTodayMarquee";
+import { ArtCard, type PanelArtVariant } from "@/components/PanelArtBackdrop";
 import { Card, SectionTitle, EmptyState, Skeleton } from "@/components/ui";
 import { useDashboard, useAppsOverview, useHeatmap, useHourOfDay, useSessions, useSettings, useGames } from "@/lib/queries";
 import type { Dashboard as DashboardData } from "@/lib/api";
-import { useApp, useMotionEnabled } from "@/store/app";
+import { useApp, useMarqueeTier, useMotionEnabled } from "@/store/app";
 import { dur, hours, relativeTime, timeLabel, accentFor } from "@/lib/format";
 import { motion } from "motion/react";
 
@@ -50,6 +53,7 @@ export default function Dashboard() {
   // charts page has no reason to re-render unless the running-game count changes.
   const activeCount = useApp((s) => s.tracking?.activeCount ?? 0);
   const motionOn = useMotionEnabled();
+  const marqueeBase = useMarqueeTier("base");
 
   const dailyGoalMin = parseInt(settings?.daily_goal_minutes ?? "0", 10) || 0;
   const goalProgress = dailyGoalMin > 0 && data ? Math.min(100, (data.todayActive / (dailyGoalMin * 60)) * 100) : 0;
@@ -79,6 +83,50 @@ export default function Dashboard() {
     return Math.round(((data.weekActive - prev) / prev) * 100);
   }, [data]);
 
+  // A pool of related screenshots for the faded panel backdrops (#9). Empty when
+  // the library list doesn't carry screenshots — backdrops fall back to covers.
+  const screenshotPool = useMemo(() => {
+    const out: string[] = [];
+    for (const g of games ?? []) {
+      if (g.kind === "app") continue;
+      for (const s of g.screenshots ?? []) {
+        out.push(s);
+        if (out.length >= 24) return out;
+      }
+    }
+    return out;
+  }, [games]);
+  const recentVariant: PanelArtVariant = screenshotPool.length >= 6 ? "screenshots-reverse" : "covers";
+
+  // Derived "interesting stats" that ride alongside the When-you-play clock (#8).
+  const playInsights = useMemo(() => {
+    const list: { label: string; value: string; sub?: string }[] = [];
+    const wkTotal = weekday.values.reduce((a, b) => a + b, 0);
+    if (wkTotal > 0) {
+      const pi = weekday.values.indexOf(Math.max(...weekday.values));
+      list.push({ label: "Peak day", value: weekday.labels[pi], sub: dur(weekday.values[pi]) });
+    }
+    if (data && data.avgSessionActive > 0) {
+      list.push({ label: "Avg session", value: dur(Math.round(data.avgSessionActive)) });
+    }
+    if (hourOfDay) {
+      const total = hourOfDay.reduce((a, b) => a + b, 0);
+      if (total > 0) {
+        const night = [22, 23, 0, 1, 2, 3, 4].reduce((a, h) => a + (hourOfDay[h] ?? 0), 0);
+        list.push({ label: "Night owl", value: `${Math.round((night / total) * 100)}%`, sub: "after 10pm" });
+      }
+    }
+    if (wkTotal > 0) {
+      const wknd = weekday.labels.reduce((a, l, i) => a + (l === "Sat" || l === "Sun" ? weekday.values[i] : 0), 0);
+      list.push({ label: "Weekend", value: `${Math.round((wknd / wkTotal) * 100)}%`, sub: "of playtime" });
+    }
+    if (heat) {
+      const days = heat.slice(-30).filter((d) => d.seconds > 0).length;
+      list.push({ label: "Active days", value: String(days), sub: "last 30" });
+    }
+    return list;
+  }, [heat, weekday, data, hourOfDay]);
+
   return (
     <Page
       title={greeting}
@@ -102,25 +150,22 @@ export default function Dashboard() {
       >
         <NowPlaying />
 
-        {appsOverview && appsOverview.todayActive > 0 && (
-          <Link to="/apps" className="card flex items-center justify-between gap-4 border border-line bg-white/[0.03] px-4 py-3 transition hover:bg-white/[0.05]">
-            <div className="flex items-center gap-3">
-              <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent-sheen/20 text-accent-3">
-                <AppWindow className="h-4 w-4" />
-              </span>
-              <div>
-                <div className="text-sm font-700">Apps today</div>
-                <div className="text-xs text-ink-dim">{dur(appsOverview.todayActive)} active · separate from game stats</div>
-              </div>
-            </div>
-            <div className="text-right text-sm font-800 text-ink-soft">
-              {appsOverview.topApps[0]?.name ?? "—"}
-              <ArrowUpRight className="ml-1 inline h-4 w-4 text-ink-dim" />
-            </div>
-          </Link>
+        {appsOverview && appsOverview.todayActive > 0 && appsOverview.topApps.length > 0 && (
+          <motion.div variants={motionOn ? fadeUp : undefined}>
+            <AppsTodayMarquee overview={appsOverview} appGames={(games ?? []).filter((g) => g.kind === "app")} />
+          </motion.div>
         )}
 
-        <motion.div className="grid gap-4 lg:grid-cols-[1fr_minmax(240px,300px)] lg:items-stretch" variants={motionOn ? stagger : undefined}>
+        <motion.div
+          className={`grid gap-4 lg:grid-cols-[1fr_minmax(240px,300px)] lg:items-stretch ${marqueeBase ? "xl:grid-cols-[104px_1fr_minmax(220px,290px)]" : ""}`}
+          variants={motionOn ? stagger : undefined}
+        >
+          {/* A drifting portrait cover wall, slotted left of the now-compacter stats. */}
+          {marqueeBase && (
+            <div className="hidden xl:block">
+              <VerticalCoverMarquee games={games ?? []} className="h-full min-h-[240px]" />
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4 lg:grid-rows-2">
             <StatTile icon={<Zap className="h-[18px] w-[18px]" />} label="Today" value={data ? data.todayActive / 3600 : 0} decimals={1} suffix="h" accent="#34d399" delay={0.02} hint={data ? `${dur(data.todayRuntime)} runtime` : ""} />
             <StatTile
@@ -207,7 +252,7 @@ export default function Dashboard() {
 
         {/* Today's timeline strip — the Gantt, everywhere. */}
         <motion.div variants={motionOn ? fadeUp : undefined}>
-          <Card>
+          <ArtCard variant="covers" games={games ?? []}>
             <SectionTitle
               sheen
               title="Today's timeline"
@@ -241,7 +286,7 @@ export default function Dashboard() {
                 </span>
               </p>
             )}
-          </Card>
+          </ArtCard>
         </motion.div>
 
         <motion.div variants={motionOn ? fadeUp : undefined}>
@@ -259,8 +304,9 @@ export default function Dashboard() {
                 }
               />
               <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_minmax(200px,280px)] lg:items-stretch">
-                <div className="min-w-0">
-                  {heat ? <Heatmap data={heat} /> : <Skeleton className="h-28 w-full" />}
+                {/* Larger cells + vertical centering let the grid fill the panel. */}
+                <div className="flex min-w-0 flex-col justify-center">
+                  {heat ? <Heatmap data={heat} maxStep={30} /> : <Skeleton className="h-40 w-full" />}
                 </div>
                 <LibraryPlaytimeChart games={games ?? []} />
               </div>
@@ -273,7 +319,11 @@ export default function Dashboard() {
           <motion.div variants={motionOn ? fadeUp : undefined}>
             <Card className="h-full">
               <SectionTitle sheen title="When you play" subtitle="Active time by hour of day" />
-              {hourOfDay ? <PolarHours values={hourOfDay} use24={use24} /> : <Skeleton className="mx-auto h-[240px] w-[240px] rounded-full" />}
+              {/* Clock shrinks to make room for a column of derived play insights. */}
+              <div className="mt-1 grid items-center gap-3 sm:grid-cols-[auto_1fr]">
+                {hourOfDay ? <PolarHours values={hourOfDay} use24={use24} /> : <Skeleton className="mx-auto h-[240px] w-[240px] rounded-full" />}
+                <PlayInsights insights={playInsights} />
+              </div>
             </Card>
           </motion.div>
           <motion.div variants={motionOn ? fadeUp : undefined}>
@@ -305,7 +355,7 @@ export default function Dashboard() {
         )}
 
         <motion.div variants={motionOn ? fadeUp : undefined}>
-          <Card>
+          <ArtCard variant={recentVariant} games={games ?? []} images={screenshotPool}>
             <SectionTitle
               sheen
               title="Recent sessions"
@@ -342,10 +392,32 @@ export default function Dashboard() {
             ) : (
               <EmptyState title="No sessions recorded yet" />
             )}
-          </Card>
+          </ArtCard>
         </motion.div>
       </motion.div>
     </Page>
+  );
+}
+
+function PlayInsights({ insights }: { insights: { label: string; value: string; sub?: string }[] }) {
+  if (insights.length === 0) {
+    return <p className="text-sm text-ink-dim">Play more to unlock pattern insights.</p>;
+  }
+  return (
+    <div className="space-y-1.5">
+      {insights.map((it) => (
+        <div
+          key={it.label}
+          className="flex items-baseline justify-between gap-3 rounded-xl border border-line bg-white/[0.02] px-3 py-2"
+        >
+          <span className="text-[11px] font-700 uppercase tracking-wide text-ink-dim">{it.label}</span>
+          <span className="text-right">
+            <span className="font-display text-sm font-800 tabular-nums text-ink">{it.value}</span>
+            {it.sub && <span className="ml-1.5 text-[10px] text-ink-faint">{it.sub}</span>}
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }
 

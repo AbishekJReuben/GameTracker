@@ -6,6 +6,7 @@ import { Page } from "@/components/Page";
 import { Timeline, type TimelineRange } from "@/components/Timeline";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
 import { Card, SectionTitle, Segmented, EmptyState, Skeleton } from "@/components/ui";
+import { MarqueeFX, MarqueeCard, type MarqueeFXVariant } from "@/components/MarqueeFX";
 import { useSessions, useGames } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { accentFor, dur, hourLabel, partialDate } from "@/lib/format";
@@ -17,10 +18,12 @@ type Mode = "sessions" | "completions";
 const RANGE_OPTS = TIMELINE_RANGE_OPTIONS;
 
 export default function TimelinePage() {
-  const defaultRange = useApp((s) => s.prefs.timelineRange);
+  const setPref = useApp((s) => s.setPref);
+  // Range is a remembered toggle, shared with per-game timelines.
+  const range = useApp((s) => s.prefs.timelineRange);
+  const setRange = (v: TimelineRange) => setPref("timelineRange", v);
   const enabled = useMotionEnabled();
   const [mode, setMode] = useState<Mode>("sessions");
-  const [range, setRange] = useState<TimelineRange>(defaultRange);
   const [hiddenGames, setHiddenGames] = useState<Set<string>>(new Set());
   const [hiddenApps, setHiddenApps] = useState<Set<string>>(new Set());
 
@@ -91,6 +94,7 @@ export default function TimelinePage() {
             colorFor={colorFor}
             emptyMessage="Play a tracked game to fill in your games timeline."
             barClassName=""
+            marqueeVariant="diagonal"
           />
           <TimelineInsights sessions={gameSessions} colorFor={colorFor} kind="game" title="Games insights" />
 
@@ -106,6 +110,7 @@ export default function TimelinePage() {
             colorFor={colorFor}
             emptyMessage="Use a tracked app to fill in your apps timeline."
             barClassName="opacity-90 [background-image:linear-gradient(90deg,transparent,rgba(255,255,255,0.04))]"
+            marqueeVariant="conveyor"
           />
           <TimelineInsights sessions={appSessions} colorFor={colorFor} kind="app" title="Apps insights" />
           </motion.div>
@@ -117,9 +122,9 @@ export default function TimelinePage() {
             exit={enabled ? { opacity: 0, x: -16 } : undefined}
             transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
           >
-            <Card className="p-5">
+            <MarqueeCard variant="kenburns" games={(games ?? []).filter((g) => g.kind === "game" && g.status === "completed")} className="p-5">
               {games ? <CompletionTimeline games={games.filter((g) => g.kind === "game" && g.status === "completed")} colorFor={colorFor} /> : <Skeleton className="h-64 w-full" />}
-            </Card>
+            </MarqueeCard>
           </motion.div>
         )}
       </AnimatePresence>
@@ -139,6 +144,7 @@ function TimelineSection({
   colorFor,
   emptyMessage,
   barClassName,
+  marqueeVariant,
 }: {
   title: string;
   icon: ReactNode;
@@ -151,6 +157,7 @@ function TimelineSection({
   colorFor: (gameId: string, accent?: string | null) => string;
   emptyMessage: string;
   barClassName?: string;
+  marqueeVariant?: MarqueeFXVariant;
 }) {
   return (
     <div className="mb-8">
@@ -159,14 +166,17 @@ function TimelineSection({
         <h2 className="font-display text-lg font-800 tracking-tight">{title}</h2>
         <span className="text-sm text-ink-dim">({sessions.length})</span>
       </div>
-      <Card className={`overflow-visible p-5 ${barClassName ?? ""}`}>
-        {isLoading ? (
-          <Skeleton className="h-40 w-full" />
-        ) : sessions.length > 0 ? (
-          <Timeline sessions={sessions} range={range} compact maxLanes={8} colorFor={(s) => colorFor(s.gameId, s.accentColor)} />
-        ) : (
-          <EmptyState title={`No ${title.toLowerCase()} sessions`} message={emptyMessage} />
-        )}
+      <Card className={`relative overflow-visible p-5 ${barClassName ?? ""}`}>
+        {marqueeVariant && legend.length > 0 && <MarqueeFX variant={marqueeVariant} games={legend} opacity={0.12} />}
+        <div className="relative z-10">
+          {isLoading ? (
+            <Skeleton className="h-40 w-full" />
+          ) : sessions.length > 0 ? (
+            <Timeline sessions={sessions} range={range} compact maxLanes={8} colorFor={(s) => colorFor(s.gameId, s.accentColor)} />
+          ) : (
+            <EmptyState title={`No ${title.toLowerCase()} sessions`} message={emptyMessage} />
+          )}
+        </div>
       </Card>
       {legend.length > 0 && (
         <div className="mt-4 flex flex-wrap gap-2">

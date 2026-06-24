@@ -286,6 +286,12 @@ export interface GameStats {
   medianPlaytimeMinutes: number | null;
 }
 
+/** Cached live stats served instantly from the DB, plus when they were fetched. */
+export interface CachedGameStats {
+  stats: GameStats | null;
+  fetchedUtc: string | null;
+}
+
 export interface Candidate {
   name: string;
   installFolder: string | null;
@@ -733,7 +739,10 @@ export const api = {
     call<MetacriticReview[]>("fetch_metacritic_reviews", { gameId, slug: slug ?? null }),
   auditOnlineContent: () => call<void>("audit_online_content"),
   repairLibraryContent: () => call<void>("repair_library_content"),
-  fetchGameStats: (gameId: string) => call<GameStats | null>("fetch_game_stats", { gameId }),
+  /** Cached live stats from the DB — instant, no network (renders immediately). */
+  getGameStats: (gameId: string) => call<CachedGameStats>("get_game_stats", { gameId }),
+  /** Kick off a background refresh; result arrives via the `game://stats` event. */
+  refreshGameStats: (gameId: string) => call<void>("refresh_game_stats", { gameId }),
   launchGame: (id: string) => call<void>("launch_game", { id }),
   openEmbed: (label: string, url: string, x: number, y: number, w: number, h: number) =>
     call<void>("open_embed", { label, url, x, y, w, h }),

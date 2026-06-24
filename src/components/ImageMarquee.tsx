@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { assetUrl } from "@/lib/api";
-import { useMotionEnabled } from "@/store/app";
+import { useMarqueeTier, useMotionEnabled } from "@/store/app";
 import { cn } from "@/lib/cn";
 
 /**
@@ -23,11 +23,12 @@ export function ImageMarquee({
   fade?: boolean;
 }) {
   const enabled = useMotionEnabled();
+  const showMarquee = useMarqueeTier("base");
   const shots = useMemo(
     () => images.map((u) => assetUrl(u)).filter((u): u is string => !!u).slice(0, 16),
     [images]
   );
-  if (shots.length === 0) return null;
+  if (!showMarquee || shots.length === 0) return null;
   // Duplicate so the -50% loop is seamless (only needed while animating).
   const strip = enabled ? [...shots, ...shots] : shots;
 

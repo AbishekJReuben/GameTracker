@@ -23,6 +23,7 @@ import { GameCard } from "@/components/GameCard";
 import { GameList, GameCompact, GameAlbum, GameTheatre, GameReorder } from "@/components/LibraryViews";
 import { DetectModal } from "@/components/DetectModal";
 import { Segmented, EmptyState, Skeleton, Toggle } from "@/components/ui";
+import { MarqueeFX } from "@/components/MarqueeFX";
 import { useGames, useRefreshAll } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { viewSwap } from "@/lib/motion";
@@ -109,11 +110,22 @@ export default function LibraryPage() {
   const csvJob = useProgress((s) => s.getJob("csv-import"));
   const anyBusy = useProgress((s) => s.isAnyBusy());
   const [q, setQ] = useState("");
-  const [status, setStatus] = useState<StatusFilter>("all");
-  const [sort, setSort] = useState<Sort>("recent");
-  const [trackedOnly, setTrackedOnly] = useState(false);
-  const [tag, setTag] = useState<string | null>(null);
-  const [tagsOpen, setTagsOpen] = useState(false);
+  // Filters/sort/toggles are remembered across sessions (search text stays transient).
+  const filters = useApp((s) => s.prefs.libraryFilters);
+  const status = filters.status;
+  const sort = filters.sort;
+  const trackedOnly = filters.trackedOnly;
+  const tag = filters.tag;
+  const tagsOpen = filters.tagsOpen;
+  const patchFilters = (p: Partial<typeof filters>) =>
+    setPref("libraryFilters", { ...useApp.getState().prefs.libraryFilters, ...p });
+  const setStatus = (v: StatusFilter) => patchFilters({ status: v });
+  const setSort = (v: Sort) => patchFilters({ sort: v });
+  const setTrackedOnly = (v: boolean) => patchFilters({ trackedOnly: v });
+  const setTag = (v: (string | null) | ((cur: string | null) => string | null)) =>
+    patchFilters({ tag: typeof v === "function" ? v(useApp.getState().prefs.libraryFilters.tag) : v });
+  const setTagsOpen = (v: boolean | ((o: boolean) => boolean)) =>
+    patchFilters({ tagsOpen: typeof v === "function" ? v(useApp.getState().prefs.libraryFilters.tagsOpen) : v });
   const [detectOpen, setDetectOpen] = useState(false);
 
   useEffect(() => {
@@ -260,15 +272,16 @@ export default function LibraryPage() {
           <button
             type="button"
             onClick={() => setTagsOpen((o) => !o)}
-            className="flex w-full items-center gap-2 rounded-xl border border-line bg-white/[0.02] px-3 py-2 text-left transition hover:bg-white/[0.04]"
+            className="relative flex w-full items-center gap-2 overflow-hidden rounded-xl border border-line bg-white/[0.02] px-3 py-2 text-left transition hover:bg-white/[0.04]"
           >
-            <Tag className="h-4 w-4 shrink-0 text-ink-dim" />
-            <span className="text-sm font-700 text-ink-soft">Tags</span>
-            <span className="text-xs font-600 tabular-nums text-ink-dim">({allTags.length})</span>
+            <MarqueeFX variant="driftReverse" games={onlyGames} opacity={0.12} />
+            <Tag className="relative z-10 h-4 w-4 shrink-0 text-ink-dim" />
+            <span className="relative z-10 text-sm font-700 text-ink-soft">Tags</span>
+            <span className="relative z-10 text-xs font-600 tabular-nums text-ink-dim">({allTags.length})</span>
             {tag && (
-              <span className="pill border border-line bg-accent-sheen text-white">{tag}</span>
+              <span className="relative z-10 pill border border-line bg-accent-sheen text-white">{tag}</span>
             )}
-            <ChevronDown className={cn("ml-auto h-4 w-4 shrink-0 text-ink-dim transition", tagsOpen && "rotate-180")} />
+            <ChevronDown className={cn("relative z-10 ml-auto h-4 w-4 shrink-0 text-ink-dim transition", tagsOpen && "rotate-180")} />
           </button>
           {tagsOpen && (
             <div className="mt-2 flex flex-wrap items-center gap-1.5 rounded-xl border border-line border-t-0 rounded-t-none bg-white/[0.01] px-3 py-2.5">

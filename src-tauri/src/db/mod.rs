@@ -292,6 +292,19 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 15;
     }
 
+    if version < 16 {
+        // Cache live/estimated game stats with the game so GameDetail can render
+        // them instantly (no blocking network on open) and refresh slowly.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE games ADD COLUMN stats_json TEXT;
+            ALTER TABLE games ADD COLUMN stats_fetched_utc TEXT;
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 16;")?;
+        version = 16;
+    }
+
     let _ = version;
     Ok(())
 }

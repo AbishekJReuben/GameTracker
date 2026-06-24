@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { EntryKind, Game, TrackingState, api } from "@/lib/api";
+import { EntryKind, Game, GameStatus, TrackingState, api } from "@/lib/api";
 import { isTauri } from "@/lib/tauri";
 import { type TimelineRange, normalizeTimelineRange } from "@/lib/timelineZoom";
 
@@ -18,6 +18,27 @@ export type TimeFormat = "12h" | "24h";
 export type WeekStart = "sun" | "mon";
 export type { TimelineRange } from "@/lib/timelineZoom";
 export type LibraryView = "grid" | "list" | "compact" | "album" | "theatre";
+/** Marquee backdrop intensity: off = none, compact = only the original/base
+ *  marquees, full = base + the extra decorative backdrops on most panels. */
+export type MarqueeLevel = "off" | "compact" | "full";
+export type LibraryStatusFilter = "all" | GameStatus;
+export type LibrarySort = "recent" | "name" | "playtime" | "score" | "manual";
+
+/** Persisted Library page filters/toggles (search text stays transient). */
+export interface LibraryFilters {
+  status: LibraryStatusFilter;
+  sort: LibrarySort;
+  trackedOnly: boolean;
+  tag: string | null;
+  tagsOpen: boolean;
+}
+
+/** Persisted Sessions page filters/toggles (specific dates stay transient). */
+export interface SessionFilters {
+  kind: EntryKind;
+  minMinutes: string;
+  excludeIdle: boolean;
+}
 
 export interface Prefs {
   accent: AccentTheme;
@@ -29,6 +50,8 @@ export interface Prefs {
   timeFormat: TimeFormat;
   weekStart: WeekStart;
   scanlines: boolean;
+  /** Decorative marquee backdrops intensity (off / compact / full). */
+  marquee: MarqueeLevel;
   libraryView: LibraryView;
   /** Show the "Suggested" recommendations tab in the sidebar. Default off. */
   showSuggested: boolean;
@@ -36,6 +59,10 @@ export interface Prefs {
   themeMuted: boolean;
   /** Persisted game order for the Library's "Manual" sort (array of game ids). */
   manualOrder: string[];
+  /** Remembered Library filters/sort/toggles. */
+  libraryFilters: LibraryFilters;
+  /** Remembered Sessions filters/toggles. */
+  sessionFilters: SessionFilters;
   widgets: {
     goal: boolean;
     secondary: boolean;
@@ -54,10 +81,13 @@ const DEFAULT_PREFS: Prefs = {
   timeFormat: "12h",
   weekStart: "mon",
   scanlines: true,
+  marquee: "full",
   libraryView: "grid",
   showSuggested: false,
   themeMuted: true,
   manualOrder: [],
+  libraryFilters: { status: "all", sort: "recent", trackedOnly: false, tag: null, tagsOpen: false },
+  sessionFilters: { kind: "game", minMinutes: "", excludeIdle: false },
   widgets: { goal: true, secondary: true, patterns: true, heatmap: true },
 };
 
@@ -71,6 +101,8 @@ function mergePrefs(parsed: Partial<Prefs>): Prefs {
     ...DEFAULT_PREFS,
     ...parsed,
     widgets: { ...DEFAULT_PREFS.widgets, ...parsed.widgets },
+    libraryFilters: { ...DEFAULT_PREFS.libraryFilters, ...parsed.libraryFilters },
+    sessionFilters: { ...DEFAULT_PREFS.sessionFilters, ...parsed.sessionFilters },
   };
   return {
     ...merged,
@@ -201,4 +233,18 @@ export const useApp = create<AppStore>((set, get) => ({
 /** Convenience hook: whether rich motion should run, honoring the user's pref. */
 export function useMotionEnabled() {
   return useApp((s) => s.prefs.motion === "full");
+}
+
+/**
+ * Whether a marquee of the given tier should be shown for the current pref:
+ * - "base"  — the original marquees: shown unless the level is "off".
+ * - "extra" — the broad decorative backdrops: shown only when level is "full".
+ */
+export function useMarqueeTier(tier: "base" | "extra" = "extra") {
+  return useApp((s) => {
+    const lvl = s.prefs.marquee ?? "full";
+    if (lvl === "off") return false;
+    if (lvl === "full") return true;
+    return tier === "base";
+  });
 }

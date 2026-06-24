@@ -337,3 +337,79 @@ both totals).
 - Tracker constants: tick 2s, merge window 120s, reload cache ~16s
 - Installer output: `src-tauri/target/release/bundle/nsis/GameTracker_<ver>_x64-setup.exe`
 - Toolchain present on the original dev machine: Rust 1.96, Node 21, dotnet 10 (unused now)
+
+---
+
+## 12. June 2026 UX / performance pass (v3.1.x) — changes & new conventions
+
+### Performance: network commands must run OFF the main thread
+The online-fetch commands were synchronous `#[tauri::command] fn`, which run on the **main
+thread** and froze the WebView while doing blocking HTTP — this caused the "page hangs for a
+second" and "app feels very slow when info is loading" bugs. They are now **`async fn`** whose
+blocking body is offloaded via the **`run_blocking`** helper in `commands.rs` (wraps
+`tauri::async_runtime::spawn_blocking`). Pattern: clone `state.pool` / `state.media_dir` out of
+`State<'_, AppState>` **first**, then move the clones into the closure (`State` isn't `'static`).
+Converted: `fetch_cover`, `fetch_game_info`, `fetch_hltb`, `fetch_app_info`,
+`fetch_steam_reviews`, `fetch_metacritic_reviews`.
+**Rule: any new network/file-heavy command does the same — never a plain sync `fn`.** Pure
+sub-millisecond SQLite commands stay sync (as before).
+
+### Live game stats are cached with the game (migration v16)
+The old blocking `fetch_game_stats` is **removed**. Migration **v16** adds `games.stats_json` +
+`games.stats_fetched_utc` (helpers `games::get_stats_cache` / `set_stats_cache`). Two commands
+replace it:
+- `get_game_stats(game_id) -> CachedGameStats { stats, fetchedUtc }` — **sync, instant**, reads
+  the cache only (no network → no hang on open).
+- `refresh_game_stats(game_id)` — spawns a worker thread (like `enrich_game_async`), fetches,
+  caches, and emits **`game://stats`** `{ id, stats, fetchedUtc }`; returns immediately.
+
+`GameStatsPanel` renders the cache instantly on open, kicks a background refresh only when the
+cache is missing or **>6h stale**, and listens for `game://stats` to update in place.
+`metadata::GameStats` now derives `Deserialize` too (so the cache JSON can be read back).
+Latest DB `user_version` is **16**.
+
+### Prefs persist all filters/toggles (store/app.ts)
+`Prefs` gained `libraryFilters` (status / sort / trackedOnly / tag / tagsOpen), `sessionFilters`
+(kind / minMinutes / excludeIdle), and `marquee` (below). The Library and Sessions pages read
+these from prefs instead of local `useState`; `timelineRange` is now written by GameDetail **and**
+the Timeline page (shared "remembered" range). `mergePrefs` merges the new nested slices. All
+prefs still mirror to the DB `ui_prefs` key, so they survive a localStorage wipe / reinstall.
+
+### GameDetail
+- **Missing-info nudge**: a one-tap "Get data" banner appears only when core enrichment fields are
+  absent **and** the entry was never enrich-attempted (tracked in `localStorage`
+  `gt.enrichAttempted`, set inside `enrichAll`).
+- **Session history** is grouped into **24-hour day buckets** (Today / Yesterday / dated headers
+  with per-day totals); each session shows its start time + duration.
+
+### Dashboard
+Stat tiles compacted to free horizontal space; new pieces: `VerticalCoverMarquee` (portrait cover
+wall, left of the stats on `xl`), `AppsTodayMarquee` (CSS-mask-vignette app reel + a parallax icon
+layer), and an "interesting stats" column beside the When-you-play clock (`PlayInsights`).
+`Heatmap` gained a `maxStep` prop so it can grow to fill its panel.
+
+### Marquee background system + 3-state toggle
+`prefs.marquee: "off" | "compact" | "full"` (default **full**; Settings → Appearance). Gating hook
+**`useMarqueeTier(tier: "base" | "extra")`** in `store/app.ts`:
+- **base** marquees (the originals — `CoverMarquee`, `VerticalCoverMarquee`, `ImageMarquee`,
+  `PanelArtBackdrop`/`ArtCard`, the `AppsTodayMarquee` reel) self-hide only when level is `off`.
+- **extra** decorative backdrops show **only** when level is `full`.
+
+The extra engine is **`components/MarqueeFX.tsx`** — one component with ~18 distinct techniques
+(`drift`, `driftReverse`, `vertical`, `verticalReverse`, `parallax`, `diagonal`, `tilt3d`,
+`conveyor`, `duotone`, `grayscale`, `bokeh`, `kenburns`, `ticker`, `wave`, `spotlight`, `mosaic`,
+`pulse`, `shader`) + a **`MarqueeCard`** wrapper (Card + backdrop + `relative z-10` content). The
+`shader` variant uses `components/animations/MarqueeShader.tsx` (self-contained WebGL plasma).
+Applied across Dashboard / Library / Timeline / Collection / Sessions / Tags with
+category-relevant art (covers, app icons, screenshots→cover fallback). Cover/icon variants render
+via `GameArt` (gradient+initials fallback → **never an empty rail**, even pre-cover); the
+photo-filter variants (`duotone` / `grayscale` / `bokeh` / `kenburns`) need real images
+(screenshots, else cover URLs). New CSS keyframes in `index.css`: `gt-marquee-y`, `gt-kenburns`,
+`gt-spotlight`, `gt-wave` (joining `gt-marquee`).
+
+**Backdrop pattern** (reuse this for any new marquee panel): the backdrop is
+`pointer-events-none absolute inset-0 overflow-hidden rounded-[inherit]` with vignette scrims; the
+host panel must be `relative` and its content lifted to `relative z-10` — exactly what
+`ArtCard`/`MarqueeCard` do. **Do not** add `overflow-hidden` to the host `Card` when it has hover
+tooltips (Timeline / Heatmap): the backdrop already clips itself, and clipping the Card would cut
+off the tooltips.

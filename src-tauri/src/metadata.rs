@@ -1830,7 +1830,7 @@ fn itunes_theme_url(name: &str) -> Option<String> {
 
 // ---------- Live game statistics (players, owners, revenue, reviews) ----------
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameStats {
     /// Live players in-game right now (Steam, exact).

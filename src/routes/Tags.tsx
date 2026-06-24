@@ -5,11 +5,13 @@ import { Tag, Search, Star, Trophy, Clock, ArrowRight } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Card, SectionTitle, EmptyState, Skeleton } from "@/components/ui";
 import { LevelBar } from "@/components/RadialGauge";
-import { useTagAnalytics } from "@/lib/queries";
+import { MarqueeFX, MarqueeCard } from "@/components/MarqueeFX";
+import { useGames, useTagAnalytics } from "@/lib/queries";
 import { dur } from "@/lib/format";
 
 export default function TagsPage() {
   const { data, isLoading } = useTagAnalytics();
+  const { data: games } = useGames();
   const [q, setQ] = useState("");
   const navigate = useNavigate();
 
@@ -52,7 +54,9 @@ export default function TagsPage() {
             message="Add tags when editing games, or fetch game info from Steam to import genres automatically."
           />
         ) : (
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="relative overflow-hidden rounded-3xl">
+            <MarqueeFX variant="drift" games={games ?? []} className="rounded-3xl" />
+            <div className="relative z-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {filtered.map((t, i) => (
               <motion.button
                 key={t.tag}
@@ -95,10 +99,11 @@ export default function TagsPage() {
                 </div>
               </motion.button>
             ))}
+            </div>
           </div>
         )}
 
-        <Card>
+        <MarqueeCard variant="shader" games={games ?? []}>
           <SectionTitle title="Tip" subtitle="Tags power Collection analytics" />
           <p className="text-sm text-ink-soft">
             Tags appear on the{" "}
@@ -108,7 +113,7 @@ export default function TagsPage() {
             genre radar and breakdown charts. Use{" "}
             <span className="font-700 text-ink">Get game info</span> in Library to pull Steam genres, or add custom tags when editing any game.
           </p>
-        </Card>
+        </MarqueeCard>
       </div>
     </Page>
   );

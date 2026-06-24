@@ -49,7 +49,7 @@ function useMeasuredWidth() {
   return { ref, width };
 }
 
-export function Heatmap({ data }: { data: DayValue[] }) {
+export function Heatmap({ data, maxStep = 22 }: { data: DayValue[]; maxStep?: number }) {
   const enabled = useMotionEnabled();
   const containerRef = useRef<HTMLDivElement>(null);
   const { ref: measureRef, width } = useMeasuredWidth();
@@ -84,11 +84,11 @@ export function Heatmap({ data }: { data: DayValue[] }) {
   const { cell, gap, step } = useMemo(() => {
     const cols = Math.max(weeks.length, 1);
     if (width <= 0) return { cell: 12, gap: 3, step: 15 };
-    const step = Math.min(22, Math.max(10, width / cols));
+    const step = Math.min(maxStep, Math.max(10, width / cols));
     const gap = Math.max(2, Math.round(step * 0.2));
     const cell = Math.max(6, Math.floor(step - gap));
     return { cell, gap, step: cell + gap };
-  }, [width, weeks.length]);
+  }, [width, weeks.length, maxStep]);
 
   let cellIndex = 0;
 

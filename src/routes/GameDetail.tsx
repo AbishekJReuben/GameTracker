@@ -50,6 +50,53 @@ import { SteamAchievementDetailPanel } from "@/components/SteamAchievements";
 const STATUSES: GameStatus[] = ["playing", "backlog", "on_hold", "completed", "dropped", "watched"];
 const RANGE_OPTS = TIMELINE_RANGE_OPTIONS;
 
+// Remember which entries the user has already run "Get data" on, so the
+// missing-info nudge appears only for games whose details were never fetched.
+const ENRICH_ATTEMPT_KEY = "gt.enrichAttempted";
+function readAttempted(): Set<string> {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(ENRICH_ATTEMPT_KEY) || "[]"));
+  } catch {
+    return new Set();
+  }
+}
+function hasEnrichAttempt(id: string): boolean {
+  return readAttempted().has(id);
+}
+function markEnrichAttempt(id: string) {
+  try {
+    const set = readAttempted();
+    set.add(id);
+    localStorage.setItem(ENRICH_ATTEMPT_KEY, JSON.stringify([...set]));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** A friendly heading for a session's local day: Today / Yesterday / dated. */
+function dayHeading(d: Date): string {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const that = new Date(d);
+  that.setHours(0, 0, 0, 0);
+  const diffDays = Math.round((today.getTime() - that.getTime()) / 86_400_000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return d.toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: d.getFullYear() === today.getFullYear() ? undefined : "numeric",
+  });
+}
+
+/** "cover art", "cover art & screenshots", "cover art, screenshots & 2 more". */
+function listLabel(items: string[]): string {
+  if (items.length === 1) return items[0];
+  if (items.length === 2) return `${items[0]} & ${items[1]}`;
+  return `${items.slice(0, 2).join(", ")} & ${items.length - 2} more`;
+}
+
 function activityHost(url?: string | null): string | null {
   if (!url) return null;
   try {
@@ -88,14 +135,20 @@ export default function GameDetail() {
   const openGameModal = useApp((s) => s.openGameModal);
   const pushToast = useApp((s) => s.pushToast);
   const use24 = useApp((s) => s.prefs.timeFormat === "24h");
-  const defaultRange = useApp((s) => s.prefs.timelineRange);
+  const setPref = useApp((s) => s.setPref);
+  // The timeline range is a remembered toggle, shared with the Timeline page.
+  const range = useApp((s) => s.prefs.timelineRange);
+  const setRange = (v: TimelineRange) => setPref("timelineRange", v);
   const setStatus = useSetStatus();
   const refresh = useRefreshAll();
   const [coverBusy, setCoverBusy] = useState(false);
   const [infoBusy, setInfoBusy] = useState(false);
   const [hltbBusy, setHltbBusy] = useState(false);
   const [trailerPlaying, setTrailerPlaying] = useState(false);
-  const [range, setRange] = useState<TimelineRange>(defaultRange);
+  const [enrichAttempted, setEnrichAttempted] = useState(false);
+  useEffect(() => {
+    setEnrichAttempted(id ? hasEnrichAttempt(id) : false);
+  }, [id]);
   const enabled = useMotionEnabled();
   const { scrollY } = useScroll();
   const heroY = useTransform(scrollY, [0, 280], [0, enabled ? 48 : 0]);
@@ -138,6 +191,30 @@ export default function GameDetail() {
     () => sessionList.reduce((m, s) => Math.max(m, s.runtimeSeconds), 1),
     [sessionList]
   );
+  // Session history grouped into 24h day buckets (newest first), each with its
+  // own per-day totals; sessions within a day are listed newest-first.
+  const sessionDayGroups = useMemo(() => {
+    const byDay = new Map<string, Session[]>();
+    for (const s of sessionList) {
+      const d = new Date(s.startUtc);
+      const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      const arr = byDay.get(key);
+      if (arr) arr.push(s);
+      else byDay.set(key, [s]);
+    }
+    return [...byDay.entries()]
+      .map(([key, list]) => {
+        const sorted = [...list].sort((a, b) => new Date(b.startUtc).getTime() - new Date(a.startUtc).getTime());
+        return {
+          key,
+          label: dayHeading(new Date(sorted[0].startUtc)),
+          sessions: sorted,
+          active: list.reduce((a, s) => a + s.activeSeconds, 0),
+          runtime: list.reduce((a, s) => a + s.runtimeSeconds, 0),
+        };
+      })
+      .sort((a, b) => new Date(b.sessions[0].startUtc).getTime() - new Date(a.sessions[0].startUtc).getTime());
+  }, [sessionList]);
   const nowMs = Date.now();
   const infoEntries = useMemo(() => {
     if (!game?.infoJson) return [] as [string, string][];
@@ -148,6 +225,24 @@ export default function GameDetail() {
       return [];
     }
   }, [game?.infoJson]);
+
+  // Core enrichment fields this entry is still missing — drives the "Get data" nudge.
+  const missingInfo = useMemo(() => {
+    if (!game) return [] as string[];
+    const m: string[] = [];
+    if (isApp) {
+      if (!game.coverPath && !game.iconPath) m.push("logo");
+      if (!game.developer) m.push("publisher");
+      if (!game.notes) m.push("description");
+    } else {
+      if (!game.coverPath) m.push("cover art");
+      if (game.screenshots.length === 0) m.push("screenshots");
+      if (!game.developer) m.push("developer");
+      if (!game.releaseYear) m.push("release year");
+      if (game.metacritic == null) m.push("Metacritic");
+    }
+    return m;
+  }, [game, isApp]);
 
   const lastPlayedLabel = useMemo(() => {
     if (!game) return "—";
@@ -173,6 +268,10 @@ export default function GameDetail() {
   // just the Wikipedia info pass for apps.
   const enrichAll = async () => {
     if (!game) return;
+    // Mark up-front so the "missing info" nudge disappears immediately and never
+    // nags again for this entry, even if some sources return nothing.
+    markEnrichAttempt(game.id);
+    setEnrichAttempted(true);
     if (isApp) {
       await fetchInfo();
       return;
@@ -264,6 +363,7 @@ export default function GameDetail() {
   }
 
   const hasSessions = sessionList.length > 0;
+  const showEnrichNudge = !enrichAttempted && !infoBusy && !coverBusy && !hltbBusy && missingInfo.length > 0;
 
   // Every HowLongToBeat figure the game has, in increasing-effort order.
   const hltbItems = [
@@ -459,6 +559,32 @@ export default function GameDetail() {
         </div>
       </motion.div>
 
+      {/* Missing-info nudge — only for entries whose details were never fetched. */}
+      {showEnrichNudge && (
+        <motion.button
+          type="button"
+          onClick={enrichAll}
+          initial={enabled ? { opacity: 0, y: -8 } : false}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
+          className="mb-6 flex w-full items-center justify-between gap-4 rounded-2xl border border-accent-1/25 bg-accent-1/[0.06] px-4 py-3 text-left transition hover:bg-accent-1/[0.1]"
+          title={`Missing: ${missingInfo.join(", ")}`}
+        >
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-sheen/20 text-accent-3">
+              <Sparkles className="h-4 w-4" />
+            </span>
+            <div className="min-w-0">
+              <div className="truncate text-sm font-700">Missing {listLabel(missingInfo)}</div>
+              <div className="text-xs text-ink-dim">
+                Tap to fetch {isApp ? "details from Wikipedia" : "the cover & details from Steam, plus HowLongToBeat"}.
+              </div>
+            </div>
+          </div>
+          <span className="shrink-0 text-xs font-700 text-accent-3">{isApp ? "Get info" : "Get data"} →</span>
+        </motion.button>
+      )}
+
       {/* Stats */}
       <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
         {isApp ? (
@@ -516,67 +642,81 @@ export default function GameDetail() {
 
       {hasSessions && (
         <Card className="mb-6 overflow-visible">
-          <SectionTitle title="Session history" subtitle={`${sessionList.length} sessions`} />
-          <div className="max-h-[420px] divide-y divide-line overflow-y-auto">
-              {sessionList.map((s, i) => {
-                const barW = (s.runtimeSeconds / maxSessionRuntime) * 100;
-                const startMs = new Date(s.startUtc).getTime();
-                const endMs = new Date(s.endUtc ?? s.lastSeenUtc).getTime();
-                const segments = clipFocusSpans(s, startMs, endMs, nowMs);
-                const span = endMs - startMs || 1;
-                const acts = sessionActivities(s);
-                return (
-                <motion.div
-                  key={s.id}
-                  className="flex items-center gap-3 py-2.5"
-                  initial={enabled ? { opacity: 0, x: -16 } : false}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: Math.min(i * 0.03, 0.35), duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
-                >
-                  <div className="w-24 shrink-0 text-xs text-ink-dim">
-                    {dateLabel(s.startUtc)}
-                    <div className="text-[11px] text-ink-faint">{timeLabel(s.startUtc, use24)}</div>
-                  </div>
-                  <div className="relative min-w-0 flex-1">
-                    <div className="relative h-2 overflow-hidden rounded-full bg-white/[0.05]" style={{ width: `${barW}%`, minWidth: 24 }}>
-                      {segments.map((seg, si) => {
-                        const leftPct = ((seg.startMs - startMs) / span) * 100;
-                        const widthPct = ((seg.endMs - seg.startMs) / span) * 100;
-                        return (
-                          <span
-                            key={si}
-                            className="absolute inset-y-0 rounded-full"
-                            style={{
-                              left: `${leftPct}%`,
-                              width: `${Math.max(widthPct, 1)}%`,
-                              background: accent,
-                              opacity: seg.focused ? 1 : 0.35,
-                              boxShadow: seg.focused ? `0 0 10px -2px ${accent}` : undefined,
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
-                    {acts.length > 0 && (
-                      <div className="mt-1 space-y-0.5">
-                        {acts.map((a, ai) => (
-                          <div key={ai} className="truncate text-[10px] text-ink-faint">
-                            {a.title ?? a.host}
-                            {a.host && a.title && <span className="text-ink-faint/80"> · {a.host}</span>}
+          <SectionTitle
+            title="Session history"
+            subtitle={`${sessionList.length} sessions · ${sessionDayGroups.length} ${sessionDayGroups.length === 1 ? "day" : "days"}`}
+          />
+          <div className="mt-1 max-h-[460px] overflow-y-auto">
+            {sessionDayGroups.map((g) => (
+              <div key={g.key}>
+                {/* 24-hour bucket header: the day + its session count & total time. */}
+                <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-line/60 bg-bg-900/95 py-1.5 backdrop-blur-sm">
+                  <span className="text-[11px] font-800 uppercase tracking-wider text-ink-soft">{g.label}</span>
+                  <span className="text-[10px] tabular-nums text-ink-faint">
+                    {g.sessions.length} {g.sessions.length === 1 ? "session" : "sessions"} · {dur(isApp ? g.runtime : g.active)}
+                  </span>
+                </div>
+                <div className="divide-y divide-line/40">
+                  {g.sessions.map((s, i) => {
+                    const barW = (s.runtimeSeconds / maxSessionRuntime) * 100;
+                    const startMs = new Date(s.startUtc).getTime();
+                    const endMs = new Date(s.endUtc ?? s.lastSeenUtc).getTime();
+                    const segments = clipFocusSpans(s, startMs, endMs, nowMs);
+                    const span = endMs - startMs || 1;
+                    const acts = sessionActivities(s);
+                    return (
+                      <motion.div
+                        key={s.id}
+                        className="flex items-center gap-3 py-2.5"
+                        initial={enabled ? { opacity: 0, x: -16 } : false}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ delay: Math.min(i * 0.03, 0.35), duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+                      >
+                        <div className="w-16 shrink-0 text-xs tabular-nums text-ink-dim">{timeLabel(s.startUtc, use24)}</div>
+                        <div className="relative min-w-0 flex-1">
+                          <div className="relative h-2 overflow-hidden rounded-full bg-white/[0.05]" style={{ width: `${barW}%`, minWidth: 24 }}>
+                            {segments.map((seg, si) => {
+                              const leftPct = ((seg.startMs - startMs) / span) * 100;
+                              const widthPct = ((seg.endMs - seg.startMs) / span) * 100;
+                              return (
+                                <span
+                                  key={si}
+                                  className="absolute inset-y-0 rounded-full"
+                                  style={{
+                                    left: `${leftPct}%`,
+                                    width: `${Math.max(widthPct, 1)}%`,
+                                    background: accent,
+                                    opacity: seg.focused ? 1 : 0.35,
+                                    boxShadow: seg.focused ? `0 0 10px -2px ${accent}` : undefined,
+                                  }}
+                                />
+                              );
+                            })}
                           </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <div className="w-24 shrink-0 text-right">
-                    <div className="text-sm font-800 tabular-nums">{dur(isApp ? s.runtimeSeconds : s.activeSeconds)}</div>
-                    {s.runtimeSeconds > s.activeSeconds + 30 && (
-                      <div className="text-[10px] tabular-nums text-ink-faint">{dur(s.activeSeconds)} focused</div>
-                    )}
-                  </div>
-                </motion.div>
-              );})}
-            </div>
+                          {acts.length > 0 && (
+                            <div className="mt-1 space-y-0.5">
+                              {acts.map((a, ai) => (
+                                <div key={ai} className="truncate text-[10px] text-ink-faint">
+                                  {a.title ?? a.host}
+                                  {a.host && a.title && <span className="text-ink-faint/80"> · {a.host}</span>}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                        <div className="w-24 shrink-0 text-right">
+                          <div className="text-sm font-800 tabular-nums">{dur(isApp ? s.runtimeSeconds : s.activeSeconds)}</div>
+                          {s.runtimeSeconds > s.activeSeconds + 30 && (
+                            <div className="text-[10px] tabular-nums text-ink-faint">{dur(s.activeSeconds)} focused</div>
+                          )}
+                        </div>
+                      </motion.div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
         </Card>
       )}
 

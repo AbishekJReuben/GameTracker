@@ -632,22 +632,27 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return undefined as T;
     case "write_text_file":
       return undefined as T;
-    case "fetch_game_stats":
+    case "get_game_stats":
       return {
-        currentPlayers: 4332,
-        peakConcurrent: 4912,
-        ownersMin: 5_000_000,
-        ownersMax: 10_000_000,
-        ownersLabel: "5,000,000 – 10,000,000",
-        priceUsd: 14.99,
-        revenueEstimateUsd: 112_425_000,
-        totalReviews: 488781,
-        positiveReviews: 474039,
-        positivePct: 97,
-        reviewDesc: "Overwhelmingly Positive",
-        avgPlaytimeMinutes: 1840,
-        medianPlaytimeMinutes: 1290,
+        stats: {
+          currentPlayers: 4332,
+          peakConcurrent: 4912,
+          ownersMin: 5_000_000,
+          ownersMax: 10_000_000,
+          ownersLabel: "5,000,000 – 10,000,000",
+          priceUsd: 14.99,
+          revenueEstimateUsd: 112_425_000,
+          totalReviews: 488781,
+          positiveReviews: 474039,
+          positivePct: 97,
+          reviewDesc: "Overwhelmingly Positive",
+          avgPlaytimeMinutes: 1840,
+          medianPlaytimeMinutes: 1290,
+        },
+        fetchedUtc: nowIso,
       } as T;
+    case "refresh_game_stats":
+      return undefined as T;
     case "launch_game":
       return undefined as T;
     case "open_embed":

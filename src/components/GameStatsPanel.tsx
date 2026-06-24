@@ -1,9 +1,15 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Users, Flame, Package, DollarSign, ThumbsUp, Clock3, RefreshCw, Loader2 } from "lucide-react";
 import { api, GameStats } from "@/lib/api";
+import { isTauri } from "@/lib/tauri";
+import { relativeTime } from "@/lib/format";
 import { SectionTitle, Skeleton } from "@/components/ui";
 
 type Props = { gameId: string; gameName: string };
+
+// Cached stats older than this trigger a silent background refresh on open.
+const STALE_MS = 6 * 60 * 60 * 1000;
 
 function compact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
@@ -54,26 +60,64 @@ function Tile({
 
 export function GameStatsPanel({ gameId, gameName }: Props) {
   const [stats, setStats] = useState<GameStats | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [fetchedUtc, setFetchedUtc] = useState<string | null>(null);
+  const [updating, setUpdating] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const load = () => {
-    setLoading(true);
+  const refresh = () => {
+    setUpdating(true);
     setError(null);
-    api
-      .fetchGameStats(gameId)
-      .then((s) => setStats(s))
-      .catch((e) => setError(String(e)))
-      .finally(() => {
-        setLoading(false);
-        setLoaded(true);
-      });
+    api.refreshGameStats(gameId).catch((e) => {
+      setError(String(e));
+      setUpdating(false);
+    });
   };
 
+  // Load the cached stats instantly (sub-ms DB read — no network, no hang), then
+  // silently refresh in the background only when stale or never fetched.
   useEffect(() => {
-    load();
+    let cancelled = false;
+    setLoaded(false);
+    setStats(null);
+    setFetchedUtc(null);
+    setError(null);
+    setUpdating(false);
+    api
+      .getGameStats(gameId)
+      .then((c) => {
+        if (cancelled) return;
+        setStats(c.stats);
+        setFetchedUtc(c.fetchedUtc);
+        const age = c.fetchedUtc ? Date.now() - new Date(c.fetchedUtc).getTime() : Infinity;
+        if (!c.stats || age > STALE_MS) refresh();
+      })
+      .catch((e) => !cancelled && setError(String(e)))
+      .finally(() => !cancelled && setLoaded(true));
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameId]);
+
+  // Background refreshes arrive as a `game://stats` event from the backend.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let un: (() => void) | undefined;
+    let active = true;
+    listen<{ id: string; stats: GameStats | null; fetchedUtc: string | null }>("game://stats", (e) => {
+      if (e.payload.id !== gameId) return;
+      setStats(e.payload.stats);
+      setFetchedUtc(e.payload.fetchedUtc);
+      setUpdating(false);
+    }).then((f) => {
+      if (active) un = f;
+      else f();
+    });
+    return () => {
+      active = false;
+      un?.();
+    };
   }, [gameId]);
 
   const hasAny =
@@ -85,26 +129,29 @@ export function GameStatsPanel({ gameId, gameName }: Props) {
       stats.revenueEstimateUsd != null ||
       stats.avgPlaytimeMinutes != null);
 
+  // Only block with skeletons when there's nothing cached yet to show.
+  const showSkeleton = !hasAny && !error && (updating || !loaded);
+
   return (
     <div>
       <SectionTitle
         title="Live stats"
         subtitle="Players, sales & reviews"
         right={
-          <button onClick={load} disabled={loading} className="btn btn-ghost h-8 text-xs" title="Refresh live stats">
-            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-            Refresh
+          <button onClick={refresh} disabled={updating} className="btn btn-ghost h-8 text-xs" title="Refresh live stats">
+            {updating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            {updating ? "Updating" : "Refresh"}
           </button>
         }
       />
 
-      {loading && !loaded ? (
+      {showSkeleton ? (
         <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-3">
           {Array.from({ length: 6 }).map((_, i) => (
             <Skeleton key={i} className="h-24 w-full" />
           ))}
         </div>
-      ) : error ? (
+      ) : error && !hasAny ? (
         <p className="pt-2 text-sm text-ink-dim">Could not load live stats for {gameName}.</p>
       ) : !hasAny ? (
         <p className="pt-2 text-sm text-ink-dim">Live sales & player stats are only available for games on Steam.</p>
@@ -136,8 +183,15 @@ export function GameStatsPanel({ gameId, gameName }: Props) {
               <Tile icon={<Clock3 className="h-4 w-4" />} color="#f472b6" label="Avg playtime" value={hoursLabel(stats!.avgPlaytimeMinutes)} sub={stats!.medianPlaytimeMinutes != null ? `${hoursLabel(stats!.medianPlaytimeMinutes)} median` : undefined} estimated />
             )}
           </div>
-          <p className="mt-3 text-[11px] text-ink-faint">
-            "est." figures are SteamSpy estimates; revenue is a rough gross (owners × price) before Steam's cut, refunds and discounts.
+          <p className="mt-3 flex flex-wrap items-center gap-x-2 text-[11px] text-ink-faint">
+            <span>
+              "est." figures are SteamSpy estimates; revenue is a rough gross (owners × price) before Steam's cut, refunds and discounts.
+            </span>
+            {fetchedUtc && (
+              <span className="text-ink-faint/80">
+                · {updating ? "Updating…" : `Updated ${relativeTime(fetchedUtc)}`}
+              </span>
+            )}
           </p>
         </>
       )}

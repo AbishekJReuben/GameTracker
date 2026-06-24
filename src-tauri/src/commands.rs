@@ -19,6 +19,19 @@ use std::path::Path;
 use tauri::{Emitter, State};
 use tauri_plugin_opener::OpenerExt;
 
+/// Run blocking work (network / file I/O) off Tauri's main thread so the UI never
+/// janks while a command is in flight. The online-fetch commands use this so that
+/// opening a game or pressing "Get data" no longer freezes the app.
+async fn run_blocking<T, F>(f: F) -> AppResult<T>
+where
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| AppError::msg(format!("background task failed: {e}")))?
+}
+
 // ---------- settings ----------
 
 #[tauri::command]
@@ -103,43 +116,57 @@ pub fn set_game_cover(state: State<AppState>, id: String, source: String) -> App
 
 /// User-triggered only. Requires online metadata opt-in.
 #[tauri::command]
-pub fn fetch_cover(state: State<AppState>, id: String, name: String) -> AppResult<Option<GameDto>> {
-    if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
-        return Err(AppError::msg(
-            "Turn on Online metadata in Settings to fetch covers from Steam.",
-        ));
-    }
-    match metadata::fetch_cover(&name, &state.media_dir, &id)? {
-        Some(cover) => {
-            games::set_cover_path(&state.pool, &id, &cover)?;
-            games::get(&state.pool, &id)
+pub async fn fetch_cover(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> AppResult<Option<GameDto>> {
+    let pool = state.pool.clone();
+    let media_dir = state.media_dir.clone();
+    run_blocking(move || {
+        if !settings::get_bool(&pool, "online_metadata_enabled")? {
+            return Err(AppError::msg(
+                "Turn on Online metadata in Settings to fetch covers from Steam.",
+            ));
         }
-        None => Ok(None),
-    }
+        match metadata::fetch_cover(&name, &media_dir, &id)? {
+            Some(cover) => {
+                games::set_cover_path(&pool, &id, &cover)?;
+                games::get(&pool, &id)
+            }
+            None => Ok(None),
+        }
+    })
+    .await
 }
 
 /// Fetch developer, release year, metacritic, genres, and blurb from Steam (keyless).
 /// Fills empty fields and merges genre tags. Optionally downloads cover too.
 #[tauri::command]
-pub fn fetch_game_info(
-    state: State<AppState>,
+pub async fn fetch_game_info(
+    state: State<'_, AppState>,
     id: String,
     name: String,
     with_cover: Option<bool>,
 ) -> AppResult<Option<GameDto>> {
-    if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
-        return Err(AppError::msg(
-            "Turn on Online metadata in Settings to fetch game info from Steam.",
-        ));
-    }
-    let with_cover = with_cover.unwrap_or(false);
-    match metadata::fetch_game_info(&name, &state.media_dir, &id, with_cover)? {
-        Some(meta) => {
-            apply_game_metadata(&state.pool, &id, &meta)?;
-            games::get(&state.pool, &id)
+    let pool = state.pool.clone();
+    let media_dir = state.media_dir.clone();
+    run_blocking(move || {
+        if !settings::get_bool(&pool, "online_metadata_enabled")? {
+            return Err(AppError::msg(
+                "Turn on Online metadata in Settings to fetch game info from Steam.",
+            ));
         }
-        None => Ok(None),
-    }
+        let with_cover = with_cover.unwrap_or(false);
+        match metadata::fetch_game_info(&name, &media_dir, &id, with_cover)? {
+            Some(meta) => {
+                apply_game_metadata(&pool, &id, &meta)?;
+                games::get(&pool, &id)
+            }
+            None => Ok(None),
+        }
+    })
+    .await
 }
 
 /// Outcome of a manual "check for updates" — whether a newer signed release is
@@ -281,52 +308,100 @@ pub(crate) fn enrich_game_async(
     });
 }
 
-/// Live + estimated stats (players now, peak, owners, revenue est., reviews) for
-/// a game. Resolves a Steam appid from the stored id or the name; non-Steam games
-/// (no appid) return `None`. Gated by the online-metadata opt-in.
+/// Cached live stats served instantly from the DB, plus when they were fetched.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedGameStats {
+    pub stats: Option<metadata::GameStats>,
+    pub fetched_utc: Option<String>,
+}
+
+/// Return the *cached* live stats for a game (no network), so GameDetail renders
+/// them instantly without hanging. Empty when never fetched — the UI then calls
+/// `refresh_game_stats` to populate them in the background.
 #[tauri::command]
-pub fn fetch_game_stats(
+pub fn get_game_stats(state: State<AppState>, game_id: String) -> AppResult<CachedGameStats> {
+    let (json, fetched_utc) = games::get_stats_cache(&state.pool, &game_id)?;
+    let stats = json.and_then(|j| serde_json::from_str::<metadata::GameStats>(&j).ok());
+    Ok(CachedGameStats { stats, fetched_utc })
+}
+
+/// Kick off a background refresh of a game's live stats. Returns immediately; the
+/// fetch runs on a worker thread (network must not block the UI), caches the
+/// result with the game, and emits `game://stats` with `{ id, stats, fetchedUtc }`
+/// so the open GameDetail updates in place. Gated by the online-metadata opt-in.
+#[tauri::command]
+pub fn refresh_game_stats(
+    app: tauri::AppHandle,
     state: State<AppState>,
     game_id: String,
-) -> AppResult<Option<metadata::GameStats>> {
+) -> AppResult<()> {
     if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
         return Err(AppError::msg(
             "Turn on Online metadata in Settings to fetch live game stats.",
         ));
     }
-    let game = games::get(&state.pool, &game_id)?.ok_or_else(|| AppError::msg("Game not found."))?;
+    let pool = state.pool.clone();
+    std::thread::spawn(move || {
+        refresh_game_stats_inner(&app, &pool, &game_id);
+    });
+    Ok(())
+}
+
+fn refresh_game_stats_inner(app: &tauri::AppHandle, pool: &crate::db::DbPool, game_id: &str) {
+    let emit = |stats: Option<&metadata::GameStats>, fetched: Option<&str>| {
+        let _ = app.emit(
+            "game://stats",
+            serde_json::json!({ "id": game_id, "stats": stats, "fetchedUtc": fetched }),
+        );
+    };
+    let Ok(Some(game)) = games::get(pool, game_id) else {
+        emit(None, None);
+        return;
+    };
     let appid = match game.steam_app_id {
         Some(a) if a > 0 => Some(a as u64),
         _ => metadata::resolve_steam_appid(&game.display_name),
     };
     let Some(appid) = appid else {
-        return Ok(None);
+        // Non-Steam game: no stats source. Tell the UI so it can stop "updating".
+        emit(None, None);
+        return;
     };
     // Cache the resolved appid so subsequent loads (and covers) are exact.
     if game.steam_app_id.is_none() {
-        let _ = games::set_steam_app_id(&state.pool, &game_id, appid as i64);
+        let _ = games::set_steam_app_id(pool, game_id, appid as i64);
     }
-    Ok(Some(metadata::fetch_game_stats(appid)))
+    let stats = metadata::fetch_game_stats(appid);
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Ok(json) = serde_json::to_string(&stats) {
+        let _ = games::set_stats_cache(pool, game_id, &json, &now);
+    }
+    emit(Some(&stats), Some(&now));
 }
 
 /// Fetch HowLongToBeat estimates (main, main+extra, completionist).
 #[tauri::command]
-pub fn fetch_hltb(
-    state: State<AppState>,
+pub async fn fetch_hltb(
+    state: State<'_, AppState>,
     id: String,
     name: String,
     apply_as_manual: Option<bool>,
 ) -> AppResult<Option<GameDto>> {
-    let apply = apply_as_manual.unwrap_or(true);
-    match hltb::lookup(&name)? {
-        Some(times) => {
-            games::apply_hltb(&state.pool, &id, &times, apply)?;
-            games::get(&state.pool, &id)?
-                .ok_or_else(|| AppError::msg("Game not found"))
-                .map(Some)
+    let pool = state.pool.clone();
+    run_blocking(move || {
+        let apply = apply_as_manual.unwrap_or(true);
+        match hltb::lookup(&name)? {
+            Some(times) => {
+                games::apply_hltb(&pool, &id, &times, apply)?;
+                games::get(&pool, &id)?
+                    .ok_or_else(|| AppError::msg("Game not found"))
+                    .map(Some)
+            }
+            None => Ok(None),
         }
-        None => Ok(None),
-    }
+    })
+    .await
 }
 
 /// Add a game from a dropped/selected path (exe or folder). Returns the saved game.
@@ -421,38 +496,43 @@ pub fn add_app_from_path(
 /// Fetch a one-line description + logo for an app from Wikipedia (keyless).
 /// Requires the online-metadata opt-in, like the game equivalents.
 #[tauri::command]
-pub fn fetch_app_info(
-    state: State<AppState>,
+pub async fn fetch_app_info(
+    state: State<'_, AppState>,
     id: String,
     name: String,
     with_image: Option<bool>,
 ) -> AppResult<Option<GameDto>> {
-    if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
-        return Err(AppError::msg(
-            "Turn on Online metadata in Settings to fetch app info.",
-        ));
-    }
-    let with_image = with_image.unwrap_or(true);
-    match metadata::fetch_app_info(&name, &state.media_dir, &id, with_image)? {
-        Some(info) => {
-            games::apply_metadata(
-                &state.pool,
-                &id,
-                info.developer.as_deref(),
-                info.release_year,
-                None,
-                info.description.as_deref(),
-                &info.genre_tags,
-                info.cover_path.as_deref(),
-            )?;
-            games::set_media(&state.pool, &id, &info.screenshots, None, info.website.as_deref(), None)?;
-            if let Some(json) = info.info_json.as_deref() {
-                games::set_info_json(&state.pool, &id, json)?;
-            }
-            games::get(&state.pool, &id)
+    let pool = state.pool.clone();
+    let media_dir = state.media_dir.clone();
+    run_blocking(move || {
+        if !settings::get_bool(&pool, "online_metadata_enabled")? {
+            return Err(AppError::msg(
+                "Turn on Online metadata in Settings to fetch app info.",
+            ));
         }
-        None => Ok(None),
-    }
+        let with_image = with_image.unwrap_or(true);
+        match metadata::fetch_app_info(&name, &media_dir, &id, with_image)? {
+            Some(info) => {
+                games::apply_metadata(
+                    &pool,
+                    &id,
+                    info.developer.as_deref(),
+                    info.release_year,
+                    None,
+                    info.description.as_deref(),
+                    &info.genre_tags,
+                    info.cover_path.as_deref(),
+                )?;
+                games::set_media(&pool, &id, &info.screenshots, None, info.website.as_deref(), None)?;
+                if let Some(json) = info.info_json.as_deref() {
+                    games::set_info_json(&pool, &id, json)?;
+                }
+                games::get(&pool, &id)
+            }
+            None => Ok(None),
+        }
+    })
+    .await
 }
 
 // ---------- detection ----------
@@ -799,47 +879,54 @@ pub fn set_autostart(enabled: bool) -> AppResult<()> {
 // ---------- reviews ----------
 
 #[tauri::command]
-pub fn fetch_steam_reviews(app_id: i64) -> AppResult<Vec<metadata::SteamReview>> {
-    if app_id <= 0 {
-        return Ok(Vec::new());
-    }
-    metadata::fetch_steam_reviews(app_id as u64)
+pub async fn fetch_steam_reviews(app_id: i64) -> AppResult<Vec<metadata::SteamReview>> {
+    run_blocking(move || {
+        if app_id <= 0 {
+            return Ok(Vec::new());
+        }
+        metadata::fetch_steam_reviews(app_id as u64)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn fetch_metacritic_reviews(
-    state: State<AppState>,
+pub async fn fetch_metacritic_reviews(
+    state: State<'_, AppState>,
     game_id: String,
     slug: Option<String>,
 ) -> AppResult<Vec<metadata::MetacriticReview>> {
-    if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
-        return Err(AppError::msg(
-            "Turn on Online metadata in Settings to fetch Metacritic reviews.",
-        ));
-    }
-    let game = games::get(&state.pool, &game_id)?.ok_or_else(|| AppError::msg("Game not found."))?;
-    let resolved = if let Some(s) = slug.filter(|s| !s.trim().is_empty()) {
-        if metadata::metacritic_slug_valid(&s, &game.display_name) {
-            s
+    let pool = state.pool.clone();
+    run_blocking(move || {
+        if !settings::get_bool(&pool, "online_metadata_enabled")? {
+            return Err(AppError::msg(
+                "Turn on Online metadata in Settings to fetch Metacritic reviews.",
+            ));
+        }
+        let game = games::get(&pool, &game_id)?.ok_or_else(|| AppError::msg("Game not found."))?;
+        let resolved = if let Some(s) = slug.filter(|s| !s.trim().is_empty()) {
+            if metadata::metacritic_slug_valid(&s, &game.display_name) {
+                s
+            } else {
+                metadata::resolve_metacritic_slug(&game.display_name)
+                    .ok_or_else(|| AppError::msg("Could not find this game on Metacritic."))?
+            }
+        } else if let Some(s) = game.metacritic_slug.as_ref().filter(|s| !s.trim().is_empty()) {
+            if metadata::metacritic_slug_valid(s, &game.display_name) {
+                s.clone()
+            } else {
+                metadata::resolve_metacritic_slug(&game.display_name)
+                    .ok_or_else(|| AppError::msg("Could not find this game on Metacritic."))?
+            }
         } else {
             metadata::resolve_metacritic_slug(&game.display_name)
                 .ok_or_else(|| AppError::msg("Could not find this game on Metacritic."))?
+        };
+        if game.metacritic_slug.as_deref() != Some(resolved.as_str()) {
+            let _ = games::set_metacritic_slug(&pool, &game_id, &resolved);
         }
-    } else if let Some(s) = game.metacritic_slug.as_ref().filter(|s| !s.trim().is_empty()) {
-        if metadata::metacritic_slug_valid(s, &game.display_name) {
-            s.clone()
-        } else {
-            metadata::resolve_metacritic_slug(&game.display_name)
-                .ok_or_else(|| AppError::msg("Could not find this game on Metacritic."))?
-        }
-    } else {
-        metadata::resolve_metacritic_slug(&game.display_name)
-            .ok_or_else(|| AppError::msg("Could not find this game on Metacritic."))?
-    };
-    if game.metacritic_slug.as_deref() != Some(resolved.as_str()) {
-        let _ = games::set_metacritic_slug(&state.pool, &game_id, &resolved);
-    }
-    metadata::fetch_metacritic_reviews(&resolved)
+        metadata::fetch_metacritic_reviews(&resolved)
+    })
+    .await
 }
 
 /// Probe Steam, Metacritic, HLTB, trailer, theme, website & reviews for every entry (background).

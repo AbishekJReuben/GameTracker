@@ -206,6 +206,18 @@ export default function SettingsPage() {
           <SettingRow icon={<ScanLine className="h-4 w-4" />} title="Scanlines" desc="Subtle CRT-style overlay for extra game feel.">
             <SpringToggle checked={prefs.scanlines} onChange={(v) => setPref("scanlines", v)} />
           </SettingRow>
+          <SettingRow icon={<Sparkles className="h-4 w-4" />} title="Marquee backgrounds" desc="Drifting cover & screenshot art behind panels. Off, Compact (originals only), or Full (everywhere).">
+            <Segmented
+              value={prefs.marquee}
+              onChange={(v) => setPref("marquee", v)}
+              size="sm"
+              options={[
+                { value: "off", label: "Off" },
+                { value: "compact", label: "Compact" },
+                { value: "full", label: "Full" },
+              ]}
+            />
+          </SettingRow>
           <SettingRow icon={<LayoutGrid className="h-4 w-4" />} title="Density" desc="Comfortable spacing or a tighter, info-dense layout.">
             <Segmented
               value={prefs.density}

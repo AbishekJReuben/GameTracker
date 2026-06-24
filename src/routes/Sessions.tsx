@@ -6,6 +6,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { Page } from "@/components/Page";
 import { GameArt } from "@/components/GameArt";
 import { Card, Toggle, EmptyState, Skeleton, Segmented } from "@/components/ui";
+import { MarqueeCard } from "@/components/MarqueeFX";
 import { useSessions, useGames } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { api, EntryKind, SessionFilter } from "@/lib/api";
@@ -15,13 +16,21 @@ export default function SessionsPage() {
   const { data: games } = useGames();
   const pushToast = useApp((s) => s.pushToast);
   const use24 = useApp((s) => s.prefs.timeFormat === "24h");
+  const setPref = useApp((s) => s.setPref);
   const enabled = useMotionEnabled();
   const [gameId, setGameId] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
-  const [minMinutes, setMinMinutes] = useState("");
-  const [excludeIdle, setExcludeIdle] = useState(false);
-  const [kind, setKind] = useState<EntryKind>("game");
+  // kind / min-minutes / hide-AFK are remembered; the specific game & dates stay transient.
+  const sf = useApp((s) => s.prefs.sessionFilters);
+  const kind = sf.kind;
+  const minMinutes = sf.minMinutes;
+  const excludeIdle = sf.excludeIdle;
+  const patchSf = (p: Partial<typeof sf>) =>
+    setPref("sessionFilters", { ...useApp.getState().prefs.sessionFilters, ...p });
+  const setMinMinutes = (v: string) => patchSf({ minMinutes: v });
+  const setExcludeIdle = (v: boolean) => patchSf({ excludeIdle: v });
+  const setKind = (v: EntryKind) => patchSf({ kind: v });
 
   const filteredGames = useMemo(() => (games ?? []).filter((g) => g.kind === kind), [games, kind]);
 
@@ -73,7 +82,7 @@ export default function SessionsPage() {
         </>
       }
     >
-      <Card className="mb-5 p-4">
+      <MarqueeCard variant="spotlight" games={games ?? []} className="mb-5 p-4">
         <div className="mb-4">
           <Segmented
             value={kind}
@@ -108,9 +117,9 @@ export default function SessionsPage() {
             <Toggle checked={excludeIdle} onChange={setExcludeIdle} label="Hide AFK-ended" />
           </div>
         </div>
-      </Card>
+      </MarqueeCard>
 
-      <Card className="p-0">
+      <MarqueeCard variant="vertical" games={games ?? []} className="p-0">
         {isLoading ? (
           <div className="space-y-2 p-4">
             {Array.from({ length: 8 }).map((_, i) => (
@@ -160,7 +169,7 @@ export default function SessionsPage() {
             <EmptyState title="No sessions match" message="Adjust your filters or play a tracked game." />
           </div>
         )}
-      </Card>
+      </MarqueeCard>
     </Page>
   );
 }

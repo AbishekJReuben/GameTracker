@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import type { Game } from "@/lib/api";
 import { GameArt } from "./GameArt";
-import { useMotionEnabled } from "@/store/app";
+import { useMarqueeTier, useMotionEnabled } from "@/store/app";
 import { cn } from "@/lib/cn";
 
 /**
@@ -28,20 +28,25 @@ export function CoverMarquee({
   dimmed?: boolean;
 }) {
   const enabled = useMotionEnabled();
+  const showMarquee = useMarqueeTier("base");
 
-  // Best/most-finished games lead the wall, then anything else with art.
+  // Cover art leads the wall (then completed/highly-rated); games without a
+  // cover still join via GameArt's gradient+initials poster so the wall is never
+  // empty before covers have been fetched.
   const covers = useMemo(() => {
-    const withCover = games.filter((g) => g.kind === "game" && g.coverPath);
-    return [...withCover]
+    return [...games.filter((g) => g.kind === "game")]
       .sort((a, b) => {
-        const sa = (a.status === "completed" ? 1000 : 0) + (a.rating ?? 0);
-        const sb = (b.status === "completed" ? 1000 : 0) + (b.rating ?? 0);
-        return sb - sa;
+        const score = (g: Game) =>
+          (g.coverPath ? 4000 : 0) +
+          (g.steamAppId ? 1500 : 0) +
+          (g.status === "completed" ? 1000 : 0) +
+          (g.rating ?? 0);
+        return score(b) - score(a);
       })
       .slice(0, max);
   }, [games, max]);
 
-  if (covers.length === 0) return null;
+  if (!showMarquee || covers.length === 0) return null;
   // Duplicate so the -50% loop is seamless (only needed while animating).
   const strip = enabled ? [...covers, ...covers] : covers;
 

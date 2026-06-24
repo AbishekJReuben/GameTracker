@@ -29,6 +29,7 @@ import { Reveal } from "@/components/Reveal";
 import { GameArt } from "@/components/GameArt";
 import { GameScores } from "@/components/GameScores";
 import { CoverMarquee } from "@/components/CoverMarquee";
+import { MarqueeCard } from "@/components/MarqueeFX";
 import { InsightsContent } from "./Insights";
 import { useCatalog, useGames } from "@/lib/queries";
 import { useMotionEnabled } from "@/store/app";
@@ -149,7 +150,7 @@ export default function CollectionPage() {
 
         {/* Gauges */}
         <Reveal>
-        <Card>
+        <MarqueeCard variant="bokeh" games={games ?? []}>
           <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
             <GaugeStat icon={<Trophy className="h-4 w-4" />} label="Completed" value={data.totalCompleted} max={Math.max(20, data.totalCompleted)} text={String(data.totalCompleted)} from="var(--accent-1)" to="var(--accent-3)" />
             <GaugeStat icon={<Star className="h-4 w-4" />} label="Avg my score" value={data.avgMyScore} max={100} text={data.avgMyScore.toFixed(1)} from="#fbbf24" to="#fb923c" />
@@ -160,7 +161,7 @@ export default function CollectionPage() {
               <div className="text-[11px] uppercase tracking-wider text-ink-dim">pts {delta >= 0 ? "kinder than critics" : "harsher than critics"}</div>
             </div>
           </div>
-        </Card>
+        </MarqueeCard>
         </Reveal>
 
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4 lg:grid-cols-6">
@@ -185,7 +186,7 @@ export default function CollectionPage() {
 
         <Reveal delay={0.05}>
         <div className="grid gap-6 lg:grid-cols-3">
-          <Card>
+          <MarqueeCard variant="pulse" games={games ?? []}>
             <SectionTitle title="Library status" subtitle="Where your games stand" />
             <ResponsiveContainer width="100%" height={220}>
               <PieChart>
@@ -205,9 +206,9 @@ export default function CollectionPage() {
                 </span>
               ))}
             </div>
-          </Card>
+          </MarqueeCard>
 
-          <Card className="lg:col-span-2">
+          <MarqueeCard variant="wave" games={games ?? []} className="lg:col-span-2">
             <SectionTitle title="Your journey" subtitle="Cumulative games completed over time" />
             {cumulative.length > 1 ? (
               <ResponsiveContainer width="100%" height={220}>
@@ -228,13 +229,13 @@ export default function CollectionPage() {
             ) : (
               <EmptyState title="Not enough history" message="Add completed years across multiple years to chart your journey." />
             )}
-          </Card>
+          </MarqueeCard>
         </div>
         </Reveal>
 
         {data.perYear.length > 0 && (
           <Reveal delay={0.08}>
-          <Card>
+          <MarqueeCard variant="ticker" games={completed}>
             <SectionTitle title="Completions per year" subtitle="Count and average scores by finish year" />
             <ResponsiveContainer width="100%" height={240}>
               <BarChart data={data.perYear} margin={{ top: 8, right: 12, left: -18, bottom: 0 }}>
@@ -248,7 +249,7 @@ export default function CollectionPage() {
                 <Bar yAxisId="right" dataKey="avgScore" name="Avg my score" fill="#fbbf24" radius={[6, 6, 0, 0]} opacity={0.85} isAnimationActive animationBegin={200} animationDuration={700} animationEasing="ease-out" />
               </BarChart>
             </ResponsiveContainer>
-          </Card>
+          </MarqueeCard>
           </Reveal>
         )}
 
@@ -258,7 +259,7 @@ export default function CollectionPage() {
 
         <Reveal delay={0.1}>
         <div className="grid gap-6 lg:grid-cols-2">
-          <Card>
+          <MarqueeCard variant="tilt3d" games={completed}>
             <SectionTitle title="Score distribution" subtitle="How generous is your scoring?" />
             <div className="flex h-[200px] items-end gap-3 px-2">
               {scoreHist.map((b, i) => (
@@ -275,9 +276,9 @@ export default function CollectionPage() {
                 </div>
               ))}
             </div>
-          </Card>
+          </MarqueeCard>
 
-          <Card>
+          <MarqueeCard variant="verticalReverse" games={completed}>
             <SectionTitle title="My score vs Metacritic" subtitle="Above the line = you liked it more" />
             <ResponsiveContainer width="100%" height={220}>
               <ScatterChart margin={{ top: 8, right: 12, left: -18, bottom: 0 }}>
@@ -300,28 +301,28 @@ export default function CollectionPage() {
                 <Scatter data={scatter} fill="var(--accent-3)" fillOpacity={0.8} isAnimationActive={false} shape={(props) => <PopScatterDot {...props} enabled={enabled} />} />
               </ScatterChart>
             </ResponsiveContainer>
-          </Card>
+          </MarqueeCard>
         </div>
         </Reveal>
 
         <Reveal delay={0.12}>
         <div className="grid gap-6 lg:grid-cols-2">
-          <Card>
+          <MarqueeCard variant="duotone" games={completed}>
             <SectionTitle title="By era" subtitle="Release decade of games you finished" right={<History className="h-4 w-4 text-ink-dim" />} />
             {decades.length > 0 ? (
               <BarList items={decades.map((d) => ({ label: d.label, value: d.count }))} />
             ) : (
               <EmptyState title="No release years" />
             )}
-          </Card>
-          <Card>
+          </MarqueeCard>
+          <MarqueeCard variant="grayscale" games={completed}>
             <SectionTitle title="Top genres" subtitle="Your most-completed tags" right={<Tag className="h-4 w-4 text-ink-dim" />} />
             {tagCounts.length > 0 ? (
               <BarList items={tagCounts.map((t) => ({ label: t.tag, value: t.count }))} />
             ) : (
               <EmptyState title="No tags yet" message="Add tags to your games to see genre breakdowns." />
             )}
-          </Card>
+          </MarqueeCard>
         </div>
         </Reveal>
 
@@ -353,7 +354,7 @@ export default function CollectionPage() {
           </Card>
         </div>
 
-        <Card>
+        <MarqueeCard variant="mosaic" games={completed}>
           <SectionTitle title="Top studios" subtitle="Most-completed developers" />
           {data.topStudios.length > 0 ? (
             <div className="space-y-2">
@@ -373,7 +374,7 @@ export default function CollectionPage() {
           ) : (
             <EmptyState title="No studio data" />
           )}
-        </Card>
+        </MarqueeCard>
 
         {hallOfFame.length > 0 && (
           <Card>
