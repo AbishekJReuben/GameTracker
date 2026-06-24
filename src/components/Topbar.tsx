@@ -17,10 +17,12 @@ export function Topbar({
   subtitle?: string;
   actions?: ReactNode;
 }) {
-  const tracking = useApp((s) => s.tracking);
+  // Only the paused flag is needed here; subscribing to the whole tracking
+  // object would re-render the always-mounted Topbar every 2s for nothing.
+  const trackingPaused = useApp((s) => s.tracking?.paused ?? false);
   const { data: settings } = useSettings();
   const qc = useQueryClient();
-  const paused = settings?.tracking_paused === "true" || tracking?.paused;
+  const paused = settings?.tracking_paused === "true" || trackingPaused;
   const motionOn = useMotionEnabled();
 
   const togglePause = async () => {

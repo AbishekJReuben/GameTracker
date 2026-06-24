@@ -6,7 +6,6 @@ import {
   Plus,
   Radar,
   FileSpreadsheet,
-  ImageDown,
   Sparkles,
   Loader2,
   LayoutGrid,
@@ -14,21 +13,21 @@ import {
   Grid3x3,
   GalleryHorizontalEnd,
   Clapperboard,
-  Timer,
+  GripVertical,
   Tag,
   ChevronDown,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Page } from "@/components/Page";
 import { GameCard } from "@/components/GameCard";
-import { GameList, GameCompact, GameAlbum, GameTheatre } from "@/components/LibraryViews";
+import { GameList, GameCompact, GameAlbum, GameTheatre, GameReorder } from "@/components/LibraryViews";
 import { DetectModal } from "@/components/DetectModal";
 import { Segmented, EmptyState, Skeleton, Toggle } from "@/components/ui";
 import { useGames, useRefreshAll } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { viewSwap } from "@/lib/motion";
 import { useProgress } from "@/store/progress";
-import { runBulkCovers, runBulkGameInfo, runBulkHltb, runCsvImport } from "@/lib/bulkTasks";
+import { runEnrichAll, runCsvImport } from "@/lib/bulkTasks";
 import type { LibraryView } from "@/store/app";
 import { cn } from "@/lib/cn";
 import { api, Game, GameStatus } from "@/lib/api";
@@ -65,7 +64,7 @@ function ViewSwitcher({ value, onChange }: { value: LibraryView; onChange: (v: L
 }
 
 type StatusFilter = "all" | GameStatus;
-type Sort = "recent" | "name" | "playtime" | "score";
+type Sort = "recent" | "name" | "playtime" | "score" | "manual";
 
 const STATUS_OPTS: { value: StatusFilter; label: string }[] = [
   { value: "all", label: "All" },
@@ -82,6 +81,7 @@ const SORT_OPTS: { value: Sort; label: string }[] = [
   { value: "name", label: "Name" },
   { value: "playtime", label: "Playtime" },
   { value: "score", label: "Score" },
+  { value: "manual", label: "Manual" },
 ];
 
 /** Completed-date sort key (newest first); null when no completion date. */
@@ -100,6 +100,7 @@ export default function LibraryPage() {
   const refresh = useRefreshAll();
   const view = useApp((s) => s.prefs.libraryView);
   const setPref = useApp((s) => s.setPref);
+  const manualOrder = useApp((s) => s.prefs.manualOrder);
   const motionOn = useMotionEnabled();
   const liveGameId = useApp((s) => (s.tracking?.isPlaying ? s.tracking.gameId : null));
   const coverJob = useProgress((s) => s.getJob("covers"));
@@ -141,6 +142,13 @@ export default function LibraryPage() {
       if (q && !`${g.displayName} ${g.developer ?? ""}`.toLowerCase().includes(q.toLowerCase())) return false;
       return true;
     });
+    // Manual sort: honour the user's saved drag order verbatim (no live-game
+    // float). Unranked games fall to the end, stably by name.
+    if (sort === "manual") {
+      const pos = new Map(manualOrder.map((id, i) => [id, i] as const));
+      const at = (g: Game) => pos.get(g.id) ?? Number.MAX_SAFE_INTEGER;
+      return [...list].sort((a, b) => at(a) - at(b) || a.displayName.localeCompare(b.displayName));
+    }
     const by: Record<Sort, (a: Game, b: Game) => number> = {
       name: (a, b) => a.displayName.localeCompare(b.displayName),
       playtime: (a, b) => b.totalRuntimeSeconds - a.totalRuntimeSeconds,
@@ -153,6 +161,7 @@ export default function LibraryPage() {
         if (cb != null) return 1;
         return new Date(b.lastPlayedUtc ?? b.createdAt).getTime() - new Date(a.lastPlayedUtc ?? a.createdAt).getTime();
       },
+      manual: () => 0,
     };
     // The game running right now floats to the very top, then anything marked
     // "playing", then everything else ordered by the chosen sort.
@@ -163,7 +172,29 @@ export default function LibraryPage() {
       if (ra !== rb) return ra - rb;
       return by[sort](a, b);
     });
-  }, [games, onlyGames, q, status, sort, trackedOnly, tag, liveGameId]);
+  }, [games, onlyGames, q, status, sort, trackedOnly, tag, liveGameId, manualOrder]);
+
+  // Local working copy for drag reordering — keeps drags buttery (no global
+  // re-sort per swap); the saved order is persisted shortly after you let go.
+  const [manualList, setManualList] = useState<Game[]>([]);
+  useEffect(() => {
+    if (sort === "manual") setManualList(filtered);
+  }, [sort, filtered]);
+  useEffect(() => {
+    if (sort !== "manual" || manualList.length === 0) return;
+    const t = setTimeout(() => {
+      const ids = manualList.map((g) => g.id);
+      const shown = new Set(ids);
+      const prev = useApp.getState().prefs.manualOrder;
+      const rest = prev.filter((id) => !shown.has(id));
+      const known = new Set([...ids, ...rest]);
+      const others = onlyGames.filter((g) => !known.has(g.id)).map((g) => g.id);
+      const next = [...ids, ...rest, ...others];
+      const unchanged = next.length === prev.length && next.every((id, i) => id === prev[i]);
+      if (!unchanged) setPref("manualOrder", next);
+    }, 450);
+    return () => clearTimeout(t);
+  }, [manualList, sort, onlyGames, setPref]);
 
   const importCsv = async () => {
     const path = (await api.defaultCsvPath()) ?? (await open({ multiple: false, filters: [{ name: "CSV", extensions: ["csv"] }] }));
@@ -175,12 +206,20 @@ export default function LibraryPage() {
     }
   };
 
-  const fetchCovers = () => runBulkCovers(onlyGames, refresh, pushToast);
-  const fetchGameInfo = () => runBulkGameInfo(onlyGames, refresh, pushToast);
-  const fetchHltb = () => runBulkHltb(onlyGames, refresh, pushToast);
+  const fetchAll = () => runEnrichAll(onlyGames, refresh, pushToast);
 
   const jobLabel = (job: typeof coverJob, fallback: string) =>
     job ? (job.total > 0 ? `${job.done}/${job.total}` : `${job.done}…`) : fallback;
+
+  // One "Get data" button drives all three enrichment passes; reflect whichever is running.
+  const enrichJob = coverJob ?? infoJob ?? hltbJob;
+  const enrichLabel = coverJob
+    ? `Covers ${jobLabel(coverJob, "")}`
+    : infoJob
+    ? `Info ${jobLabel(infoJob, "")}`
+    : hltbJob
+    ? `HLTB ${jobLabel(hltbJob, "")}`
+    : "Get data";
 
   return (
     <Page
@@ -188,17 +227,9 @@ export default function LibraryPage() {
       subtitle={games ? `${onlyGames.length} games` : "Your games"}
       actions={
         <>
-          <button onClick={fetchCovers} disabled={anyBusy} className="btn btn-ghost h-10" title="Fetch cover art online (Steam)">
-            {coverJob ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageDown className="h-4 w-4" />}
-            {jobLabel(coverJob, "Get covers")}
-          </button>
-          <button onClick={fetchGameInfo} disabled={anyBusy} className="btn btn-ghost h-10" title="Fetch developer, year, Metacritic & genres (Steam)">
-            {infoJob ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-            {jobLabel(infoJob, "Get game info")}
-          </button>
-          <button onClick={fetchHltb} disabled={anyBusy} className="btn btn-ghost h-10" title="Fetch playtime from HowLongToBeat (Main+Extra)">
-            {hltbJob ? <Loader2 className="h-4 w-4 animate-spin" /> : <Timer className="h-4 w-4" />}
-            {jobLabel(hltbJob, "Get HLTB")}
+          <button onClick={fetchAll} disabled={anyBusy} className="btn btn-ghost h-10" title="Fetch covers, info (Steam) & HowLongToBeat for your whole library">
+            {enrichJob ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+            {enrichLabel}
           </button>
           <button onClick={importCsv} disabled={anyBusy} className="btn btn-ghost h-10" title="Import CSV">
             {csvJob ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSpreadsheet className="h-4 w-4" />}
@@ -263,6 +294,14 @@ export default function LibraryPage() {
           {Array.from({ length: 10 }).map((_, i) => (
             <Skeleton key={i} className="aspect-[3/4]" />
           ))}
+        </div>
+      ) : filtered.length > 0 && sort === "manual" ? (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 rounded-xl border border-line bg-white/[0.02] px-3 py-2 text-xs font-600 text-ink-dim">
+            <GripVertical className="h-4 w-4 shrink-0 text-ink-dim" />
+            Drag the handle to set your own order — it's saved automatically. Clear search & filters first to reorder the whole library.
+          </div>
+          <GameReorder games={manualList.length ? manualList : filtered} onReorder={setManualList} />
         </div>
       ) : filtered.length > 0 ? (
         <AnimatePresence mode="wait">

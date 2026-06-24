@@ -182,6 +182,17 @@
     transform: translateY(100%);
   }
 }
+/* Seamless horizontal marquee: the strip is duplicated, so -50% scrolls exactly
+   one copy. Pure CSS so it starts on mount regardless of route-transition timing
+   (a JS percentage-transform animation didn't kick off until a remount). */
+@keyframes gt-marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
 @keyframes blink {
   0%,
   100% {

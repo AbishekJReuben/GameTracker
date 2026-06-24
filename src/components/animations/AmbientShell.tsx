@@ -73,8 +73,11 @@ function Orb({
   return (
     <motion.div
       className={`absolute rounded-full blur-[130px] ${className}`}
-      style={{ background: color, opacity: 0.16 }}
-      animate={animate ? { x: drift, y: driftY, scale: [1, 1.06, 0.98, 1] } : undefined}
+      style={{ background: color, opacity: 0.16, willChange: "transform" }}
+      // Drift only (translate is GPU-composited). We deliberately avoid animating
+      // `scale` here: rescaling a 130px-blurred layer forces a full re-raster of
+      // the blur every frame, which was a constant source of background jank.
+      animate={animate ? { x: drift, y: driftY } : undefined}
       transition={animate ? { duration: dur, repeat: Infinity, ease: "easeInOut" } : undefined}
     />
   );

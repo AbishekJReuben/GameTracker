@@ -337,6 +337,8 @@ function buildDashboard(): Dashboard {
     gamesBacklog: MOCK_GAMES.filter((g) => g.kind === "game" && g.status === "backlog").length,
     gamesPlaying: MOCK_GAMES.filter((g) => g.kind === "game" && g.status === "playing").length,
     gamesDropped: MOCK_GAMES.filter((g) => g.kind === "game" && g.status === "dropped").length,
+    gamesOnHold: MOCK_GAMES.filter((g) => g.kind === "game" && g.status === "on_hold").length,
+    gamesWatched: MOCK_GAMES.filter((g) => g.kind === "game" && g.status === "watched").length,
     currentStreak: 4,
     longestStreak: 11,
     uniqueGamesPlayed: new Set(list.map((s) => s.gameId)).size,

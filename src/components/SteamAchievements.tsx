@@ -4,6 +4,7 @@ import { motion } from "motion/react";
 import { ExternalLink, Loader2, Lock, RefreshCw, Trophy } from "lucide-react";
 import { Game, SteamAchievement } from "@/lib/api";
 import {
+  achievementCompletionBuckets,
   aggregateSteamAchievements,
   computeGameAchievementInsights,
   hasAchievementList,
@@ -498,6 +499,12 @@ export function SteamAchievementCollectionSection({ games }: { games: Game[] }) 
               hint="games at 100%"
             />
           </div>
+          <AchievementGraphs
+            unlocked={overview?.totalUnlocked ?? fallback.totalUnlocked}
+            total={overview?.totalPossible ?? fallback.totalPossible}
+            avgPercent={overview?.avgPercent ?? fallback.avgPercent}
+            games={games}
+          />
           {overview && overview.highlights.length > 0 && (
             <div className="mt-6">
               <AchievementHighlightsSection highlights={overview.highlights} mode="library" />
@@ -603,6 +610,87 @@ export function SteamAchievementInsightsBlock({ games }: { games: Game[] }) {
         </div>
       )}
     </Card>
+  );
+}
+
+/** Overall completion radial + per-game completion-spread bands for the library. */
+function AchievementGraphs({
+  unlocked,
+  total,
+  avgPercent,
+  games,
+}: {
+  unlocked: number;
+  total: number;
+  avgPercent: number;
+  games: Game[];
+}) {
+  const { buckets, tracked } = useMemo(() => achievementCompletionBuckets(games), [games]);
+  const overallPct = total > 0 ? Math.round((unlocked / total) * 100) : 0;
+  const maxCount = Math.max(1, ...buckets.map((b) => b.count));
+
+  return (
+    <div className="mt-6 grid gap-6 rounded-2xl border border-line bg-white/[0.015] p-4 md:grid-cols-[auto_1fr] md:items-center">
+      <div className="flex items-center gap-4">
+        <CompletionRing percent={overallPct} />
+        <div>
+          <div className="font-display text-2xl font-900 tabular-nums text-amber">{unlocked.toLocaleString()}</div>
+          <div className="text-xs text-ink-dim">of {total.toLocaleString()} unlocked</div>
+          <div className="mt-1 text-[11px] text-ink-faint">{avgPercent}% avg across {tracked} games</div>
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <div className="mb-1 text-[11px] font-700 uppercase tracking-wider text-ink-dim">Completion spread</div>
+        {buckets.map((b) => (
+          <div key={b.label} className="flex items-center gap-3">
+            <span className="w-20 shrink-0 text-[11px] font-600 text-ink-soft">{b.label}</span>
+            <div className="relative h-3 flex-1 overflow-hidden rounded-full bg-white/[0.05]">
+              <motion.div
+                className="h-full rounded-full"
+                style={{ background: b.tone, boxShadow: `0 0 10px -2px ${b.tone}` }}
+                initial={{ width: 0 }}
+                whileInView={{ width: `${(b.count / maxCount) * 100}%` }}
+                viewport={{ once: true, margin: "-30px" }}
+                transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+              />
+            </div>
+            <span className="w-7 shrink-0 text-right text-xs font-800 tabular-nums text-ink">{b.count}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CompletionRing({ percent }: { percent: number }) {
+  const r = 34;
+  const circ = 2 * Math.PI * r;
+  const clamped = Math.min(100, Math.max(0, percent));
+  const offset = circ * (1 - clamped / 100);
+  return (
+    <div className="relative h-[88px] w-[88px] shrink-0">
+      <svg viewBox="0 0 80 80" className="h-full w-full -rotate-90">
+        <circle cx="40" cy="40" r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="7" />
+        <motion.circle
+          cx="40"
+          cy="40"
+          r={r}
+          fill="none"
+          stroke="#fbbf24"
+          strokeWidth="7"
+          strokeLinecap="round"
+          strokeDasharray={circ}
+          initial={{ strokeDashoffset: circ }}
+          whileInView={{ strokeDashoffset: offset }}
+          viewport={{ once: true }}
+          transition={{ duration: 0.9, ease: [0.22, 1, 0.36, 1] }}
+          style={{ filter: "drop-shadow(0 0 6px rgba(251,191,36,0.5))" }}
+        />
+      </svg>
+      <div className="absolute inset-0 grid place-items-center">
+        <span className="font-display text-lg font-900 tabular-nums text-amber">{percent}%</span>
+      </div>
+    </div>
   );
 }
 

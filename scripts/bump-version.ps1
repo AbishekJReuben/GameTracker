@@ -15,6 +15,10 @@
     from tauri.conf.json, and the version label in the app reads package_info()
     (driven by Cargo.toml / tauri.conf.json), so those need no manual edit.
 
+    The frontend version strings (title bar "vX.Y.Z", Settings "Tracker X.Y.Z")
+    read package.json at build time via Vite's `__APP_VERSION__` define
+    (src/lib/version.ts), so bumping package.json here updates them too.
+
 .PARAMETER Version
     The new semver version, e.g. 3.0.4  (a leading "v" is accepted and stripped).
     If omitted, the current version is printed and nothing is changed.

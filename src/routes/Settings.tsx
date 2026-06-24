@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
 import { isTauri } from "@/lib/tauri";
+import { APP_VERSION } from "@/lib/version";
 import {
   Power,
   Moon,
@@ -472,7 +473,7 @@ export default function SettingsPage() {
           </div>
           <div>
             <div className="font-display font-800 text-ink">
-              Tracker <span className="accent-text">3.0</span>
+              Tracker <span className="accent-text">{appVersion || APP_VERSION}</span>
             </div>
             <div className="text-xs">Local-first game playtime analytics · Tauri 2 · React 19 · Motion 12 · Tailwind 4</div>
           </div>

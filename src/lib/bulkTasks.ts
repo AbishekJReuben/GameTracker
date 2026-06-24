@@ -172,6 +172,18 @@ export async function runBulkAppInfo(apps: Game[], refresh: () => void, pushToas
   }
 }
 
+/**
+ * One-tap library enrichment: fetch covers, then game info, then HowLongToBeat
+ * for every game, in sequence. Each step manages its own progress job + toast.
+ */
+export async function runEnrichAll(games: Game[], refresh: () => void, pushToast: ToastFn) {
+  const prog = useProgress.getState();
+  if (prog.isKindBusy("covers") || prog.isKindBusy("game-info") || prog.isKindBusy("hltb")) return;
+  await runBulkCovers(games, refresh, pushToast);
+  await runBulkGameInfo(games, refresh, pushToast);
+  await runBulkHltb(games, refresh, pushToast);
+}
+
 export async function runBulkHltb(games: Game[], refresh: () => void, pushToast: ToastFn) {
   const prog = useProgress.getState();
   if (prog.isKindBusy("hltb")) return;

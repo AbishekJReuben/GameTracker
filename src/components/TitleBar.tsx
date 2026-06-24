@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Gamepad2, Minus, Square, Copy, X } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { isTauri } from "@/lib/tauri";
+import { APP_VERSION } from "@/lib/version";
 
 function WinBtn({
   label,
@@ -65,7 +66,7 @@ export function TitleBar() {
           <Gamepad2 className="h-3 w-3 text-white" />
         </div>
         <span className="truncate text-[12px] font-700 tracking-[0.18em] text-ink-dim">TRACKER</span>
-        <span className="rounded bg-white/[0.06] px-1.5 py-px text-[9px] font-800 tracking-wide text-accent-3">v3</span>
+        <span className="rounded bg-white/[0.06] px-1.5 py-px text-[9px] font-800 tracking-wide text-accent-3">v{APP_VERSION}</span>
       </div>
 
       <div className="flex items-center">

@@ -15,13 +15,14 @@ type Props = {
  * Plays a game's theme while its detail page is open. Prefers a full-length
  * YouTube track (hidden, audio-only) and falls back to a 30s iTunes preview.
  *
- * WebViews block *audible* autoplay until a user gesture, so we start muted and
- * the first click/keypress anywhere on the page unmutes it. The mute choice
- * persists. The player unmounts when you leave, so the theme stops on its own.
+ * WebViews block *audible* autoplay until a user gesture, so the element starts
+ * muted; the first click/keypress anywhere re-applies the user's saved choice
+ * (audible if they've unmuted, silent if not). The mute setting is a single
+ * global preference (off for all games or on for all games) that persists across
+ * games and restarts. The player unmounts when you leave, so the theme stops.
  */
 export function ThemePlayer({ youtubeId, audioUrl, name, suppressed = false }: Props) {
   const muted = useApp((s) => s.prefs.themeMuted);
-  const setPref = useApp((s) => s.setPref);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const didAutoStart = useRef(false);
@@ -78,8 +79,9 @@ export function ThemePlayer({ youtubeId, audioUrl, name, suppressed = false }: P
     }
   }, [suppressed, muted, youtubeId, ytCommand]);
 
-  // First interaction anywhere on the screen kicks off audible playback (the
-  // gesture browsers require). Fires once per page open; later manual mutes win.
+  // The first interaction satisfies the browser's gesture requirement, so we
+  // re-apply the user's saved mute choice audibly. We never flip the setting
+  // here — a globally-muted theme stays muted, so the preference is respected.
   useEffect(() => {
     if (!youtubeId && !audioUrl) return;
     const onGesture = () => {
@@ -87,8 +89,7 @@ export function ThemePlayer({ youtubeId, audioUrl, name, suppressed = false }: P
       didAutoStart.current = true;
       window.removeEventListener("pointerdown", onGesture, true);
       window.removeEventListener("keydown", onGesture, true);
-      if (useApp.getState().prefs.themeMuted) setPref("themeMuted", false);
-      else applyMute();
+      applyMute();
     };
     window.addEventListener("pointerdown", onGesture, true);
     window.addEventListener("keydown", onGesture, true);
@@ -96,7 +97,7 @@ export function ThemePlayer({ youtubeId, audioUrl, name, suppressed = false }: P
       window.removeEventListener("pointerdown", onGesture, true);
       window.removeEventListener("keydown", onGesture, true);
     };
-  }, [youtubeId, audioUrl, setPref, applyMute]);
+  }, [youtubeId, audioUrl, applyMute]);
 
   if (!youtubeId && !audioUrl) return null;
 

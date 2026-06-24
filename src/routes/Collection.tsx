@@ -22,7 +22,7 @@ import {
 import { motion } from "motion/react";
 import { Trophy, Star, Gauge, Scale, TrendingUp, TrendingDown, Tag, History, Radar as RadarIcon, Sparkles, Clock, BookOpen, XCircle, Sparkle } from "lucide-react";
 import { Page } from "@/components/Page";
-import { Card, SectionTitle, EmptyState, Skeleton } from "@/components/ui";
+import { Card, SectionTitle, EmptyState, Skeleton, statusLabel } from "@/components/ui";
 import { RadialGauge, LevelBar } from "@/components/RadialGauge";
 import { RadarChart } from "@/components/Charts";
 import { Reveal } from "@/components/Reveal";
@@ -129,7 +129,7 @@ export default function CollectionPage() {
   }
 
   const scatter = data.scorePoints.map((p) => ({ ...p, z: 1 }));
-  const statusPie = data.statusCounts.map(([name, value]) => ({ name, value }));
+  const statusPie = data.statusCounts.filter(([, value]) => value > 0).map(([name, value]) => ({ name, value }));
   const maxHist = Math.max(1, ...scoreHist.map((b) => b.count));
 
   return (
@@ -201,7 +201,7 @@ export default function CollectionPage() {
               {statusPie.map((s) => (
                 <span key={s.name} className="flex items-center gap-1.5 capitalize text-ink-soft">
                   <span className="h-2 w-2 rounded-full" style={{ background: STATUS_COLORS[s.name] }} />
-                  {s.name} <span className="font-800 text-ink">{s.value}</span>
+                  {statusLabel(s.name)} <span className="font-800 text-ink">{s.value}</span>
                 </span>
               ))}
             </div>

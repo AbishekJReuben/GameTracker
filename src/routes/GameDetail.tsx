@@ -13,13 +13,13 @@ import {
   Star,
   Trophy,
   FolderOpen,
-  ImageDown,
   Sparkles,
   Loader2,
   Timer,
   AppWindow,
   ExternalLink,
   Camera,
+  Play,
 } from "lucide-react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { Page } from "@/components/Page";
@@ -31,8 +31,10 @@ import { useApp, useMotionEnabled } from "@/store/app";
 import { dur, dateLabel, relativeTime, timeLabel, partialDate, formatHltbMinutes } from "@/lib/format";
 import { clipFocusSpans } from "@/lib/focusSpans";
 import { api, assetUrl, GameStatus, Session } from "@/lib/api";
+import { canLaunchGame } from "@/lib/launch";
 import { isTauri } from "@/lib/tauri";
 import { ScreenshotGallery } from "@/components/ScreenshotGallery";
+import { ImageMarquee } from "@/components/ImageMarquee";
 import { Captures } from "@/components/Captures";
 import { SteamReviewsPanel } from "@/components/SteamReviewsPanel";
 import { MetacriticReviewsPanel } from "@/components/MetacriticReviewsPanel";
@@ -109,7 +111,7 @@ export default function GameDetail() {
   }, [allGames, game, id, isApp]);
 
   useEffect(() => {
-    document.querySelector("[data-page-scroll]")?.scrollTo({ top: 0 });
+    document.querySelector("[data-page-scroll]")?.scrollTo?.({ top: 0 });
   }, [id]);
 
   useEffect(() => {
@@ -131,6 +133,12 @@ export default function GameDetail() {
   const tags = game?.tags ?? [];
   const sessionList = sessions ?? [];
   const shots = screenshots ?? [];
+  // Hoisted out of the session-history render loop (was an O(n²) Math.max per row).
+  const maxSessionRuntime = useMemo(
+    () => sessionList.reduce((m, s) => Math.max(m, s.runtimeSeconds), 1),
+    [sessionList]
+  );
+  const nowMs = Date.now();
   const infoEntries = useMemo(() => {
     if (!game?.infoJson) return [] as [string, string][];
     try {
@@ -150,6 +158,29 @@ export default function GameDetail() {
     if (started !== "—") return started;
     return "Never";
   }, [game]);
+
+  const launch = async () => {
+    if (!game) return;
+    try {
+      await api.launchGame(game.id);
+      pushToast({ kind: "success", title: "Launching", message: game.displayName });
+    } catch (err) {
+      pushToast({ kind: "info", title: "Launch failed", message: String(err) });
+    }
+  };
+
+  // One "Get data" action: covers + Steam info + HowLongToBeat for games;
+  // just the Wikipedia info pass for apps.
+  const enrichAll = async () => {
+    if (!game) return;
+    if (isApp) {
+      await fetchInfo();
+      return;
+    }
+    await fetchCover();
+    await fetchInfo();
+    await fetchHltb();
+  };
 
   const fetchCover = async () => {
     if (!game) return;
@@ -234,6 +265,13 @@ export default function GameDetail() {
 
   const hasSessions = sessionList.length > 0;
 
+  // Every HowLongToBeat figure the game has, in increasing-effort order.
+  const hltbItems = [
+    { label: "Main Story", minutes: game.hltbMainMinutes, color: "#34d399" },
+    { label: "Main + Extra", minutes: game.hltbMainExtraMinutes, color: "#22d3ee" },
+    { label: "100% (Completionist)", minutes: game.hltbCompletionistMinutes, color: "#7c5cff" },
+  ].filter((x): x is { label: string; minutes: number; color: string } => x.minutes != null && x.minutes > 0);
+
   const detailsCard = (
     <Card className="h-full">
       <SectionTitle title="Details" />
@@ -247,9 +285,6 @@ export default function GameDetail() {
         ))}
         <Row label="First tracked" value={dateLabel(game.firstPlayedUtc)} />
         <Row label="Tracked" value={game.isTracked ? "Yes" : "Catalog only"} />
-        {!isApp && game.hltbMainExtraMinutes != null && (
-          <Row label="HLTB Main+Extra" value={formatHltbMinutes(game.hltbMainExtraMinutes)} />
-        )}
       </dl>
       {tags.length > 0 && (
         <div className="mt-4 flex flex-wrap gap-1.5">
@@ -302,22 +337,15 @@ export default function GameDetail() {
       subtitle=""
       actions={
         <>
-          {!isApp && (
-            <button onClick={fetchCover} disabled={coverBusy || infoBusy} className="btn btn-ghost h-10" title="Download cover art from Steam">
-              {coverBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageDown className="h-4 w-4" />}
-              Get cover
-            </button>
-          )}
-          <button onClick={fetchInfo} disabled={coverBusy || infoBusy || hltbBusy} className="btn btn-ghost h-10" title={isApp ? "Fetch description & logo from Wikipedia" : "Fetch developer, year, Metacritic, genres from Steam"}>
-            {infoBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-            Get info
+          <button
+            onClick={enrichAll}
+            disabled={coverBusy || infoBusy || hltbBusy}
+            className="btn btn-ghost h-10"
+            title={isApp ? "Fetch description & logo from Wikipedia" : "Fetch cover & info (Steam) and HowLongToBeat estimates"}
+          >
+            {coverBusy || infoBusy || hltbBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+            {isApp ? "Get info" : "Get data"}
           </button>
-          {!isApp && (
-            <button onClick={fetchHltb} disabled={coverBusy || infoBusy || hltbBusy} className="btn btn-ghost h-10" title="Fetch playtime estimates from HowLongToBeat">
-              {hltbBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Timer className="h-4 w-4" />}
-              HLTB
-            </button>
-          )}
           <button onClick={() => openGameModal({ game })} className="btn btn-primary h-10">
             <Pencil className="h-4 w-4" /> Edit
           </button>
@@ -390,6 +418,15 @@ export default function GameDetail() {
             </div>
           </div>
           <div className="flex flex-col gap-2">
+            {canLaunchGame(game) && (
+              <button
+                onClick={launch}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-emerald-500/90 px-4 text-sm font-800 text-white shadow-card transition hover:bg-emerald-500"
+                title="Launch game"
+              >
+                <Play className="h-4 w-4 fill-current" /> Play
+              </button>
+            )}
             {!isApp && (
               <div className="inline-flex rounded-xl border border-line bg-bg-900/70 p-1">
                 {STATUSES.map((s) => (
@@ -412,6 +449,18 @@ export default function GameDetail() {
           </div>
         </div>
       </motion.div>
+
+      {/* Screenshot marquee — a drifting strip of store imagery under the hero. */}
+      {game.screenshots.length > 0 && (
+        <motion.div
+          initial={enabled ? { opacity: 0, y: 10 } : false}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, delay: 0.1 }}
+          className="mb-6"
+        >
+          <ImageMarquee images={game.screenshots} className="h-28 sm:h-36" durationSec={46} />
+        </motion.div>
+      )}
 
       {/* Stats */}
       <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -443,6 +492,21 @@ export default function GameDetail() {
         </p>
       )}
 
+      {!isApp && hltbItems.length > 0 && (
+        <Card className="mb-6">
+          <SectionTitle
+            title="How long to beat"
+            subtitle="Completion estimates from HowLongToBeat"
+            right={<span className="pill inline-flex items-center gap-1 border border-line bg-white/[0.06] text-ink-soft"><Timer className="h-3 w-3" /> HLTB</span>}
+          />
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            {hltbItems.map((it) => (
+              <HltbStat key={it.label} label={it.label} minutes={it.minutes} color={it.color} />
+            ))}
+          </div>
+        </Card>
+      )}
+
       {/* No play history yet — store images + details up top. */}
       {!hasSessions && storeAndDetails("mb-6")}
 
@@ -459,11 +523,10 @@ export default function GameDetail() {
           <SectionTitle title="Session history" subtitle={`${sessionList.length} sessions`} />
           <div className="max-h-[420px] divide-y divide-line overflow-y-auto">
               {sessionList.map((s, i) => {
-                const maxRt = Math.max(...sessionList.map((x) => x.runtimeSeconds), 1);
-                const barW = (s.runtimeSeconds / maxRt) * 100;
+                const barW = (s.runtimeSeconds / maxSessionRuntime) * 100;
                 const startMs = new Date(s.startUtc).getTime();
                 const endMs = new Date(s.endUtc ?? s.lastSeenUtc).getTime();
-                const segments = clipFocusSpans(s, startMs, endMs, Date.now());
+                const segments = clipFocusSpans(s, startMs, endMs, nowMs);
                 const span = endMs - startMs || 1;
                 const acts = sessionActivities(s);
                 return (
@@ -603,6 +666,18 @@ function Scorebox({ label, value, color, icon }: { label: string; value: number;
         </div>
         <div className="text-[11px]">out of 100</div>
       </div>
+    </div>
+  );
+}
+
+function HltbStat({ label, minutes, color }: { label: string; minutes: number; color: string }) {
+  return (
+    <div className="rounded-xl border border-line bg-white/[0.02] p-3">
+      <div className="flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wide text-ink-dim">
+        <span className="h-1.5 w-1.5 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
+        {label}
+      </div>
+      <div className="mt-1 font-display text-lg font-800 tabular-nums text-ink">{formatHltbMinutes(minutes)}</div>
     </div>
   );
 }

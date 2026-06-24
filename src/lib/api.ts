@@ -199,6 +199,8 @@ export interface Dashboard {
   gamesBacklog: number;
   gamesPlaying: number;
   gamesDropped: number;
+  gamesOnHold: number;
+  gamesWatched: number;
   currentStreak: number;
   longestStreak: number;
   uniqueGamesPlayed: number;

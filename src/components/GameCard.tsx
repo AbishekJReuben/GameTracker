@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { memo, useRef } from "react";
 import { Link } from "react-router-dom";
 import { motion, useMotionValue, useSpring, useTransform } from "motion/react";
 import { Pencil, Clock, Gamepad2, Play } from "lucide-react";
@@ -27,7 +27,7 @@ function cardEntrance(i: number): { x?: number; y?: number } {
   }
 }
 
-export function GameCard({ game, index = 0 }: { game: Game; index?: number }) {
+export const GameCard = memo(function GameCard({ game, index = 0 }: { game: Game; index?: number }) {
   const openGameModal = useApp((s) => s.openGameModal);
   const pushToast = useApp((s) => s.pushToast);
   const liveGameId = useApp((s) => (s.tracking?.isPlaying ? s.tracking.gameId : null));
@@ -190,4 +190,4 @@ export function GameCard({ game, index = 0 }: { game: Game; index?: number }) {
       </button>
     </motion.div>
   );
-}
+});

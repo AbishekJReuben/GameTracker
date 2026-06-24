@@ -34,6 +34,8 @@ export interface Prefs {
   showSuggested: boolean;
   /** Mute the per-game theme player. Defaults muted (autoplay needs it). */
   themeMuted: boolean;
+  /** Persisted game order for the Library's "Manual" sort (array of game ids). */
+  manualOrder: string[];
   widgets: {
     goal: boolean;
     secondary: boolean;
@@ -55,6 +57,7 @@ const DEFAULT_PREFS: Prefs = {
   libraryView: "grid",
   showSuggested: false,
   themeMuted: true,
+  manualOrder: [],
   widgets: { goal: true, secondary: true, patterns: true, heatmap: true },
 };
 

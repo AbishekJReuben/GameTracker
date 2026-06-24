@@ -1,5 +1,4 @@
 import { useMemo } from "react";
-import { motion } from "motion/react";
 import type { Game } from "@/lib/api";
 import { GameArt } from "./GameArt";
 import { useMotionEnabled } from "@/store/app";
@@ -56,10 +55,9 @@ export function CoverMarquee({
       aria-label="Game cover showcase"
     >
       <div className="absolute inset-0 flex items-center">
-        <motion.div
+        <div
           className="flex h-full w-max items-center gap-2.5 px-2 py-2"
-          animate={enabled ? { x: ["0%", "-50%"] } : undefined}
-          transition={{ duration: durationSec, repeat: Infinity, ease: "linear" }}
+          style={enabled ? { animation: `gt-marquee ${durationSec}s linear infinite`, willChange: "transform" } : undefined}
         >
           {strip.map((g, i) => (
             <div
@@ -78,7 +76,7 @@ export function CoverMarquee({
               />
             </div>
           ))}
-        </motion.div>
+        </div>
       </div>
 
       {fade && (

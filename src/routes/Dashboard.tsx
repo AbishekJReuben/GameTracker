@@ -45,7 +45,10 @@ export default function Dashboard() {
   const use24 = useApp((s) => s.prefs.timeFormat === "24h");
   const weekStart = useApp((s) => s.prefs.weekStart);
   const widgets = useApp((s) => s.prefs.widgets);
-  const tracking = useApp((s) => s.tracking);
+  // Subscribe to just the live game count, not the whole tracking object: the
+  // tracker re-emits state every 2s with growing second-counters, and this heavy
+  // charts page has no reason to re-render unless the running-game count changes.
+  const activeCount = useApp((s) => s.tracking?.activeCount ?? 0);
   const motionOn = useMotionEnabled();
 
   const dailyGoalMin = parseInt(settings?.daily_goal_minutes ?? "0", 10) || 0;
@@ -186,15 +189,17 @@ export default function Dashboard() {
           <motion.div className="flex flex-wrap gap-2" variants={motionOn ? stagger : undefined}>
             <StatusPill label="Playing" count={data.gamesPlaying} color="#34d399" to="/library" />
             <StatusPill label="Backlog" count={data.gamesBacklog} color="#3b82f6" to="/library" />
+            <StatusPill label="On Hold" count={data.gamesOnHold} color="#f59e0b" to="/library" />
             <StatusPill label="Completed" count={data.gamesCompleted} color="#7c5cff" to="/collection" />
             <StatusPill label="Dropped" count={data.gamesDropped} color="#f472b6" to="/library" />
-            {(tracking?.activeCount ?? 0) > 1 && (
+            <StatusPill label="Watched" count={data.gamesWatched} color="#22d3ee" to="/library" />
+            {activeCount > 1 && (
               <motion.span
                 variants={motionOn ? fadeUp : undefined}
                 className="pill border border-green/30 bg-green/10 text-xs font-700 text-green"
               >
                 <Gamepad2 className="mr-1 inline h-3.5 w-3.5" />
-                {tracking!.activeCount} games running
+                {activeCount} games running
               </motion.span>
             )}
           </motion.div>

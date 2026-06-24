@@ -53,6 +53,8 @@ pub struct Dashboard {
     pub games_backlog: i64,
     pub games_playing: i64,
     pub games_dropped: i64,
+    pub games_on_hold: i64,
+    pub games_watched: i64,
     pub current_streak: i64,
     pub longest_streak: i64,
     pub unique_games_played: i64,
@@ -460,6 +462,16 @@ pub fn dashboard(pool: &DbPool) -> AppResult<Dashboard> {
         [],
         |r| r.get(0),
     )?;
+    let games_on_hold: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM games WHERE kind='game' AND status='on_hold'",
+        [],
+        |r| r.get(0),
+    )?;
+    let games_watched: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM games WHERE kind='game' AND status='watched'",
+        [],
+        |r| r.get(0),
+    )?;
     let games_tracked: i64 = conn.query_row(
         "SELECT COUNT(*) FROM games WHERE kind='game' AND (exe_paths != '[]' OR install_folder IS NOT NULL)",
         [],
@@ -564,6 +576,8 @@ pub fn dashboard(pool: &DbPool) -> AppResult<Dashboard> {
         games_backlog,
         games_playing,
         games_dropped,
+        games_on_hold,
+        games_watched,
         current_streak,
         longest_streak,
         unique_games_played,

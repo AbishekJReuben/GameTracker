@@ -268,10 +268,16 @@ pub(crate) fn enrich_game_async(
                 .flatten(),
         };
         if let Some(meta) = meta {
-            if apply_game_metadata(&pool, &id, &meta).is_ok() {
-                let _ = app.emit("game://enriched", serde_json::json!({ "id": id }));
-            }
+            let _ = apply_game_metadata(&pool, &id, &meta);
         }
+        // Also pull HowLongToBeat estimates so a freshly-added game has its
+        // playtimes ready alongside its cover & info. We store the estimates
+        // only (apply=false) — auto-enrichment never inflates a game's manual
+        // playtime; the user can still apply it from the "Get data" action.
+        if let Ok(Some(times)) = hltb::lookup(&name) {
+            let _ = games::apply_hltb(&pool, &id, &times, false);
+        }
+        let _ = app.emit("game://enriched", serde_json::json!({ "id": id }));
     });
 }
 

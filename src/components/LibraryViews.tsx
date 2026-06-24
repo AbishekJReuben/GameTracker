@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { AnimatePresence, motion } from "motion/react";
-import { Clock, ChevronRight, ArrowRight, Zap, Play } from "lucide-react";
+import { AnimatePresence, motion, Reorder, useDragControls } from "motion/react";
+import { Clock, ChevronRight, ArrowRight, Zap, Play, GripVertical } from "lucide-react";
 import { Game, GameStatus } from "@/lib/api";
 import { api } from "@/lib/api";
 import { canLaunchGame } from "@/lib/launch";
 import { useApp } from "@/store/app";
 import { GameArt } from "./GameArt";
-import { statusColor } from "./ui";
+import { statusColor, statusLabel } from "./ui";
 import { dur } from "@/lib/format";
 import { useMotionEnabled } from "@/store/app";
 import { GameScores } from "./GameScores";
@@ -353,5 +353,61 @@ export function GameTheatre({ games }: { games: Game[] }) {
         })}
       </motion.div>
     </div>
+  );
+}
+
+/* ========================== MANUAL (DRAG) VIEW ========================== */
+
+/** Reorderable list for the Library's "Manual" sort. Drag a row by its handle
+ *  to set a custom order; the parent persists it. Rows still link to detail. */
+export function GameReorder({ games, onReorder }: { games: Game[]; onReorder: (next: Game[]) => void }) {
+  return (
+    <Reorder.Group axis="y" values={games} onReorder={onReorder} as="div" className="card divide-y divide-line overflow-hidden p-0">
+      {games.map((g) => (
+        <ReorderRow key={g.id} game={g} />
+      ))}
+    </Reorder.Group>
+  );
+}
+
+function ReorderRow({ game: g }: { game: Game }) {
+  const controls = useDragControls();
+  const color = statusColor(g.status);
+  return (
+    <Reorder.Item
+      value={g}
+      dragListener={false}
+      dragControls={controls}
+      className="flex items-center gap-3 bg-bg-900/30 px-3 py-2.5"
+      whileDrag={{ scale: 1.01, backgroundColor: "rgba(255,255,255,0.05)", boxShadow: "0 16px 36px -14px rgba(0,0,0,0.7)", zIndex: 5 }}
+    >
+      <button
+        type="button"
+        onPointerDown={(e) => controls.start(e)}
+        className="grid h-9 w-7 shrink-0 cursor-grab touch-none place-items-center rounded-md text-ink-dim transition hover:bg-white/[0.06] hover:text-ink active:cursor-grabbing"
+        title="Drag to reorder"
+        aria-label="Drag to reorder"
+      >
+        <GripVertical className="h-4 w-4" />
+      </button>
+      <Link to={`/game/${g.id}`} className="flex min-w-0 flex-1 items-center gap-3">
+        <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-12 w-10 shrink-0" rounded="rounded-md" />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-700">{g.displayName || "Untitled"}</div>
+          <div className="flex items-center gap-2 truncate text-[11px] text-ink-dim">
+            <span className="truncate">{g.developer ?? (g.isTracked ? "Tracked" : "Catalog")}</span>
+            {g.totalRuntimeSeconds > 0 && (
+              <span className="inline-flex shrink-0 items-center gap-1">
+                <Clock className="h-3 w-3" /> {dur(g.totalRuntimeSeconds)}
+              </span>
+            )}
+          </div>
+        </div>
+        <span className="pill shrink-0 capitalize" style={{ background: `color-mix(in srgb, ${color} 20%, transparent)`, color }}>
+          <span className="h-1.5 w-1.5 rounded-full" style={{ background: color }} />
+          {statusLabel(g.status)}
+        </span>
+      </Link>
+    </Reorder.Item>
   );
 }
