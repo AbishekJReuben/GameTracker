@@ -78,6 +78,7 @@ export function GameCard({ game, index = 0 }: { game: Game; index?: number }) {
             cover={game.coverPath}
             icon={game.iconPath}
             accent={game.accentColor}
+            steamAppId={game.steamAppId}
             className="absolute inset-0 h-full w-full"
             rounded="rounded-2xl"
           />

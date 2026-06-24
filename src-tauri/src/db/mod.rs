@@ -278,6 +278,20 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 14;
     }
 
+    if version < 15 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE games ADD COLUMN gog_product_id INTEGER;
+            ALTER TABLE games ADD COLUMN gog_achievements_unlocked INTEGER;
+            ALTER TABLE games ADD COLUMN gog_achievements_total INTEGER;
+            ALTER TABLE games ADD COLUMN gog_achievements_synced_utc TEXT;
+            ALTER TABLE games ADD COLUMN gog_achievements_json TEXT;
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 15;")?;
+        version = 15;
+    }
+
     let _ = version;
     Ok(())
 }

@@ -49,7 +49,7 @@ export function GameList({ games }: { games: Game[] }) {
             >
               <div className="grid grid-cols-[auto_1fr_auto_auto_auto_auto] items-center gap-4 px-4 py-2.5">
                 <Link to={`/game/${g.id}`} className="contents">
-                  <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} className="h-12 w-10" rounded="rounded-md" />
+                  <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-12 w-10" rounded="rounded-md" />
                   <div className="min-w-0">
                     <div className="truncate text-sm font-700">{g.displayName || "Untitled"}</div>
                     <div className="flex items-center gap-2 truncate text-[11px] text-ink-dim">
@@ -124,7 +124,7 @@ export function GameCompact({ games }: { games: Game[] }) {
           >
             <Link to={`/game/${g.id}`} className="group block">
               <div className="relative aspect-[3/4] overflow-hidden rounded-lg border border-line transition group-hover:border-line-strong group-hover:shadow-float">
-                <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} className="absolute inset-0 h-full w-full transition group-hover:scale-105" rounded="rounded-lg" />
+                <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="absolute inset-0 h-full w-full transition group-hover:scale-105" rounded="rounded-lg" />
                 <div className="absolute inset-0 bg-gradient-to-t from-black/85 to-transparent" />
                 <motion.span
                   className="absolute left-1.5 top-1.5 h-2 w-2 rounded-full"
@@ -196,7 +196,7 @@ export function GameAlbum({ games }: { games: Game[] }) {
                       className="relative aspect-[3/4] overflow-hidden rounded-xl border border-line shadow-card transition duration-300 group-hover:shadow-float"
                       style={{ boxShadow: `0 18px 40px -24px ${color}` }}
                     >
-                      <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} className="absolute inset-0 h-full w-full transition duration-500 group-hover:scale-[1.07]" rounded="rounded-xl" />
+                      <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="absolute inset-0 h-full w-full transition duration-500 group-hover:scale-[1.07]" rounded="rounded-xl" />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-transparent opacity-0 transition group-hover:opacity-100" />
                       <div className="absolute inset-x-0 bottom-0 translate-y-2 p-2.5 opacity-0 transition group-hover:translate-y-0 group-hover:opacity-100">
                         <div className="truncate text-xs font-800 text-white">{g.displayName}</div>
@@ -248,6 +248,7 @@ export function GameTheatre({ games }: { games: Game[] }) {
               cover={featured.coverPath}
               icon={featured.iconPath}
               accent={featured.accentColor}
+              steamAppId={featured.steamAppId}
               className="h-full w-full blur-2xl"
               rounded="rounded-none"
               kenBurns={enabled}
@@ -262,7 +263,7 @@ export function GameTheatre({ games }: { games: Game[] }) {
               transition={{ delay: 0.1, ...springSoft }}
               className="hidden sm:block"
             >
-              <GameArt id={featured.id} name={featured.displayName} cover={featured.coverPath} icon={featured.iconPath} accent={featured.accentColor} className="h-56 w-40 shrink-0 shadow-float" />
+              <GameArt id={featured.id} name={featured.displayName} cover={featured.coverPath} icon={featured.iconPath} accent={featured.accentColor} steamAppId={featured.steamAppId} className="h-56 w-40 shrink-0 shadow-float" />
             </motion.div>
             <motion.div
               className="min-w-0 flex-1"
@@ -336,7 +337,7 @@ export function GameTheatre({ games }: { games: Game[] }) {
               className={`relative w-[104px] shrink-0 overflow-hidden rounded-xl border transition ${active ? "border-transparent ring-2 ring-accent" : "border-line opacity-70 hover:opacity-100"}`}
             >
               <div className="relative aspect-[3/4]">
-                <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} className="absolute inset-0 h-full w-full" rounded="rounded-xl" />
+                <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="absolute inset-0 h-full w-full" rounded="rounded-xl" />
                 <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
                 <div className="absolute inset-x-0 bottom-0 truncate p-1.5 text-left text-[10px] font-700 text-white">{g.displayName}</div>
               </div>

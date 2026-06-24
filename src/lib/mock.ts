@@ -107,6 +107,10 @@ function makeGame(s: Seed, runtime: number, active: number, sessions: number, la
     steamAchievementsUnlocked: s.id.startsWith("g-hk") ? 42 : null,
     steamAchievementsTotal: s.id.startsWith("g-hk") ? 63 : null,
     steamAchievementsSyncedUtc: s.id.startsWith("g-hk") ? nowIso : null,
+    gogProductId: null,
+    gogAchievementsUnlocked: null,
+    gogAchievementsTotal: null,
+    gogAchievementsSyncedUtc: null,
     trackedRuntimeSeconds: runtime,
     trackedActiveSeconds: active,
     totalRuntimeSeconds: runtime,
@@ -812,6 +816,10 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         steamAchievementsUnlocked: null,
         steamAchievementsTotal: null,
         steamAchievementsSyncedUtc: null,
+        gogProductId: null,
+        gogAchievementsUnlocked: null,
+        gogAchievementsTotal: null,
+        gogAchievementsSyncedUtc: null,
         trackedRuntimeSeconds: 0,
         trackedActiveSeconds: 0,
         totalRuntimeSeconds: input.manualPlaytimeSeconds ?? 0,
@@ -930,6 +938,54 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         ],
         recentUnlocks: [],
       } as T;
+    case "gog_session":
+      return { linked: false, userId: null, username: null } as T;
+    case "gog_login_url":
+      return "https://auth.gog.com/auth?client_id=mock" as T;
+    case "gog_login_finish":
+    case "gog_login":
+      return { userId: "48628349957132247", username: "Mock Gogger", gameCount: 12 } as T;
+    case "gog_logout":
+    case "gog_import":
+    case "gog_sync":
+      return undefined as T;
+    case "gog_validate":
+      return { userId: "48628349957132247", username: "Mock Gogger", gameCount: 12 } as T;
+    case "gog_library":
+      return [] as T;
+    case "gog_game_achievements":
+      return [] as T;
+    case "launcher_capabilities":
+      return [
+        {
+          id: "steam",
+          name: "Steam",
+          library: "online",
+          playtime: "online",
+          achievements: "online",
+          notes: "",
+        },
+        {
+          id: "gog",
+          name: "GOG",
+          library: "online",
+          playtime: "online",
+          achievements: "online",
+          notes: "",
+        },
+        {
+          id: "epic",
+          name: "Epic Games",
+          library: "local",
+          playtime: "none",
+          achievements: "none",
+          notes: "Local installs only.",
+        },
+      ] as T;
+    case "local_launcher_library":
+      return [] as T;
+    case "local_launcher_import":
+      return [0, 0] as T;
     default:
       throw new Error(`Mock invoke not implemented: ${cmd}`);
   }

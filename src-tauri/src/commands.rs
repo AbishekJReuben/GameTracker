@@ -368,6 +368,7 @@ pub fn add_from_path(
         tags: Vec::new(),
         count_background: None,
         steam_app_id: None,
+        gog_product_id: None,
     };
     save_game(app, state, input)
 }
@@ -406,6 +407,7 @@ pub fn add_app_from_path(
         tags: Vec::new(),
         count_background: Some(true),
         steam_app_id: None,
+        gog_product_id: None,
     };
     save_game(app, state, input)
 }
@@ -492,6 +494,7 @@ pub fn import_detected(
             tags: Vec::new(),
             count_background: None,
             steam_app_id: steam_app_id.map(|a| a as i64),
+            gog_product_id: None,
         };
         let first_exe = input.exe_paths.first().cloned();
         let id = games::upsert(&state.pool, input)?;
@@ -552,6 +555,7 @@ pub fn import_detected_apps(state: State<AppState>, candidates: Vec<Candidate>) 
             tags: Vec::new(),
             count_background: Some(true),
             steam_app_id: None,
+            gog_product_id: None,
         };
         let first_exe = input.exe_paths.first().cloned();
         let id = games::upsert(&state.pool, input)?;
@@ -715,6 +719,7 @@ pub fn add_suggested_game(state: State<AppState>, input: AddSuggestionInput) -> 
         tags: input.genres,
         count_background: None,
         steam_app_id: input.steam_app_id.map(|a| a as i64),
+        gog_product_id: None,
     };
     let id = games::upsert(&state.pool, game_input)?;
     if let Some(appid) = input.steam_app_id {
@@ -1092,9 +1097,8 @@ pub fn steam_game_achievements(
         .filter(|&a| a > 0)
         .ok_or_else(|| AppError::msg("This game has no linked Steam app ID."))?;
     let api_key = crate::steam::steam_api_key()?;
-    let steam_id = settings::get(pool, "steam_id")?
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| AppError::msg("Sign in with Steam to load achievements."))?;
+    let steam_id = settings::get(pool, "steam_id")?.unwrap_or_default();
+    let install_folder = game.install_folder.clone();
 
     crate::steam::refresh_achievements_for_game(
         pool,
@@ -1102,6 +1106,7 @@ pub fn steam_game_achievements(
         &api_key,
         &steam_id,
         appid as u64,
+        install_folder.as_deref(),
     )
 }
 
@@ -1176,4 +1181,159 @@ pub fn steam_sync(
         }
     });
     Ok(())
+}
+
+// ---------- GOG sync ----------
+
+#[tauri::command]
+pub fn gog_session(state: State<AppState>) -> AppResult<crate::gog::GogSession> {
+    crate::gog::session(&state.pool)
+}
+
+#[tauri::command]
+pub fn gog_login_url() -> String {
+    crate::gog_auth::login_url()
+}
+
+#[tauri::command]
+pub fn gog_login_finish(
+    state: State<AppState>,
+    callback: String,
+) -> AppResult<crate::gog::GogValidateResult> {
+    let pool = state.pool.clone();
+    let token = crate::gog_auth::complete_from_user_input(&callback)?;
+    crate::gog::complete_login(&pool, token)
+}
+
+#[tauri::command]
+pub fn gog_login(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+) -> AppResult<crate::gog::GogValidateResult> {
+    let _ = app;
+    let _ = state;
+    Err(AppError::msg(
+        "Use the browser sign-in flow: open the login URL, then call gogLoginFinish with the redirect URL.",
+    ))
+}
+
+#[tauri::command]
+pub fn gog_logout(state: State<AppState>) -> AppResult<()> {
+    crate::gog::logout(&state.pool)
+}
+
+#[tauri::command]
+pub fn gog_validate(state: State<AppState>) -> AppResult<crate::gog::GogValidateResult> {
+    crate::gog::validate_session(&state.pool)
+}
+
+#[tauri::command]
+pub fn gog_library(state: State<AppState>) -> AppResult<Vec<crate::gog::GogLibraryGame>> {
+    crate::gog::library(&state.pool)
+}
+
+#[tauri::command]
+pub fn gog_import(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    product_ids: Vec<u64>,
+) -> AppResult<()> {
+    let pool = state.pool.clone();
+    let media_dir = state.media_dir.clone();
+    std::thread::spawn(move || {
+        let app_handle = app.clone();
+        match crate::gog::import_games(&pool, &product_ids, |id| {
+            if let Ok(Some(game)) = games::get(&pool, id) {
+                enrich_game_async(
+                    app_handle.clone(),
+                    pool.clone(),
+                    media_dir.clone(),
+                    id.to_string(),
+                    game.display_name,
+                    None,
+                );
+            }
+        }) {
+            Ok(result) => {
+                let _ = app.emit("gog://complete", &result);
+            }
+            Err(e) => {
+                let _ = app.emit("gog://error", e.to_string());
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn gog_sync(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    playtime: bool,
+    achievements: bool,
+) -> AppResult<()> {
+    let pool = state.pool.clone();
+    std::thread::spawn(move || {
+        let progress = |ev: crate::gog::GogSyncProgress| {
+            let _ = app.emit("gog://progress", &ev);
+        };
+        match crate::gog::sync(&pool, playtime, achievements, Some(&progress)) {
+            Ok(result) => {
+                let _ = app.emit("gog://complete", &result);
+            }
+            Err(e) => {
+                let _ = app.emit("gog://error", e.to_string());
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn gog_game_achievements(
+    state: State<AppState>,
+    game_id: String,
+    refresh: bool,
+) -> AppResult<Vec<crate::gog::GogAchievement>> {
+    crate::gog::game_achievements(&state.pool, &game_id, refresh)
+}
+
+// ---------- Launcher catalog (local + capabilities) ----------
+
+#[tauri::command]
+pub fn launcher_capabilities() -> Vec<crate::launcher_catalog::LauncherCapability> {
+    crate::launcher_catalog::capabilities()
+}
+
+#[tauri::command]
+pub fn local_launcher_library(
+    state: State<AppState>,
+    platform: String,
+) -> AppResult<Vec<crate::launcher_catalog::LocalLauncherGame>> {
+    crate::launcher_catalog::local_library(&state.pool, &platform)
+}
+
+#[tauri::command]
+pub fn local_launcher_import(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    platform: String,
+    names: Vec<String>,
+) -> AppResult<(i64, i64)> {
+    let pool = state.pool.clone();
+    let media_dir = state.media_dir.clone();
+    let app_handle = app.clone();
+    let pool_for_closure = pool.clone();
+    crate::launcher_catalog::import_local(&pool, &platform, &names, move |id| {
+        if let Ok(Some(game)) = games::get(&pool_for_closure, id) {
+            enrich_game_async(
+                app_handle.clone(),
+                pool_for_closure.clone(),
+                media_dir.clone(),
+                id.to_string(),
+                game.display_name,
+                None,
+            );
+        }
+    })
 }

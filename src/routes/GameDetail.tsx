@@ -362,7 +362,7 @@ export default function GameDetail() {
           <div className="absolute inset-0 bg-bg-base/82" />
         </motion.div>
         <div className="relative flex flex-col gap-5 p-6 sm:flex-row sm:items-end">
-          <GameArt id={game.id} name={game.displayName} cover={game.coverPath} icon={game.iconPath} accent={game.accentColor} className="h-44 w-32 shrink-0 shadow-float" />
+          <GameArt id={game.id} name={game.displayName} cover={game.coverPath} icon={game.iconPath} accent={game.accentColor} steamAppId={game.steamAppId} className="h-44 w-32 shrink-0 shadow-float" />
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               {isApp ? (

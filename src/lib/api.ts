@@ -58,6 +58,10 @@ export interface Game {
   steamAchievementsUnlocked: number | null;
   steamAchievementsTotal: number | null;
   steamAchievementsSyncedUtc: string | null;
+  gogProductId: number | null;
+  gogAchievementsUnlocked: number | null;
+  gogAchievementsTotal: number | null;
+  gogAchievementsSyncedUtc: string | null;
   trackedRuntimeSeconds: number;
   trackedActiveSeconds: number;
   totalRuntimeSeconds: number;
@@ -609,6 +613,72 @@ export interface SteamImportOptions {
   achievements?: boolean;
 }
 
+export interface GogSession {
+  linked: boolean;
+  userId: string | null;
+  username: string | null;
+}
+
+export interface GogValidateResult {
+  userId: string;
+  username: string | null;
+  gameCount: number;
+}
+
+export interface GogSyncResult {
+  libraryAdded: number;
+  libraryUpdated: number;
+  playtimeUpdated: number;
+  achievementsUpdated: number;
+  errors: string[];
+}
+
+export interface GogSyncProgress {
+  phase: string;
+  done: number;
+  total: number;
+  label: string;
+}
+
+export interface GogLibraryGame {
+  productId: number;
+  name: string;
+  playtimeMinutes: number;
+  hasAchievements: boolean;
+  imported: boolean;
+  trackerGameId: string | null;
+  coverImageUrl: string | null;
+}
+
+export interface GogAchievement {
+  achievementId: string;
+  achievementKey: string;
+  name: string;
+  description: string;
+  imageUrlUnlocked: string | null;
+  imageUrlLocked: string | null;
+  unlocked: boolean;
+  unlockTimeUtc: string | null;
+}
+
+export interface LauncherCapability {
+  id: string;
+  name: string;
+  library: string;
+  playtime: string;
+  achievements: string;
+  notes: string;
+}
+
+export interface LocalLauncherGame {
+  name: string;
+  installFolder: string | null;
+  exePath: string | null;
+  source: string;
+  imported: boolean;
+  trackerGameId: string | null;
+}
+
 // ---------- Command wrappers ----------
 
 export const api = {
@@ -712,6 +782,29 @@ export const api = {
       playtime: options.playtime ?? true,
       achievements: options.achievements ?? true,
     }),
+
+  gogSession: () => call<GogSession>("gog_session"),
+  gogLoginUrl: () => call<string>("gog_login_url"),
+  gogLoginFinish: (callback: string) =>
+    call<GogValidateResult>("gog_login_finish", { callback }),
+  gogLogin: () => call<GogValidateResult>("gog_login"),
+  gogLogout: () => call<void>("gog_logout"),
+  gogValidate: () => call<GogValidateResult>("gog_validate"),
+  gogLibrary: () => call<GogLibraryGame[]>("gog_library"),
+  gogImport: (productIds: number[]) => call<void>("gog_import", { productIds }),
+  gogGameAchievements: (gameId: string, refresh = false) =>
+    call<GogAchievement[]>("gog_game_achievements", { gameId, refresh }),
+  gogSync: (options: SteamSyncOptions = {}) =>
+    call<void>("gog_sync", {
+      playtime: options.playtime ?? true,
+      achievements: options.achievements ?? true,
+    }),
+
+  launcherCapabilities: () => call<LauncherCapability[]>("launcher_capabilities"),
+  localLauncherLibrary: (platform: string) =>
+    call<LocalLauncherGame[]>("local_launcher_library", { platform }),
+  localLauncherImport: (platform: string, names: string[]) =>
+    call<[number, number]>("local_launcher_import", { platform, names }),
 };
 
 /** Convert a stored absolute file path to a webview-loadable asset URL. */

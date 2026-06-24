@@ -442,6 +442,7 @@ fn apply_owned_game(
             tags: vec![],
             count_background: None,
             steam_app_id: Some(game.appid as i64),
+            gog_product_id: None,
         };
         let id = games::upsert(pool, input)?;
         actions.added = true;
@@ -473,7 +474,14 @@ fn sync_achievements_for_game(
         Some(id) => id,
         None => return Ok(false),
     };
-    let achievements = fetch_achievements(api_key, steam_id, appid)?;
+    let install_folder = games::get(pool, &game_id)?
+        .and_then(|g| g.install_folder);
+    let achievements = fetch_achievements(
+        api_key,
+        steam_id,
+        appid,
+        install_folder.as_deref(),
+    )?;
     if achievements.is_empty() {
         return Ok(false);
     }
@@ -713,8 +721,9 @@ pub fn refresh_achievements_for_game(
     api_key: &str,
     steam_id: &str,
     appid: u64,
+    install_folder: Option<&str>,
 ) -> AppResult<Vec<SteamAchievement>> {
-    let achievements = fetch_achievements(api_key, steam_id, appid)?;
+    let achievements = fetch_achievements(api_key, steam_id, appid, install_folder)?;
     if !achievements.is_empty() {
         let unlocked = achievements.iter().filter(|a| a.unlocked).count() as i64;
         let json = serde_json::to_string(&achievements).ok();
@@ -734,7 +743,7 @@ pub fn fetch_achievement_counts(
     steam_id: &str,
     appid: u64,
 ) -> AppResult<AchievementCounts> {
-    let achievements = fetch_achievements(api_key, steam_id, appid)?;
+    let achievements = fetch_achievements(api_key, steam_id, appid, None)?;
     Ok(AchievementCounts {
         unlocked: achievements.iter().filter(|a| a.unlocked).count() as i64,
         total: achievements.len() as i64,
@@ -742,6 +751,19 @@ pub fn fetch_achievement_counts(
 }
 
 pub fn fetch_achievements(
+    api_key: &str,
+    steam_id: &str,
+    appid: u64,
+    install_folder: Option<&str>,
+) -> AppResult<Vec<SteamAchievement>> {
+    let from_steam = fetch_achievements_from_steam(api_key, steam_id, appid)?;
+    if !from_steam.is_empty() {
+        return Ok(from_steam);
+    }
+    fetch_achievements_from_emu(api_key, appid, install_folder)
+}
+
+fn fetch_achievements_from_steam(
     api_key: &str,
     steam_id: &str,
     appid: u64,
@@ -864,6 +886,149 @@ pub fn fetch_achievements(
         });
     }
 
+    sort_achievements(&mut out);
+    Ok(out)
+}
+fn fetch_achievements_from_emu(
+    api_key: &str,
+    appid: u64,
+    install_folder: Option<&str>,
+) -> AppResult<Vec<SteamAchievement>> {
+    use std::collections::HashMap;
+
+    let Some(emu) = crate::steam_emu::read_emu_unlocks(appid, install_folder) else {
+        return Ok(Vec::new());
+    };
+    let appid = emu.app_id;
+
+    let mut meta: HashMap<String, (String, String, String, String, bool)> =
+        load_achievement_schema_meta(api_key, appid);
+
+    if meta.is_empty() {
+        for def in crate::steam_emu::read_local_definitions(install_folder) {
+            if def.name.is_empty() {
+                continue;
+            }
+            meta.insert(
+                def.name.clone(),
+                (
+                    if def.display_name.is_empty() {
+                        def.name.clone()
+                    } else {
+                        def.display_name
+                    },
+                    def.description,
+                    def.icon,
+                    def.icon_gray,
+                    def.hidden,
+                ),
+            );
+        }
+    }
+
+    if meta.is_empty() {
+        for name in emu.unlocks.keys() {
+            meta.insert(
+                name.clone(),
+                (name.clone(), String::new(), String::new(), String::new(), false),
+            );
+        }
+    }
+
+    let mut out = Vec::with_capacity(meta.len());
+    for (api_name, (display_name, description, icon, icon_gray, hidden)) in meta {
+        let unlocked = emu.unlocks.contains_key(&api_name);
+        let unlock_time_utc = emu
+            .unlocks
+            .get(&api_name)
+            .filter(|&&t| t > 0)
+            .and_then(|&t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|dt| dt.to_rfc3339());
+
+        let (mut display_name, mut description) = (display_name, description);
+        if hidden && !unlocked {
+            display_name = "Hidden Achievement".to_string();
+            description = String::new();
+        }
+
+        let icon_url = if unlocked && !icon.is_empty() {
+            icon
+        } else if !icon_gray.is_empty() {
+            icon_gray
+        } else {
+            icon
+        };
+
+        out.push(SteamAchievement {
+            api_name: api_name.clone(),
+            display_name,
+            description,
+            icon_url,
+            unlocked,
+            hidden,
+            unlock_time_utc,
+        });
+    }
+
+    sort_achievements(&mut out);
+    Ok(out)
+}
+
+fn load_achievement_schema_meta(
+    api_key: &str,
+    appid: u64,
+) -> std::collections::HashMap<String, (String, String, String, String, bool)> {
+    use std::collections::HashMap;
+
+    let schema_url = format!(
+        "{API_BASE}/ISteamUserStats/GetSchemaForGame/v2/?key={}&appid={appid}",
+        encode(api_key)
+    );
+    let schema = get_json_with_retry(&schema_url, 2);
+    let mut meta: HashMap<String, (String, String, String, String, bool)> = HashMap::new();
+    if let Some(ref j) = schema {
+        if let Some(arr) = j
+            .pointer("/game/availableGameStats/achievements")
+            .and_then(|a| a.as_array())
+        {
+            for a in arr {
+                let api_name = a
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if api_name.is_empty() {
+                    continue;
+                }
+                let display = a
+                    .get("displayName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&api_name)
+                    .to_string();
+                let description = a
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let icon = a
+                    .get("icon")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let icon_gray = a
+                    .get("icongray")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&icon)
+                    .to_string();
+                let hidden = a.get("hidden").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+                meta.insert(api_name, (display, description, icon, icon_gray, hidden));
+            }
+        }
+    }
+    meta
+}
+
+fn sort_achievements(out: &mut [SteamAchievement]) {
     out.sort_by(|a, b| {
         match (a.unlocked, b.unlocked) {
             (true, false) => std::cmp::Ordering::Less,
@@ -878,8 +1043,6 @@ pub fn fetch_achievements(
                 .cmp(&b.display_name.to_lowercase()),
         }
     });
-
-    Ok(out)
 }
 
 fn encode(s: &str) -> String {

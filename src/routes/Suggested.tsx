@@ -75,6 +75,7 @@ function SuggestionCard({
             name={item.name}
             cover={item.coverUrl}
             icon={item.headerImageUrl}
+            steamAppId={item.steamAppId}
             className="absolute inset-0 h-full w-full"
             rounded="rounded-none"
             kenBurns

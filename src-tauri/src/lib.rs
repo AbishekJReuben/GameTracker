@@ -14,7 +14,11 @@ mod metadata;
 #[cfg(windows)]
 mod registry;
 mod state;
+mod gog;
+mod gog_auth;
+mod launcher_catalog;
 mod steam;
+mod steam_emu;
 mod steam_openid;
 mod system;
 mod tracking;
@@ -230,6 +234,19 @@ pub fn run() {
             commands::steam_game_achievements,
             commands::steam_achievements_overview,
             commands::steam_sync,
+            commands::gog_session,
+            commands::gog_login_url,
+            commands::gog_login_finish,
+            commands::gog_login,
+            commands::gog_logout,
+            commands::gog_validate,
+            commands::gog_library,
+            commands::gog_import,
+            commands::gog_sync,
+            commands::gog_game_achievements,
+            commands::launcher_capabilities,
+            commands::local_launcher_library,
+            commands::local_launcher_import,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tracker")

@@ -394,6 +394,7 @@ pub fn import_csv(
             tags: Vec::new(),
             count_background: None,
             steam_app_id: None,
+            gog_product_id: None,
         };
         let id = games::upsert(pool, input)?;
         if let Some(times) = hltb_times {

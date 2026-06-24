@@ -382,7 +382,7 @@ export default function CollectionPage() {
               {hallOfFame.map((g, i) => (
                 <Link key={g.id} to={`/game/${g.id}`} className="group relative">
                   <div className="relative aspect-[3/4] overflow-hidden rounded-xl border border-line transition group-hover:-translate-y-1 group-hover:shadow-float">
-                    <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} className="absolute inset-0 h-full w-full" rounded="rounded-xl" />
+                    <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="absolute inset-0 h-full w-full" rounded="rounded-xl" />
                     <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
                     <div className="absolute right-1.5 top-1.5">
                       <GameScores game={g} variant="badge" index={i} className="static rounded-full px-1.5 py-0.5 text-[9px]" />
@@ -500,7 +500,7 @@ function RecentlyCompletedRail({ games }: { games: Game[] }) {
                 name={g.displayName}
                 cover={g.coverPath}
                 icon={g.iconPath}
-                accent={g.accentColor}
+                accent={g.accentColor} steamAppId={g.steamAppId}
                 className="absolute inset-0 h-full w-full"
                 rounded="rounded-xl"
               />
@@ -587,7 +587,7 @@ function DeltaList({ items, positive }: { items: { g: Game; d: number }[]; posit
     <div className="space-y-1">
       {items.map(({ g, d }) => (
         <Link key={g.id} to={`/game/${g.id}`} className="flex items-center gap-3 rounded-xl px-2 py-2 transition hover:bg-white/[0.03]">
-          <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} className="h-9 w-9" rounded="rounded-lg" />
+          <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-9 w-9" rounded="rounded-lg" />
           <div className="min-w-0 flex-1">
             <div className="truncate text-sm font-700">{g.displayName}</div>
             <div className="text-[11px] text-ink-dim">You {g.rating} · Critics {g.metacritic}</div>

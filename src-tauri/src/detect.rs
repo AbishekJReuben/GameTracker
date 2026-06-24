@@ -775,6 +775,75 @@ pub fn detect(pool: &DbPool) -> AppResult<Vec<Candidate>> {
     Ok(out)
 }
 
+/// Installed titles for a specific launcher (local discovery only).
+pub fn local_launcher_candidates(platform: &str) -> Vec<Candidate> {
+    match platform.to_lowercase().as_str() {
+        "epic" => scan_epic_manifests(),
+        "riot" => scan_riot(),
+        "ubisoft" => scan_ubisoft_registry(),
+        "rockstar" => scan_rockstar_registry(),
+        "gog" => scan_local_gog_folders(),
+        _ => Vec::new(),
+    }
+}
+
+fn scan_local_gog_folders() -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(pf) = env_path(var) {
+            let gog = pf.join("GOG Galaxy").join("Games");
+            if gog.is_dir() {
+                out.extend(scan_subfolders(gog, "GOG"));
+            }
+        }
+    }
+    let gog_default = PathBuf::from("C:\\GOG Games");
+    if gog_default.is_dir() {
+        out.extend(scan_subfolders(gog_default, "GOG"));
+    }
+    out
+}
+
+/// Import one detected candidate as a tracked game. Returns the new or existing game id.
+pub fn import_candidate(pool: &DbPool, c: &Candidate) -> AppResult<String> {
+    use crate::db::models::GameInput;
+    if let Some(id) = games::find_by_install_or_name(
+        pool,
+        c.install_folder.as_deref(),
+        &c.name,
+    )? {
+        return Ok(id);
+    }
+    let input = GameInput {
+        id: None,
+        kind: "game".to_string(),
+        display_name: c.name.clone(),
+        install_folder: c.install_folder.clone(),
+        exe_paths: c.exe_path.clone().into_iter().collect(),
+        cover_path: None,
+        status: "backlog".to_string(),
+        rating: None,
+        developer: None,
+        release_year: None,
+        started_year: None,
+        started_month: None,
+        started_day: None,
+        completed_year: None,
+        completed_month: None,
+        completed_day: None,
+        metacritic: None,
+        notes: None,
+        time_to_beat_minutes: None,
+        manual_playtime_seconds: None,
+        accent_color: None,
+        tags: Vec::new(),
+        count_background: None,
+        steam_app_id: c.steam_app_id.map(|a| a as i64),
+        gog_product_id: None,
+    };
+    games::upsert(pool, input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

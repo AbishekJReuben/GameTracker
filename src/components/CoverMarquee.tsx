@@ -72,6 +72,7 @@ export function CoverMarquee({
                 cover={g.coverPath}
                 icon={g.iconPath}
                 accent={g.accentColor}
+                steamAppId={g.steamAppId}
                 className="h-full w-full"
                 rounded="rounded-xl"
               />

@@ -247,8 +247,10 @@ export function SteamSyncPanel() {
       <p className="text-sm text-ink-dim">
 
         Sign in with Steam to pick games to import, sync official lifetime playtime, and pull
-
-        achievements. Steam does <span className="text-ink-soft">not</span> provide per-session
+        achievements for games in your Steam library. For cracked or non-library installs using
+        Goldberg / GSE emulators, Tracker can also read local unlock files when a game has a
+        Steam app id or <code className="text-ink-soft">steam_appid.txt</code> in its install
+        folder. Steam does <span className="text-ink-soft">not</span> provide per-session
 
         play history — Tracker still records sessions locally when you play. Your Game details
 

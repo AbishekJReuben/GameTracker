@@ -68,6 +68,10 @@ struct GameRow {
     steam_achievements_unlocked: Option<i64>,
     steam_achievements_total: Option<i64>,
     steam_achievements_synced_utc: Option<String>,
+    gog_product_id: Option<i64>,
+    gog_achievements_unlocked: Option<i64>,
+    gog_achievements_total: Option<i64>,
+    gog_achievements_synced_utc: Option<String>,
 }
 
 fn map_row(r: &Row) -> rusqlite::Result<GameRow> {
@@ -124,6 +128,19 @@ fn map_row(r: &Row) -> rusqlite::Result<GameRow> {
             .flatten(),
         steam_achievements_synced_utc: r
             .get::<_, Option<String>>("steam_achievements_synced_utc")
+            .ok()
+            .flatten(),
+        gog_product_id: r.get::<_, Option<i64>>("gog_product_id").ok().flatten(),
+        gog_achievements_unlocked: r
+            .get::<_, Option<i64>>("gog_achievements_unlocked")
+            .ok()
+            .flatten(),
+        gog_achievements_total: r
+            .get::<_, Option<i64>>("gog_achievements_total")
+            .ok()
+            .flatten(),
+        gog_achievements_synced_utc: r
+            .get::<_, Option<String>>("gog_achievements_synced_utc")
             .ok()
             .flatten(),
     })
@@ -238,6 +255,10 @@ fn to_dto(g: GameRow, stat: &Stat, tags: Vec<String>) -> GameDto {
         steam_achievements_unlocked: g.steam_achievements_unlocked,
         steam_achievements_total: g.steam_achievements_total,
         steam_achievements_synced_utc: g.steam_achievements_synced_utc,
+        gog_product_id: g.gog_product_id,
+        gog_achievements_unlocked: g.gog_achievements_unlocked,
+        gog_achievements_total: g.gog_achievements_total,
+        gog_achievements_synced_utc: g.gog_achievements_synced_utc,
     }
 }
 
@@ -733,6 +754,146 @@ pub fn id_by_fuzzy_name(pool: &DbPool, name: &str) -> AppResult<Option<String>> 
     Ok(None)
 }
 
+pub fn set_gog_product_id(pool: &DbPool, id: &str, product_id: i64) -> AppResult<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE games SET gog_product_id = ?1 WHERE id = ?2",
+        rusqlite::params![product_id, id],
+    )?;
+    Ok(())
+}
+
+pub fn id_by_gog_product_id(pool: &DbPool, product_id: i64) -> AppResult<Option<String>> {
+    let conn = pool.get()?;
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM games WHERE gog_product_id = ?1 AND kind = 'game' LIMIT 1",
+            [product_id],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(id)
+}
+
+pub fn find_by_name(pool: &DbPool, name: &str) -> AppResult<Option<String>> {
+    let conn = pool.get()?;
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM games WHERE display_name = ?1 COLLATE NOCASE AND kind = 'game' LIMIT 1",
+            [name],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(id)
+}
+
+pub fn find_by_install_or_name(
+    pool: &DbPool,
+    install_folder: Option<&str>,
+    name: &str,
+) -> AppResult<Option<String>> {
+    if let Some(folder) = install_folder.filter(|s| !s.trim().is_empty()) {
+        let norm = util::normalize_path(folder);
+        let conn = pool.get()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM games WHERE install_folder = ?1 AND kind = 'game' LIMIT 1",
+                [norm],
+                |r| r.get(0),
+            )
+            .ok();
+        if id.is_some() {
+            return Ok(id);
+        }
+    }
+    find_by_name(pool, name)
+}
+
+pub fn set_install_folder(pool: &DbPool, id: &str, folder: &str) -> AppResult<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE games SET install_folder = ?1 WHERE id = ?2",
+        rusqlite::params![util::normalize_path(folder), id],
+    )?;
+    Ok(())
+}
+
+pub fn add_exe_path(pool: &DbPool, id: &str, exe: &str) -> AppResult<()> {
+    let game = get(pool, id)?;
+    let Some(mut g) = game else {
+        return Ok(());
+    };
+    let norm = util::normalize_path(exe);
+    if g.exe_paths.iter().any(|p| util::paths_equal(p, &norm)) {
+        return Ok(());
+    }
+    g.exe_paths.push(norm);
+    let json = serde_json::to_string(&g.exe_paths)?;
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE games SET exe_paths = ?1 WHERE id = ?2",
+        rusqlite::params![json, id],
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct GogLinkedGame {
+    pub id: String,
+    pub display_name: String,
+    pub gog_product_id: Option<i64>,
+}
+
+pub fn list_with_gog_product_id(pool: &DbPool) -> AppResult<Vec<GogLinkedGame>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, display_name, gog_product_id FROM games
+         WHERE kind = 'game' AND gog_product_id IS NOT NULL AND gog_product_id > 0",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(GogLinkedGame {
+            id: r.get(0)?,
+            display_name: r.get(1)?,
+            gog_product_id: r.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn set_gog_achievements(
+    pool: &DbPool,
+    id: &str,
+    unlocked: i64,
+    total: i64,
+    achievements_json: Option<&str>,
+) -> AppResult<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE games SET gog_achievements_unlocked = ?1,
+                          gog_achievements_total = ?2,
+                          gog_achievements_synced_utc = ?3,
+                          gog_achievements_json = ?4
+         WHERE id = ?5",
+        rusqlite::params![unlocked, total, now, achievements_json, id],
+    )?;
+    Ok(())
+}
+
+pub fn gog_achievements_json(pool: &DbPool, id: &str) -> AppResult<Option<String>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT gog_achievements_json FROM games WHERE id = ?1")?;
+    let mut rows = stmt.query([id])?;
+    if let Some(row) = rows.next()? {
+        return Ok(row.get(0)?);
+    }
+    Ok(None)
+}
+
 /// Bump manual playtime so tracked+manual meets Steam's official total. Never decreases.
 /// Returns true when manual playtime was increased.
 pub fn apply_steam_playtime(pool: &DbPool, id: &str, steam_seconds: i64) -> AppResult<bool> {
@@ -906,6 +1067,7 @@ mod tests {
                 tags: vec![],
                 count_background: None,
                 steam_app_id: Some(123),
+                gog_product_id: None,
             },
         )
         .unwrap();
