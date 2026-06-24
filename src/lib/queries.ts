@@ -18,6 +18,8 @@ export const keys = {
   systemSpecs: ["systemSpecs"] as const,
   systemLive: ["systemLive"] as const,
   systemHistory: (m: number) => ["systemHistory", m] as const,
+  steamAchievements: (id: string) => ["steamAchievements", id] as const,
+  steamAchievementsOverview: ["steamAchievementsOverview"] as const,
 };
 
 export function useSettings() {
@@ -33,6 +35,32 @@ export function useGame(id: string | undefined) {
     queryKey: keys.game(id ?? ""),
     queryFn: () => api.getGame(id!),
     enabled: !!id,
+  });
+}
+
+export function useSteamAchievements(gameId: string | undefined) {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: keys.steamAchievements(gameId ?? ""),
+    queryFn: () => api.steamGameAchievements(gameId!, false),
+    enabled: !!gameId,
+    staleTime: 60_000,
+  });
+  const reload = async () => {
+    if (!gameId) return;
+    await qc.fetchQuery({
+      queryKey: keys.steamAchievements(gameId),
+      queryFn: () => api.steamGameAchievements(gameId, true),
+    });
+  };
+  return { ...query, reload };
+}
+
+export function useSteamAchievementsOverview() {
+  return useQuery({
+    queryKey: keys.steamAchievementsOverview,
+    queryFn: () => api.steamAchievementsOverview(),
+    staleTime: 60_000,
   });
 }
 
@@ -124,6 +152,8 @@ export function useRefreshAll() {
     qc.invalidateQueries({ queryKey: ["heatmap"] });
     qc.invalidateQueries({ queryKey: ["hourOfDay"] });
     qc.invalidateQueries({ queryKey: ["game"] });
+    qc.invalidateQueries({ queryKey: ["steamAchievements"] });
+    qc.invalidateQueries({ queryKey: keys.steamAchievementsOverview });
   };
 }
 

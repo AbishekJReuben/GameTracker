@@ -43,6 +43,7 @@ import { ActivityLog } from "@/components/ActivityLog";
 import { EmbeddedPanel } from "@/components/EmbeddedPanel";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
 import { libraryNeighbors } from "@/lib/libraryNav";
+import { SteamAchievementDetailPanel } from "@/components/SteamAchievements";
 
 const STATUSES: GameStatus[] = ["playing", "backlog", "completed", "dropped"];
 const RANGE_OPTS = TIMELINE_RANGE_OPTIONS;
@@ -430,6 +431,7 @@ export default function GameDetail() {
           </>
         )}
       </div>
+      {!isApp && <SteamAchievementDetailPanel game={game} />}
       {!isApp && (game.trackedRuntimeSeconds > 0 || game.manualPlaytimeSeconds > 0) && (
         <p className="mb-6 text-sm text-ink-dim">
           Tracked: <span className="font-700 text-ink-soft">{dur(game.trackedActiveSeconds)}</span> active

@@ -55,6 +55,9 @@ export interface Game {
   trailerUrl: string | null;
   themeYoutubeId: string | null;
   themeAudioUrl: string | null;
+  steamAchievementsUnlocked: number | null;
+  steamAchievementsTotal: number | null;
+  steamAchievementsSyncedUtc: string | null;
   trackedRuntimeSeconds: number;
   trackedActiveSeconds: number;
   totalRuntimeSeconds: number;
@@ -518,6 +521,94 @@ export interface SystemHistory {
 
 export type Settings = Record<string, string>;
 
+export interface SteamSession {
+  linked: boolean;
+  apiConfigured: boolean;
+  steamId: string | null;
+  personaName: string | null;
+  avatarUrl: string | null;
+}
+
+export interface SteamValidateResult {
+  steamId: string;
+  gameCount: number;
+  personaName: string | null;
+  avatarUrl: string | null;
+}
+
+export interface SteamAchievement {
+  apiName: string;
+  displayName: string;
+  description: string;
+  iconUrl: string;
+  unlocked: boolean;
+  hidden: boolean;
+  unlockTimeUtc: string | null;
+}
+
+export interface AchievementHighlight {
+  gameId: string;
+  gameName: string;
+  apiName: string;
+  displayName: string;
+  description: string;
+  iconUrl: string;
+  unlocked: boolean;
+  hidden: boolean;
+  unlockTimeUtc: string | null;
+  kind: string;
+}
+
+export interface SteamAchievementsOverview {
+  gamesTracked: number;
+  totalUnlocked: number;
+  totalPossible: number;
+  completedGames: number;
+  avgPercent: number;
+  hiddenUnlocked: number;
+  hiddenRemaining: number;
+  recentUnlocks30d: number;
+  highlights: AchievementHighlight[];
+  recentUnlocks: AchievementHighlight[];
+}
+
+export interface SteamSyncResult {
+  libraryAdded: number;
+  libraryUpdated: number;
+  playtimeUpdated: number;
+  achievementsUpdated: number;
+  errors: string[];
+}
+
+export interface SteamSyncProgress {
+  phase: string;
+  done: number;
+  total: number;
+  label: string;
+}
+
+export interface SteamLibraryGame {
+  appid: number;
+  name: string;
+  playtimeForeverMinutes: number;
+  playtime2WeeksMinutes: number;
+  hasAchievements: boolean;
+  imported: boolean;
+  trackerGameId: string | null;
+  headerImageUrl: string;
+}
+
+export interface SteamSyncOptions {
+  playtime?: boolean;
+  achievements?: boolean;
+}
+
+export interface SteamImportOptions {
+  appIds: number[];
+  playtime?: boolean;
+  achievements?: boolean;
+}
+
 // ---------- Command wrappers ----------
 
 export const api = {
@@ -601,6 +692,26 @@ export const api = {
   writeTextFile: (path: string, contents: string) => call<void>("write_text_file", { path, contents }),
   backupDb: (path: string) => call<void>("backup_db", { path }),
   restoreDb: (path: string) => call<void>("restore_db", { path }),
+
+  steamSession: () => call<SteamSession>("steam_session"),
+  steamLogin: () => call<SteamValidateResult>("steam_login"),
+  steamLogout: () => call<void>("steam_logout"),
+  steamValidate: () => call<SteamValidateResult>("steam_validate"),
+  steamLibrary: () => call<SteamLibraryGame[]>("steam_library"),
+  steamImport: (options: SteamImportOptions) =>
+    call<void>("steam_import", {
+      appIds: options.appIds,
+      playtime: options.playtime ?? true,
+      achievements: options.achievements ?? true,
+    }),
+  steamGameAchievements: (gameId: string, refresh = false) =>
+    call<SteamAchievement[]>("steam_game_achievements", { gameId, refresh }),
+  steamAchievementsOverview: () => call<SteamAchievementsOverview>("steam_achievements_overview"),
+  steamSync: (options: SteamSyncOptions = {}) =>
+    call<void>("steam_sync", {
+      playtime: options.playtime ?? true,
+      achievements: options.achievements ?? true,
+    }),
 };
 
 /** Convert a stored absolute file path to a webview-loadable asset URL. */

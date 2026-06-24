@@ -14,6 +14,8 @@ mod metadata;
 #[cfg(windows)]
 mod registry;
 mod state;
+mod steam;
+mod steam_openid;
 mod system;
 mod tracking;
 mod tray;
@@ -219,6 +221,15 @@ pub fn run() {
             commands::write_text_file,
             commands::backup_db,
             commands::restore_db,
+            commands::steam_session,
+            commands::steam_login,
+            commands::steam_logout,
+            commands::steam_validate,
+            commands::steam_library,
+            commands::steam_import,
+            commands::steam_game_achievements,
+            commands::steam_achievements_overview,
+            commands::steam_sync,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tracker")

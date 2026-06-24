@@ -104,6 +104,9 @@ function makeGame(s: Seed, runtime: number, active: number, sessions: number, la
     trailerUrl: s.id.startsWith("g-hk") ? "https://video.akamai.steamstatic.com/store_trailers/256679401/movie_max.mp4" : null,
     themeYoutubeId: s.id.startsWith("g-hk") ? "UWZSi5dkb_Q" : null,
     themeAudioUrl: null,
+    steamAchievementsUnlocked: s.id.startsWith("g-hk") ? 42 : null,
+    steamAchievementsTotal: s.id.startsWith("g-hk") ? 63 : null,
+    steamAchievementsSyncedUtc: s.id.startsWith("g-hk") ? nowIso : null,
     trackedRuntimeSeconds: runtime,
     trackedActiveSeconds: active,
     totalRuntimeSeconds: runtime,
@@ -806,6 +809,9 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         trailerUrl: null,
         themeYoutubeId: null,
         themeAudioUrl: null,
+        steamAchievementsUnlocked: null,
+        steamAchievementsTotal: null,
+        steamAchievementsSyncedUtc: null,
         trackedRuntimeSeconds: 0,
         trackedActiveSeconds: 0,
         totalRuntimeSeconds: input.manualPlaytimeSeconds ?? 0,
@@ -819,6 +825,111 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
     }
     case "delete_game":
       return undefined as T;
+    case "steam_session":
+      return {
+        linked: true,
+        apiConfigured: true,
+        steamId: "76561198000000000",
+        personaName: "Mock Player",
+        avatarUrl: null,
+      } as T;
+    case "steam_login":
+      return {
+        steamId: "76561198000000000",
+        gameCount: 42,
+        personaName: "Mock Player",
+        avatarUrl: null,
+      } as T;
+    case "steam_logout":
+      return undefined as T;
+    case "steam_validate":
+      return {
+        steamId: "76561198000000000",
+        gameCount: 42,
+        personaName: "Mock Player",
+      } as T;
+    case "steam_library":
+      return [
+        {
+          appid: 367520,
+          name: "Hollow Knight",
+          playtimeForeverMinutes: 1200,
+          playtime2WeeksMinutes: 45,
+          hasAchievements: true,
+          imported: true,
+          trackerGameId: "g-hk",
+          headerImageUrl: "https://cdn.cloudflare.steamstatic.com/steam/apps/367520/header.jpg",
+        },
+        {
+          appid: 1145360,
+          name: "Hades II",
+          playtimeForeverMinutes: 0,
+          playtime2WeeksMinutes: 0,
+          hasAchievements: true,
+          imported: false,
+          trackerGameId: null,
+          headerImageUrl: "https://cdn.cloudflare.steamstatic.com/steam/apps/1145360/header.jpg",
+        },
+      ] as T;
+    case "steam_import":
+    case "steam_sync":
+      return undefined as T;
+    case "steam_game_achievements":
+      return [
+        {
+          apiName: "ACH_FIRST_STEPS",
+          displayName: "First Steps",
+          description: "Complete the tutorial.",
+          iconUrl: "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/367520/ach1.jpg",
+          unlocked: true,
+          hidden: false,
+          unlockTimeUtc: new Date(Date.now() - 86400000 * 30).toISOString(),
+        },
+        {
+          apiName: "ACH_HIDDEN",
+          displayName: "Hidden Achievement",
+          description: "",
+          iconUrl: "",
+          unlocked: false,
+          hidden: true,
+          unlockTimeUtc: null,
+        },
+        {
+          apiName: "ACH_BOSS",
+          displayName: "False Knight",
+          description: "Defeat the False Knight.",
+          iconUrl: "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/367520/ach2.jpg",
+          unlocked: false,
+          hidden: false,
+          unlockTimeUtc: null,
+        },
+      ] as T;
+    case "steam_achievements_overview":
+      return {
+        gamesTracked: 2,
+        totalUnlocked: 42,
+        totalPossible: 63,
+        completedGames: 0,
+        avgPercent: 67,
+        hiddenUnlocked: 3,
+        hiddenRemaining: 5,
+        recentUnlocks30d: 4,
+        highlights: [
+          {
+            gameId: "g-hk",
+            gameName: "Hollow Knight",
+            apiName: "ACH_FIRST",
+            displayName: "First Steps",
+            description: "",
+            iconUrl: "",
+            unlocked: true,
+            hidden: false,
+            unlockTimeUtc: new Date().toISOString(),
+            kind: "recent",
+          },
+        ],
+        recentUnlocks: [],
+      } as T;
     default:
       throw new Error(`Mock invoke not implemented: ${cmd}`);
   }

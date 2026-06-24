@@ -65,6 +65,9 @@ struct GameRow {
     trailer_url: Option<String>,
     theme_youtube_id: Option<String>,
     theme_audio_url: Option<String>,
+    steam_achievements_unlocked: Option<i64>,
+    steam_achievements_total: Option<i64>,
+    steam_achievements_synced_utc: Option<String>,
 }
 
 fn map_row(r: &Row) -> rusqlite::Result<GameRow> {
@@ -111,6 +114,18 @@ fn map_row(r: &Row) -> rusqlite::Result<GameRow> {
         trailer_url: r.get::<_, Option<String>>("trailer_url").ok().flatten(),
         theme_youtube_id: r.get::<_, Option<String>>("theme_youtube_id").ok().flatten(),
         theme_audio_url: r.get::<_, Option<String>>("theme_audio_url").ok().flatten(),
+        steam_achievements_unlocked: r
+            .get::<_, Option<i64>>("steam_achievements_unlocked")
+            .ok()
+            .flatten(),
+        steam_achievements_total: r
+            .get::<_, Option<i64>>("steam_achievements_total")
+            .ok()
+            .flatten(),
+        steam_achievements_synced_utc: r
+            .get::<_, Option<String>>("steam_achievements_synced_utc")
+            .ok()
+            .flatten(),
     })
 }
 
@@ -220,6 +235,9 @@ fn to_dto(g: GameRow, stat: &Stat, tags: Vec<String>) -> GameDto {
         trailer_url: g.trailer_url,
         theme_youtube_id: g.theme_youtube_id,
         theme_audio_url: g.theme_audio_url,
+        steam_achievements_unlocked: g.steam_achievements_unlocked,
+        steam_achievements_total: g.steam_achievements_total,
+        steam_achievements_synced_utc: g.steam_achievements_synced_utc,
     }
 }
 
@@ -687,6 +705,117 @@ pub fn clear_steam_app_id(pool: &DbPool, id: &str) -> AppResult<()> {
     Ok(())
 }
 
+pub fn id_by_steam_app_id(pool: &DbPool, app_id: i64) -> AppResult<Option<String>> {
+    let conn = pool.get()?;
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM games WHERE steam_app_id = ?1 AND kind = 'game' LIMIT 1",
+            [app_id],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(id)
+}
+
+/// Fuzzy name match against existing games (for Steam library import).
+pub fn id_by_fuzzy_name(pool: &DbPool, name: &str) -> AppResult<Option<String>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, display_name FROM games WHERE kind = 'game' ORDER BY display_name",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, existing) = row?;
+        if crate::metadata::names_match(name, &existing) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Bump manual playtime so tracked+manual meets Steam's official total. Never decreases.
+/// Returns true when manual playtime was increased.
+pub fn apply_steam_playtime(pool: &DbPool, id: &str, steam_seconds: i64) -> AppResult<bool> {
+    if steam_seconds <= 0 {
+        return Ok(false);
+    }
+    let min_seconds = min_session_seconds(pool);
+    let conn = pool.get()?;
+    let (manual, tracked): (i64, i64) = conn.query_row(
+        "SELECT g.manual_playtime_seconds,
+                COALESCE((
+                    SELECT SUM(s.runtime_seconds) FROM sessions s
+                    WHERE s.game_id = g.id AND s.end_utc IS NOT NULL AND s.runtime_seconds >= ?2
+                ), 0)
+         FROM games g WHERE g.id = ?1",
+        rusqlite::params![id, min_seconds],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let current_total = manual.max(0) + tracked.max(0);
+    if steam_seconds <= current_total {
+        return Ok(false);
+    }
+    let new_manual = steam_seconds - tracked.max(0);
+    conn.execute(
+        "UPDATE games SET manual_playtime_seconds = ?1 WHERE id = ?2",
+        rusqlite::params![new_manual.max(0), id],
+    )?;
+    Ok(true)
+}
+
+pub fn set_steam_achievements(
+    pool: &DbPool,
+    id: &str,
+    unlocked: i64,
+    total: i64,
+    achievements_json: Option<&str>,
+) -> AppResult<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE games SET steam_achievements_unlocked = ?1,
+                          steam_achievements_total = ?2,
+                          steam_achievements_synced_utc = ?3,
+                          steam_achievements_json = ?4
+         WHERE id = ?5",
+        rusqlite::params![unlocked, total, now, achievements_json, id],
+    )?;
+    Ok(())
+}
+
+pub fn steam_achievements_json(pool: &DbPool, id: &str) -> AppResult<Option<String>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT steam_achievements_json FROM games WHERE id = ?1")?;
+    let mut rows = stmt.query(rusqlite::params![id])?;
+    if let Some(row) = rows.next()? {
+        let json: Option<String> = row.get(0)?;
+        Ok(json.filter(|s| !s.trim().is_empty()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// All games with stored per-achievement JSON (for library-wide stats).
+pub fn list_steam_achievement_rows(pool: &DbPool) -> AppResult<Vec<(String, String, String)>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, display_name, steam_achievements_json
+         FROM games
+         WHERE kind = 'game'
+           AND steam_achievements_json IS NOT NULL
+           AND TRIM(steam_achievements_json) != ''",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let json: String = row.get(2)?;
+        out.push((id, name, json));
+    }
+    Ok(out)
+}
+
 pub fn set_metacritic_slug(pool: &DbPool, id: &str, slug: &str) -> AppResult<()> {
     let conn = pool.get()?;
     conn.execute(
@@ -734,4 +863,56 @@ pub fn match_candidates(pool: &DbPool) -> AppResult<Vec<MatchGame>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn test_pool() -> DbPool {
+        let path = std::env::temp_dir().join(format!("gt_steam_playtime_{}.db", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&path);
+        db::init_pool(&path).expect("pool")
+    }
+
+    #[test]
+    fn apply_steam_playtime_only_increases() {
+        let pool = test_pool();
+        let id = upsert(
+            &pool,
+            GameInput {
+                id: None,
+                kind: "game".into(),
+                display_name: "Test Game".into(),
+                install_folder: None,
+                exe_paths: vec![],
+                cover_path: None,
+                status: "backlog".into(),
+                rating: None,
+                developer: None,
+                release_year: None,
+                started_year: None,
+                started_month: None,
+                started_day: None,
+                completed_year: None,
+                completed_month: None,
+                completed_day: None,
+                metacritic: None,
+                notes: None,
+                time_to_beat_minutes: None,
+                manual_playtime_seconds: Some(1800),
+                accent_color: None,
+                tags: vec![],
+                count_background: None,
+                steam_app_id: Some(123),
+            },
+        )
+        .unwrap();
+        assert!(!apply_steam_playtime(&pool, &id, 1800).unwrap());
+        assert!(apply_steam_playtime(&pool, &id, 7200).unwrap());
+        let g = get(&pool, &id).unwrap().unwrap();
+        assert_eq!(g.manual_playtime_seconds, 7200);
+        assert!(!apply_steam_playtime(&pool, &id, 3600).unwrap());
+    }
 }

@@ -256,6 +256,28 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 12;
     }
 
+    if version < 13 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE games ADD COLUMN steam_achievements_unlocked INTEGER;
+            ALTER TABLE games ADD COLUMN steam_achievements_total INTEGER;
+            ALTER TABLE games ADD COLUMN steam_achievements_synced_utc TEXT;
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 13;")?;
+        version = 13;
+    }
+
+    if version < 14 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE games ADD COLUMN steam_achievements_json TEXT;
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 14;")?;
+        version = 14;
+    }
+
     let _ = version;
     Ok(())
 }

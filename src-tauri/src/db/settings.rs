@@ -19,6 +19,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("auto_screenshots_enabled", "true"),
     ("screenshot_interval_minutes", "1"),
     ("theme_music_enabled", "true"),
+    ("steam_id", ""),
+    ("steam_persona_name", ""),
+    ("steam_avatar_url", ""),
+    ("steam_linked", "false"),
 ];
 
 fn default_for(key: &str) -> Option<&'static str> {

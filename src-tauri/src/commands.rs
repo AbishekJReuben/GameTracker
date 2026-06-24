@@ -17,6 +17,7 @@ use chrono::Datelike;
 use std::collections::HashMap;
 use std::path::Path;
 use tauri::{Emitter, State};
+use tauri_plugin_opener::OpenerExt;
 
 // ---------- settings ----------
 
@@ -241,7 +242,7 @@ fn apply_game_metadata(
 /// with `{ id }` when done so the UI can refetch. No-op when online metadata is
 /// off. `steam_app_id`, when known from detection/autosuggest, makes the lookup
 /// exact instead of a name search.
-fn enrich_game_async(
+pub(crate) fn enrich_game_async(
     app: tauri::AppHandle,
     pool: crate::db::DbPool,
     media_dir: std::path::PathBuf,
@@ -1027,4 +1028,152 @@ pub fn restore_db(state: State<AppState>, path: String, app: tauri::AppHandle) -
     std::fs::copy(src, &pending)?;
     // `restart()` diverges (`-> !`), satisfying the return type.
     app.restart()
+}
+
+// ---------- Steam sync ----------
+
+#[tauri::command]
+pub fn steam_session(state: State<AppState>) -> AppResult<crate::steam::SteamSession> {
+    crate::steam::session(&state.pool)
+}
+
+#[tauri::command]
+pub fn steam_login(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+) -> AppResult<crate::steam::SteamValidateResult> {
+    if !crate::steam::api_key_configured() {
+        return Err(AppError::msg(
+            "Steam sync is not available in this build (developer API key missing).",
+        ));
+    }
+    let pool = state.pool.clone();
+    let steam_id = crate::steam_openid::login_blocking(|url| {
+        app.opener()
+            .open_url(url, None::<&str>)
+            .map_err(|e| AppError::msg(format!("Could not open browser: {e}")))
+    })?;
+    crate::steam::complete_login(&pool, &steam_id)
+}
+
+#[tauri::command]
+pub fn steam_logout(state: State<AppState>) -> AppResult<()> {
+    crate::steam::logout(&state.pool)
+}
+
+#[tauri::command]
+pub fn steam_validate(state: State<AppState>) -> AppResult<crate::steam::SteamValidateResult> {
+    crate::steam::validate_session(&state.pool)
+}
+
+#[tauri::command]
+pub fn steam_library(state: State<AppState>) -> AppResult<Vec<crate::steam::SteamLibraryGame>> {
+    crate::steam::library(&state.pool)
+}
+
+#[tauri::command]
+pub fn steam_game_achievements(
+    state: State<AppState>,
+    game_id: String,
+    refresh: Option<bool>,
+) -> AppResult<Vec<crate::steam::SteamAchievement>> {
+    let pool = &state.pool;
+    let force = refresh.unwrap_or(false);
+    if !force {
+        let cached = crate::steam::achievements_for_game(pool, &game_id)?;
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+    }
+
+    let game = games::get(pool, &game_id)?.ok_or_else(|| AppError::msg("Game not found."))?;
+    let appid = game
+        .steam_app_id
+        .filter(|&a| a > 0)
+        .ok_or_else(|| AppError::msg("This game has no linked Steam app ID."))?;
+    let api_key = crate::steam::steam_api_key()?;
+    let steam_id = settings::get(pool, "steam_id")?
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| AppError::msg("Sign in with Steam to load achievements."))?;
+
+    crate::steam::refresh_achievements_for_game(
+        pool,
+        &game_id,
+        &api_key,
+        &steam_id,
+        appid as u64,
+    )
+}
+
+#[tauri::command]
+pub fn steam_achievements_overview(
+    state: State<AppState>,
+) -> AppResult<crate::steam::SteamAchievementsOverview> {
+    crate::steam::achievements_overview(&state.pool)
+}
+
+#[tauri::command]
+pub fn steam_import(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    app_ids: Vec<u64>,
+    playtime: bool,
+    achievements: bool,
+) -> AppResult<()> {
+    let pool = state.pool.clone();
+    let media_dir = state.media_dir.clone();
+    std::thread::spawn(move || {
+        let progress = |ev: crate::steam::SteamSyncProgress| {
+            let _ = app.emit("steam://progress", &ev);
+        };
+        match crate::steam::import_games(
+            &pool,
+            &app_ids,
+            playtime,
+            achievements,
+            Some(&progress),
+        ) {
+            Ok((result, imported)) => {
+                for game in imported {
+                    enrich_game_async(
+                        app.clone(),
+                        pool.clone(),
+                        media_dir.clone(),
+                        game.id,
+                        game.name,
+                        Some(game.appid),
+                    );
+                }
+                let _ = app.emit("steam://complete", &result);
+            }
+            Err(e) => {
+                let _ = app.emit("steam://error", e.to_string());
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn steam_sync(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    playtime: bool,
+    achievements: bool,
+) -> AppResult<()> {
+    let pool = state.pool.clone();
+    std::thread::spawn(move || {
+        let progress = |ev: crate::steam::SteamSyncProgress| {
+            let _ = app.emit("steam://progress", &ev);
+        };
+        match crate::steam::sync(&pool, playtime, achievements, Some(&progress)) {
+            Ok(result) => {
+                let _ = app.emit("steam://complete", &result);
+            }
+            Err(e) => {
+                let _ = app.emit("steam://error", e.to_string());
+            }
+        }
+    });
+    Ok(())
 }

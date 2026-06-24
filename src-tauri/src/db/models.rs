@@ -42,6 +42,9 @@ pub struct GameDto {
     pub trailer_url: Option<String>,
     pub theme_youtube_id: Option<String>,
     pub theme_audio_url: Option<String>,
+    pub steam_achievements_unlocked: Option<i64>,
+    pub steam_achievements_total: Option<i64>,
+    pub steam_achievements_synced_utc: Option<String>,
     // session stats (tracked only)
     pub tracked_runtime_seconds: i64,
     pub tracked_active_seconds: i64,

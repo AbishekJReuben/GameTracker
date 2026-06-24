@@ -34,6 +34,8 @@ import { useCatalog, useGames } from "@/lib/queries";
 import { useMotionEnabled } from "@/store/app";
 import { Game } from "@/lib/api";
 import { dur, hours } from "@/lib/format";
+import { aggregateSteamAchievements } from "@/lib/steamAchievements";
+import { SteamAchievementBadge, SteamAchievementCollectionSection } from "@/components/SteamAchievements";
 
 const AXIS = { stroke: "#454c66", fontSize: 11 };
 const STATUS_COLORS: Record<string, string> = { playing: "#34d399", completed: "#7c5cff", backlog: "#3b82f6", dropped: "#f472b6" };
@@ -106,6 +108,8 @@ export default function CollectionPage() {
 
   const hallOfFame = useMemo(() => [...completed].filter((g) => g.rating != null).sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0)).slice(0, 8), [completed]);
 
+  const steamAchStats = useMemo(() => aggregateSteamAchievements(games ?? []), [games]);
+
   const delta = useMemo(() => (data ? Math.round((data.avgMyScore - data.avgMetacritic) * 10) / 10 : 0), [data]);
 
   if (isLoading || !data) {
@@ -167,6 +171,15 @@ export default function CollectionPage() {
           <MiniStat icon={<Star className="h-4 w-4" />} label="Scored" value={`${data.scoredCount}/${data.totalCompleted}`} hint="with your rating" delay={0.16} />
           {data.avgTimeToBeatMinutes > 0 && (
             <MiniStat icon={<History className="h-4 w-4" />} label="Avg HLTB" value={`${Math.round(data.avgTimeToBeatMinutes / 60)}h`} hint="time to beat est." delay={0.2} />
+          )}
+          {steamAchStats.gamesTracked > 0 && (
+            <MiniStat
+              icon={<Trophy className="h-4 w-4" />}
+              label="Achievements"
+              value={`${steamAchStats.totalUnlocked.toLocaleString()}`}
+              hint={`${steamAchStats.avgPercent}% avg · ${steamAchStats.completedGames} platinum`}
+              delay={0.24}
+            />
           )}
         </div>
 
@@ -375,12 +388,21 @@ export default function CollectionPage() {
                       <GameScores game={g} variant="badge" index={i} className="static rounded-full px-1.5 py-0.5 text-[9px]" />
                     </div>
                     {i === 0 && <div className="absolute left-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-amber text-[10px] font-900 text-black">1</div>}
+                    <div className="absolute left-1.5 bottom-8">
+                      <SteamAchievementBadge game={g} size="xs" />
+                    </div>
                     <div className="absolute inset-x-0 bottom-0 truncate p-1.5 text-[10px] font-700 text-white">{g.displayName}</div>
                   </div>
                 </Link>
               ))}
             </div>
           </Card>
+        )}
+
+        {steamAchStats.gamesTracked > 0 && (
+          <Reveal delay={0.15}>
+            <SteamAchievementCollectionSection games={games ?? []} />
+          </Reveal>
         )}
 
         <div className="pt-2">
@@ -485,6 +507,9 @@ function RecentlyCompletedRail({ games }: { games: Game[] }) {
               <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/10 to-transparent" />
               <div className="absolute right-1.5 top-1.5">
                 <GameScores game={g} variant="badge" index={i} className="static rounded-full px-1.5 py-0.5 text-[9px]" />
+              </div>
+              <div className="absolute left-1.5 bottom-10">
+                <SteamAchievementBadge game={g} size="xs" />
               </div>
               <div className="absolute inset-x-0 bottom-0 p-2">
                 <div className="truncate text-[11px] font-800 text-white">{g.displayName}</div>

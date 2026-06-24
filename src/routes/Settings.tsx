@@ -43,6 +43,7 @@ import type { AccentTheme } from "@/store/app";
 import { api, type Settings } from "@/lib/api";
 import { runCsvImport } from "@/lib/bulkTasks";
 import { ContentAuditPanel } from "@/components/ContentAuditPanel";
+import { SteamSyncPanel } from "@/components/SteamSyncPanel";
 
 const ACCENTS: { id: AccentTheme; label: string; colors: [string, string, string] }[] = [
   { id: "aurora", label: "Aurora", colors: ["#7c5cff", "#3b82f6", "#22d3ee"] },
@@ -349,6 +350,14 @@ export default function SettingsPage() {
           </SettingRow>
           <ContentAuditPanel />
         </div>
+      ),
+    },
+    {
+      id: "steam",
+      title: "Steam sync",
+      subtitle: "Import library, playtime & achievements from your Steam account",
+      content: (
+        <SteamSyncPanel />
       ),
     },
     {

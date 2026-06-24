@@ -43,7 +43,12 @@ const APP_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 /// Keys we surface to the app via compile-time `option_env!`. Read from a `.env`
 /// file (repo root or `src-tauri/`) so a locally-provided key is baked into the
 /// binary for both `tauri dev` and packaged builds — no runtime .env needed.
-const ENV_KEYS: &[&str] = &["RAWG_API_KEY", "YOUTUBE_API_KEY", "STEAMGRIDDB_API_KEY"];
+const ENV_KEYS: &[&str] = &[
+    "RAWG_API_KEY",
+    "YOUTUBE_API_KEY",
+    "STEAMGRIDDB_API_KEY",
+    "STEAM_WEB_API_KEY",
+];
 
 fn export_env_from_dotenv() {
     // Later files win, so check src-tauri/.env after the repo-root .env.

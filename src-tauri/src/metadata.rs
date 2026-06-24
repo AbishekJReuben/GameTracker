@@ -76,7 +76,7 @@ fn normalize_name(s: &str) -> String {
         .collect()
 }
 
-fn names_match(query: &str, candidate: &str) -> bool {
+pub fn names_match(query: &str, candidate: &str) -> bool {
     if name_similarity(query, candidate) >= 0.85 {
         return true;
     }
