@@ -27,15 +27,16 @@ import {
   AppWindow,
 } from "lucide-react";
 import { Page } from "@/components/Page";
-import { Card, SectionTitle, EmptyState, Skeleton, Segmented, Badge } from "@/components/ui";
+import { SectionTitle, EmptyState, Skeleton, Segmented, Badge } from "@/components/ui";
+import { Panel } from "@/components/Panel";
 import { SYSTEM_HISTORY_RANGES, rangeToHistoryMinutes, rangeToLookbackMs, type TimelineRange } from "@/lib/timelineZoom";
 import { RadialGauge, LevelBar } from "@/components/RadialGauge";
 import { GameArt } from "@/components/GameArt";
-import { useSystemLive, useSystemHistory, useSessions, useSettings } from "@/lib/queries";
+import { useSystemLive, useSystemHistory, useSessions, useSettings, useGames } from "@/lib/queries";
 import { Timeline } from "@/components/Timeline";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { dur } from "@/lib/format";
-import { SystemSample } from "@/lib/api";
+import { SystemSample, type Game } from "@/lib/api";
 
 const C = {
   cpu: "#22d3ee",
@@ -71,6 +72,7 @@ export default function SystemsPage() {
   const lookbackMs = rangeToLookbackMs(range);
   const fromUtc = useMemo(() => new Date(Date.now() - lookbackMs).toISOString(), [lookbackMs]);
   const { data: sessions } = useSessions({ fromUtc });
+  const { data: games } = useGames();
 
   const specs = live?.specs;
   const samples = live?.samples ?? [];
@@ -133,45 +135,45 @@ export default function SystemsPage() {
 
         {/* Live gauges */}
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-          <GaugeCard icon={<Cpu className="h-4 w-4" />} label="CPU" pct={latest?.cpu ?? 0} temp={latest?.cpuTemp} from={C.cpu} to="#0ea5e9" sub={`${fmt(latest?.cpuClockMhz != null ? latest.cpuClockMhz / 1000 : null, " GHz", 2)}`} />
-          <GaugeCard icon={<Monitor className="h-4 w-4" />} label="GPU" pct={latest?.gpu ?? 0} temp={latest?.gpuTemp} from={C.gpu} to="#7c5cff" sub={specs.hasGpuSensors ? `${fmt(latest?.gpuPowerW, " W")}` : "no sensor"} />
-          <GaugeCard icon={<MemoryStick className="h-4 w-4" />} label="RAM" pct={latest?.ram ?? 0} temp={latest?.ramTemp} from={C.ram} to="#22d3ee" sub={`${fmt(latest?.ramUsedGb, "", 1)} / ${fmt(latest?.ramTotalGb, " GB", 0)}`} />
-          <GaugeCard icon={<HardDrive className="h-4 w-4" />} label="Disk" pct={latest?.diskUsage ?? 0} temp={latest?.diskTemp} from={C.disk} to="#fb923c" sub={latest?.disk != null ? `${Math.round(latest.disk)}% active` : "capacity used"} />
+          <GaugeCard panelKey="systems.gauge.cpu" games={games ?? []} icon={<Cpu className="h-4 w-4" />} label="CPU" pct={latest?.cpu ?? 0} temp={latest?.cpuTemp} from={C.cpu} to="#0ea5e9" sub={`${fmt(latest?.cpuClockMhz != null ? latest.cpuClockMhz / 1000 : null, " GHz", 2)}`} />
+          <GaugeCard panelKey="systems.gauge.gpu" games={games ?? []} icon={<Monitor className="h-4 w-4" />} label="GPU" pct={latest?.gpu ?? 0} temp={latest?.gpuTemp} from={C.gpu} to="#7c5cff" sub={specs.hasGpuSensors ? `${fmt(latest?.gpuPowerW, " W")}` : "no sensor"} />
+          <GaugeCard panelKey="systems.gauge.ram" games={games ?? []} icon={<MemoryStick className="h-4 w-4" />} label="RAM" pct={latest?.ram ?? 0} temp={latest?.ramTemp} from={C.ram} to="#22d3ee" sub={`${fmt(latest?.ramUsedGb, "", 1)} / ${fmt(latest?.ramTotalGb, " GB", 0)}`} />
+          <GaugeCard panelKey="systems.gauge.disk" games={games ?? []} icon={<HardDrive className="h-4 w-4" />} label="Disk" pct={latest?.diskUsage ?? 0} temp={latest?.diskTemp} from={C.disk} to="#fb923c" sub={latest?.disk != null ? `${Math.round(latest.disk)}% active` : "capacity used"} />
         </div>
 
         {/* Live charts */}
         <div className="grid gap-6 lg:grid-cols-2">
-          <Card>
+          <Panel panelKey="systems.live-load" games={games ?? []} art="icon">
             <SectionTitle sheen title="Live load" subtitle="CPU · GPU · RAM · disk — last 10 minutes" right={<LivePulse />} />
             <LiveChart samples={samples} kind="usage" />
-          </Card>
-          <Card>
+          </Panel>
+          <Panel panelKey="systems.temperatures" games={games ?? []} art="icon">
             <SectionTitle sheen title="Temperatures" subtitle="CPU & GPU thermals" right={<Thermometer className="h-4 w-4 text-ink-dim" />} />
             {specs.hasCpuTemp || specs.hasGpuSensors || latest?.ramTemp != null ? (
               <LiveChart samples={samples} kind="temp" />
             ) : (
               <EmptyState title="No temperature sensors" message="Run as administrator (CPU) or check that the sensor bridge is present (GPU)." />
             )}
-          </Card>
+          </Panel>
         </div>
 
         {/* Per-core */}
         {latest && latest.perCore.length > 0 && (
-          <Card>
+          <Panel panelKey="systems.cores" games={games ?? []} art="icon">
             <SectionTitle sheen title="Per-core utilization" subtitle={`${latest.perCore.length} logical processors`} right={<Boxes className="h-4 w-4 text-ink-dim" />} />
             <CoreGrid cores={latest.perCore} />
-          </Card>
+          </Panel>
         )}
 
         {/* Component detail */}
         <div className="grid gap-6 lg:grid-cols-3">
-          <GpuCard specs={specs} latest={latest} />
-          <MemoryCard latest={latest} swapTotal={specs.swapTotalGb} />
-          <StorageCard disks={specs.disks} activity={latest?.disk} />
+          <GpuCard games={games ?? []} specs={specs} latest={latest} />
+          <MemoryCard games={games ?? []} latest={latest} swapTotal={specs.swapTotalGb} />
+          <StorageCard games={games ?? []} disks={specs.disks} activity={latest?.disk} />
         </div>
 
         {/* History + combined session timeline */}
-        <Card>
+        <Panel panelKey="systems.history" games={games ?? []} sessions={sessions} art="icon">
           <SectionTitle
             sheen
             title="History"
@@ -192,7 +194,7 @@ export default function SystemsPage() {
             footer={<HistoryUsageChart history={history} metric={histMetric} lookbackMs={lookbackMs} />}
           />
           <SessionLegend sessions={sessions ?? []} />
-        </Card>
+        </Panel>
       </div>
     </Page>
   );
@@ -240,9 +242,9 @@ function Identity({ icon, label, value, sub }: { icon: React.ReactNode; label: s
   );
 }
 
-function GaugeCard({ icon, label, pct, temp, from, to, sub }: { icon: React.ReactNode; label: string; pct: number; temp?: number | null; from: string; to: string; sub?: string }) {
+function GaugeCard({ panelKey, games, icon, label, pct, temp, from, to, sub }: { panelKey: string; games: Game[]; icon: React.ReactNode; label: string; pct: number; temp?: number | null; from: string; to: string; sub?: string }) {
   return (
-    <Card className="flex flex-col items-center gap-2 py-5">
+    <Panel panelKey={panelKey} games={games} art="icon" className="flex flex-col items-center gap-2 py-5">
       <div className="flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">{icon}{label}</div>
       <RadialGauge value={pct} max={100} size={132} from={from} to={to}>
         <div className="text-center">
@@ -255,7 +257,7 @@ function GaugeCard({ icon, label, pct, temp, from, to, sub }: { icon: React.Reac
         </div>
       </RadialGauge>
       {sub && <div className="text-[11px] text-ink-faint">{sub}</div>}
-    </Card>
+    </Panel>
   );
 }
 
@@ -360,10 +362,10 @@ function CoreGrid({ cores }: { cores: number[] }) {
   );
 }
 
-function GpuCard({ specs, latest }: { specs: import("@/lib/api").SystemSpecs; latest?: SystemSample }) {
+function GpuCard({ games, specs, latest }: { games: Game[]; specs: import("@/lib/api").SystemSpecs; latest?: SystemSample }) {
   const memPct = latest?.gpuMemUsedMb != null && latest?.gpuMemTotalMb ? (latest.gpuMemUsedMb / latest.gpuMemTotalMb) * 100 : 0;
   return (
-    <Card>
+    <Panel panelKey="systems.gpu" games={games} art="icon">
       <SectionTitle title="Graphics" subtitle={specs.gpuNames[0] ?? "GPU"} right={<Monitor className="h-4 w-4 text-ink-dim" />} />
       {specs.hasGpuSensors ? (
         <div className="space-y-3">
@@ -382,13 +384,13 @@ function GpuCard({ specs, latest }: { specs: import("@/lib/api").SystemSpecs; la
       ) : (
         <EmptyState title="No GPU sensor data" message="The sensor bridge reports GPU temperature, load and VRAM for NVIDIA, AMD and Intel GPUs." />
       )}
-    </Card>
+    </Panel>
   );
 }
 
-function MemoryCard({ latest, swapTotal }: { latest?: SystemSample; swapTotal: number }) {
+function MemoryCard({ games, latest, swapTotal }: { games: Game[]; latest?: SystemSample; swapTotal: number }) {
   return (
-    <Card>
+    <Panel panelKey="systems.memory" games={games} art="icon">
       <SectionTitle title="Memory" subtitle="RAM & swap" right={<MemoryStick className="h-4 w-4 text-ink-dim" />} />
       <div className="space-y-4">
         <div>
@@ -416,13 +418,13 @@ function MemoryCard({ latest, swapTotal }: { latest?: SystemSample; swapTotal: n
           </div>
         )}
       </div>
-    </Card>
+    </Panel>
   );
 }
 
-function StorageCard({ disks, activity }: { disks: import("@/lib/api").DiskSpec[]; activity?: number | null }) {
+function StorageCard({ games, disks, activity }: { games: Game[]; disks: import("@/lib/api").DiskSpec[]; activity?: number | null }) {
   return (
-    <Card>
+    <Panel panelKey="systems.storage" games={games} art="icon">
       <SectionTitle title="Storage" subtitle={activity != null ? `${Math.round(activity)}% activity` : `${disks.length} drives`} right={<HardDrive className="h-4 w-4 text-ink-dim" />} />
       <div className="space-y-3">
         {disks.length === 0 && <EmptyState title="No drives detected" />}
@@ -444,7 +446,7 @@ function StorageCard({ disks, activity }: { disks: import("@/lib/api").DiskSpec[
           );
         })}
       </div>
-    </Card>
+    </Panel>
   );
 }
 

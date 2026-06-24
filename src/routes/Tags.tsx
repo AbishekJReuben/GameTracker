@@ -3,9 +3,9 @@ import { Link, useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
 import { Tag, Search, Star, Trophy, Clock, ArrowRight } from "lucide-react";
 import { Page } from "@/components/Page";
-import { Card, SectionTitle, EmptyState, Skeleton } from "@/components/ui";
+import { SectionTitle, EmptyState, Skeleton } from "@/components/ui";
+import { Panel } from "@/components/Panel";
 import { LevelBar } from "@/components/RadialGauge";
-import { MarqueeFX, MarqueeCard } from "@/components/MarqueeFX";
 import { useGames, useTagAnalytics } from "@/lib/queries";
 import { dur } from "@/lib/format";
 
@@ -54,8 +54,7 @@ export default function TagsPage() {
             message="Add tags when editing games, or fetch game info from Steam to import genres automatically."
           />
         ) : (
-          <div className="relative overflow-hidden rounded-3xl">
-            <MarqueeFX variant="drift" games={games ?? []} className="rounded-3xl" />
+          <Panel panelKey="tags.grid" games={games ?? []} className="overflow-hidden">
             <div className="relative z-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {filtered.map((t, i) => (
               <motion.button
@@ -100,10 +99,10 @@ export default function TagsPage() {
               </motion.button>
             ))}
             </div>
-          </div>
+          </Panel>
         )}
 
-        <MarqueeCard variant="shader" games={games ?? []}>
+        <Panel panelKey="tags.tip" games={games ?? []}>
           <SectionTitle title="Tip" subtitle="Tags power Collection analytics" />
           <p className="text-sm text-ink-soft">
             Tags appear on the{" "}
@@ -113,7 +112,7 @@ export default function TagsPage() {
             genre radar and breakdown charts. Use{" "}
             <span className="font-700 text-ink">Get game info</span> in Library to pull Steam genres, or add custom tags when editing any game.
           </p>
-        </MarqueeCard>
+        </Panel>
       </div>
     </Page>
   );

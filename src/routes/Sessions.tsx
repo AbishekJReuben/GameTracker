@@ -5,8 +5,8 @@ import { Download, FileJson, Moon, Zap, Clock } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { Page } from "@/components/Page";
 import { GameArt } from "@/components/GameArt";
-import { Card, Toggle, EmptyState, Skeleton, Segmented } from "@/components/ui";
-import { MarqueeCard } from "@/components/MarqueeFX";
+import { Toggle, EmptyState, Skeleton, Segmented } from "@/components/ui";
+import { Panel } from "@/components/Panel";
 import { useSessions, useGames } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { api, EntryKind, SessionFilter } from "@/lib/api";
@@ -82,7 +82,7 @@ export default function SessionsPage() {
         </>
       }
     >
-      <MarqueeCard variant="spotlight" games={games ?? []} className="mb-5 p-4">
+      <Panel panelKey="sessions.filters" games={games ?? []} sessions={sessions} className="mb-5 p-4">
         <div className="mb-4">
           <Segmented
             value={kind}
@@ -117,9 +117,9 @@ export default function SessionsPage() {
             <Toggle checked={excludeIdle} onChange={setExcludeIdle} label="Hide AFK-ended" />
           </div>
         </div>
-      </MarqueeCard>
+      </Panel>
 
-      <MarqueeCard variant="vertical" games={games ?? []} className="p-0">
+      <Panel panelKey="sessions.table" games={games ?? []} sessions={sessions} className="p-0">
         {isLoading ? (
           <div className="space-y-2 p-4">
             {Array.from({ length: 8 }).map((_, i) => (
@@ -169,7 +169,7 @@ export default function SessionsPage() {
             <EmptyState title="No sessions match" message="Adjust your filters or play a tracked game." />
           </div>
         )}
-      </MarqueeCard>
+      </Panel>
     </Page>
   );
 }

@@ -202,6 +202,15 @@
     transform: translateY(-50%);
   }
 }
+
+@keyframes gt-orbit {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
 /* Ken Burns: slow cinematic zoom + pan on a single backdrop image. */
 @keyframes gt-kenburns {
   0% {

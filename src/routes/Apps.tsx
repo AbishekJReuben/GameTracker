@@ -25,7 +25,8 @@ import { DetectModal } from "@/components/DetectModal";
 import { Heatmap } from "@/components/Heatmap";
 import { StatTile } from "@/components/StatTile";
 import { PolarHours } from "@/components/Charts";
-import { Card, SectionTitle, EmptyState, Skeleton } from "@/components/ui";
+import { SectionTitle, EmptyState, Skeleton } from "@/components/ui";
+import { Panel } from "@/components/Panel";
 import { useGames, useAppsOverview, useHeatmap, useHourOfDay, useRefreshAll } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { useProgress } from "@/store/progress";
@@ -334,7 +335,7 @@ export default function AppsPage() {
           {hasUsage && (
             <div className="grid gap-6 lg:grid-cols-3">
               <motion.div className="lg:col-span-2" initial={false}>
-                <Card className="h-full">
+                <Panel panelKey="apps.activity" games={apps} art="icon" className="h-full">
                   <SectionTitle
                     sheen
                     title="App activity"
@@ -347,10 +348,10 @@ export default function AppsPage() {
                     }
                   />
                   {heat ? <Heatmap data={heat} /> : <Skeleton className="h-28 w-full" />}
-                </Card>
+                </Panel>
               </motion.div>
 
-              <Card className="h-full">
+              <Panel panelKey="apps.top" games={apps} art="icon" className="h-full">
                 <SectionTitle sheen title="Top apps" subtitle="By total time" />
                 {overview && overview.topApps.length > 0 ? (
                   <div className="space-y-1">
@@ -374,19 +375,19 @@ export default function AppsPage() {
                 ) : (
                   <EmptyState title="No app usage yet" message="Run a tracked app and it'll rank here." />
                 )}
-              </Card>
+              </Panel>
             </div>
           )}
 
           {hasUsage && hourOfDay && hourOfDay.some((h) => h > 0) && (
-            <Card>
+            <Panel panelKey="apps.hourly" games={apps} art="icon">
               <SectionTitle sheen title="When you use apps" subtitle="Focused app time by hour of day" />
               <PolarHours values={hourOfDay} use24={use24} />
-            </Card>
+            </Panel>
           )}
 
           {/* App library */}
-          <Card className="!p-0">
+          <Panel panelKey="apps.library" games={apps} art="icon" className="!p-0">
             <div className="flex flex-wrap items-center justify-between gap-3 p-4 pb-0">
               <SectionTitle title="Your apps" subtitle={`${totalApps} tracked`} />
               <div className="relative min-w-[220px]">
@@ -407,7 +408,7 @@ export default function AppsPage() {
                 <EmptyState title="No apps match your search" />
               )}
             </div>
-          </Card>
+          </Panel>
         </div>
       ) : isLoading ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">

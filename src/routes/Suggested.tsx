@@ -21,10 +21,11 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { Page } from "@/components/Page";
-import { Card, SectionTitle, EmptyState, Skeleton, Badge } from "@/components/ui";
+import { SectionTitle, EmptyState, Skeleton, Badge } from "@/components/ui";
+import { Panel } from "@/components/Panel";
 import { GameArt } from "@/components/GameArt";
 import { useQueryClient } from "@tanstack/react-query";
-import { useSuggestions as useSuggestionsQuery, useRefreshAll, useSettings } from "@/lib/queries";
+import { useSuggestions as useSuggestionsQuery, useRefreshAll, useSettings, useGames } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { api, GameSuggestion } from "@/lib/api";
 import { cn } from "@/lib/cn";
@@ -145,6 +146,7 @@ function SuggestionCard({
 
 export default function SuggestedPage() {
   const { data: settings } = useSettings();
+  const { data: libraryGames } = useGames();
   const online = settings?.online_metadata_enabled === "true";
   const qc = useQueryClient();
   const { data, isLoading, error, isFetching } = useSuggestionsQuery(online);
@@ -260,7 +262,7 @@ export default function SuggestedPage() {
         />
       ) : data ? (
         <div className="space-y-6">
-          <Card className="overflow-hidden">
+          <Panel panelKey="suggested.taste" games={libraryGames ?? []} className="overflow-hidden">
             <div className="absolute inset-x-0 top-0 h-px bg-accent-sheen opacity-60" />
             <SectionTitle
               title="Your taste profile"
@@ -364,7 +366,7 @@ export default function SuggestedPage() {
               developers, and critic alignment, then search Steam for matches. Inspired by research on weighted hybrid
               filtering for game libraries.
             </p>
-          </Card>
+          </Panel>
 
           {data.suggestions.length === 0 ? (
             <EmptyState

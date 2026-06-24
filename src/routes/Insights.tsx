@@ -2,7 +2,8 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { AnimatePresence, motion } from "motion/react";
 import { Calendar, Flame, Gamepad2, Trophy, Zap, Clock, Target, Sparkles } from "lucide-react";
-import { Card, SectionTitle, EmptyState, Skeleton, Segmented } from "@/components/ui";
+import { SectionTitle, EmptyState, Skeleton, Segmented } from "@/components/ui";
+import { Panel } from "@/components/Panel";
 import { GameArt } from "@/components/GameArt";
 import { StatTile } from "@/components/StatTile";
 import { Reveal } from "@/components/Reveal";
@@ -131,7 +132,7 @@ export function InsightsContent({ kind = "game" }: { kind?: EntryKind }) {
             </div>
 
             <Reveal y={12}>
-              <Card>
+              <Panel panelKey={`insights.monthly.${kind}`} games={allGames ?? []} art={kind === "app" ? "icon" : "cover"}>
                 <SectionTitle
                   title="Monthly activity"
                   subtitle={`Active hours per month in ${year}`}
@@ -144,12 +145,12 @@ export function InsightsContent({ kind = "game" }: { kind?: EntryKind }) {
                   }
                 />
                 <StaggeredMonthBars monthly={monthly} maxMonth={maxMonth} />
-              </Card>
+              </Panel>
             </Reveal>
 
             <div className="grid gap-6 lg:grid-cols-2">
               <Reveal y={12}>
-                <Card className="h-full">
+                <Panel panelKey={`insights.top.${kind}`} games={allGames ?? []} art={kind === "app" ? "icon" : "cover"} className="h-full">
                   <SectionTitle title={kind === "game" ? "Top games" : "Top apps"} subtitle={`Most active in ${year}`} />
                   {data.topGames.length > 0 ? (
                     <div className="space-y-1">
@@ -175,11 +176,11 @@ export function InsightsContent({ kind = "game" }: { kind?: EntryKind }) {
                   ) : (
                     <EmptyState title={kind === "game" ? "No ranked games" : "No ranked apps"} />
                   )}
-                </Card>
+                </Panel>
               </Reveal>
 
               <Reveal y={12} delay={0.05}>
-                <Card className="h-full">
+                <Panel panelKey={`insights.milestones.${kind}`} games={allGames ?? []} art={kind === "app" ? "icon" : "cover"} className="h-full">
                   <SectionTitle title="Milestones" subtitle="Highlights from your year" />
                   <div className="space-y-3">
                     <Milestone icon={<Calendar className="h-4 w-4" />} label="Busiest month" value={data.bestMonth} hint={data.bestMonthSeconds > 0 ? `${hours(data.bestMonthSeconds, 1)}h active` : "—"} delay={0} />
@@ -202,7 +203,7 @@ export function InsightsContent({ kind = "game" }: { kind?: EntryKind }) {
                       <Milestone icon={<AppWindow className="h-4 w-4" />} label="Most used app" value={data.topGames[0]?.name ?? "—"} hint={data.topGames[0] ? `${dur(data.topGames[0].activeSeconds)} this year` : "No app usage yet"} delay={0.15} />
                     )}
                   </div>
-                </Card>
+                </Panel>
               </Reveal>
             </div>
 

@@ -5,8 +5,9 @@ import { AppWindow, Gamepad2 } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Timeline, type TimelineRange } from "@/components/Timeline";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
-import { Card, SectionTitle, Segmented, EmptyState, Skeleton } from "@/components/ui";
-import { MarqueeFX, MarqueeCard, type MarqueeFXVariant } from "@/components/MarqueeFX";
+import { SectionTitle, Segmented, EmptyState, Skeleton } from "@/components/ui";
+import { Panel } from "@/components/Panel";
+import { useLiveSessionBonus } from "@/lib/liveStats";
 import { useSessions, useGames } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { accentFor, dur, hourLabel, partialDate } from "@/lib/format";
@@ -94,9 +95,8 @@ export default function TimelinePage() {
             colorFor={colorFor}
             emptyMessage="Play a tracked game to fill in your games timeline."
             barClassName=""
-            marqueeVariant="diagonal"
           />
-          <TimelineInsights sessions={gameSessions} colorFor={colorFor} kind="game" title="Games insights" />
+          <TimelineInsights sessions={gameSessions} games={legendGames} colorFor={colorFor} kind="game" title="Games insights" />
 
           <TimelineSection
             title="Apps"
@@ -110,9 +110,8 @@ export default function TimelinePage() {
             colorFor={colorFor}
             emptyMessage="Use a tracked app to fill in your apps timeline."
             barClassName="opacity-90 [background-image:linear-gradient(90deg,transparent,rgba(255,255,255,0.04))]"
-            marqueeVariant="conveyor"
           />
-          <TimelineInsights sessions={appSessions} colorFor={colorFor} kind="app" title="Apps insights" />
+          <TimelineInsights sessions={appSessions} games={legendApps} colorFor={colorFor} kind="app" title="Apps insights" />
           </motion.div>
         ) : (
           <motion.div
@@ -122,9 +121,13 @@ export default function TimelinePage() {
             exit={enabled ? { opacity: 0, x: -16 } : undefined}
             transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
           >
-            <MarqueeCard variant="kenburns" games={(games ?? []).filter((g) => g.kind === "game" && g.status === "completed")} className="p-5">
+            <Panel
+              panelKey="timeline.completions"
+              games={(games ?? []).filter((g) => g.kind === "game" && g.status === "completed")}
+              className="p-5"
+            >
               {games ? <CompletionTimeline games={games.filter((g) => g.kind === "game" && g.status === "completed")} colorFor={colorFor} /> : <Skeleton className="h-64 w-full" />}
-            </MarqueeCard>
+            </Panel>
           </motion.div>
         )}
       </AnimatePresence>
@@ -144,7 +147,6 @@ function TimelineSection({
   colorFor,
   emptyMessage,
   barClassName,
-  marqueeVariant,
 }: {
   title: string;
   icon: ReactNode;
@@ -157,7 +159,6 @@ function TimelineSection({
   colorFor: (gameId: string, accent?: string | null) => string;
   emptyMessage: string;
   barClassName?: string;
-  marqueeVariant?: MarqueeFXVariant;
 }) {
   return (
     <div className="mb-8">
@@ -166,8 +167,12 @@ function TimelineSection({
         <h2 className="font-display text-lg font-800 tracking-tight">{title}</h2>
         <span className="text-sm text-ink-dim">({sessions.length})</span>
       </div>
-      <Card className={`relative overflow-visible p-5 ${barClassName ?? ""}`}>
-        {marqueeVariant && legend.length > 0 && <MarqueeFX variant={marqueeVariant} games={legend} opacity={0.12} />}
+      <Panel
+        panelKey={`timeline.section.${title.toLowerCase()}`}
+        games={legend}
+        sessions={sessions}
+        className={`relative overflow-visible p-5 ${barClassName ?? ""}`}
+      >
         <div className="relative z-10">
           {isLoading ? (
             <Skeleton className="h-40 w-full" />
@@ -177,7 +182,7 @@ function TimelineSection({
             <EmptyState title={`No ${title.toLowerCase()} sessions`} message={emptyMessage} />
           )}
         </div>
-      </Card>
+      </Panel>
       {legend.length > 0 && (
         <div className="mt-4 flex flex-wrap gap-2">
           {legend.map((g) => {
@@ -210,11 +215,13 @@ function TimelineSection({
 
 function TimelineInsights({
   sessions,
+  games,
   colorFor,
   kind,
   title,
 }: {
   sessions: Session[];
+  games: Game[];
   colorFor: (id: string, accent?: string | null) => string;
   kind: EntryKind;
   title?: string;
@@ -222,6 +229,8 @@ function TimelineInsights({
   const enabled = useMotionEnabled();
   const use24 = useApp((s) => s.prefs.timeFormat === "24h");
   const isApp = kind === "app";
+
+  const liveBonus = useLiveSessionBonus(sessions, kind);
 
   const { top, hours, peakHour, totals } = useMemo(() => {
     const byId = new Map<string, { id: string; name: string; secs: number; sessions: number; accent: string | null }>();
@@ -262,6 +271,7 @@ function TimelineInsights({
 
   const maxTop = Math.max(1, ...top.map((t) => t.secs));
   const maxHour = Math.max(1, ...hours);
+  const totalActive = totals.secs + liveBonus;
 
   return (
     <div className="mb-8 grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-4">
@@ -271,7 +281,7 @@ function TimelineInsights({
         </div>
       )}
       {/* Top titles in view */}
-      <Card className="lg:col-span-2 2xl:col-span-2">
+      <Panel panelKey={`timeline.insights.top.${kind}`} games={games} sessions={sessions} className="lg:col-span-2 2xl:col-span-2">
         <SectionTitle
           title="Where your time went"
           subtitle={isApp ? "By focused active time" : "By active playtime in this view"}
@@ -307,10 +317,10 @@ function TimelineInsights({
             );
           })}
         </div>
-      </Card>
+      </Panel>
 
       {/* Active by hour */}
-      <Card>
+      <Panel panelKey={`timeline.insights.hourly.${kind}`} games={games} sessions={sessions}>
         <SectionTitle title="Active by hour" subtitle={`Peak around ${hourLabel(peakHour, use24)}`} />
         <div className="mt-4 flex h-28 items-end gap-[3px]">
           {hours.map((v, h) => (
@@ -330,20 +340,20 @@ function TimelineInsights({
           <span>{hourLabel(12, use24)}</span>
           <span>{hourLabel(23, use24)}</span>
         </div>
-      </Card>
+      </Panel>
 
       {/* Summary stats */}
-      <Card>
+      <Panel panelKey={`timeline.insights.summary.${kind}`} games={games} sessions={sessions}>
         <SectionTitle title="Summary" subtitle="In this view" />
         <div className="mt-3 grid grid-cols-2 gap-3">
-          <Stat label="Total active" value={dur(totals.secs)} />
+          <Stat label="Total active" value={dur(totalActive)} />
           <Stat label="Sessions" value={String(totals.sessions)} />
           <Stat label="Active days" value={String(totals.days)} />
           <Stat label="Titles" value={String(totals.titles)} />
           <Stat label="Avg session" value={dur(totals.avg)} />
           <Stat label="Longest active" value={dur(totals.longest)} />
         </div>
-      </Card>
+      </Panel>
     </div>
   );
 }

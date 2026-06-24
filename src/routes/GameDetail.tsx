@@ -25,7 +25,8 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { Page } from "@/components/Page";
 import { GameArt } from "@/components/GameArt";
 import { Timeline, type TimelineRange } from "@/components/Timeline";
-import { Card, HudPanel, SectionTitle, StatusBadge, Badge, EmptyState, Skeleton, Segmented, statusColor, statusLabel } from "@/components/ui";
+import { SectionTitle, StatusBadge, Badge, EmptyState, Skeleton, Segmented, statusColor, statusLabel } from "@/components/ui";
+import { Panel } from "@/components/Panel";
 import { useGame, useGames, useSessions, useScreenshots, useSetStatus, useRefreshAll, useSettings } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { dur, dateLabel, relativeTime, timeLabel, partialDate, formatHltbMinutes } from "@/lib/format";
@@ -46,6 +47,8 @@ import { EmbeddedPanel } from "@/components/EmbeddedPanel";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
 import { libraryNeighbors } from "@/lib/libraryNav";
 import { SteamAchievementDetailPanel } from "@/components/SteamAchievements";
+import { useLiveEntryStats, useLiveNowMs } from "@/lib/liveStats";
+import { cn } from "@/lib/cn";
 
 const STATUSES: GameStatus[] = ["playing", "backlog", "on_hold", "completed", "dropped", "watched"];
 const RANGE_OPTS = TIMELINE_RANGE_OPTIONS;
@@ -215,7 +218,19 @@ export default function GameDetail() {
       })
       .sort((a, b) => new Date(b.sessions[0].startUtc).getTime() - new Date(a.sessions[0].startUtc).getTime());
   }, [sessionList]);
-  const nowMs = Date.now();
+  const nowMs = useLiveNowMs();
+  const liveStats = useLiveEntryStats(
+    id,
+    game?.kind === "app" ? "app" : "game",
+    game
+      ? {
+          totalRuntimeSeconds: game.totalRuntimeSeconds,
+          totalActiveSeconds: game.totalActiveSeconds,
+          sessionCount: game.sessionCount,
+        }
+      : undefined,
+    sessionList
+  );
   const infoEntries = useMemo(() => {
     if (!game?.infoJson) return [] as [string, string][];
     try {
@@ -373,7 +388,7 @@ export default function GameDetail() {
   ].filter((x): x is { label: string; minutes: number; color: string } => x.minutes != null && x.minutes > 0);
 
   const detailsCard = (
-    <Card className="h-full">
+    <Panel panelKey="game-detail.details" game={game} games={allGames ?? []} className="h-full">
       <SectionTitle title="Details" />
       <dl className="grid gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
         <Row label={isApp ? "Publisher" : "Developer"} value={game.developer ?? "—"} />
@@ -398,12 +413,12 @@ export default function GameDetail() {
       {game.notes && (
         <div className="mt-4 rounded-xl border border-line bg-white/[0.02] p-3 text-sm leading-relaxed text-ink-soft">{game.notes}</div>
       )}
-    </Card>
+    </Panel>
   );
 
   const storeImagesCard = (cls: string) =>
     game.screenshots.length > 0 ? (
-      <Card className={cls}>
+      <Panel panelKey="game-detail.screenshots" game={game} games={allGames ?? []} className={cls}>
         <SectionTitle
           title={isApp ? "Media" : "Store images"}
           subtitle={`${game.screenshots.length} ${isApp ? "images" : "screenshots"}${isApp ? " from Wikipedia" : " from Steam"}`}
@@ -418,7 +433,7 @@ export default function GameDetail() {
         <div className="mt-4">
           <ScreenshotGallery urls={game.screenshots} name={game.displayName} />
         </div>
-      </Card>
+      </Panel>
     ) : null;
 
   const storeAndDetails = (cls: string) =>
@@ -589,17 +604,17 @@ export default function GameDetail() {
       <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
         {isApp ? (
           <>
-            <MiniStat icon={<Clock className="h-4 w-4" />} label="Total time" value={dur(game.totalRuntimeSeconds)} color="#22d3ee" delay={0} />
-            <MiniStat icon={<Zap className="h-4 w-4" />} label="Focused time" value={dur(game.totalActiveSeconds)} color="#34d399" delay={0.06} />
-            <MiniStat icon={<Hash className="h-4 w-4" />} label="Sessions" value={String(game.sessionCount)} color="var(--accent-1)" delay={0.12} />
-            <MiniStat icon={<CalendarClock className="h-4 w-4" />} label="Last used" value={lastPlayedLabel} color="#f472b6" delay={0.18} />
+            <MiniStat panelKey="game-detail.stat.runtime" game={game} icon={<Clock className="h-4 w-4" />} label="Total time" value={dur(liveStats.totalRuntimeSeconds)} color="#22d3ee" delay={0} live={liveStats.isLive} />
+            <MiniStat panelKey="game-detail.stat.active" game={game} icon={<Zap className="h-4 w-4" />} label="Focused time" value={dur(liveStats.totalActiveSeconds)} color="#34d399" delay={0.06} live={liveStats.isLive} />
+            <MiniStat panelKey="game-detail.stat.sessions" game={game} icon={<Hash className="h-4 w-4" />} label="Sessions" value={String(liveStats.sessionCount)} color="var(--accent-1)" delay={0.12} />
+            <MiniStat panelKey="game-detail.stat.last" game={game} icon={<CalendarClock className="h-4 w-4" />} label="Last used" value={lastPlayedLabel} color="#f472b6" delay={0.18} />
           </>
         ) : (
           <>
-            <MiniStat icon={<Clock className="h-4 w-4" />} label="Total runtime" value={dur(game.totalRuntimeSeconds)} color="#22d3ee" delay={0} />
-            <MiniStat icon={<Zap className="h-4 w-4" />} label="Active play" value={dur(game.totalActiveSeconds)} color="#34d399" delay={0.06} />
-            <MiniStat icon={<Hash className="h-4 w-4" />} label="Sessions" value={String(game.sessionCount)} color="var(--accent-1)" delay={0.12} />
-            <MiniStat icon={<CalendarClock className="h-4 w-4" />} label="Last played" value={lastPlayedLabel} color="#f472b6" delay={0.18} />
+            <MiniStat panelKey="game-detail.stat.runtime" game={game} icon={<Clock className="h-4 w-4" />} label="Total runtime" value={dur(liveStats.totalRuntimeSeconds)} color="#22d3ee" delay={0} live={liveStats.isLive} />
+            <MiniStat panelKey="game-detail.stat.active" game={game} icon={<Zap className="h-4 w-4" />} label="Active play" value={dur(liveStats.totalActiveSeconds)} color="#34d399" delay={0.06} live={liveStats.isLive} />
+            <MiniStat panelKey="game-detail.stat.sessions" game={game} icon={<Hash className="h-4 w-4" />} label="Sessions" value={String(liveStats.sessionCount)} color="var(--accent-1)" delay={0.12} />
+            <MiniStat panelKey="game-detail.stat.last" game={game} icon={<CalendarClock className="h-4 w-4" />} label="Last played" value={lastPlayedLabel} color="#f472b6" delay={0.18} />
           </>
         )}
       </div>
@@ -615,7 +630,7 @@ export default function GameDetail() {
       )}
 
       {!isApp && hltbItems.length > 0 && (
-        <Card className="mb-6">
+        <Panel panelKey="game-detail.hltb" game={game} games={allGames ?? []} className="mb-6">
           <SectionTitle
             title="How long to beat"
             subtitle="Completion estimates from HowLongToBeat"
@@ -626,7 +641,7 @@ export default function GameDetail() {
               <HltbStat key={it.label} label={it.label} minutes={it.minutes} color={it.color} />
             ))}
           </div>
-        </Card>
+        </Panel>
       )}
 
       {/* No play history yet — store images + details up top. */}
@@ -634,14 +649,14 @@ export default function GameDetail() {
 
       {/* Per-game timeline (Gantt) — tracking data sits above any media. */}
       {game.isTracked && (
-        <Card className="mb-6 overflow-visible">
+        <Panel panelKey="game-detail.timeline" game={game} games={allGames ?? []} sessions={sessionList} className="mb-6 overflow-visible">
           <SectionTitle title={isApp ? "Usage timeline" : "Play timeline"} subtitle={isApp ? "When you used this app" : "When you played this game"} right={<Segmented value={range} onChange={setRange} options={RANGE_OPTS} size="sm" />} />
           <Timeline sessions={sessionList} range={range} colorFor={() => accent} />
-        </Card>
+        </Panel>
       )}
 
       {hasSessions && (
-        <Card className="mb-6 overflow-visible">
+        <Panel panelKey="game-detail.sessions" game={game} games={allGames ?? []} sessions={sessionList} className="mb-6 overflow-visible">
           <SectionTitle
             title="Session history"
             subtitle={`${sessionList.length} sessions · ${sessionDayGroups.length} ${sessionDayGroups.length === 1 ? "day" : "days"}`}
@@ -717,7 +732,7 @@ export default function GameDetail() {
               </div>
             ))}
           </div>
-        </Card>
+        </Panel>
       )}
 
       {hasSessions && storeAndDetails("mb-6")}
@@ -727,7 +742,7 @@ export default function GameDetail() {
 
       {/* Browser & window activity — exact URL/title spans with start→end times. */}
       {sessionList.some((s) => (s.activitySpans?.length ?? 0) > 0) && (
-        <Card className="mt-6 overflow-visible">
+        <Panel panelKey="game-detail.activity" game={game} games={allGames ?? []} sessions={sessionList} className="mt-6 overflow-visible">
           <SectionTitle
             title="Window & browser activity"
             subtitle={isApp ? "What was on screen while this app ran" : "What was on screen while you played — URLs with exact times"}
@@ -735,12 +750,12 @@ export default function GameDetail() {
           <div className="mt-4">
             <ActivityLog sessions={sessionList} />
           </div>
-        </Card>
+        </Panel>
       )}
 
       {/* Auto-captured in-game screenshots (taken every ~30 min while playing). */}
       {shots.length > 0 && (
-        <Card className="mt-6">
+        <Panel panelKey="game-detail.captures" game={game} games={allGames ?? []} className="mt-6">
           <SectionTitle
             title="Screenshots"
             subtitle={`${shots.length} captured automatically while playing`}
@@ -749,7 +764,7 @@ export default function GameDetail() {
           <div className="mt-4">
             <Captures shots={shots} gameId={game.id} name={game.displayName} />
           </div>
-        </Card>
+        </Panel>
       )}
 
       {game.screenshots.length === 0 && game.website && (
@@ -761,20 +776,20 @@ export default function GameDetail() {
       )}
 
       {isApp && game.notes && (
-        <Card className="mt-6">
+        <Panel panelKey="game-detail.about" game={game} games={allGames ?? []} className="mt-6">
           <SectionTitle title="About" subtitle="From online sources" />
           <p className="mt-3 text-sm leading-relaxed text-ink-soft">{game.notes}</p>
-        </Card>
+        </Panel>
       )}
 
       {!isApp && (
         <div className="mt-6 space-y-4">
           <SectionTitle title="Stats, reviews & links" subtitle="Players, sales, Steam, Metacritic & official site" />
-          <Card className="space-y-6">
+          <Panel panelKey="game-detail.reviews" game={game} games={allGames ?? []} className="space-y-6">
             <GameStatsPanel gameId={game.id} gameName={game.displayName} />
             <SteamReviewsPanel steamAppId={game.steamAppId} gameName={game.displayName} />
             <MetacriticReviewsPanel gameId={game.id} gameName={game.displayName} metacriticSlug={game.metacriticSlug} />
-          </Card>
+          </Panel>
           {/* Trailer sits at the bottom, right above the official website. */}
           {game.trailerUrl && (
             <TrailerPanel url={game.trailerUrl} poster={game.backgroundUrl ?? game.coverPath} name={game.displayName} onPlayingChange={setTrailerPlaying} />
@@ -821,7 +836,25 @@ function HltbStat({ label, minutes, color }: { label: string; minutes: number; c
   );
 }
 
-function MiniStat({ icon, label, value, color, delay = 0 }: { icon: React.ReactNode; label: string; value: string; color: string; delay?: number }) {
+function MiniStat({
+  panelKey,
+  game,
+  icon,
+  label,
+  value,
+  color,
+  delay = 0,
+  live = false,
+}: {
+  panelKey: string;
+  game: import("@/lib/api").Game;
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  color: string;
+  delay?: number;
+  live?: boolean;
+}) {
   const enabled = useMotionEnabled();
   return (
     <motion.div
@@ -829,13 +862,13 @@ function MiniStat({ icon, label, value, color, delay = 0 }: { icon: React.ReactN
       animate={{ opacity: 1, y: 0, scale: 1 }}
       transition={{ delay, duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
     >
-      <HudPanel className="p-4">
+      <Panel panelKey={panelKey} game={game} shell="hud" className={cn("!p-4", live && "ring-1 ring-green/25")}>
       <div className="grid h-9 w-9 place-items-center rounded-xl" style={{ background: `color-mix(in srgb, ${color} 16%, transparent)`, color }}>
         {icon}
       </div>
       <div className="mt-3 font-display text-xl font-800 tabular-nums">{value}</div>
-      <div className="text-xs text-ink-dim">{label}</div>
-      </HudPanel>
+      <div className="text-xs text-ink-dim">{label}{live ? " · live" : ""}</div>
+      </Panel>
     </motion.div>
   );
 }

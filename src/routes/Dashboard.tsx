@@ -13,7 +13,8 @@ import { PolarHours, WeekdayBars } from "@/components/Charts";
 import { VerticalCoverMarquee } from "@/components/VerticalCoverMarquee";
 import { AppsTodayMarquee } from "@/components/AppsTodayMarquee";
 import { ArtCard, type PanelArtVariant } from "@/components/PanelArtBackdrop";
-import { Card, SectionTitle, EmptyState, Skeleton } from "@/components/ui";
+import { Panel } from "@/components/Panel";
+import { SectionTitle, EmptyState, Skeleton } from "@/components/ui";
 import { useDashboard, useAppsOverview, useHeatmap, useHourOfDay, useSessions, useSettings, useGames } from "@/lib/queries";
 import type { Dashboard as DashboardData } from "@/lib/api";
 import { useApp, useMarqueeTier, useMotionEnabled } from "@/store/app";
@@ -195,15 +196,15 @@ export default function Dashboard() {
             <StatTile icon={<Layers className="h-[18px] w-[18px]" />} label="Games played" value={data?.uniqueGamesPlayed ?? 0} accent="#f472b6" delay={0.14} hint={data ? `${data.gamesPlaying} playing now` : ""} />
           </div>
 
-          <Card className="flex h-full min-h-0 flex-col p-4">
+          <Panel panelKey="dashboard.top-games" games={games ?? []} className="flex h-full min-h-0 flex-col p-4">
             <SectionTitle sheen title="Top games" subtitle="By active playtime" />
             <TopGamesList data={data} isLoading={isLoading} className="mt-2 min-h-0 flex-1" />
-          </Card>
+          </Panel>
         </motion.div>
 
         {widgets.goal && dailyGoalMin > 0 && data && (
           <motion.div variants={motionOn ? fadeUp : undefined}>
-            <Card className="p-4">
+            <Panel panelKey="dashboard.goal" games={games ?? []} className="p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
                   <div className="grid h-10 w-10 place-items-center rounded-xl bg-green/15 text-green">
@@ -226,7 +227,7 @@ export default function Dashboard() {
                   transition={{ duration: 0.8, ease: [0.22, 1, 0.36, 1] }}
                 />
               </div>
-            </Card>
+            </Panel>
           </motion.div>
         )}
 
@@ -291,7 +292,7 @@ export default function Dashboard() {
 
         <motion.div variants={motionOn ? fadeUp : undefined}>
           {widgets.heatmap && (
-            <Card className="h-full">
+            <Panel panelKey="dashboard.heatmap" games={games ?? []} className="h-full">
               <SectionTitle
                 sheen
                 title="Activity"
@@ -310,34 +311,34 @@ export default function Dashboard() {
                 </div>
                 <LibraryPlaytimeChart games={games ?? []} />
               </div>
-            </Card>
+            </Panel>
           )}
         </motion.div>
 
         {widgets.patterns && (
         <motion.div className="grid gap-6 lg:grid-cols-2" variants={motionOn ? stagger : undefined}>
           <motion.div variants={motionOn ? fadeUp : undefined}>
-            <Card className="h-full">
+            <Panel panelKey="dashboard.hourly" games={games ?? []} className="h-full">
               <SectionTitle sheen title="When you play" subtitle="Active time by hour of day" />
               {/* Clock shrinks to make room for a column of derived play insights. */}
               <div className="mt-1 grid items-center gap-3 sm:grid-cols-[auto_1fr]">
                 {hourOfDay ? <PolarHours values={hourOfDay} use24={use24} /> : <Skeleton className="mx-auto h-[240px] w-[240px] rounded-full" />}
                 <PlayInsights insights={playInsights} />
               </div>
-            </Card>
+            </Panel>
           </motion.div>
           <motion.div variants={motionOn ? fadeUp : undefined}>
-            <Card className="h-full">
+            <Panel panelKey="dashboard.weekday" games={games ?? []} className="h-full">
               <SectionTitle sheen title="Your week" subtitle="Play distribution across weekdays" />
               {heat ? <WeekdayBars values={weekday.values} labels={weekday.labels} /> : <Skeleton className="h-[180px] w-full" />}
-            </Card>
+            </Panel>
           </motion.div>
         </motion.div>
         )}
 
         {data?.longestSession && (
           <motion.div variants={motionOn ? fadeUp : undefined}>
-            <Card className="flex flex-wrap items-center justify-between gap-4 p-4">
+            <Panel panelKey="dashboard.longest" games={games ?? []} className="flex flex-wrap items-center justify-between gap-4 p-4">
               <div>
                 <div className="text-[11px] font-700 uppercase tracking-wider text-ink-dim">Longest session</div>
                 <div className="mt-1 font-display text-xl font-800 text-ink">{dur(data.longestSession.seconds)}</div>
@@ -350,7 +351,7 @@ export default function Dashboard() {
                 </div>
               </div>
               <div className="text-right text-xs text-ink-faint">Avg session: {dur(Math.round(data.avgSessionActive))} active</div>
-            </Card>
+            </Panel>
           </motion.div>
         )}
 

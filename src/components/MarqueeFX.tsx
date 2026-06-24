@@ -32,18 +32,68 @@ export type MarqueeFXVariant =
   | "spotlight"
   | "mosaic"
   | "pulse"
-  | "shader";
+  | "shader"
+  | "filmstrip"
+  | "hexgrid"
+  | "orbit"
+  | "zoom"
+  | "stagger"
+  | "ribbon"
+  | "polaroid"
+  | "split"
+  | "frost"
+  | "accent"
+  | "columns"
+  | "icons";
+
+/** All backdrop techniques — used for deterministic per-panel assignment. */
+export const MARQUEE_VARIANTS: MarqueeFXVariant[] = [
+  "drift",
+  "driftReverse",
+  "vertical",
+  "verticalReverse",
+  "parallax",
+  "diagonal",
+  "tilt3d",
+  "conveyor",
+  "duotone",
+  "grayscale",
+  "bokeh",
+  "kenburns",
+  "ticker",
+  "wave",
+  "spotlight",
+  "mosaic",
+  "pulse",
+  "shader",
+  "filmstrip",
+  "hexgrid",
+  "orbit",
+  "zoom",
+  "stagger",
+  "ribbon",
+  "polaroid",
+  "split",
+  "frost",
+  "accent",
+  "columns",
+  "icons",
+];
 
 type ArtKind = "cover" | "icon";
 
 const DEFAULT_OPACITY: Partial<Record<MarqueeFXVariant, number>> = {
   kenburns: 0.26,
+  zoom: 0.24,
   bokeh: 0.3,
   duotone: 0.22,
   grayscale: 0.2,
   spotlight: 0.22,
   ticker: 0.12,
   shader: 0.24,
+  filmstrip: 0.18,
+  frost: 0.2,
+  icons: 0.14,
 };
 
 function sortByArt(games: Game[]): Game[] {
@@ -190,6 +240,107 @@ function MosaicRows({ games, motionOn }: { games: Game[]; motionOn: boolean }) {
       </div>
       <div className="relative flex-1 overflow-hidden">
         <CoverTrack games={[...games].reverse()} durationSec={46} reverse motionOn={motionOn} aspect="aspect-[3/4]" gap="gap-2" />
+      </div>
+    </div>
+  );
+}
+
+/** Three narrow vertical columns — distinct from the 7-column `vertical` variant. */
+function TripleColumns({ games, motionOn, reverse = false }: { games: Game[]; motionOn: boolean; reverse?: boolean }) {
+  return (
+    <div className="absolute inset-0 flex gap-4 px-3">
+      {Array.from({ length: 3 }).map((_, c) => {
+        const rotated = [...games.slice(c * 3), ...games.slice(0, c * 3)];
+        const strip = motionOn ? [...rotated, ...rotated] : rotated;
+        const up = (c % 2 === 0) !== reverse;
+        return (
+          <div key={c} className="relative flex-1 overflow-hidden">
+            <div
+              className="absolute inset-x-0 top-0 flex w-full flex-col items-center gap-4"
+              style={motionOn ? { animation: `gt-marquee-y ${36 + c * 6}s linear infinite${up ? " reverse" : ""}`, willChange: "transform" } : undefined}
+            >
+              {strip.map((g, i) => (
+                <div key={`${g.id}-${i}`} className="aspect-[3/4] w-full shrink-0 overflow-hidden rounded-lg border border-white/5">
+                  <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-full w-full" rounded="rounded-lg" />
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Honeycomb-style offset grid of covers. */
+function HexGrid({ games, motionOn }: { games: Game[]; motionOn: boolean }) {
+  const strip = motionOn ? [...games, ...games] : games;
+  return (
+    <div className="absolute inset-0 flex items-center overflow-hidden">
+      <div
+        className="flex w-max flex-wrap gap-2 px-3"
+        style={motionOn ? { animation: "gt-marquee 72s linear infinite", willChange: "transform", width: "max(200%, 100%)" } : undefined}
+      >
+        {strip.map((g, i) => (
+          <div
+            key={`${g.id}-${i}`}
+            className="aspect-[3/4] h-24 shrink-0 overflow-hidden rounded-lg border border-white/5 sm:h-28"
+            style={{ marginTop: i % 2 === 0 ? 0 : 18 }}
+          >
+            <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-full w-full" rounded="rounded-lg" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Slow orbital ring of cover tiles. */
+function OrbitRing({ games, motionOn }: { games: Game[]; motionOn: boolean }) {
+  const ring = games.slice(0, 10);
+  return (
+    <div className="absolute inset-0 grid place-items-center">
+      <div
+        className="relative h-[140%] w-[140%]"
+        style={motionOn ? { animation: "gt-orbit 48s linear infinite", willChange: "transform" } : undefined}
+      >
+        {ring.map((g, i) => {
+          const angle = (i / ring.length) * 360;
+          return (
+            <div
+              key={g.id}
+              className="absolute left-1/2 top-1/2 aspect-[3/4] w-16 -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-lg border border-white/5"
+              style={{ transform: `rotate(${angle}deg) translateY(-42%) rotate(-${angle}deg)` }}
+            >
+              <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-full w-full" rounded="rounded-lg" />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Polaroid-style tilted frames. */
+function PolaroidWall({ games, motionOn }: { games: Game[]; motionOn: boolean }) {
+  const strip = motionOn ? [...games, ...games] : games;
+  return (
+    <div className="absolute inset-0 flex items-center">
+      <div
+        className="flex w-max items-center gap-4 px-4"
+        style={motionOn ? { animation: "gt-marquee 58s linear infinite", willChange: "transform" } : undefined}
+      >
+        {strip.map((g, i) => (
+          <div
+            key={`${g.id}-${i}`}
+            className="shrink-0 rounded-sm border border-white/10 bg-white/[0.04] p-1.5 shadow-card"
+            style={{ transform: `rotate(${(i % 5) - 2}deg)` }}
+          >
+            <div className="aspect-[3/4] w-20 overflow-hidden sm:w-24">
+              <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-full w-full" rounded="rounded-sm" />
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -370,6 +521,89 @@ export function MarqueeFX({
           <CoverTrack games={sorted} durationSec={90} motionOn={motionOn} art={art} />
           <MarqueeShader />
         </>
+      );
+      break;
+    case "filmstrip":
+      content = hasPhotos && <PhotoTrack photos={photos} durationSec={55} motionOn={motionOn} imgClassName="brightness-90 contrast-105" />;
+      break;
+    case "hexgrid":
+      content = hasCovers && <HexGrid games={sorted} motionOn={motionOn} />;
+      break;
+    case "orbit":
+      content = hasCovers && <OrbitRing games={sorted} motionOn={motionOn} />;
+      break;
+    case "zoom":
+      content = hasCovers && sorted[0] && (
+        <div className="absolute inset-0 overflow-hidden">
+          <GameArt
+            id={sorted[0].id}
+            name={sorted[0].displayName}
+            cover={sorted[0].coverPath}
+            icon={sorted[0].iconPath}
+            accent={sorted[0].accentColor}
+            steamAppId={sorted[0].steamAppId}
+            className="h-full w-full"
+            rounded="rounded-none"
+            kenBurns={motionOn}
+          />
+        </div>
+      );
+      break;
+    case "stagger":
+      content = hasCovers && (
+        <div className="absolute inset-0 flex gap-2 px-2">
+          {[0, 1, 2].map((col) => (
+            <div key={col} className="relative flex-1 overflow-hidden" style={{ marginTop: col * 12 }}>
+              <CoverTrack games={[...sorted].slice(col)} durationSec={50 + col * 8} reverse={col % 2 === 1} motionOn={motionOn} art={art} aspect="aspect-[2/3]" gap="gap-2" />
+            </div>
+          ))}
+        </div>
+      );
+      break;
+    case "ribbon":
+      content = hasCovers && (
+        <div className="absolute inset-0 origin-center rotate-[12deg] scale-125">
+          <CoverTrack games={sorted} durationSec={44} motionOn={motionOn} art="icon" aspect="aspect-square" gap="gap-2" />
+        </div>
+      );
+      break;
+    case "polaroid":
+      content = hasCovers && <PolaroidWall games={sorted} motionOn={motionOn} />;
+      break;
+    case "split":
+      content = hasCovers && (
+        <div className="absolute inset-0 flex flex-col gap-1 py-1">
+          <div className="relative flex-1 overflow-hidden opacity-80">
+            <CoverTrack games={sorted} durationSec={42} motionOn={motionOn} art={art} aspect="aspect-video" gap="gap-2" />
+          </div>
+          <div className="relative flex-1 overflow-hidden">
+            <CoverTrack games={[...sorted].reverse()} durationSec={50} reverse motionOn={motionOn} art={art} aspect="aspect-video" gap="gap-2" />
+          </div>
+        </div>
+      );
+      break;
+    case "frost":
+      content = hasPhotos && (
+        <>
+          <PhotoTrack photos={photos} durationSec={64} motionOn={motionOn} imgClassName="scale-110 blur-md brightness-75" />
+          <div className="absolute inset-0 bg-bg-base/30 backdrop-blur-[1px]" style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.08'/%3E%3C/svg%3E\")" }} />
+        </>
+      );
+      break;
+    case "accent":
+      content = hasCovers && (
+        <>
+          <CoverTrack games={sorted} durationSec={60} motionOn={motionOn} art={art} />
+          <div className="absolute inset-0 bg-accent-sheen/20 mix-blend-soft-light" />
+        </>
+      );
+      break;
+    case "columns":
+      content = hasCovers && <TripleColumns games={sorted} motionOn={motionOn} />;
+      break;
+    case "icons":
+      content = hasCovers && (
+        <CoverTrack games={sorted} durationSec={52} motionOn={motionOn} art="icon" aspect="aspect-square" gap="gap-2" tileClassName="rounded-xl" />
       );
       break;
   }

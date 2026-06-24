@@ -37,9 +37,10 @@ import {
   Gauge,
 } from "lucide-react";
 import { Page } from "@/components/Page";
-import { Card, SectionTitle, Segmented } from "@/components/ui";
+import { SectionTitle, Segmented } from "@/components/ui";
+import { Panel } from "@/components/Panel";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
-import { useSettings, useRefreshAll } from "@/lib/queries";
+import { useSettings, useRefreshAll, useGames } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
 import type { AccentTheme } from "@/store/app";
 import { api, type Settings } from "@/lib/api";
@@ -67,6 +68,7 @@ const LANDING_OPTS = [
 
 export default function SettingsPage() {
   const { data: settings } = useSettings();
+  const { data: games } = useGames();
   const qc = useQueryClient();
   const pushToast = useApp((s) => s.pushToast);
   const refresh = useRefreshAll();
@@ -450,7 +452,7 @@ export default function SettingsPage() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: i * 0.04, duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
           >
-            <Card className="overflow-hidden p-0">
+            <Panel panelKey={`settings.${section.id}`} games={games ?? []} className="overflow-hidden p-0">
               <button
                 type="button"
                 onClick={() => toggleSection(section.id)}
@@ -474,7 +476,7 @@ export default function SettingsPage() {
                   </motion.div>
                 )}
               </AnimatePresence>
-            </Card>
+            </Panel>
           </motion.div>
         ))}
 
