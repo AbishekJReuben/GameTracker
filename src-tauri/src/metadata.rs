@@ -6,8 +6,10 @@
 //! - App details:  `store.steampowered.com/api/appdetails`
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::thread;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -54,15 +56,20 @@ pub struct GameMetadata {
     pub theme_youtube_id: Option<String>,
     pub theme_audio_url: Option<String>,
     pub theme_track_ids: Vec<String>,
+    pub theme_playlist_id: Option<String>,
+    pub theme_track_titles: HashMap<String, String>,
 }
 
-/// Resolved theme audio for a game: primary YouTube track, iTunes preview, and
-/// up to five distinct OST tracks scraped from YouTube search.
+/// Resolved theme audio for a game: primary YouTube track, iTunes preview, the
+/// full OST track list (scraped from a YouTube playlist when one is found), and
+/// the source playlist id so the UI can link / export it.
 #[derive(Debug, Clone, Default)]
 pub struct ThemeResolution {
     pub youtube_id: Option<String>,
     pub audio_url: Option<String>,
     pub track_ids: Vec<String>,
+    pub playlist_id: Option<String>,
+    pub track_titles: HashMap<String, String>,
 }
 
 /// Percent-encode a query term (RFC 3986 unreserved kept).
@@ -865,6 +872,8 @@ fn build_steam_metadata(
         theme_youtube_id: theme.youtube_id,
         theme_audio_url: theme.audio_url,
         theme_track_ids: theme.track_ids,
+        theme_playlist_id: theme.playlist_id,
+        theme_track_titles: theme.track_titles,
     }
 }
 
@@ -1837,35 +1846,234 @@ fn youtube_main_theme_id(name: &str) -> Option<String> {
     None
 }
 
-/// Resolve playable theme audio for a game: the main theme (required when found),
-/// up to four additional OST tracks under 10 minutes, plus a 30s iTunes preview.
+/// How many tracks to keep per game from a found OST playlist. A YouTube playlist
+/// page ships ~100 ids in its initial payload without continuation; that is the
+/// effective ceiling and is plenty for a full game soundtrack.
+const MAX_OST_TRACKS: usize = 100;
+
+/// Resolve playable theme audio for a game. Preference order for the OST:
+/// 1. a real YouTube **playlist** (full official/community OST → up to ~100 tracks);
+/// 2. otherwise a duration-filtered scrape of OST search results (≤30 tracks);
+/// always with the targeted main theme first and a keyless 30s iTunes preview.
 pub fn resolve_theme(name: &str) -> ThemeResolution {
     let main = youtube_main_theme_id(name);
 
-    let mut track_ids = Vec::new();
+    let playlist_id = youtube_search_playlist_id(name);
+    let mut track_ids: Vec<String> = Vec::new();
+    let mut track_titles: HashMap<String, String> = HashMap::new();
+
     if let Some(ref id) = main {
         track_ids.push(id.clone());
     }
 
-    if let Some(html) = youtube_search_html(&format!("{name} original soundtrack OST")) {
-        for hit in extract_youtube_search_hits(&html, 24) {
-            if track_ids.len() >= 5 {
+    if let Some(ref list) = playlist_id {
+        let (ids, titles) = youtube_playlist_entries(list, MAX_OST_TRACKS);
+        track_titles.extend(titles);
+        for vid in ids {
+            if track_ids.len() >= MAX_OST_TRACKS {
                 break;
             }
-            if track_ids.contains(&hit.id) {
-                continue;
-            }
-            if theme_extra_duration_ok(&hit) {
-                track_ids.push(hit.id);
+            if !track_ids.contains(&vid) {
+                track_ids.push(vid);
             }
         }
     }
+
+    // Fallback (or top-up) when no playlist was found: scrape OST search results,
+    // dropping hour-long compilations via the duration filter.
+    if playlist_id.is_none() {
+        if let Some(html) = youtube_search_html(&format!("{name} original soundtrack OST")) {
+            track_titles.extend(extract_youtube_video_titles(&html, 60));
+            for hit in extract_youtube_search_hits(&html, 60) {
+                if track_ids.len() >= 30 {
+                    break;
+                }
+                if track_ids.contains(&hit.id) {
+                    continue;
+                }
+                if theme_extra_duration_ok(&hit) {
+                    track_ids.push(hit.id);
+                }
+            }
+        }
+    }
+
+    fill_youtube_titles_oembed(&mut track_titles, &track_ids, 24);
 
     ThemeResolution {
         youtube_id: main.or_else(|| track_ids.first().cloned()),
         audio_url: itunes_theme_url(name),
         track_ids,
+        playlist_id,
+        track_titles,
     }
+}
+
+/// Find a YouTube **playlist** id for a game's OST. Uses the "Playlist" search
+/// filter (`sp=EgIQAw%3D%3D`) across a few query phrasings and returns the first
+/// plausible list id (`PL…`, `OLAK5uy_…`, `RDCLAK…`, or any long id). Keyless.
+fn youtube_search_playlist_id(name: &str) -> Option<String> {
+    const PLAYLIST_FILTER: &str = "EgIQAw%3D%3D";
+    for query in [
+        format!("{name} full OST"),
+        format!("{name} original soundtrack complete"),
+        format!("{name} OST playlist"),
+        format!("{name} soundtrack"),
+    ] {
+        let url = format!(
+            "https://www.youtube.com/results?search_query={}&sp={}&hl=en&gl=US",
+            encode(&query),
+            PLAYLIST_FILTER
+        );
+        let Some(html) = youtube_get_html(&url) else {
+            continue;
+        };
+        if let Some(id) = extract_youtube_playlist_id(&html) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Video ids plus human titles scraped from a playlist page (one HTTP round-trip).
+fn youtube_playlist_entries(list_id: &str, limit: usize) -> (Vec<String>, HashMap<String, String>) {
+    let url = format!(
+        "https://www.youtube.com/playlist?list={}&hl=en&gl=US",
+        encode(list_id)
+    );
+    youtube_get_html(&url)
+        .map(|html| {
+            let ids = extract_youtube_video_ids(&html, limit);
+            let titles = extract_youtube_video_titles(&html, limit);
+            (ids, titles)
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a YouTube oEmbed JSON payload for the human video title.
+pub(crate) fn parse_youtube_oembed_title(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get("title")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Decode a JSON string fragment scraped from YouTube markup (`\u0026`, etc.).
+fn decode_json_string_fragment(raw: &str) -> String {
+    serde_json::from_str::<String>(&format!("\"{raw}\"")).unwrap_or_else(|_| raw.to_string())
+}
+
+/// First `"title":{"content":"…"}` in a YouTube page window.
+fn extract_youtube_title_content(window: &str) -> Option<String> {
+    const NEEDLE: &str = "\"title\":{\"content\":\"";
+    let idx = window.find(NEEDLE)?;
+    let start = idx + NEEDLE.len();
+    let end = window[start..].find('"')?;
+    Some(decode_json_string_fragment(&window[start..start + end]))
+}
+
+/// Pair video ids with titles from a YouTube playlist/search page.
+pub(crate) fn extract_youtube_video_titles(html: &str, limit: usize) -> HashMap<String, String> {
+    if limit == 0 {
+        return HashMap::new();
+    }
+    const NEEDLE: &str = "\"videoId\":\"";
+    let mut from = 0;
+    let mut out = HashMap::new();
+    while out.len() < limit {
+        let Some(rel) = html[from..].find(NEEDLE) else {
+            break;
+        };
+        let id_start = from + rel + NEEDLE.len();
+        let id: String = html[id_start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if id.len() != 11 || out.contains_key(&id) {
+            from = id_start;
+            continue;
+        }
+        let window_end = (id_start + 4500).min(html.len());
+        if let Some(title) = extract_youtube_title_content(&html[id_start..window_end]) {
+            out.insert(id, title);
+        }
+        from = id_start;
+    }
+    out
+}
+
+/// Keyless oEmbed title lookup for a single 11-char video id.
+pub(crate) fn youtube_video_title_oembed(vid: &str) -> Option<String> {
+    if vid.len() != 11 {
+        return None;
+    }
+    let url = format!(
+        "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json"
+    );
+    youtube_get_oembed(&url).and_then(|body| parse_youtube_oembed_title(&body))
+}
+
+fn youtube_get_oembed(url: &str) -> Option<String> {
+    let resp = ureq::get(url)
+        .set("User-Agent", UA)
+        .timeout(TIMEOUT)
+        .call()
+        .ok()?;
+    if resp.status() != 200 {
+        return None;
+    }
+    let mut body = String::new();
+    resp.into_reader().read_to_string(&mut body).ok()?;
+    Some(body)
+}
+
+/// Fill missing titles via oEmbed (throttled; capped so enrichment stays fast).
+fn fill_youtube_titles_oembed(
+    titles: &mut HashMap<String, String>,
+    ids: &[String],
+    max_fetch: usize,
+) {
+    let mut fetched = 0usize;
+    for id in ids {
+        if titles.contains_key(id) {
+            continue;
+        }
+        if fetched >= max_fetch {
+            break;
+        }
+        if let Some(title) = youtube_video_title_oembed(id) {
+            titles.insert(id.clone(), title);
+            fetched += 1;
+            thread::sleep(Duration::from_millis(60));
+        }
+    }
+}
+
+/// First plausible `"playlistId":"…"` in a results/search page. Playlist ids are
+/// longer than the 11-char video ids and usually start with a known prefix.
+fn extract_youtube_playlist_id(html: &str) -> Option<String> {
+    const NEEDLE: &str = "\"playlistId\":\"";
+    let mut from = 0;
+    while let Some(rel) = html[from..].find(NEEDLE) {
+        let start = from + rel + NEEDLE.len();
+        let id: String = html[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        from = start;
+        let looks_real = id.len() >= 16
+            || id.starts_with("PL")
+            || id.starts_with("OLAK5uy_")
+            || id.starts_with("RDCLAK")
+            || id.starts_with("RD");
+        if looks_real && id.len() >= 13 {
+            return Some(id);
+        }
+    }
+    None
 }
 
 fn youtube_theme_id_api(name: &str, key: &str) -> Option<String> {
@@ -1888,17 +2096,22 @@ fn youtube_search_html(query: &str) -> Option<String> {
         "https://www.youtube.com/results?search_query={}&hl=en&gl=US",
         encode(query)
     );
-    let resp = ureq::get(&url)
+    youtube_get_html(&url)
+}
+
+/// GET a YouTube page as HTML with browser-like headers, skipping the EU
+/// cookie-consent interstitial so we get the real (data-bearing) page.
+fn youtube_get_html(url: &str) -> Option<String> {
+    let resp = ureq::get(url)
         .set("User-Agent", UA)
         .set("Accept-Language", "en-US,en;q=0.9")
-        // Skip the EU cookie-consent interstitial so we get the real results page.
         .set("Cookie", "CONSENT=YES+1; SOCS=CAI")
         .timeout(TIMEOUT)
         .call()
         .ok()?;
     let mut buf = String::new();
     resp.into_reader()
-        .take(4_000_000)
+        .take(6_000_000)
         .read_to_string(&mut buf)
         .ok()?;
     if buf.len() < 1000 {
@@ -2211,6 +2424,8 @@ fn fetch_rawg_game_info(
         theme_youtube_id: theme.youtube_id,
         theme_audio_url: theme.audio_url,
         theme_track_ids: theme.track_ids,
+        theme_playlist_id: theme.playlist_id,
+        theme_track_titles: theme.track_titles,
     }))
 }
 
@@ -2311,6 +2526,43 @@ mod tests {
         );
     }
 
+    /// Live, network-gated end-to-end check of the OST resolver. Run explicitly
+    /// with `cargo test --lib -- --ignored resolve_full_ost_live`.
+    #[test]
+    #[ignore]
+    fn resolve_full_ost_live() {
+        for name in ["Hollow Knight", "Baldur's Gate 3", "Batman: Arkham Knight"] {
+            let theme = resolve_theme(name);
+            println!(
+                "{name}: playlist={:?} tracks={}",
+                theme.playlist_id,
+                theme.track_ids.len()
+            );
+            assert!(
+                theme.track_ids.len() >= 10,
+                "{name} should resolve a full OST (got {})",
+                theme.track_ids.len()
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_youtube_playlist_id() {
+        // Skips a short/garbage id, returns the first real-looking list id.
+        let html = r#"{"playlistId":"short"}{"playlistRenderer":{"playlistId":"PLi1CK-rsvz1Nfz83RMBp"}}"#;
+        assert_eq!(
+            extract_youtube_playlist_id(html).as_deref(),
+            Some("PLi1CK-rsvz1Nfz83RMBp")
+        );
+        // Album-style (OLAK5uy_) ids are accepted too.
+        let album = r#""playlistId":"OLAK5uy_kABCDEFGHIJKLMNOPQRSTUVWX1234567""#;
+        assert_eq!(
+            extract_youtube_playlist_id(album).as_deref(),
+            Some("OLAK5uy_kABCDEFGHIJKLMNOPQRSTUVWX1234567")
+        );
+        assert_eq!(extract_youtube_playlist_id("no lists here"), None);
+    }
+
     #[test]
     fn parse_duration_simple_text_variants() {
         assert_eq!(parse_duration_simple_text("3:45"), Some(225));
@@ -2342,6 +2594,74 @@ mod tests {
             .first()
             .map(|h| h.id.clone());
         assert_eq!(main.as_deref(), Some("maintheme11"));
+    }
+
+    #[test]
+    fn parse_youtube_oembed_title_parses_json() {
+        let json = r#"{"title":"Hollow Knight OST - Dirtmouth","author_name":"Amellifera"}"#;
+        assert_eq!(
+            parse_youtube_oembed_title(json).as_deref(),
+            Some("Hollow Knight OST - Dirtmouth")
+        );
+        assert_eq!(parse_youtube_oembed_title("{}"), None);
+    }
+
+    #[test]
+    fn extract_youtube_title_content_from_markup() {
+        let html = r#""videoId":"NSlkW1fFkyo","title":{"content":"Hollow Knight OST - Dirtmouth"}"#;
+        let titles = extract_youtube_video_titles(html, 5);
+        assert_eq!(
+            titles.get("NSlkW1fFkyo").map(String::as_str),
+            Some("Hollow Knight OST - Dirtmouth")
+        );
+    }
+
+    #[test]
+    fn extract_youtube_video_titles_pairs_multiple_ids() {
+        let html = r#"
+            "videoId":"aaaaaaaaaaa","title":{"content":"Track One"}
+            "videoId":"bbbbbbbbbbb","title":{"content":"Track Two"}
+            "videoId":"aaaaaaaaaaa","title":{"content":"Track One Duplicate"}
+        "#;
+        let titles = extract_youtube_video_titles(html, 10);
+        assert_eq!(titles.len(), 2);
+        assert_eq!(titles.get("aaaaaaaaaaa").map(String::as_str), Some("Track One"));
+        assert_eq!(titles.get("bbbbbbbbbbb").map(String::as_str), Some("Track Two"));
+    }
+
+    /// Live oEmbed check — run with:
+    /// `cargo test --lib youtube_video_title_oembed_live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn youtube_video_title_oembed_live() {
+        let title = youtube_video_title_oembed("NSlkW1fFkyo").unwrap_or_default();
+        println!("oEmbed title: {title}");
+        assert!(
+            title.to_lowercase().contains("dirtmouth"),
+            "expected Dirtmouth in title, got: {title}"
+        );
+    }
+
+    /// Live playlist title scrape — run with:
+    /// `cargo test --lib youtube_playlist_titles_live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn youtube_playlist_titles_live() {
+        let list = "PLmOldskd2VbL7_t-NE9p6rEboq_v0AHko";
+        let (ids, titles) = youtube_playlist_entries(list, 12);
+        assert!(ids.len() >= 8, "expected playlist ids, got {}", ids.len());
+        let with_titles = ids.iter().filter(|id| titles.contains_key(*id)).count();
+        println!("{with_titles}/{} ids have scraped titles", ids.len());
+        assert!(
+            with_titles >= 6,
+            "expected most playlist entries to have titles, got {with_titles}"
+        );
+        if let Some(t) = titles.get("NSlkW1fFkyo") {
+            assert!(
+                t.to_lowercase().contains("dirtmouth"),
+                "unexpected Dirtmouth title: {t}"
+            );
+        }
     }
 
     #[test]

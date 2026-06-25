@@ -117,6 +117,8 @@ fn repair_game(
                         theme.youtube_id.as_deref(),
                         theme.audio_url.as_deref(),
                         &theme.track_ids,
+                        theme.playlist_id.as_deref(),
+                        &theme.track_titles,
                     )?;
                     fixes.push("theme audio resolved".into());
                 }
@@ -163,6 +165,8 @@ fn repair_game(
                     meta.theme_youtube_id.as_deref(),
                     meta.theme_audio_url.as_deref(),
                     &meta.theme_track_ids,
+                    meta.theme_playlist_id.as_deref(),
+                    &meta.theme_track_titles,
                 )?;
                 fixes.push("metadata via RAWG/Steam fallback".into());
             }
@@ -204,9 +208,10 @@ fn repair_game(
         }
     }
 
-    // Backfill multi-track OST lists for games enriched before migration v17,
-    // or refresh lists that may include long compilations.
-    let needs_ost_refresh = game.theme_track_ids.is_empty()
+    // Backfill full OST playlists for games enriched before migration v18 (no
+    // source playlist + only a handful of tracks), or where the main theme isn't
+    // first in the list.
+    let needs_ost_refresh = (game.theme_playlist_id.is_none() && game.theme_track_ids.len() < 6)
         || game
             .theme_youtube_id
             .as_ref()
@@ -220,6 +225,8 @@ fn repair_game(
                 theme.youtube_id.as_deref().or(game.theme_youtube_id.as_deref()),
                 game.theme_audio_url.as_deref(),
                 &theme.track_ids,
+                theme.playlist_id.as_deref(),
+                &theme.track_titles,
             )?;
             fixes.push("OST track list backfilled".into());
         }

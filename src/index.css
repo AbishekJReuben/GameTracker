@@ -208,6 +208,56 @@
     transform: translateY(100%);
   }
 }
+/* Jukebox volume slider — themed round thumb on both engines. */
+.jukebox-volume::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: #fff;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-1) 60%, transparent);
+  cursor: pointer;
+}
+.jukebox-volume::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: none;
+  border-radius: 9999px;
+  background: #fff;
+  cursor: pointer;
+}
+/* Vertical volume rail on the jukebox floater. */
+.jukebox-volume-vertical {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 3px;
+  min-height: 44px;
+  max-height: 72px;
+  appearance: none;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+}
+.jukebox-volume-vertical::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
+  background: #fff;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-1) 55%, transparent);
+  cursor: pointer;
+}
+.jukebox-volume-vertical::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: none;
+  border-radius: 9999px;
+  background: #fff;
+  cursor: pointer;
+}
+
 /* Seamless horizontal marquee: the strip is duplicated, so -50% scrolls exactly
    one copy. Pure CSS so it starts on mount regardless of route-transition timing
    (a JS percentage-transform animation didn't kick off until a remount). */

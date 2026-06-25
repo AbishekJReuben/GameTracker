@@ -105,6 +105,10 @@ function makeGame(s: Seed, runtime: number, active: number, sessions: number, la
     themeYoutubeId: s.id.startsWith("g-hk") ? "UWZSi5dkb_Q" : null,
     themeAudioUrl: null,
     themeTrackIds: s.id.startsWith("g-hk") ? ["UWZSi5dkb_Q", "9Zd6D8qP7kM"] : [],
+    themePlaylistId: null,
+    themeTrackTitles: s.id.startsWith("g-hk")
+      ? { UWZSi5dkb_Q: "Hollow Knight OST - Greenpath", "9Zd6D8qP7kM": "Hollow Knight OST - Dirtmouth" }
+      : {},
     steamAchievementsUnlocked: s.id.startsWith("g-hk") ? 42 : null,
     steamAchievementsTotal: s.id.startsWith("g-hk") ? 63 : null,
     steamAchievementsSyncedUtc: s.id.startsWith("g-hk") ? nowIso : null,
@@ -826,6 +830,8 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         themeYoutubeId: null,
         themeAudioUrl: null,
         themeTrackIds: [],
+        themePlaylistId: null,
+        themeTrackTitles: {},
         steamAchievementsUnlocked: null,
         steamAchievementsTotal: null,
         steamAchievementsSyncedUtc: null,

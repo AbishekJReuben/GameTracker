@@ -103,8 +103,12 @@ export default function SessionsPage() {
 
   return (
     <Page
-      title="Sessions"
-      subtitle={sessions ? `${sessions.length} sessions · ${dur(totals.active)} active` : "Your play log"}
+      title="Replay"
+      subtitle={
+        sessions
+          ? `Soundtracks & play log · ${sessions.length} sessions · ${dur(totals.active)} active`
+          : "Soundtracks & your play log"
+      }
       actions={
         <>
           <button onClick={exportJson} className="btn btn-ghost h-10">
@@ -119,6 +123,8 @@ export default function SessionsPage() {
       {showMarquee && marqueeImages.length >= 2 && (
         <ShaderImageTransition images={marqueeImages} className="mb-5 h-36 md:h-44" />
       )}
+
+      <ThemePlaylist games={games ?? []} />
 
       <Panel panelKey="sessions.filters" games={games ?? []} sessions={sessions} className="mb-5 p-4">
         <div className="mb-4">
@@ -156,8 +162,6 @@ export default function SessionsPage() {
           </div>
         </div>
       </Panel>
-
-      <ThemePlaylist games={games ?? []} />
 
       <Panel panelKey="sessions.table" games={games ?? []} sessions={sessions} className="p-0">
         {isLoading ? (

@@ -1,6 +1,6 @@
 import { NavLink, useLocation } from "react-router-dom";
 import { motion } from "motion/react";
-import { LayoutDashboard, Library, CalendarRange, ListChecks, Trophy, Settings, Gamepad2, Tag, Compass, AppWindow, Cpu } from "lucide-react";
+import { LayoutDashboard, Library, CalendarRange, Disc3, Trophy, Settings, Gamepad2, Tag, Compass, AppWindow, Cpu } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { dur } from "@/lib/format";
@@ -13,7 +13,7 @@ const NAV = [
   { to: "/apps", label: "Apps", icon: AppWindow },
   { to: "/system", label: "System", icon: Cpu },
   { to: "/timeline", label: "Timeline", icon: CalendarRange },
-  { to: "/sessions", label: "Sessions", icon: ListChecks },
+  { to: "/sessions", label: "Replay", icon: Disc3 },
   { to: "/collection", label: "Collection", icon: Trophy },
   { to: "/suggested", label: "Suggested", icon: Compass },
   { to: "/tags", label: "Tags", icon: Tag },

@@ -13,7 +13,7 @@ import { dur, hours } from "@/lib/format";
 import { EntryKind } from "@/lib/api";
 import { AppWindow } from "lucide-react";
 import { aggregateSteamAchievements } from "@/lib/steamAchievements";
-import { SteamAchievementBadge, SteamAchievementInsightsBlock } from "@/components/SteamAchievements";
+import { SteamAchievementBadge } from "@/components/SteamAchievements";
 
 type MonthRow = { month: string | number; label: string; hours: number; seconds: number };
 
@@ -207,11 +207,6 @@ export function InsightsContent({ kind = "game" }: { kind?: EntryKind }) {
               </Reveal>
             </div>
 
-            {kind === "game" && allGames && allGames.length > 0 && (
-              <Reveal y={12} delay={0.08}>
-                <SteamAchievementInsightsBlock games={allGames} />
-              </Reveal>
-            )}
             </motion.div>
           </AnimatePresence>
         )}

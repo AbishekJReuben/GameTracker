@@ -261,6 +261,8 @@ fn apply_game_metadata(
         meta.theme_youtube_id.as_deref(),
         meta.theme_audio_url.as_deref(),
         &meta.theme_track_ids,
+        meta.theme_playlist_id.as_deref(),
+        &meta.theme_track_titles,
     )?;
     Ok(())
 }
@@ -307,6 +309,101 @@ pub(crate) fn enrich_game_async(
         }
         let _ = app.emit("game://enriched", serde_json::json!({ "id": id }));
     });
+}
+
+/// A game's OST is "sparse" if we have no source playlist and only a handful of
+/// tracks — i.e. it predates the full-OST resolver and should be backfilled.
+fn ost_is_sparse(g: &crate::db::models::GameDto) -> bool {
+    g.theme_playlist_id.is_none() && g.theme_track_ids.len() < 6
+}
+
+/// Resolve a game's **full** OST (playlist scrape → up to ~100 tracks) on demand
+/// and persist it, then emit `game://enriched` so the open page refetches. Runs
+/// on a worker thread. Gated by the online-metadata opt-in.
+#[tauri::command]
+pub fn fetch_full_ost(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    game_id: String,
+) -> AppResult<()> {
+    if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
+        return Err(AppError::msg(
+            "Turn on Online metadata in Settings to fetch soundtracks.",
+        ));
+    }
+    let pool = state.pool.clone();
+    std::thread::spawn(move || {
+        let Ok(Some(game)) = games::get(&pool, &game_id) else {
+            let _ = app.emit("game://enriched", serde_json::json!({ "id": game_id }));
+            return;
+        };
+        let theme = metadata::resolve_theme(&game.display_name);
+        let _ = games::set_theme(
+            &pool,
+            &game_id,
+            theme.youtube_id.as_deref(),
+            theme.audio_url.as_deref(),
+            &theme.track_ids,
+            theme.playlist_id.as_deref(),
+            &theme.track_titles,
+        );
+        let _ = app.emit("game://enriched", serde_json::json!({ "id": game_id }));
+    });
+    Ok(())
+}
+
+/// Backfill full OSTs across the whole library. Spawns a throttled worker that
+/// scrapes a full YouTube OST playlist for every game whose soundtrack is still
+/// sparse, persists each result, and emits `ost://progress` `{ done, total,
+/// gameId, name, tracks }` per game then `ost://done` `{ count }`. Returns the
+/// number of games queued so the UI can show a total immediately. Gated by the
+/// online-metadata opt-in.
+#[tauri::command]
+pub fn build_ost_library(app: tauri::AppHandle, state: State<AppState>) -> AppResult<usize> {
+    if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
+        return Err(AppError::msg(
+            "Turn on Online metadata in Settings to build the soundtrack library.",
+        ));
+    }
+    let pool = state.pool.clone();
+    let pending: Vec<crate::db::models::GameDto> = games::list(&pool)?
+        .into_iter()
+        .filter(|g| g.kind == "game" && ost_is_sparse(g))
+        .collect();
+    let total = pending.len();
+
+    std::thread::spawn(move || {
+        for (i, game) in pending.into_iter().enumerate() {
+            let theme = metadata::resolve_theme(&game.display_name);
+            let tracks = theme.track_ids.len();
+            let _ = games::set_theme(
+                &pool,
+                &game.id,
+                theme.youtube_id.as_deref(),
+                theme.audio_url.as_deref(),
+                &theme.track_ids,
+                theme.playlist_id.as_deref(),
+                &theme.track_titles,
+            );
+            let _ = app.emit(
+                "ost://progress",
+                serde_json::json!({
+                    "done": i + 1,
+                    "total": total,
+                    "gameId": game.id,
+                    "name": game.display_name,
+                    "tracks": tracks,
+                }),
+            );
+            // Be polite to YouTube between games.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+        let _ = app.emit("ost://done", serde_json::json!({ "count": total }));
+        // Refresh any open lists so newly-linked OSTs appear.
+        let _ = app.emit("game://enriched", serde_json::json!({ "id": "" }));
+    });
+
+    Ok(total)
 }
 
 /// Cached live stats served instantly from the DB, plus when they were fetched.

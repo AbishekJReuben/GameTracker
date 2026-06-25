@@ -3,21 +3,33 @@ import { assetUrl } from "@/lib/api";
 import { useJukebox } from "@/store/jukebox";
 import { useApp } from "@/store/app";
 
-/** Hidden YouTube iframe + Media Session — mounted once at app root. */
+/**
+ * Hidden YouTube iframe that is the actual audio engine, mounted once at app
+ * root. Drives playback, reports progress to the store, auto-advances the queue,
+ * and wires the OS Media Session (Windows media keys + on-screen scrubber).
+ */
 export function JukeboxEngine() {
   const tracks = useJukebox((s) => s.tracks);
   const index = useJukebox((s) => s.index);
   const playing = useJukebox((s) => s.playing);
   const active = useJukebox((s) => s.active);
+  const volume = useJukebox((s) => s.volume);
+  const progress = useJukebox((s) => s.progress);
+  const duration = useJukebox((s) => s.duration);
+  const seekNonce = useJukebox((s) => s.seekNonce);
   const play = useJukebox((s) => s.play);
   const pause = useJukebox((s) => s.pause);
   const next = useJukebox((s) => s.next);
   const prev = useJukebox((s) => s.prev);
+  const ended = useJukebox((s) => s.ended);
+  const setProgress = useJukebox((s) => s.setProgress);
+  const seekTo = useJukebox((s) => s.seekTo);
   const muted = useApp((s) => s.prefs.themeMuted);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const ready = useRef(false);
   const didGesture = useRef(false);
+  const lastEndedAt = useRef(0);
   const track = tracks[index];
 
   const ytCommand = useCallback((func: string, args: unknown[] = []) => {
@@ -27,16 +39,17 @@ export function JukeboxEngine() {
     );
   }, []);
 
-  const applyMute = useCallback(() => {
+  const applyVolume = useCallback(() => {
     if (!track) return;
-    if (muted) ytCommand("mute");
-    else {
+    if (muted) {
+      ytCommand("mute");
+    } else {
       ytCommand("unMute");
-      ytCommand("setVolume", [65]);
+      ytCommand("setVolume", [volume]);
     }
     if (playing) ytCommand("playVideo");
     else ytCommand("pauseVideo");
-  }, [muted, playing, track, ytCommand]);
+  }, [muted, volume, playing, track, ytCommand]);
 
   const loadTrack = useCallback(
     (i: number, autoplay: boolean) => {
@@ -47,38 +60,74 @@ export function JukeboxEngine() {
         ytCommand("playVideo");
         if (!muted) {
           ytCommand("unMute");
-          ytCommand("setVolume", [65]);
+          ytCommand("setVolume", [volume]);
         }
       }
     },
-    [tracks, muted, ytCommand]
+    [tracks, muted, volume, ytCommand]
   );
 
+  // Re-apply mute/volume/play-state whenever they change.
   useEffect(() => {
-    applyMute();
-  }, [applyMute]);
+    applyVolume();
+  }, [applyVolume]);
 
+  // Load a new track when the current index/vid changes.
   useEffect(() => {
     if (!track || !ready.current) return;
     loadTrack(index, playing);
+    ytCommand("getVideoData");
   }, [index, track?.vid]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Honor explicit seek requests from the store (seek bar, repeat-one, prev-restart).
+  useEffect(() => {
+    if (!seekNonce) return;
+    const { seekSeconds } = useJukebox.getState();
+    ytCommand("seekTo", [seekSeconds, true]);
+    ytCommand("playVideo");
+    ytCommand("getVideoData");
+  }, [seekNonce, ytCommand]);
+
+  // YouTube only pushes infoDelivery on demand — poll while playing so the seek bar moves.
+  useEffect(() => {
+    if (!active || !playing || !ready.current) return;
+    ytCommand("getVideoData");
+    const id = window.setInterval(() => ytCommand("getVideoData"), 400);
+    return () => clearInterval(id);
+  }, [active, playing, track?.vid, ytCommand]);
+
+  // Progress + auto-advance from the player's postMessages.
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       if (typeof e.data !== "string") return;
+      let d: { event?: string; info?: unknown };
       try {
-        const d = JSON.parse(e.data) as { event?: string; info?: number };
-        if (d.event === "onStateChange" && d.info === 0 && tracks.length > 1) {
-          next();
-        }
+        d = JSON.parse(e.data);
       } catch {
-        /* ignore */
+        return;
+      }
+      const fireEnded = () => {
+        // De-dupe the burst of end events YouTube can emit around a track switch.
+        const now = Date.now();
+        if (now - lastEndedAt.current < 1500) return;
+        lastEndedAt.current = now;
+        ended();
+      };
+      if (d.event === "infoDelivery" && d.info && typeof d.info === "object") {
+        const info = d.info as { currentTime?: number; duration?: number; playerState?: number };
+        if (typeof info.currentTime === "number" && typeof info.duration === "number" && info.duration > 0) {
+          setProgress(info.currentTime, info.duration);
+        }
+        if (info.playerState === 0) fireEnded();
+      } else if (d.event === "onStateChange" && d.info === 0) {
+        fireEnded();
       }
     };
     window.addEventListener("message", onMsg);
     return () => window.removeEventListener("message", onMsg);
-  }, [tracks.length, next]);
+  }, [ended, setProgress]);
 
+  // First user gesture unlocks audible autoplay (browsers block it otherwise).
   useEffect(() => {
     const onGesture = () => {
       if (didGesture.current) return;
@@ -87,7 +136,7 @@ export function JukeboxEngine() {
       window.removeEventListener("keydown", onGesture, true);
       if (!muted && playing) {
         ytCommand("unMute");
-        ytCommand("setVolume", [65]);
+        ytCommand("setVolume", [volume]);
         ytCommand("playVideo");
       }
     };
@@ -97,9 +146,9 @@ export function JukeboxEngine() {
       window.removeEventListener("pointerdown", onGesture, true);
       window.removeEventListener("keydown", onGesture, true);
     };
-  }, [muted, playing, ytCommand]);
+  }, [muted, playing, volume, ytCommand]);
 
-  // Windows / OS media overlay (play/pause/skip hardware keys).
+  // ---- OS Media Session: metadata + play state + scrubber ----
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     const ms = navigator.mediaSession;
@@ -126,22 +175,56 @@ export function JukeboxEngine() {
     ms.playbackState = playing ? "playing" : "paused";
   }, [active, track, playing]);
 
+  // Keep the OS scrubber in sync with playback position.
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState) return;
+    if (!active || duration <= 0) return;
+    try {
+      navigator.mediaSession.setPositionState({
+        duration,
+        position: Math.min(progress, duration),
+        playbackRate: 1,
+      });
+    } catch {
+      /* some platforms throw on bad ranges */
+    }
+  }, [active, progress, duration]);
+
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     const ms = navigator.mediaSession;
 
-    const onPlay = () => play();
-    const onPause = () => pause();
-    const onNext = () => next();
-    const onPrev = () => prev();
+    const handlers: [MediaSessionAction, MediaSessionActionHandler | null][] = [
+      ["play", () => play()],
+      ["pause", () => pause()],
+      ["nexttrack", () => next()],
+      ["previoustrack", () => prev()],
+      ["stop", () => pause()],
+      [
+        "seekto",
+        (d) => {
+          if (typeof d.seekTime === "number") seekTo(d.seekTime);
+        },
+      ],
+      [
+        "seekforward",
+        (d) => seekTo(useJukebox.getState().progress + (d.seekOffset || 10)),
+      ],
+      [
+        "seekbackward",
+        (d) => seekTo(Math.max(0, useJukebox.getState().progress - (d.seekOffset || 10))),
+      ],
+    ];
 
-    ms.setActionHandler("play", onPlay);
-    ms.setActionHandler("pause", onPause);
-    ms.setActionHandler("nexttrack", onNext);
-    ms.setActionHandler("previoustrack", onPrev);
-
+    for (const [action, handler] of handlers) {
+      try {
+        ms.setActionHandler(action, handler);
+      } catch {
+        /* unsupported action on this platform */
+      }
+    }
     return () => {
-      for (const action of ["play", "pause", "nexttrack", "previoustrack"] as const) {
+      for (const [action] of handlers) {
         try {
           ms.setActionHandler(action, null);
         } catch {
@@ -149,7 +232,7 @@ export function JukeboxEngine() {
         }
       }
     };
-  }, [play, pause, next, prev]);
+  }, [play, pause, next, prev, seekTo]);
 
   if (!active || !track) return null;
 
@@ -170,8 +253,9 @@ export function JukeboxEngine() {
           JSON.stringify({ event: "listening", id: 1, channel: "widget" }),
           "*"
         );
-        applyMute();
+        applyVolume();
         if (playing) loadTrack(index, true);
+        ytCommand("getVideoData");
       }}
       className="pointer-events-none fixed bottom-0 left-0 h-px w-px opacity-[0.001]"
     />

@@ -55,8 +55,12 @@ export interface Game {
   trailerUrl: string | null;
   themeYoutubeId: string | null;
   themeAudioUrl: string | null;
-  /** Up to five YouTube OST tracks per game (enrichment). */
+  /** Full OST track list (up to ~100), scraped from a YouTube playlist when found. */
   themeTrackIds: string[];
+  /** Source YouTube playlist id for the full OST, when one was found. */
+  themePlaylistId: string | null;
+  /** Human-readable YouTube titles keyed by video id (from playlist scrape / oEmbed). */
+  themeTrackTitles: Record<string, string>;
   steamAchievementsUnlocked: number | null;
   steamAchievementsTotal: number | null;
   steamAchievementsSyncedUtc: string | null;
@@ -745,6 +749,10 @@ export const api = {
   getGameStats: (gameId: string) => call<CachedGameStats>("get_game_stats", { gameId }),
   /** Kick off a background refresh; result arrives via the `game://stats` event. */
   refreshGameStats: (gameId: string) => call<void>("refresh_game_stats", { gameId }),
+  /** Resolve a single game's full OST now; refetch on the `game://enriched` event. */
+  fetchFullOst: (gameId: string) => call<void>("fetch_full_ost", { gameId }),
+  /** Backfill full OSTs across the library; returns the count queued, progress via `ost://progress`. */
+  buildOstLibrary: () => call<number>("build_ost_library"),
   launchGame: (id: string) => call<void>("launch_game", { id }),
   openEmbed: (label: string, url: string, x: number, y: number, w: number, h: number) =>
     call<void>("open_embed", { label, url, x, y, w, h }),

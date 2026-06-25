@@ -42,6 +42,16 @@ export function gameYoutubeTracks(g: Game, ostMix: boolean): string[] {
   return fromDb;
 }
 
+/** Prefer the stored YouTube title; fall back to generic game-based labels. */
+export function trackLabel(g: Game, vid: string, index: number, total: number): string {
+  const real = g.themeTrackTitles?.[vid]?.trim();
+  if (real) return real;
+  if (total > 1) {
+    return index === 0 ? `${g.displayName} · main theme` : `${g.displayName} · track ${index + 1}`;
+  }
+  return g.displayName;
+}
+
 export function buildGameTrackList(g: Game): JukeboxTrack[] {
   const ids = gameYoutubeTracks(g, true);
   return ids.map((vid, i) => ({
@@ -51,12 +61,7 @@ export function buildGameTrackList(g: Game): JukeboxTrack[] {
     iconPath: g.iconPath,
     accentColor: g.accentColor,
     vid,
-    label:
-      ids.length > 1
-        ? i === 0
-          ? `${g.displayName} · main theme`
-          : `${g.displayName} · track ${i + 1}`
-        : g.displayName,
+    label: trackLabel(g, vid, i, ids.length),
   }));
 }
 
@@ -70,6 +75,25 @@ export function gameToJukeboxTrack(g: Game, vid: string, label: string): Jukebox
     vid,
     label,
   };
+}
+
+/** Max video ids YouTube's anonymous `watch_videos` temporary playlist accepts. */
+export const WATCH_VIDEOS_MAX = 50;
+
+/**
+ * An anonymous, no-login YouTube playlist URL built from a queue. YouTube caps
+ * `watch_videos` at 50 ids and the resulting list is temporary — good enough to
+ * "open my mix in YouTube". Returns null if there are no tracks.
+ */
+export function buildWatchVideosUrl(tracks: JukeboxTrack[]): string | null {
+  const ids = Array.from(new Set(tracks.map((t) => t.vid))).slice(0, WATCH_VIDEOS_MAX);
+  if (!ids.length) return null;
+  return `https://www.youtube.com/watch_videos?video_ids=${ids.join(",")}`;
+}
+
+/** Canonical URL for a real YouTube playlist id. */
+export function playlistUrl(listId: string): string {
+  return `https://www.youtube.com/playlist?list=${listId}`;
 }
 
 export type JukeboxSource = "all" | "top" | "completed";
@@ -112,13 +136,7 @@ export function buildJukeboxQueue(
     }
     const ids = gameYoutubeTracks(g, ostMix);
     ids.forEach((vid, ti) => {
-      list.push(
-        gameToJukeboxTrack(
-          g,
-          vid,
-          ids.length > 1 ? `${g.displayName} · track ${ti + 1}` : g.displayName
-        )
-      );
+      list.push(gameToJukeboxTrack(g, vid, trackLabel(g, vid, ti, ids.length)));
     });
   }
 

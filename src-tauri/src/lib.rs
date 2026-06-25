@@ -203,6 +203,8 @@ pub fn run() {
             commands::repair_library_content,
             commands::get_game_stats,
             commands::refresh_game_stats,
+            commands::fetch_full_ost,
+            commands::build_ost_library,
             commands::launch_game,
             embed::open_embed,
             embed::set_embed_bounds,

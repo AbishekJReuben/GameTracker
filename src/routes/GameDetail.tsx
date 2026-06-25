@@ -42,6 +42,7 @@ import { MetacriticReviewsPanel } from "@/components/MetacriticReviewsPanel";
 import { TrailerPanel } from "@/components/TrailerPanel";
 import { GameStatsPanel } from "@/components/GameStatsPanel";
 import { ThemePlayer, ThemeToggleButton } from "@/components/ThemePlayer";
+import { SoundtrackPanel } from "@/components/SoundtrackPanel";
 import { ActivityLog } from "@/components/ActivityLog";
 import { EmbeddedPanel } from "@/components/EmbeddedPanel";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
@@ -743,6 +744,9 @@ export default function GameDetail() {
       )}
 
       {hasSessions && storeAndDetails("mb-6")}
+
+      {/* Full soundtrack — browse & play this game's OST in one place. */}
+      {!isApp && <SoundtrackPanel game={game} />}
 
       {/* Achievements sit below the store imagery / posters. */}
       {!isApp && <SteamAchievementDetailPanel game={game} />}

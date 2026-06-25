@@ -316,6 +316,30 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 17;
     }
 
+    if version < 18 {
+        // Source YouTube playlist id for a game's full OST (when one is found),
+        // so the jukebox can deep-link / export it. theme_track_ids now holds the
+        // full playlist (up to ~100), not just five.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE games ADD COLUMN theme_playlist_id TEXT;
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 18;")?;
+        version = 18;
+    }
+
+    if version < 19 {
+        // Human-readable YouTube titles keyed by video id for jukebox labels.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE games ADD COLUMN theme_track_titles TEXT NOT NULL DEFAULT '{}';
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 19;")?;
+        version = 19;
+    }
+
     let _ = version;
     Ok(())
 }

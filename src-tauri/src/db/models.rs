@@ -43,6 +43,8 @@ pub struct GameDto {
     pub theme_youtube_id: Option<String>,
     pub theme_audio_url: Option<String>,
     pub theme_track_ids: Vec<String>,
+    pub theme_playlist_id: Option<String>,
+    pub theme_track_titles: std::collections::HashMap<String, String>,
     pub steam_achievements_unlocked: Option<i64>,
     pub steam_achievements_total: Option<i64>,
     pub steam_achievements_synced_utc: Option<String>,

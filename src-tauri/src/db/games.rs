@@ -66,6 +66,8 @@ struct GameRow {
     theme_youtube_id: Option<String>,
     theme_audio_url: Option<String>,
     theme_track_ids: Vec<String>,
+    theme_playlist_id: Option<String>,
+    theme_track_titles: HashMap<String, String>,
     steam_achievements_unlocked: Option<i64>,
     steam_achievements_total: Option<i64>,
     steam_achievements_synced_utc: Option<String>,
@@ -123,6 +125,12 @@ fn map_row(r: &Row) -> rusqlite::Result<GameRow> {
             .get::<_, String>("theme_track_ids")
             .ok()
             .map(|j| parse_exe_paths(&j))
+            .unwrap_or_default(),
+        theme_playlist_id: r.get::<_, Option<String>>("theme_playlist_id").ok().flatten(),
+        theme_track_titles: r
+            .get::<_, String>("theme_track_titles")
+            .ok()
+            .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default(),
         steam_achievements_unlocked: r
             .get::<_, Option<i64>>("steam_achievements_unlocked")
@@ -259,6 +267,8 @@ fn to_dto(g: GameRow, stat: &Stat, tags: Vec<String>) -> GameDto {
         theme_youtube_id: g.theme_youtube_id,
         theme_audio_url: g.theme_audio_url,
         theme_track_ids: g.theme_track_ids,
+        theme_playlist_id: g.theme_playlist_id,
+        theme_track_titles: g.theme_track_titles,
         steam_achievements_unlocked: g.steam_achievements_unlocked,
         steam_achievements_total: g.steam_achievements_total,
         steam_achievements_synced_utc: g.steam_achievements_synced_utc,
@@ -596,13 +606,17 @@ pub fn set_media(
     Ok(())
 }
 
-/// Persist the resolved per-game theme (YouTube video id, OST track list, and/or iTunes preview).
+/// Persist the resolved per-game theme (YouTube video id, OST track list,
+/// source playlist id, and/or iTunes preview). Empty inputs are skipped so a
+/// later sparse refetch can't wipe a richer earlier result.
 pub fn set_theme(
     pool: &DbPool,
     id: &str,
     youtube_id: Option<&str>,
     audio_url: Option<&str>,
     track_ids: &[String],
+    playlist_id: Option<&str>,
+    track_titles: &HashMap<String, String>,
 ) -> AppResult<()> {
     let conn = pool.get()?;
     if let Some(yt) = youtube_id.filter(|s| !s.trim().is_empty()) {
@@ -621,6 +635,19 @@ pub fn set_theme(
         let json = serde_json::to_string(track_ids).unwrap_or_else(|_| "[]".to_string());
         conn.execute(
             "UPDATE games SET theme_track_ids = ?1 WHERE id = ?2",
+            rusqlite::params![json, id],
+        )?;
+    }
+    if let Some(list) = playlist_id.filter(|s| !s.trim().is_empty()) {
+        conn.execute(
+            "UPDATE games SET theme_playlist_id = ?1 WHERE id = ?2",
+            rusqlite::params![list, id],
+        )?;
+    }
+    if !track_titles.is_empty() {
+        let json = serde_json::to_string(track_titles).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "UPDATE games SET theme_track_titles = ?1 WHERE id = ?2",
             rusqlite::params![json, id],
         )?;
     }
