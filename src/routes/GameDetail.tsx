@@ -161,6 +161,13 @@ export default function GameDetail() {
   const backTo = isApp ? "/apps" : "/library";
   const backLabel = isApp ? "Apps" : "Library";
 
+  const themeYoutube = game?.themeYoutubeId ?? game?.themeTrackIds?.[0] ?? null;
+  const hasThemeAudio = !!(
+    themeYoutube ||
+    game?.themeAudioUrl ||
+    (game?.themeTrackIds?.length ?? 0) > 0
+  );
+
   const neighbors = useMemo(() => {
     if (!id || !allGames || !game) return null;
     return libraryNeighbors(allGames, id, isApp ? "app" : "game");
@@ -529,7 +536,7 @@ export default function GameDetail() {
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-3">
               <h1 className="font-display text-3xl font-800 tracking-tight text-balance">{game.displayName || "Untitled game"}</h1>
-              {!isApp && themeMusicOn && (game.themeYoutubeId || game.themeAudioUrl) && <ThemeToggleButton name={game.displayName} />}
+              {!isApp && themeMusicOn && hasThemeAudio && <ThemeToggleButton game={game} />}
             </div>
             <div className="mt-3 flex flex-wrap items-center gap-4">
               {game.rating != null && <Scorebox label="My score" value={game.rating} color="#fbbf24" icon={<Star className="h-3.5 w-3.5" />} />}
@@ -801,8 +808,8 @@ export default function GameDetail() {
       )}
 
       {/* Per-game theme: hidden audio player (toggle lives by the title). */}
-      {!isApp && themeMusicOn && (game.themeYoutubeId || game.themeAudioUrl) && (
-        <ThemePlayer youtubeId={game.themeYoutubeId} audioUrl={game.themeAudioUrl} name={game.displayName} suppressed={trailerPlaying} />
+      {!isApp && themeMusicOn && hasThemeAudio && (
+        <ThemePlayer youtubeId={themeYoutube} audioUrl={game.themeAudioUrl} name={game.displayName} suppressed={trailerPlaying} />
       )}
     </Page>
   );
