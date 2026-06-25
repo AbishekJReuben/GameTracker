@@ -260,6 +260,7 @@ fn apply_game_metadata(
         id,
         meta.theme_youtube_id.as_deref(),
         meta.theme_audio_url.as_deref(),
+        &meta.theme_track_ids,
     )?;
     Ok(())
 }
@@ -763,6 +764,24 @@ pub fn tag_analytics(state: State<AppState>) -> AppResult<Vec<TagStat>> {
 #[tauri::command]
 pub fn list_tags(state: State<AppState>) -> AppResult<Vec<String>> {
     stats::list_tags(&state.pool)
+}
+
+/// Rename a tag everywhere (merges into the target if it already exists).
+#[tauri::command]
+pub fn rename_tag(state: State<AppState>, old: String, new: String) -> AppResult<()> {
+    games::rename_tag(&state.pool, &old, &new)
+}
+
+/// Delete a tag, removing it from every game.
+#[tauri::command]
+pub fn delete_tag(state: State<AppState>, name: String) -> AppResult<()> {
+    games::delete_tag(&state.pool, &name)
+}
+
+/// Merge several tags into one target tag.
+#[tauri::command]
+pub fn merge_tags(state: State<AppState>, sources: Vec<String>, target: String) -> AppResult<()> {
+    games::merge_tags(&state.pool, &sources, &target)
 }
 
 // ---------- suggestions ----------

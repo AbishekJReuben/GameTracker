@@ -216,15 +216,16 @@ pub fn audit_one(game: &GameDto, media_dir: &Path) -> ContentAuditRow {
                     .or(game.theme_audio_url.clone()),
             ));
         } else {
-            let (yt, itunes) = metadata::resolve_theme(&game.display_name);
-            let status = if yt.is_some() || itunes.is_some() {
+            let theme = metadata::resolve_theme(&game.display_name);
+            let status = if theme.youtube_id.is_some() || theme.audio_url.is_some() || !theme.track_ids.is_empty() {
                 "available"
             } else {
                 "missing"
             };
-            let detail = yt
+            let detail = theme
+                .youtube_id
                 .map(|id| format!("YouTube {id}"))
-                .or(itunes.map(|u| u.chars().take(60).collect()));
+                .or(theme.audio_url.map(|u| u.chars().take(60).collect()));
             probes.push(probe("theme", "Theme audio", status, detail));
         }
     } else {

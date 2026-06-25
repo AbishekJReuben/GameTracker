@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ResponsiveContainer,
@@ -20,7 +20,7 @@ import {
   Legend,
 } from "recharts";
 import { motion } from "motion/react";
-import { Trophy, Star, Gauge, Scale, TrendingUp, TrendingDown, Tag, History, Radar as RadarIcon, Sparkles, Clock, BookOpen, XCircle, Sparkle } from "lucide-react";
+import { Trophy, Star, Gauge, Scale, TrendingUp, TrendingDown, Tag, History, Radar as RadarIcon, Sparkles, Clock, BookOpen, XCircle, Sparkle, Gamepad2, Eye, EyeOff, CalendarRange, Hourglass, Rabbit, Turtle } from "lucide-react";
 import { Page } from "@/components/Page";
 import { SectionTitle, EmptyState, Skeleton, statusLabel } from "@/components/ui";
 import { Panel } from "@/components/Panel";
@@ -40,6 +40,7 @@ import { SteamAchievementBadge, SteamAchievementCollectionSection } from "@/comp
 
 const AXIS = { stroke: "#454c66", fontSize: 11 };
 const STATUS_COLORS: Record<string, string> = { playing: "#34d399", completed: "#7c5cff", backlog: "#3b82f6", dropped: "#f472b6", on_hold: "#f59e0b", watched: "#22d3ee" };
+const MONTH_ABBR = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"];
 
 export default function CollectionPage() {
   const { data, isLoading } = useCatalog();
@@ -111,7 +112,91 @@ export default function CollectionPage() {
 
   const steamAchStats = useMemo(() => aggregateSteamAchievements(games ?? []), [games]);
 
+  // Square treemaps: every app (by active time) and every game (by runtime),
+  // each tile sized to its hours and backed by its own art. Sorted big→small.
+  const appHourItems = useMemo(
+    () =>
+      (games ?? [])
+        .filter((g) => g.kind === "app" && g.totalActiveSeconds > 0)
+        .map((g) => ({ g, seconds: g.totalActiveSeconds }))
+        .sort((a, b) => b.seconds - a.seconds),
+    [games]
+  );
+  const gameHourItems = useMemo(
+    () =>
+      (games ?? [])
+        .filter((g) => g.kind === "game" && g.totalRuntimeSeconds > 0)
+        .map((g) => ({ g, seconds: g.totalRuntimeSeconds }))
+        .sort((a, b) => b.seconds - a.seconds),
+    [games]
+  );
+
   const delta = useMemo(() => (data ? Math.round((data.avgMyScore - data.avgMetacritic) * 10) / 10 : 0), [data]);
+
+  const curYear = new Date().getFullYear();
+
+  // #5 — how much of the current year has elapsed.
+  const yearProgress = useMemo(() => {
+    const start = new Date(curYear, 0, 1).getTime();
+    const end = new Date(curYear + 1, 0, 1).getTime();
+    const pct = Math.min(100, ((Date.now() - start) / (end - start)) * 100);
+    const totalDays = Math.round((end - start) / 86_400_000);
+    const dayOfYear = Math.min(totalDays, Math.floor((Date.now() - start) / 86_400_000) + 1);
+    return { pct, dayOfYear, totalDays, daysLeft: Math.max(0, totalDays - dayOfYear) };
+  }, [curYear]);
+
+  // #4 — completions per month, this year vs last (drives the velocity chart).
+  const velocity = useMemo(() => {
+    const months = MONTH_ABBR.map((label, m) => ({ m, label, cur: 0, prev: 0 }));
+    for (const g of completed) {
+      if (!g.completedYear) continue;
+      // Many CSV imports only have a completion year — default to January so
+      // they still appear on the chart instead of being silently dropped.
+      const mi = Math.max(0, Math.min(11, (g.completedMonth ?? 1) - 1));
+      if (g.completedYear === curYear) months[mi].cur += 1;
+      else if (g.completedYear === curYear - 1) months[mi].prev += 1;
+    }
+    const curTotal = months.reduce((a, x) => a + x.cur, 0);
+    const elapsedMonths = Math.max(1, new Date().getMonth() + 1);
+    return { months, curTotal, pace: curTotal / elapsedMonths };
+  }, [completed, curYear]);
+
+  // #3 — year-over-year comparison of completions, playtime, scores.
+  const yoy = useMemo(() => {
+    const agg = (year: number) => {
+      const list = completed.filter((g) => g.completedYear === year);
+      const rated = list.filter((g) => g.rating != null);
+      return {
+        count: list.length,
+        hours: list.reduce((a, g) => a + g.totalRuntimeSeconds, 0) / 3600,
+        avg: rated.length ? rated.reduce((a, g) => a + (g.rating ?? 0), 0) / rated.length : 0,
+        perfect: list.filter((g) => (g.rating ?? 0) >= 95).length,
+      };
+    };
+    return { cur: agg(curYear), prev: agg(curYear - 1) };
+  }, [completed, curYear]);
+
+  // #8 — your tracked playtime vs HowLongToBeat estimates.
+  const hltb = useMemo(() => {
+    const rows = completed
+      .map((g) => {
+        const estMin = g.hltbMainMinutes ?? g.timeToBeatMinutes ?? 0;
+        const est = estMin * 60;
+        const yours = g.totalRuntimeSeconds;
+        if (est <= 0 || yours <= 600) return null; // need an estimate + real playtime
+        return { g, est, yours, deltaPct: ((yours - est) / est) * 100 };
+      })
+      .filter((r): r is { g: Game; est: number; yours: number; deltaPct: number } => !!r);
+    const avgDelta = rows.length ? rows.reduce((a, r) => a + r.deltaPct, 0) / rows.length : 0;
+    const byDelta = [...rows].sort((a, b) => a.deltaPct - b.deltaPct);
+    return {
+      rows,
+      count: rows.length,
+      avgDelta,
+      faster: byDelta.filter((r) => r.deltaPct < -2).slice(0, 4),
+      slower: byDelta.filter((r) => r.deltaPct > 2).reverse().slice(0, 4),
+    };
+  }, [completed]);
 
   if (isLoading || !data) {
     return (
@@ -232,6 +317,54 @@ export default function CollectionPage() {
           </Panel>
         </div>
         </Reveal>
+
+        {(appHourItems.length > 0 || gameHourItems.length > 0) && (
+          <Reveal delay={0.06}>
+            <div className="grid gap-6 lg:grid-cols-2">
+              <TreemapPanel
+                panelKey="collection.app-hours"
+                games={games ?? []}
+                title="App active hours"
+                subtitle="Where your focused app time goes"
+                icon={<Clock className="h-4 w-4 text-accent-3" />}
+                items={appHourItems}
+                art="icon"
+                emptyMessage="Track some apps to see their active-hours breakdown."
+              />
+              <TreemapPanel
+                panelKey="collection.game-hours"
+                games={games ?? []}
+                title="Game total hours"
+                subtitle="Total runtime across every game you've played"
+                icon={<Gamepad2 className="h-4 w-4 text-accent-1" />}
+                items={gameHourItems}
+                art="cover"
+                emptyMessage="Play tracked games to see their total-hours breakdown."
+              />
+            </div>
+          </Reveal>
+        )}
+
+        <Reveal delay={0.07}>
+          <YearPulsePanel
+            games={games ?? []}
+            year={curYear}
+            progress={yearProgress}
+            velocity={velocity}
+          />
+        </Reveal>
+
+        {(yoy.cur.count > 0 || yoy.prev.count > 0) && (
+          <Reveal delay={0.08}>
+            <YearOverYearPanel games={games ?? []} year={curYear} yoy={yoy} />
+          </Reveal>
+        )}
+
+        {hltb.count > 0 && (
+          <Reveal delay={0.09}>
+            <HltbVerdictPanel games={games ?? []} hltb={hltb} />
+          </Reveal>
+        )}
 
         {data.perYear.length > 0 && (
           <Reveal delay={0.08}>
@@ -599,6 +732,456 @@ function DeltaList({ items, positive }: { items: { g: Game; d: number }[]; posit
           </span>
         </Link>
       ))}
+    </div>
+  );
+}
+
+interface TreeItem {
+  g: Game;
+  seconds: number;
+}
+interface TreeRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+const PIE_COLORS = ["#7c5cff", "#22d3ee", "#34d399", "#f472b6", "#fbbf24", "#60a5fa", "#a78bfa", "#fb923c", "#f87171", "#2dd4bf", "#c084fc", "#facc15"];
+
+/**
+ * Squarified treemap (Bruls–Huizing–van Wijk) over a width×height box. Returns
+ * one rectangle per value, in input order, with tiles kept close to square so
+ * even the long tail stays tappable. Values must be > 0 and pre-sorted big→small.
+ */
+function squarify(values: number[], width: number, height: number): TreeRect[] {
+  const n = values.length;
+  const rects: TreeRect[] = new Array(n);
+  if (n === 0) return rects;
+  const total = values.reduce((a, b) => a + b, 0) || 1;
+  const scale = (width * height) / total;
+  const areas = values.map((v) => v * scale);
+
+  let x = 0, y = 0, w = width, h = height;
+  let i = 0;
+  let row: number[] = [];
+
+  const worst = (idxs: number[], side: number) => {
+    let sum = 0, max = -Infinity, min = Infinity;
+    for (const k of idxs) {
+      const a = areas[k];
+      sum += a;
+      if (a > max) max = a;
+      if (a < min) min = a;
+    }
+    const s2 = sum * sum;
+    const l2 = side * side || 1;
+    return Math.max((l2 * max) / (s2 || 1), s2 / (l2 * (min || 1)));
+  };
+
+  const layout = () => {
+    const sum = row.reduce((a, k) => a + areas[k], 0) || 1;
+    if (w >= h) {
+      const colW = sum / h;
+      let yy = y;
+      for (const k of row) {
+        const rh = (areas[k] / sum) * h;
+        rects[k] = { x, y: yy, w: colW, h: rh };
+        yy += rh;
+      }
+      x += colW;
+      w -= colW;
+    } else {
+      const rowH = sum / w;
+      let xx = x;
+      for (const k of row) {
+        const rw = (areas[k] / sum) * w;
+        rects[k] = { x: xx, y, w: rw, h: rowH };
+        xx += rw;
+      }
+      y += rowH;
+      h -= rowH;
+    }
+    row = [];
+  };
+
+  while (i < n) {
+    const side = Math.min(w, h) || 1;
+    if (row.length === 0) {
+      row.push(i++);
+      continue;
+    }
+    if (worst([...row, i], side) <= worst(row, side)) row.push(i++);
+    else layout();
+  }
+  if (row.length) layout();
+  return rects;
+}
+
+function TreemapPanel({
+  panelKey,
+  games,
+  title,
+  subtitle,
+  icon,
+  items,
+  art,
+  emptyMessage,
+}: {
+  panelKey: string;
+  games: Game[];
+  title: string;
+  subtitle: string;
+  icon: React.ReactNode;
+  items: TreeItem[];
+  art: "cover" | "icon";
+  emptyMessage: string;
+}) {
+  // One title can dwarf the rest — toggle out any of the top 5 individually so
+  // the treemap re-packs and smaller tiles get room.
+  const [excluded, setExcluded] = useState<Set<string>>(() => new Set());
+  const canHide = items.length > 6;
+  const top5 = items.slice(0, 5);
+  const source = items.filter((it) => !excluded.has(it.g.id));
+  const toggleExcluded = (id: string) =>
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const rects = useMemo(() => squarify(source.map((it) => it.seconds), 100, 100), [source]);
+  const totalH = source.reduce((a, it) => a + it.seconds, 0) / 3600;
+
+  return (
+    <Panel panelKey={panelKey} games={games}>
+      <SectionTitle title={title} subtitle={subtitle} right={icon} />
+      {items.length === 0 ? (
+        <EmptyState title="No hours yet" message={emptyMessage} />
+      ) : (
+        <>
+          {canHide && (
+            <div className="mt-1 flex w-full flex-wrap items-center gap-1.5 rounded-xl border border-line bg-white/[0.02] px-2.5 py-2">
+              <span className="mr-1 inline-flex items-center gap-1 text-[10px] font-800 uppercase tracking-wider text-ink-dim">
+                <Eye className="h-3 w-3" />
+                Top 5
+              </span>
+              {top5.map((it, i) => {
+                const out = excluded.has(it.g.id);
+                return (
+                  <button
+                    key={it.g.id}
+                    type="button"
+                    onClick={() => toggleExcluded(it.g.id)}
+                    title={out ? `Show ${it.g.displayName} in the treemap` : `Hide ${it.g.displayName} from the treemap`}
+                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-700 tabular-nums transition focus-ring ${
+                      out ? "border-line/60 text-ink-faint line-through opacity-60" : "border-line text-ink-soft hover:border-accent/40"
+                    }`}
+                  >
+                    {out ? <EyeOff className="h-2.5 w-2.5 shrink-0" /> : <Eye className="h-2.5 w-2.5 shrink-0 opacity-50" />}
+                    <span className="h-2 w-2 rounded-full" style={{ background: it.g.accentColor || PIE_COLORS[i % PIE_COLORS.length] }} />
+                    <span className="max-w-[92px] truncate">{it.g.displayName}</span>
+                    {(it.seconds / 3600).toFixed(1)}h
+                  </button>
+                );
+              })}
+              {excluded.size > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setExcluded(new Set())}
+                  className="ml-auto text-[10px] font-700 text-accent-3 hover:underline"
+                >
+                  Show all
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* The square treemap — every tile is a game/app, sized by hours. */}
+          <div className="relative mt-3 aspect-square w-full overflow-hidden rounded-2xl border border-line bg-bg-900/60">
+            {source.map((it, i) => (
+              <TreemapTile key={it.g.id} item={it} rect={rects[i]} art={art} />
+            ))}
+            <div className="pointer-events-none absolute right-2 top-2 rounded-lg bg-black/55 px-2 py-1 text-right backdrop-blur">
+              <div className="font-display text-sm font-800 tabular-nums text-white">{totalH.toFixed(totalH >= 100 ? 0 : 1)}h</div>
+              <div className="text-[9px] font-700 uppercase tracking-wider text-white/60">{excluded.size > 0 ? "visible" : "total"}</div>
+            </div>
+          </div>
+          <p className="mt-2 text-[10px] text-ink-faint">Tiles sized by hours · hover any tile for its name & time</p>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function TreemapTile({ item, rect, art }: { item: TreeItem; rect: TreeRect | undefined; art: "cover" | "icon" }) {
+  if (!rect) return null;
+  const { g, seconds } = item;
+  const hours = seconds / 3600;
+  const big = rect.w > 16 && rect.h > 13; // enough room for name + hours
+  const med = rect.w > 9 && rect.h > 7;
+  return (
+    <div
+      className="group absolute p-[2px]"
+      style={{ left: `${rect.x}%`, top: `${rect.y}%`, width: `${rect.w}%`, height: `${rect.h}%` }}
+      title={`${g.displayName} · ${hours.toFixed(1)}h`}
+    >
+      <Link
+        to={`/game/${g.id}`}
+        className="relative block h-full w-full overflow-hidden rounded-md ring-1 ring-inset ring-black/40 transition duration-200 hover:z-20 hover:ring-2 hover:ring-white/70"
+      >
+        <GameArt
+          id={g.id}
+          name={g.displayName}
+          cover={g.coverPath}
+          icon={g.iconPath}
+          accent={g.accentColor}
+          steamAppId={g.steamAppId}
+          variant={art === "icon" ? "icon" : undefined}
+          className="absolute inset-0 h-full w-full"
+          rounded="rounded-md"
+        />
+        <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/25 to-black/5" />
+        <div className={`absolute inset-x-0 bottom-0 p-1.5 transition-opacity duration-200 ${big ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`}>
+          <div className="truncate text-[11px] font-800 leading-tight text-white drop-shadow">{g.displayName}</div>
+          <div className="text-[10px] font-700 tabular-nums text-white/85">{hours.toFixed(1)}h</div>
+        </div>
+        {!big && med && (
+          <div className="absolute left-1 top-1 rounded bg-black/55 px-1 py-0.5 text-[9px] font-800 tabular-nums text-white opacity-0 transition-opacity group-hover:opacity-100">
+            {hours.toFixed(1)}h
+          </div>
+        )}
+      </Link>
+    </div>
+  );
+}
+
+// ---- This-year analytics (#3 YoY, #4 velocity, #5 year progress) ----
+
+interface YearProgress {
+  pct: number;
+  dayOfYear: number;
+  totalDays: number;
+  daysLeft: number;
+}
+interface VelocityData {
+  months: { m: number; label: string; cur: number; prev: number }[];
+  curTotal: number;
+  pace: number;
+}
+
+function YearRing({ pct }: { pct: number }) {
+  const r = 30;
+  const circ = 2 * Math.PI * r;
+  const offset = circ * (1 - Math.min(100, Math.max(0, pct)) / 100);
+  return (
+    <div className="relative h-[84px] w-[84px] shrink-0">
+      <svg viewBox="0 0 80 80" className="h-full w-full -rotate-90">
+        <defs>
+          <linearGradient id="yearRing" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stopColor="var(--accent-1)" />
+            <stop offset="100%" stopColor="var(--accent-3)" />
+          </linearGradient>
+        </defs>
+        <circle cx="40" cy="40" r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="7" />
+        <motion.circle
+          cx="40"
+          cy="40"
+          r={r}
+          fill="none"
+          stroke="url(#yearRing)"
+          strokeWidth="7"
+          strokeLinecap="round"
+          strokeDasharray={circ}
+          initial={{ strokeDashoffset: circ }}
+          whileInView={{ strokeDashoffset: offset }}
+          viewport={{ once: true }}
+          transition={{ duration: 1, ease: [0.22, 1, 0.36, 1] }}
+          style={{ filter: "drop-shadow(0 0 6px color-mix(in srgb, var(--accent-1) 60%, transparent))" }}
+        />
+      </svg>
+      <div className="absolute inset-0 grid place-items-center">
+        <CalendarRange className="h-5 w-5 text-accent-3" />
+      </div>
+    </div>
+  );
+}
+
+function YearPulsePanel({ games, year, progress, velocity }: { games: Game[]; year: number; progress: YearProgress; velocity: VelocityData }) {
+  const enabled = useMotionEnabled();
+  const maxBar = Math.max(1, ...velocity.months.flatMap((m) => [m.cur, m.prev]));
+  const chartH = 100;
+  return (
+    <Panel panelKey="collection.year-pulse" games={games}>
+      <SectionTitle title={`${year} in focus`} subtitle="How far through the year — and your completion pace" right={<CalendarRange className="h-4 w-4 text-ink-dim" />} />
+      <div className="mt-2 grid gap-5 lg:grid-cols-[minmax(0,250px)_1fr] lg:items-center">
+        <div className="flex items-center gap-4">
+          <YearRing pct={progress.pct} />
+          <div>
+            <div className="font-display text-3xl font-900 tabular-nums leading-none">{progress.pct.toFixed(0)}%</div>
+            <div className="mt-1 text-xs text-ink-dim">of {year} gone</div>
+            <div className="mt-2 text-[11px] text-ink-faint">
+              Day {progress.dayOfYear} · <span className="text-ink-soft">{progress.daysLeft}</span> days left
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div className="mb-2 flex items-center justify-between text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+            <span>Completions per month</span>
+            <span className="normal-case tracking-normal text-ink-faint">
+              <span className="font-800 text-ink-soft">{velocity.curTotal}</span> this year · {velocity.pace.toFixed(1)}/mo pace
+            </span>
+          </div>
+          <div className="flex h-[120px] items-end gap-1.5">
+            {velocity.months.map((m, i) => {
+              const curH = m.cur > 0 ? Math.max(6, Math.round((m.cur / maxBar) * chartH)) : 0;
+              const prevH = m.prev > 0 ? Math.max(4, Math.round((m.prev / maxBar) * chartH)) : 0;
+              return (
+                <div key={i} className="flex flex-1 flex-col items-center gap-1">
+                  <div className="relative flex w-full items-end justify-center" style={{ height: chartH }}>
+                    {prevH > 0 && (
+                      <div
+                        className="absolute bottom-0 w-full rounded-t bg-white/[0.07]"
+                        style={{ height: prevH }}
+                        title={`${year - 1}: ${m.prev}`}
+                      />
+                    )}
+                    {enabled ? (
+                      <motion.div
+                        className="relative w-[68%] rounded-t bg-accent-sheen"
+                        initial={false}
+                        animate={{ height: curH }}
+                        transition={{ delay: i * 0.03, duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+                        style={{ boxShadow: m.cur > 0 ? "0 0 14px -4px var(--accent-1)" : undefined }}
+                        title={`${year}: ${m.cur}`}
+                      />
+                    ) : (
+                      <div
+                        className="relative w-[68%] rounded-t bg-accent-sheen"
+                        style={{ height: curH, boxShadow: m.cur > 0 ? "0 0 14px -4px var(--accent-1)" : undefined }}
+                        title={`${year}: ${m.cur}`}
+                      />
+                    )}
+                  </div>
+                  <span className="text-[9px] font-700 text-ink-faint">{m.label}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-2 flex gap-4 text-[10px] text-ink-dim">
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-accent-sheen" /> {year}</span>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-white/20" /> {year - 1}</span>
+          </div>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+interface YoYAgg {
+  count: number;
+  hours: number;
+  avg: number;
+  perfect: number;
+}
+
+function YearOverYearPanel({ games, year, yoy }: { games: Game[]; year: number; yoy: { cur: YoYAgg; prev: YoYAgg } }) {
+  const metrics: { label: string; cur: number; prev: number; fmt: (n: number) => string; points?: boolean }[] = [
+    { label: "Completed", cur: yoy.cur.count, prev: yoy.prev.count, fmt: (n) => String(Math.round(n)) },
+    { label: "Hours played", cur: yoy.cur.hours, prev: yoy.prev.hours, fmt: (n) => `${n.toFixed(0)}h` },
+    { label: "Avg score", cur: yoy.cur.avg, prev: yoy.prev.avg, fmt: (n) => (n ? n.toFixed(1) : "—"), points: true },
+    { label: "Perfect (95+)", cur: yoy.cur.perfect, prev: yoy.prev.perfect, fmt: (n) => String(Math.round(n)) },
+  ];
+  return (
+    <Panel panelKey="collection.yoy" games={games}>
+      <SectionTitle title="Year over year" subtitle={`${year} vs ${year - 1}`} right={<TrendingUp className="h-4 w-4 text-ink-dim" />} />
+      <div className="mt-2 grid grid-cols-2 gap-3 md:grid-cols-4">
+        {metrics.map((m) => {
+          const diff = m.cur - m.prev;
+          const pct = m.points ? diff : m.prev > 0 ? (diff / m.prev) * 100 : m.cur > 0 ? 100 : 0;
+          const up = diff >= 0;
+          const color = up ? "#34d399" : "#f472b6";
+          const show = !(m.cur === 0 && m.prev === 0);
+          return (
+            <div key={m.label} className="rounded-2xl border border-line bg-white/[0.02] p-3">
+              <div className="text-[10px] font-700 uppercase tracking-wider text-ink-dim">{m.label}</div>
+              <div className="mt-1 font-display text-2xl font-800 tabular-nums text-ink">{m.fmt(m.cur)}</div>
+              <div className="mt-1.5 flex items-center justify-between gap-2">
+                <span className="text-[10px] text-ink-faint">{year - 1}: {m.fmt(m.prev)}</span>
+                {show && (m.cur !== m.prev) && (
+                  <span className="inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-800 tabular-nums" style={{ background: `color-mix(in srgb, ${color} 16%, transparent)`, color }}>
+                    {up ? <TrendingUp className="h-2.5 w-2.5" /> : <TrendingDown className="h-2.5 w-2.5" />}
+                    {m.points ? `${diff >= 0 ? "+" : ""}${diff.toFixed(1)}` : `${diff >= 0 ? "+" : ""}${Math.round(pct)}%`}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+interface HltbRow {
+  g: Game;
+  est: number;
+  yours: number;
+  deltaPct: number;
+}
+
+function HltbVerdictPanel({ games, hltb }: { games: Game[]; hltb: { count: number; avgDelta: number; faster: HltbRow[]; slower: HltbRow[] } }) {
+  const faster = hltb.avgDelta < 0;
+  return (
+    <Panel panelKey="collection.hltb" games={games}>
+      <SectionTitle title="You vs HowLongToBeat" subtitle={`Your playtime against community estimates · ${hltb.count} games`} right={<Hourglass className="h-4 w-4 text-ink-dim" />} />
+      <div className="mt-2 flex flex-wrap items-center gap-4 rounded-2xl border border-line bg-white/[0.015] p-4">
+        <div
+          className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl"
+          style={{ background: `color-mix(in srgb, ${faster ? "#34d399" : "#f59e0b"} 16%, transparent)`, color: faster ? "#34d399" : "#f59e0b" }}
+        >
+          {faster ? <Rabbit className="h-7 w-7" /> : <Turtle className="h-7 w-7" />}
+        </div>
+        <div className="min-w-0">
+          <div className="font-display text-2xl font-900 tabular-nums text-ink">
+            {Math.abs(hltb.avgDelta).toFixed(0)}% {faster ? "faster" : "slower"}
+          </div>
+          <div className="text-sm text-ink-dim">
+            On average you finish {faster ? "quicker than" : "slower than"} the typical HowLongToBeat main story.
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 grid gap-6 md:grid-cols-2">
+        <HltbList title="Speedran" subtitle="Finished well under estimate" rows={hltb.faster} positive />
+        <HltbList title="Savored" subtitle="Took your time over the estimate" rows={hltb.slower} positive={false} />
+      </div>
+    </Panel>
+  );
+}
+
+function HltbList({ title, subtitle, rows, positive }: { title: string; subtitle: string; rows: HltbRow[]; positive: boolean }) {
+  const color = positive ? "#34d399" : "#f472b6";
+  if (rows.length === 0) return null;
+  return (
+    <div>
+      <div className="mb-0.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">{title}</div>
+      <p className="mb-3 text-xs text-ink-faint">{subtitle}</p>
+      <div className="space-y-1">
+        {rows.map(({ g, est, yours, deltaPct }) => (
+          <Link key={g.id} to={`/game/${g.id}`} className="flex items-center gap-3 rounded-xl px-2 py-2 transition hover:bg-white/[0.03]">
+            <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-9 w-9" rounded="rounded-lg" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-700">{g.displayName}</div>
+              <div className="text-[11px] text-ink-dim">You {dur(yours)} · HLTB {dur(est)}</div>
+            </div>
+            <span className="shrink-0 rounded-lg px-2 py-1 text-sm font-800 tabular-nums" style={{ background: `color-mix(in srgb, ${color} 16%, transparent)`, color }}>
+              {deltaPct >= 0 ? "+" : ""}
+              {deltaPct.toFixed(0)}%
+            </span>
+          </Link>
+        ))}
+      </div>
     </div>
   );
 }

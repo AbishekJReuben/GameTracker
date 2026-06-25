@@ -115,6 +115,32 @@
   --accent-2: #c084fc;
   --accent-3: #fbbf24;
 }
+:root[data-accent="synthwave"] {
+  --accent-1: #e94aff;
+  --accent-2: #7c5cff;
+  --accent-3: #22d3ee;
+}
+:root[data-accent="gold"] {
+  --accent-1: #fbbf24;
+  --accent-2: #f59e0b;
+  --accent-3: #fde68a;
+}
+:root[data-accent="forest"] {
+  --accent-1: #22c55e;
+  --accent-2: #14b8a6;
+  --accent-3: #a3e635;
+}
+:root[data-accent="rose"] {
+  --accent-1: #fb7185;
+  --accent-2: #f472b6;
+  --accent-3: #c084fc;
+}
+:root[data-accent="mono"] {
+  --accent-1: #94a3b8;
+  --accent-2: #64748b;
+  --accent-3: #cbd5e1;
+}
+/* "custom" sets --accent-1/2/3 inline on :root (see applyPrefsToDom). */
 
 /* ---------------------------------------------------------------- keyframes */
 @keyframes shimmer {
@@ -240,6 +266,43 @@
   }
   50% {
     transform: translateY(-16px);
+  }
+}
+/* In-place "fx" backdrop animations (no marquee scroll). */
+@keyframes gt-twinkle {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes gt-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.06);
+  }
+}
+@keyframes gt-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-7px);
+  }
+}
+@keyframes gt-tilt {
+  0%,
+  100% {
+    transform: scale(1.15) rotateX(4deg) rotateY(-8deg);
+  }
+  50% {
+    transform: scale(1.15) rotateX(-3deg) rotateY(9deg);
   }
 }
 @keyframes blink {

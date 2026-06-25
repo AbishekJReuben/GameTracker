@@ -104,6 +104,7 @@ function makeGame(s: Seed, runtime: number, active: number, sessions: number, la
     trailerUrl: s.id.startsWith("g-hk") ? "https://video.akamai.steamstatic.com/store_trailers/256679401/movie_max.mp4" : null,
     themeYoutubeId: s.id.startsWith("g-hk") ? "UWZSi5dkb_Q" : null,
     themeAudioUrl: null,
+    themeTrackIds: s.id.startsWith("g-hk") ? ["UWZSi5dkb_Q", "9Zd6D8qP7kM"] : [],
     steamAchievementsUnlocked: s.id.startsWith("g-hk") ? 42 : null,
     steamAchievementsTotal: s.id.startsWith("g-hk") ? 63 : null,
     steamAchievementsSyncedUtc: s.id.startsWith("g-hk") ? nowIso : null,
@@ -680,6 +681,10 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
     }
     case "list_tags":
       return [...new Set(MOCK_GAMES.flatMap((g) => g.tags))].sort() as T;
+    case "rename_tag":
+    case "delete_tag":
+    case "merge_tags":
+      return undefined as T;
     case "suggest_games":
       return {
         generatedAt: new Date().toISOString(),
@@ -820,6 +825,7 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         trailerUrl: null,
         themeYoutubeId: null,
         themeAudioUrl: null,
+        themeTrackIds: [],
         steamAchievementsUnlocked: null,
         steamAchievementsTotal: null,
         steamAchievementsSyncedUtc: null,

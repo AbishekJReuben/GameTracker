@@ -1,6 +1,6 @@
 import type { Game, Session } from "@/lib/api";
 import type { MarqueeFXVariant } from "@/components/MarqueeFX";
-import { MARQUEE_VARIANTS } from "@/components/MarqueeFX";
+import { MOVING_VARIANTS, FX_VARIANTS } from "@/components/MarqueeFX";
 
 export type PanelArtKind = "cover" | "icon";
 
@@ -24,9 +24,16 @@ function hashKey(key: string): number {
   return Math.abs(h);
 }
 
-/** Stable variant per panel key — spreads across 30 techniques. */
+/**
+ * Stable variant per panel key. Only ~40% of panels get a *scrolling* marquee;
+ * the other ~60% get an in-place "fx" technique (fade, breathe, glow, light,
+ * tilt, ken-burns…) so the app doesn't feel like everything is sliding.
+ */
 export function panelVariant(panelKey: string): MarqueeFXVariant {
-  return MARQUEE_VARIANTS[hashKey(panelKey) % MARQUEE_VARIANTS.length]!;
+  const h = hashKey(panelKey);
+  const moving = h % 5 < 2; // 2 of every 5 → 40%
+  const pool = moving ? MOVING_VARIANTS : FX_VARIANTS;
+  return pool[(h >>> 3) % pool.length]!;
 }
 
 function sortLibrary(games: Game[]): Game[] {
@@ -100,7 +107,11 @@ export function panelArt(panelKey: string, ctx: PanelArtContext): PanelArtResult
     games = completedGames(library).length ? completedGames(library) : topPlayed(library);
   } else if (key.startsWith("sessions")) {
     const ids = new Set((ctx.sessions ?? []).map((s) => s.gameId));
-    games = library.filter((g) => ids.has(g.id));
+    const inView = library.filter((g) => ids.has(g.id));
+    // Always top up with the most-played art so a single-game day still has a
+    // varied backdrop instead of the same cover repeated across the panel.
+    const extra = topPlayed(library).filter((g) => !ids.has(g.id));
+    games = [...inView, ...extra];
     if (!games.length) games = topPlayed(library);
   } else if (key.startsWith("apps")) {
     games = library.filter((g) => g.kind === "app");

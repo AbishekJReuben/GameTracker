@@ -109,9 +109,15 @@ fn repair_game(
             }
             if game.theme_youtube_id.is_none() && game.theme_audio_url.is_none() {
                 let theme_name = details.name.as_deref().unwrap_or(&game.display_name);
-                let (yt, audio) = metadata::resolve_theme(theme_name);
-                if yt.is_some() || audio.is_some() {
-                    games::set_theme(pool, &game.id, yt.as_deref(), audio.as_deref())?;
+                let theme = metadata::resolve_theme(theme_name);
+                if theme.youtube_id.is_some() || theme.audio_url.is_some() || !theme.track_ids.is_empty() {
+                    games::set_theme(
+                        pool,
+                        &game.id,
+                        theme.youtube_id.as_deref(),
+                        theme.audio_url.as_deref(),
+                        &theme.track_ids,
+                    )?;
                     fixes.push("theme audio resolved".into());
                 }
             }
@@ -156,6 +162,7 @@ fn repair_game(
                     &game.id,
                     meta.theme_youtube_id.as_deref(),
                     meta.theme_audio_url.as_deref(),
+                    &meta.theme_track_ids,
                 )?;
                 fixes.push("metadata via RAWG/Steam fallback".into());
             }
@@ -194,6 +201,27 @@ fn repair_game(
         if let Some(fixed) = metadata::trailer_playable_url(raw).filter(|u| u != raw) {
             games::set_media(pool, &game.id, &[], None, None, Some(&fixed))?;
             fixes.push("trailer url fixed (480 fallback)".into());
+        }
+    }
+
+    // Backfill multi-track OST lists for games enriched before migration v17,
+    // or refresh lists that may include long compilations.
+    let needs_ost_refresh = game.theme_track_ids.is_empty()
+        || game
+            .theme_youtube_id
+            .as_ref()
+            .is_some_and(|id| game.theme_track_ids.first() != Some(id));
+    if game.kind == "game" && needs_ost_refresh {
+        let theme = metadata::resolve_theme(&game.display_name);
+        if !theme.track_ids.is_empty() {
+            games::set_theme(
+                pool,
+                &game.id,
+                theme.youtube_id.as_deref().or(game.theme_youtube_id.as_deref()),
+                game.theme_audio_url.as_deref(),
+                &theme.track_ids,
+            )?;
+            fixes.push("OST track list backfilled".into());
         }
     }
 

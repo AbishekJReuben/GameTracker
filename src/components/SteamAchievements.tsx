@@ -17,7 +17,8 @@ import {
 } from "@/lib/steamAchievements";
 import { relativeTime } from "@/lib/format";
 import { useMotionEnabled } from "@/store/app";
-import { Card, EmptyState, SectionTitle, Segmented, Skeleton } from "./ui";
+import { EmptyState, SectionTitle, Segmented, Skeleton } from "./ui";
+import { MarqueeCard } from "./MarqueeFX";
 import { GameArt } from "./GameArt";
 import { cn } from "@/lib/cn";
 import { useSteamAchievements, useSteamAchievementsOverview } from "@/lib/queries";
@@ -116,7 +117,7 @@ export function SteamAchievementDetailPanel({ game }: { game: Game }) {
   }
 
   return (
-    <Card className="mb-6">
+    <MarqueeCard variant="drift" games={[game]} opacity={0.1} className="mb-6">
       <SectionTitle
         title="Steam achievements"
         subtitle={
@@ -189,7 +190,7 @@ export function SteamAchievementDetailPanel({ game }: { game: Game }) {
           View on Steam
         </a>
       )}
-    </Card>
+    </MarqueeCard>
   );
 }
 
@@ -412,7 +413,7 @@ export function SteamAchievementCard({ game }: { game: Game }) {
   const pct = steamAchievementPercent(game)!;
 
   return (
-    <Card>
+    <MarqueeCard variant="drift" games={[game]} opacity={0.1}>
       <SectionTitle
         title="Steam achievements"
         subtitle={
@@ -449,7 +450,7 @@ export function SteamAchievementCard({ game }: { game: Game }) {
           </a>
         )}
       </div>
-    </Card>
+    </MarqueeCard>
   );
 }
 
@@ -463,7 +464,7 @@ export function SteamAchievementCollectionSection({ games }: { games: Game[] }) 
   if (gamesTracked === 0 && !isLoading) return null;
 
   return (
-    <Card>
+    <MarqueeCard variant="drift" games={leaders.length ? leaders : games} opacity={0.1}>
       <SectionTitle
         title="Steam achievements"
         subtitle={
@@ -545,7 +546,7 @@ export function SteamAchievementCollectionSection({ games }: { games: Game[] }) 
           Sync achievements from Settings → Steam sync to keep this list current.
         </p>
       )}
-    </Card>
+    </MarqueeCard>
   );
 }
 
@@ -561,7 +562,7 @@ export function SteamAchievementInsightsBlock({ games }: { games: Game[] }) {
   if (gamesTracked === 0) return null;
 
   return (
-    <Card>
+    <MarqueeCard variant="drift" games={leaders.length ? leaders : games} opacity={0.1}>
       <SectionTitle
         title="Steam achievements"
         subtitle={
@@ -609,7 +610,7 @@ export function SteamAchievementInsightsBlock({ games }: { games: Game[] }) {
           ))}
         </div>
       )}
-    </Card>
+    </MarqueeCard>
   );
 }
 

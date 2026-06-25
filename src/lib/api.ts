@@ -55,6 +55,8 @@ export interface Game {
   trailerUrl: string | null;
   themeYoutubeId: string | null;
   themeAudioUrl: string | null;
+  /** Up to five YouTube OST tracks per game (enrichment). */
+  themeTrackIds: string[];
   steamAchievementsUnlocked: number | null;
   steamAchievementsTotal: number | null;
   steamAchievementsSyncedUtc: string | null;
@@ -753,6 +755,9 @@ export const api = {
   closeEmbed: (label: string) => call<void>("close_embed", { label }),
   tagAnalytics: () => call<TagStat[]>("tag_analytics"),
   listTags: () => call<string[]>("list_tags"),
+  renameTag: (old: string, name: string) => call<void>("rename_tag", { old, new: name }),
+  deleteTag: (name: string) => call<void>("delete_tag", { name }),
+  mergeTags: (sources: string[], target: string) => call<void>("merge_tags", { sources, target }),
   suggestGames: (refresh = false) => call<SuggestionsResult>("suggest_games", { refresh }),
   addSuggestedGame: (input: AddSuggestionInput) => call<Game>("add_suggested_game", { input }),
   setSuggestedExcludedTags: (tags: string[]) =>

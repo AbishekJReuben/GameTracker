@@ -44,10 +44,17 @@ export type MarqueeFXVariant =
   | "frost"
   | "accent"
   | "columns"
-  | "icons";
+  | "icons"
+  // Non-translating "fx" techniques (no marquee scroll):
+  | "crossfade"
+  | "breathe"
+  | "float"
+  | "glow"
+  | "lightfield"
+  | "tiltpan";
 
-/** All backdrop techniques — used for deterministic per-panel assignment. */
-export const MARQUEE_VARIANTS: MarqueeFXVariant[] = [
+/** Techniques that translate (a scrolling marquee, horizontal or vertical). */
+export const MOVING_VARIANTS: MarqueeFXVariant[] = [
   "drift",
   "driftReverse",
   "vertical",
@@ -59,17 +66,14 @@ export const MARQUEE_VARIANTS: MarqueeFXVariant[] = [
   "duotone",
   "grayscale",
   "bokeh",
-  "kenburns",
   "ticker",
   "wave",
-  "spotlight",
   "mosaic",
   "pulse",
   "shader",
   "filmstrip",
   "hexgrid",
   "orbit",
-  "zoom",
   "stagger",
   "ribbon",
   "polaroid",
@@ -79,6 +83,23 @@ export const MARQUEE_VARIANTS: MarqueeFXVariant[] = [
   "columns",
   "icons",
 ];
+
+/** Techniques that animate *in place* — no marquee scroll (fades, breathing,
+ *  floating, glow, light field, ken-burns, spotlight, tilt). */
+export const FX_VARIANTS: MarqueeFXVariant[] = [
+  "crossfade",
+  "breathe",
+  "float",
+  "glow",
+  "lightfield",
+  "tiltpan",
+  "kenburns",
+  "zoom",
+  "spotlight",
+];
+
+/** All backdrop techniques — used for deterministic per-panel assignment. */
+export const MARQUEE_VARIANTS: MarqueeFXVariant[] = [...MOVING_VARIANTS, ...FX_VARIANTS];
 
 type ArtKind = "cover" | "icon";
 
@@ -94,6 +115,12 @@ const DEFAULT_OPACITY: Partial<Record<MarqueeFXVariant, number>> = {
   filmstrip: 0.18,
   frost: 0.2,
   icons: 0.14,
+  crossfade: 0.18,
+  breathe: 0.16,
+  float: 0.16,
+  glow: 0.24,
+  lightfield: 0.24,
+  tiltpan: 0.16,
 };
 
 function sortByArt(games: Game[]): Game[] {
@@ -365,6 +392,64 @@ function TextTicker({ labels, motionOn }: { labels: string[]; motionOn: boolean 
   );
 }
 
+/** A static grid of covers (no scroll); each tile can carry an in-place animation. */
+function StaticGrid({
+  games,
+  motionOn,
+  tileStyle,
+  art = "cover",
+}: {
+  games: Game[];
+  motionOn: boolean;
+  tileStyle?: (i: number) => CSSProperties | undefined;
+  art?: ArtKind;
+}) {
+  const tiles = games.slice(0, 18);
+  return (
+    <div className="absolute inset-0 grid grid-cols-5 gap-2 p-2 sm:grid-cols-7">
+      {tiles.map((g, i) => (
+        <div
+          key={`${g.id}-${i}`}
+          className="aspect-[3/4] overflow-hidden rounded-lg border border-white/5"
+          style={motionOn ? tileStyle?.(i) : undefined}
+        >
+          <GameArt
+            id={g.id}
+            name={g.displayName}
+            cover={g.coverPath}
+            icon={g.iconPath}
+            accent={g.accentColor}
+            steamAppId={g.steamAppId}
+            variant={art === "icon" ? "icon" : undefined}
+            className="h-full w-full"
+            rounded="rounded-lg"
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** A few large blurred covers with a slow pulsing accent glow — fully static. */
+function GlowWall({ games, motionOn }: { games: Game[]; motionOn: boolean }) {
+  const picks = games.slice(0, 4);
+  return (
+    <div className="absolute inset-0 flex">
+      {picks.map((g, i) => (
+        <div key={g.id} className="relative flex-1 overflow-hidden">
+          <div className="absolute inset-0 scale-110 blur-[3px]">
+            <GameArt id={g.id} name={g.displayName} cover={g.coverPath} icon={g.iconPath} accent={g.accentColor} steamAppId={g.steamAppId} className="h-full w-full" rounded="rounded-none" />
+          </div>
+          <div
+            className="absolute inset-0 bg-accent-sheen/25 mix-blend-soft-light"
+            style={motionOn ? { animation: "glow-pulse 5s ease-in-out infinite", animationDelay: `${i * 0.6}s` } : undefined}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function MarqueeFX({
   variant,
   games = [],
@@ -604,6 +689,59 @@ export function MarqueeFX({
     case "icons":
       content = hasCovers && (
         <CoverTrack games={sorted} durationSec={52} motionOn={motionOn} art="icon" aspect="aspect-square" gap="gap-2" tileClassName="rounded-xl" />
+      );
+      break;
+    case "crossfade":
+      content = hasCovers && (
+        <StaticGrid
+          games={sorted}
+          motionOn={motionOn}
+          art={art}
+          tileStyle={(i) => ({ animation: "gt-twinkle 4.5s ease-in-out infinite", animationDelay: `${(i % 9) * 0.25}s`, willChange: "opacity" })}
+        />
+      );
+      break;
+    case "breathe":
+      content = hasCovers && (
+        <StaticGrid
+          games={sorted}
+          motionOn={motionOn}
+          art={art}
+          tileStyle={(i) => ({ animation: "gt-breathe 5.5s ease-in-out infinite", animationDelay: `${(i % 7) * 0.3}s`, transformOrigin: "center", willChange: "transform" })}
+        />
+      );
+      break;
+    case "float":
+      content = hasCovers && (
+        <StaticGrid
+          games={sorted}
+          motionOn={motionOn}
+          art={art}
+          tileStyle={(i) => ({ animation: "gt-float 6s ease-in-out infinite", animationDelay: `${(i % 5) * 0.4}s`, willChange: "transform" })}
+        />
+      );
+      break;
+    case "glow":
+      content = hasCovers && <GlowWall games={sorted} motionOn={motionOn} />;
+      break;
+    case "lightfield":
+      content = hasCovers && (
+        <>
+          <StaticGrid games={sorted} motionOn={false} art={art} />
+          <MarqueeShader />
+        </>
+      );
+      break;
+    case "tiltpan":
+      content = hasCovers && (
+        <div className="absolute inset-0 [perspective:1000px]">
+          <div
+            className="absolute inset-0 scale-[1.15]"
+            style={motionOn ? { animation: "gt-tilt 14s ease-in-out infinite", transformStyle: "preserve-3d", willChange: "transform" } : undefined}
+          >
+            <StaticGrid games={sorted} motionOn={false} art={art} />
+          </div>
+        </div>
       );
       break;
   }

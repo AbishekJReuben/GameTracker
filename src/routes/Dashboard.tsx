@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { Link } from "react-router-dom";
-import { Zap, Flame, CalendarDays, Library as LibraryIcon, Plus, TrendingUp, TrendingDown, ArrowUpRight, Clock, Target, Focus, Layers, Gamepad2, Sparkles } from "lucide-react";
+import { Zap, Flame, CalendarDays, Library as LibraryIcon, Plus, TrendingUp, TrendingDown, ArrowUpRight, Clock, Target, Focus, Layers, Gamepad2, Sparkles, Coffee } from "lucide-react";
 import { Page } from "@/components/Page";
 import { NowPlaying } from "@/components/NowPlaying";
 import { StatTile } from "@/components/StatTile";
@@ -76,6 +76,26 @@ export default function Dashboard() {
     if (h < 18) return "Good afternoon";
     return "Good evening";
   }, []);
+
+  // A streak that's never "0 days": if the most recent days have gaming it's a
+  // play streak; otherwise it's a "rest" streak of consecutive days off. Derived
+  // from the heatmap so it's always consistent with what's on screen.
+  const streak = useMemo(() => {
+    const days = heat ?? [];
+    if (days.length === 0) {
+      const c = data?.currentStreak ?? 0;
+      return c > 0 ? { gaming: true, count: c } : { gaming: false, count: 1 };
+    }
+    const sorted = [...days].sort((a, b) => a.date.localeCompare(b.date));
+    let i = sorted.length - 1;
+    const gaming = sorted[i].seconds > 0;
+    let count = 0;
+    while (i >= 0 && sorted[i].seconds > 0 === gaming) {
+      count += 1;
+      i -= 1;
+    }
+    return { gaming, count: Math.max(1, count) };
+  }, [heat, data]);
 
   const weekDelta = useMemo(() => {
     if (!data) return 0;
@@ -164,7 +184,7 @@ export default function Dashboard() {
           {/* A drifting portrait cover wall, slotted left of the now-compacter stats. */}
           {marqueeBase && (
             <div className="hidden xl:block">
-              <VerticalCoverMarquee games={games ?? []} className="h-full min-h-[240px]" />
+              <VerticalCoverMarquee games={games ?? []} screenshots={screenshotPool} className="h-full min-h-[240px]" />
             </div>
           )}
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4 lg:grid-rows-2">
@@ -188,7 +208,11 @@ export default function Dashboard() {
             >
               {data && data.last14.length > 0 && <Sparkline values={data.last14.map((d) => d.seconds)} width={96} height={40} />}
             </StatTile>
-            <StatTile icon={<Flame className="h-[18px] w-[18px]" />} label="Streak" value={data?.currentStreak ?? 0} suffix={data?.currentStreak === 1 ? " day" : " days"} accent="#fbbf24" delay={0.1} hint={data ? `Longest ${data.longestStreak} days` : ""} />
+            {streak.gaming ? (
+              <StatTile icon={<Flame className="h-[18px] w-[18px]" />} label="Play streak" value={streak.count} suffix={streak.count === 1 ? " day" : " days"} accent="#fbbf24" delay={0.1} hint={data ? `Longest ${data.longestStreak} days` : ""} />
+            ) : (
+              <StatTile icon={<Coffee className="h-[18px] w-[18px]" />} label="Rest streak" value={streak.count} suffix={streak.count === 1 ? " day" : " days"} accent="#60a5fa" delay={0.1} hint={data ? `Best play streak ${data.longestStreak}d` : ""} />
+            )}
             <StatTile icon={<LibraryIcon className="h-[18px] w-[18px]" />} label="Library" value={data?.gamesTotal ?? 0} accent="var(--accent-1)" delay={0.14} hint={data ? `${data.gamesCompleted} completed · ${data.gamesTracked} tracked` : ""} />
             <StatTile icon={<Clock className="h-[18px] w-[18px]" />} label="All-time" value={data ? data.totalActive / 3600 : 0} decimals={0} suffix="h" accent="#a78bfa" delay={0.02} hint={data ? `${data.sessionCount} sessions` : ""} />
             <StatTile icon={<CalendarDays className="h-[18px] w-[18px]" />} label="This month" value={data ? data.monthActive / 3600 : 0} decimals={1} suffix="h" accent="#60a5fa" delay={0.06} hint={data ? `${dur(data.monthRuntime)} runtime` : ""} />

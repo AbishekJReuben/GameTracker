@@ -11,7 +11,22 @@ export interface Toast {
   icon?: string | null;
 }
 
-export type AccentTheme = "aurora" | "toxic" | "ember" | "magma" | "ice" | "sunset";
+export type AccentTheme =
+  | "aurora"
+  | "toxic"
+  | "ember"
+  | "magma"
+  | "ice"
+  | "sunset"
+  | "synthwave"
+  | "gold"
+  | "forest"
+  | "rose"
+  | "mono"
+  | "custom";
+
+/** A user-defined accent: three hex stops (start → mid → end). */
+export type CustomAccent = [string, string, string];
 export type MotionLevel = "full" | "reduced" | "off";
 export type Density = "cozy" | "compact";
 export type TimeFormat = "12h" | "24h";
@@ -42,6 +57,8 @@ export interface SessionFilters {
 
 export interface Prefs {
   accent: AccentTheme;
+  /** The three hex stops used when `accent === "custom"`. */
+  customAccent: CustomAccent;
   motion: MotionLevel;
   density: Density;
   background: boolean;
@@ -73,6 +90,7 @@ export interface Prefs {
 
 const DEFAULT_PREFS: Prefs = {
   accent: "aurora",
+  customAccent: ["#7c5cff", "#3b82f6", "#22d3ee"],
   motion: "full",
   density: "cozy",
   background: true,
@@ -159,6 +177,17 @@ export function applyPrefsToDom(p: Prefs) {
   el.dataset.accent = p.accent;
   el.dataset.motion = p.motion === "off" ? "off" : "on";
   el.dataset.density = p.density;
+  // A custom accent overrides the three palette vars inline; any preset clears
+  // the overrides so its [data-accent] stylesheet rule takes effect again.
+  if (p.accent === "custom" && p.customAccent) {
+    el.style.setProperty("--accent-1", p.customAccent[0]);
+    el.style.setProperty("--accent-2", p.customAccent[1]);
+    el.style.setProperty("--accent-3", p.customAccent[2]);
+  } else {
+    el.style.removeProperty("--accent-1");
+    el.style.removeProperty("--accent-2");
+    el.style.removeProperty("--accent-3");
+  }
 }
 
 interface AppStore {

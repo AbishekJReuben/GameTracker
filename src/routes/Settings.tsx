@@ -42,7 +42,7 @@ import { Panel } from "@/components/Panel";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
 import { useSettings, useRefreshAll, useGames } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
-import type { AccentTheme } from "@/store/app";
+import type { AccentTheme, CustomAccent } from "@/store/app";
 import { api, type Settings } from "@/lib/api";
 import { runCsvImport } from "@/lib/bulkTasks";
 import { ContentAuditPanel } from "@/components/ContentAuditPanel";
@@ -55,6 +55,11 @@ const ACCENTS: { id: AccentTheme; label: string; colors: [string, string, string
   { id: "magma", label: "Magma", colors: ["#fb5d6a", "#f472b6", "#fb923c"] },
   { id: "ice", label: "Ice", colors: ["#38bdf8", "#6366f1", "#22d3ee"] },
   { id: "sunset", label: "Sunset", colors: ["#f472b6", "#c084fc", "#fbbf24"] },
+  { id: "synthwave", label: "Synthwave", colors: ["#e94aff", "#7c5cff", "#22d3ee"] },
+  { id: "gold", label: "Gold", colors: ["#fbbf24", "#f59e0b", "#fde68a"] },
+  { id: "forest", label: "Forest", colors: ["#22c55e", "#14b8a6", "#a3e635"] },
+  { id: "rose", label: "Rosé", colors: ["#fb7185", "#f472b6", "#c084fc"] },
+  { id: "mono", label: "Mono", colors: ["#94a3b8", "#64748b", "#cbd5e1"] },
 ];
 
 const LANDING_OPTS = [
@@ -178,7 +183,7 @@ export default function SettingsPage() {
       content: (
         <div className="space-y-1">
           <SettingRow icon={<Palette className="h-4 w-4" />} title="Accent theme" desc="The signature color of glows, gradients and highlights.">
-            <div className="flex flex-wrap justify-end gap-2">
+            <div className="flex max-w-[280px] flex-wrap justify-end gap-2">
               {ACCENTS.map((a) => (
                 <button
                   key={a.id}
@@ -188,8 +193,25 @@ export default function SettingsPage() {
                   style={{ background: `linear-gradient(135deg, ${a.colors[0]}, ${a.colors[1]} 50%, ${a.colors[2]})` }}
                 />
               ))}
+              {/* Custom accent — the live gradient of the user's three stops. */}
+              <button
+                onClick={() => setPref("accent", "custom")}
+                title="Custom"
+                className={`relative grid h-8 w-8 place-items-center rounded-lg border-2 transition ${prefs.accent === "custom" ? "scale-110 border-white" : "border-transparent hover:scale-105"}`}
+                style={{ background: `linear-gradient(135deg, ${prefs.customAccent[0]}, ${prefs.customAccent[1]} 50%, ${prefs.customAccent[2]})` }}
+              >
+                <Sparkles className="h-3.5 w-3.5 text-white/90 drop-shadow" />
+              </button>
             </div>
           </SettingRow>
+          <CustomAccentRow
+            value={prefs.customAccent}
+            active={prefs.accent === "custom"}
+            onChange={(next) => {
+              setPref("customAccent", next);
+              if (prefs.accent !== "custom") setPref("accent", "custom");
+            }}
+          />
           <SettingRow icon={<Sparkles className="h-4 w-4" />} title="Animation level" desc="Full motion, reduced flourishes, or none (also the safest for low-end PCs).">
             <Segmented
               value={prefs.motion}
@@ -527,6 +549,40 @@ function SettingRow({ icon, title, desc, children }: { icon: React.ReactNode; ti
         <div className="text-xs text-ink-dim">{desc}</div>
       </div>
       <div className="shrink-0">{children}</div>
+    </div>
+  );
+}
+
+function CustomAccentRow({ value, active, onChange }: { value: CustomAccent; active: boolean; onChange: (next: CustomAccent) => void }) {
+  const set = (i: number, c: string) => {
+    const n = [...value] as CustomAccent;
+    n[i] = c;
+    onChange(n);
+  };
+  const labels = ["Start", "Mid", "End"];
+  return (
+    <div className={`rounded-xl px-2 py-3 transition ${active ? "bg-white/[0.03] ring-1 ring-inset ring-accent-3/30" : "hover:bg-white/[0.02]"}`}>
+      <div className="flex items-center gap-4">
+        <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white/[0.04] text-ink-soft">
+          <Palette className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-700">Custom accent {active && <span className="ml-1 text-[10px] font-700 uppercase tracking-wider text-accent-3">active</span>}</div>
+          <div className="text-xs text-ink-dim">Craft your own three-stop gradient — applied when “Custom” is selected.</div>
+        </div>
+        <div className="flex shrink-0 items-end gap-2">
+          {[0, 1, 2].map((i) => (
+            <label key={i} className="flex cursor-pointer flex-col items-center gap-1">
+              <span className="relative h-9 w-9 overflow-hidden rounded-lg border border-line shadow-card transition hover:scale-105">
+                <span className="absolute inset-0" style={{ background: value[i] }} />
+                <input type="color" value={value[i]} onChange={(e) => set(i, e.target.value)} className="absolute inset-0 cursor-pointer opacity-0" />
+              </span>
+              <span className="text-[9px] font-700 uppercase tracking-wide text-ink-faint">{labels[i]}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="mt-3 h-2 w-full rounded-full" style={{ background: `linear-gradient(90deg, ${value[0]}, ${value[1]} 50%, ${value[2]})` }} />
     </div>
   );
 }

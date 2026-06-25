@@ -8,6 +8,7 @@ import { AnimatedOutlet } from "./components/AnimatedOutlet";
 import { Toasts } from "./components/Toasts";
 import { ProgressDock } from "./components/ProgressDock";
 import { Onboarding } from "./components/Onboarding";
+import { SplashScreen } from "./components/SplashScreen";
 import { GameModal } from "./components/GameModal";
 import { DropZone } from "./components/DropZone";
 import { useTauriBridge } from "./lib/bridge";
@@ -84,6 +85,7 @@ function AppShell() {
           {location.pathname}
         </span>
       )}
+      <SplashScreen />
     </div>
   );
 }

@@ -53,6 +53,16 @@ pub struct GameMetadata {
     pub trailer_url: Option<String>,
     pub theme_youtube_id: Option<String>,
     pub theme_audio_url: Option<String>,
+    pub theme_track_ids: Vec<String>,
+}
+
+/// Resolved theme audio for a game: primary YouTube track, iTunes preview, and
+/// up to five distinct OST tracks scraped from YouTube search.
+#[derive(Debug, Clone, Default)]
+pub struct ThemeResolution {
+    pub youtube_id: Option<String>,
+    pub audio_url: Option<String>,
+    pub track_ids: Vec<String>,
 }
 
 /// Percent-encode a query term (RFC 3986 unreserved kept).
@@ -838,7 +848,7 @@ fn build_steam_metadata(
     let website = details.website.clone().filter(|s| !s.trim().is_empty());
     let trailer = trailer_url(details);
     let theme_name = details.name.as_deref().unwrap_or(name);
-    let (theme_youtube_id, theme_audio_url) = resolve_theme(theme_name);
+    let theme = resolve_theme(theme_name);
 
     GameMetadata {
         developer,
@@ -852,8 +862,9 @@ fn build_steam_metadata(
         background_url,
         website,
         trailer_url: trailer,
-        theme_youtube_id,
-        theme_audio_url,
+        theme_youtube_id: theme.youtube_id,
+        theme_audio_url: theme.audio_url,
+        theme_track_ids: theme.track_ids,
     }
 }
 
@@ -1733,22 +1744,128 @@ fn get_json(url: &str) -> Option<serde_json::Value> {
 
 // ---------- Per-game theme audio ----------
 
-/// Resolve a playable theme for a game: a full-length YouTube video (keyless
-/// search-page scrape, or the Data API when a key is set) plus a keyless 30s
-/// iTunes soundtrack preview as a no-JS fallback.
-pub fn resolve_theme(name: &str) -> (Option<String>, Option<String>) {
-    (youtube_theme_id(name), itunes_theme_url(name))
+/// Max length for OST mix extras — longer uploads are usually full compilations.
+const MAX_THEME_SECS: u64 = 600;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct YoutubeSearchHit {
+    id: String,
+    duration_secs: Option<u64>,
 }
 
-fn youtube_theme_id(name: &str) -> Option<String> {
-    // Prefer the Data API only when a key is configured (slightly better
-    // targeting); otherwise scrape the public results page — no key required.
+/// Parse YouTube `lengthText.simpleText` values like `3:45` or `1:02:30`.
+fn parse_duration_simple_text(s: &str) -> Option<u64> {
+    let parts: Vec<u64> = s
+        .trim()
+        .split(':')
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    match parts.as_slice() {
+        [m, s] if *m < 100 => Some(m * 60 + s),
+        [h, m, s] => Some(h * 3600 + m * 60 + s),
+        _ => None,
+    }
+}
+
+/// Read `lengthText.simpleText` from a `videoRenderer` window after a video id.
+fn extract_length_text_secs(window: &str) -> Option<u64> {
+    let idx = window.find("\"lengthText\"")?;
+    let sub = &window[idx..window.len().min(idx + 500)];
+    const SIMPLE: &str = "\"simpleText\":\"";
+    let start = sub.find(SIMPLE)? + SIMPLE.len();
+    let end = sub[start..].find('"')?;
+    parse_duration_simple_text(&sub[start..start + end])
+}
+
+/// Scan a YouTube results page for video ids paired with duration when present.
+fn extract_youtube_search_hits(html: &str, scan_limit: usize) -> Vec<YoutubeSearchHit> {
+    if scan_limit == 0 {
+        return Vec::new();
+    }
+    const NEEDLE: &str = "\"videoId\":\"";
+    let mut from = 0;
+    let mut out = Vec::new();
+    while out.len() < scan_limit {
+        let Some(rel) = html[from..].find(NEEDLE) else {
+            break;
+        };
+        let id_start = from + rel + NEEDLE.len();
+        let id: String = html[id_start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if id.len() == 11 && !out.iter().any(|h: &YoutubeSearchHit| h.id == id) {
+            let window_end = (id_start + 2500).min(html.len());
+            let duration_secs = extract_length_text_secs(&html[id_start..window_end]);
+            out.push(YoutubeSearchHit { id, duration_secs });
+        }
+        from = id_start;
+    }
+    out
+}
+
+fn theme_extra_duration_ok(hit: &YoutubeSearchHit) -> bool {
+    hit.duration_secs.is_some_and(|s| s <= MAX_THEME_SECS)
+}
+
+/// Pick the main theme — always resolved via the targeted main-theme search first.
+fn youtube_main_theme_id(name: &str) -> Option<String> {
     if let Some(key) = youtube_key() {
         if let Some(id) = youtube_theme_id_api(name, &key) {
             return Some(id);
         }
     }
-    youtube_scrape_theme_id(name)
+    for query in [
+        format!("{name} original soundtrack main theme"),
+        format!("{name} main theme official"),
+        format!("{name} original soundtrack"),
+    ] {
+        let Some(html) = youtube_search_html(&query) else {
+            continue;
+        };
+        let hits = extract_youtube_search_hits(&html, 12);
+        // Prefer a short main theme, but always return something if available.
+        if let Some(id) = hits
+            .iter()
+            .find(|h| h.duration_secs.is_some_and(|s| s <= MAX_THEME_SECS))
+            .map(|h| h.id.clone())
+            .or_else(|| hits.first().map(|h| h.id.clone()))
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Resolve playable theme audio for a game: the main theme (required when found),
+/// up to four additional OST tracks under 10 minutes, plus a 30s iTunes preview.
+pub fn resolve_theme(name: &str) -> ThemeResolution {
+    let main = youtube_main_theme_id(name);
+
+    let mut track_ids = Vec::new();
+    if let Some(ref id) = main {
+        track_ids.push(id.clone());
+    }
+
+    if let Some(html) = youtube_search_html(&format!("{name} original soundtrack OST")) {
+        for hit in extract_youtube_search_hits(&html, 24) {
+            if track_ids.len() >= 5 {
+                break;
+            }
+            if track_ids.contains(&hit.id) {
+                continue;
+            }
+            if theme_extra_duration_ok(&hit) {
+                track_ids.push(hit.id);
+            }
+        }
+    }
+
+    ThemeResolution {
+        youtube_id: main.or_else(|| track_ids.first().cloned()),
+        audio_url: itunes_theme_url(name),
+        track_ids,
+    }
 }
 
 fn youtube_theme_id_api(name: &str, key: &str) -> Option<String> {
@@ -1764,13 +1881,6 @@ fn youtube_theme_id_api(name: &str, key: &str) -> Option<String> {
         .get("videoId")?
         .as_str()
         .map(|s| s.to_string())
-}
-
-/// Keyless YouTube: fetch the public search-results page and pull the first
-/// real video id out of the embedded `ytInitialData` (`"videoId":"<11 chars>"`).
-fn youtube_scrape_theme_id(name: &str) -> Option<String> {
-    let html = youtube_search_html(&format!("{name} original soundtrack"))?;
-    extract_youtube_video_id(&html)
 }
 
 fn youtube_search_html(query: &str) -> Option<String> {
@@ -1800,20 +1910,32 @@ fn youtube_search_html(query: &str) -> Option<String> {
 /// First `"videoId":"<id>"` in a YouTube results page. Ids are exactly 11 chars
 /// of `[A-Za-z0-9_-]`. Kept pure so it can be unit-tested offline.
 fn extract_youtube_video_id(html: &str) -> Option<String> {
+    extract_youtube_video_ids(html, 1).into_iter().next()
+}
+
+/// Collect up to `limit` unique 11-char YouTube video ids from a results page.
+fn extract_youtube_video_ids(html: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
     const NEEDLE: &str = "\"videoId\":\"";
     let mut from = 0;
-    while let Some(rel) = html[from..].find(NEEDLE) {
+    let mut out = Vec::new();
+    while out.len() < limit {
+        let Some(rel) = html[from..].find(NEEDLE) else {
+            break;
+        };
         let start = from + rel + NEEDLE.len();
         let id: String = html[start..]
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
             .collect();
-        if id.len() == 11 {
-            return Some(id);
+        if id.len() == 11 && !out.contains(&id) {
+            out.push(id);
         }
         from = start;
     }
-    None
+    out
 }
 
 fn itunes_theme_url(name: &str) -> Option<String> {
@@ -2064,7 +2186,7 @@ fn fetch_rawg_game_info(
     }
 
     let theme_name = if rawg_name.is_empty() { name } else { rawg_name };
-    let (theme_youtube_id, theme_audio_url) = resolve_theme(theme_name);
+    let theme = resolve_theme(theme_name);
 
     // RAWG has no portrait cover. Keyless-first: Wikipedia box art (or SteamGridDB
     // if a key is set), then RAWG's landscape background image as a last resort.
@@ -2086,8 +2208,9 @@ fn fetch_rawg_game_info(
         background_url,
         website,
         trailer_url,
-        theme_youtube_id,
-        theme_audio_url,
+        theme_youtube_id: theme.youtube_id,
+        theme_audio_url: theme.audio_url,
+        theme_track_ids: theme.track_ids,
     }))
 }
 
@@ -2168,6 +2291,57 @@ mod tests {
         let messy = r#""videoId":"short","videoId":"abcdefghijk""#;
         assert_eq!(extract_youtube_video_id(messy).as_deref(), Some("abcdefghijk"));
         assert_eq!(extract_youtube_video_id("no ids here"), None);
+    }
+
+    #[test]
+    fn extracts_multiple_youtube_video_ids() {
+        let html = r#"
+            "videoId":"dQw4w9WgXcQ"
+            "videoId":"abcdefghijk"
+            "videoId":"dQw4w9WgXcQ"
+            "videoId":"12345678901"
+        "#;
+        assert_eq!(
+            extract_youtube_video_ids(html, 5),
+            vec![
+                "dQw4w9WgXcQ".to_string(),
+                "abcdefghijk".to_string(),
+                "12345678901".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_duration_simple_text_variants() {
+        assert_eq!(parse_duration_simple_text("3:45"), Some(225));
+        assert_eq!(parse_duration_simple_text("1:02:30"), Some(3750));
+        assert_eq!(parse_duration_simple_text("bad"), None);
+    }
+
+    #[test]
+    fn search_hits_skip_long_compilations_for_extras() {
+        let html = r#"
+            "videoId":"comp1111111","lengthText":{"simpleText":"1:40:56"}
+            "videoId":"short222222","lengthText":{"simpleText":"3:45"}
+            "videoId":"short333333","lengthText":{"simpleText":"4:12"}
+        "#;
+        let hits = extract_youtube_search_hits(html, 10);
+        let short: Vec<_> = hits
+            .iter()
+            .filter(|h| theme_extra_duration_ok(h))
+            .map(|h| h.id.as_str())
+            .collect();
+        assert_eq!(short, vec!["short222222", "short333333"]);
+    }
+
+    #[test]
+    fn resolve_theme_puts_main_first() {
+        // Main-theme query is tried before the OST scrape; stub via hits parser only.
+        let html_main = r#""videoId":"maintheme11","lengthText":{"simpleText":"2:58"}"#;
+        let main = extract_youtube_search_hits(html_main, 1)
+            .first()
+            .map(|h| h.id.clone());
+        assert_eq!(main.as_deref(), Some("maintheme11"));
     }
 
     #[test]

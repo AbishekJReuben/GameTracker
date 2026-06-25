@@ -2,7 +2,7 @@ use crate::db::models::{GameDto, GameInput};
 use crate::db::{settings, DbPool, PooledConn};
 use crate::error::{AppError, AppResult};
 use crate::util;
-use rusqlite::Row;
+use rusqlite::{OptionalExtension, Row};
 use std::collections::HashMap;
 
 /// Lightweight game record used by the tracking matcher.
@@ -65,6 +65,7 @@ struct GameRow {
     trailer_url: Option<String>,
     theme_youtube_id: Option<String>,
     theme_audio_url: Option<String>,
+    theme_track_ids: Vec<String>,
     steam_achievements_unlocked: Option<i64>,
     steam_achievements_total: Option<i64>,
     steam_achievements_synced_utc: Option<String>,
@@ -118,6 +119,11 @@ fn map_row(r: &Row) -> rusqlite::Result<GameRow> {
         trailer_url: r.get::<_, Option<String>>("trailer_url").ok().flatten(),
         theme_youtube_id: r.get::<_, Option<String>>("theme_youtube_id").ok().flatten(),
         theme_audio_url: r.get::<_, Option<String>>("theme_audio_url").ok().flatten(),
+        theme_track_ids: r
+            .get::<_, String>("theme_track_ids")
+            .ok()
+            .map(|j| parse_exe_paths(&j))
+            .unwrap_or_default(),
         steam_achievements_unlocked: r
             .get::<_, Option<i64>>("steam_achievements_unlocked")
             .ok()
@@ -252,6 +258,7 @@ fn to_dto(g: GameRow, stat: &Stat, tags: Vec<String>) -> GameDto {
         trailer_url: g.trailer_url,
         theme_youtube_id: g.theme_youtube_id,
         theme_audio_url: g.theme_audio_url,
+        theme_track_ids: g.theme_track_ids,
         steam_achievements_unlocked: g.steam_achievements_unlocked,
         steam_achievements_total: g.steam_achievements_total,
         steam_achievements_synced_utc: g.steam_achievements_synced_utc,
@@ -439,6 +446,90 @@ fn set_tags_tx(tx: &rusqlite::Transaction, game_id: &str, tags: &[String]) -> Ap
     Ok(())
 }
 
+/// Repoint every game from `from_id` onto `to_id`, then drop the now-empty tag.
+fn fold_tag_tx(tx: &rusqlite::Transaction, from_id: &str, to_id: &str) -> AppResult<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO game_tags(game_id, tag_id)
+         SELECT game_id, ?1 FROM game_tags WHERE tag_id = ?2",
+        rusqlite::params![to_id, from_id],
+    )?;
+    tx.execute("DELETE FROM game_tags WHERE tag_id = ?1", [from_id])?;
+    tx.execute("DELETE FROM tags WHERE id = ?1", [from_id])?;
+    Ok(())
+}
+
+fn tag_id_by_name(tx: &rusqlite::Transaction, name: &str) -> AppResult<Option<String>> {
+    Ok(tx
+        .query_row("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE", [name], |r| r.get(0))
+        .optional()?)
+}
+
+/// Rename a tag. If the new name already exists (case-insensitive), the two are
+/// merged so games keep a single deduplicated label.
+pub fn rename_tag(pool: &DbPool, old: &str, new: &str) -> AppResult<()> {
+    let old = old.trim();
+    let new = new.trim();
+    if new.is_empty() {
+        return Err(AppError::msg("Tag name can't be empty"));
+    }
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+    let Some(old_id) = tag_id_by_name(&tx, old)? else {
+        return Ok(());
+    };
+    match tag_id_by_name(&tx, new)? {
+        Some(target_id) if target_id != old_id => fold_tag_tx(&tx, &old_id, &target_id)?,
+        _ => {
+            tx.execute("UPDATE tags SET name = ?1 WHERE id = ?2", rusqlite::params![new, old_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Delete a tag entirely, removing it from every game.
+pub fn delete_tag(pool: &DbPool, name: &str) -> AppResult<()> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+    if let Some(id) = tag_id_by_name(&tx, name.trim())? {
+        tx.execute("DELETE FROM game_tags WHERE tag_id = ?1", [&id])?;
+        tx.execute("DELETE FROM tags WHERE id = ?1", [&id])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Merge several source tags into a single target tag (created if missing).
+pub fn merge_tags(pool: &DbPool, sources: &[String], target: &str) -> AppResult<()> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(AppError::msg("Target tag can't be empty"));
+    }
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+    let target_id = match tag_id_by_name(&tx, target)? {
+        Some(id) => id,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO tags(id, name) VALUES(?1, ?2)", rusqlite::params![id, target])?;
+            id
+        }
+    };
+    for src in sources {
+        let src = src.trim();
+        if src.is_empty() || src.eq_ignore_ascii_case(target) {
+            continue;
+        }
+        if let Some(src_id) = tag_id_by_name(&tx, src)? {
+            if src_id != target_id {
+                fold_tag_tx(&tx, &src_id, &target_id)?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn set_status(pool: &DbPool, id: &str, status: &str) -> AppResult<()> {
     let conn = pool.get()?;
     conn.execute(
@@ -505,12 +596,13 @@ pub fn set_media(
     Ok(())
 }
 
-/// Persist the resolved per-game theme (YouTube video id and/or iTunes preview).
+/// Persist the resolved per-game theme (YouTube video id, OST track list, and/or iTunes preview).
 pub fn set_theme(
     pool: &DbPool,
     id: &str,
     youtube_id: Option<&str>,
     audio_url: Option<&str>,
+    track_ids: &[String],
 ) -> AppResult<()> {
     let conn = pool.get()?;
     if let Some(yt) = youtube_id.filter(|s| !s.trim().is_empty()) {
@@ -523,6 +615,13 @@ pub fn set_theme(
         conn.execute(
             "UPDATE games SET theme_audio_url = ?1 WHERE id = ?2",
             rusqlite::params![audio, id],
+        )?;
+    }
+    if !track_ids.is_empty() {
+        let json = serde_json::to_string(track_ids).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "UPDATE games SET theme_track_ids = ?1 WHERE id = ?2",
+            rusqlite::params![json, id],
         )?;
     }
     Ok(())

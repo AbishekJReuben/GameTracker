@@ -7,9 +7,11 @@ import { Page } from "@/components/Page";
 import { GameArt } from "@/components/GameArt";
 import { Toggle, EmptyState, Skeleton, Segmented } from "@/components/ui";
 import { Panel } from "@/components/Panel";
+import { ShaderImageTransition } from "@/components/animations";
 import { useSessions, useGames } from "@/lib/queries";
-import { useApp, useMotionEnabled } from "@/store/app";
-import { api, EntryKind, SessionFilter } from "@/lib/api";
+import { ThemePlaylist } from "@/components/ThemePlaylist";
+import { useApp, useMarqueeTier, useMotionEnabled } from "@/store/app";
+import { api, assetUrl, EntryKind, SessionFilter } from "@/lib/api";
 import { dur, dateLabel, timeLabel } from "@/lib/format";
 
 export default function SessionsPage() {
@@ -54,6 +56,38 @@ export default function SessionsPage() {
     return { runtime, active };
   }, [sessions]);
 
+  const showMarquee = useMarqueeTier("base");
+
+  // Hero art: start from the games in the current session list, then *always*
+  // top up with the most-played library so a one-game day doesn't fill every
+  // marquee with the same image. Posters + their screenshots, deduped.
+  const marqueeGames = useMemo(() => {
+    const all = (games ?? []).filter((g) => g.kind === kind);
+    const ids = new Set((sessions ?? []).map((s) => s.gameId));
+    const inView = all.filter((g) => ids.has(g.id));
+    const rest = all
+      .filter((g) => !ids.has(g.id))
+      .sort((a, b) => (b.totalRuntimeSeconds ?? 0) - (a.totalRuntimeSeconds ?? 0));
+    // Interleave so variety shows up even when only one game was played today.
+    return [...inView, ...rest].slice(0, 28);
+  }, [games, sessions, kind]);
+
+  // A varied, deduped image pool — screenshots first (cinematic), posters next.
+  const marqueeImages = useMemo(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const push = (u?: string | null) => {
+      const r = assetUrl(u);
+      if (r && !seen.has(r)) {
+        seen.add(r);
+        out.push(r);
+      }
+    };
+    for (const g of marqueeGames) for (const s of g.screenshots ?? []) push(s);
+    for (const g of marqueeGames) push(g.coverPath);
+    return out.slice(0, 18);
+  }, [marqueeGames]);
+
   const exportCsv = async () => {
     const path = await save({ defaultPath: "tracker-sessions.csv", filters: [{ name: "CSV", extensions: ["csv"] }] });
     if (!path) return;
@@ -82,6 +116,10 @@ export default function SessionsPage() {
         </>
       }
     >
+      {showMarquee && marqueeImages.length >= 2 && (
+        <ShaderImageTransition images={marqueeImages} className="mb-5 h-36 md:h-44" />
+      )}
+
       <Panel panelKey="sessions.filters" games={games ?? []} sessions={sessions} className="mb-5 p-4">
         <div className="mb-4">
           <Segmented
@@ -118,6 +156,8 @@ export default function SessionsPage() {
           </div>
         </div>
       </Panel>
+
+      <ThemePlaylist games={games ?? []} />
 
       <Panel panelKey="sessions.table" games={games ?? []} sessions={sessions} className="p-0">
         {isLoading ? (

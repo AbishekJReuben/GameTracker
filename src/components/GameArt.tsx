@@ -18,20 +18,6 @@ interface Props {
   kenBurns?: boolean;
 }
 
-function SteamCornerBadge() {
-  return (
-    <div
-      className="pointer-events-none absolute bottom-[6%] right-[6%] z-20 flex aspect-square w-[22%] min-w-[14px] max-w-[26px] items-center justify-center rounded-[22%] bg-[#171a21]/92 shadow-md ring-1 ring-white/25"
-      title="Steam"
-      aria-hidden
-    >
-      <svg viewBox="0 0 24 24" className="h-[62%] w-[62%] fill-white">
-        <path d="M12 2C6.48 2 2 6.48 2 12c0 4.84 3.44 8.87 8 9.8V15.9c-.98-.15-1.84-.6-2.55-1.24l1.02 4.25c.9.46 1.9.71 2.95.71 1.43 0 2.75-.5 3.78-1.34l-1.55-1.34c.64.37 1.38.59 2.17.59.61 0 1.19-.13 1.72-.35l-1.02-4.24A5.96 5.96 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6c0 .32-.03.64-.08.95h2.38C19.48 4.84 16.48 2 12 2z" />
-      </svg>
-    </div>
-  );
-}
-
 /** Renders cover art, icon, or a deterministic gradient placeholder with initials. */
 export function GameArt({
   id,
@@ -39,7 +25,7 @@ export function GameArt({
   cover,
   icon,
   accent,
-  steamAppId,
+  steamAppId: _steamAppId,
   className,
   rounded = "rounded-2xl",
   variant = "cover",
@@ -66,10 +52,16 @@ export function GameArt({
   const from = accent || a;
   const to = b;
 
+  // The gradient base is a fallback that sits *behind* the cover. Once an opaque
+  // image is loaded it's fully hidden, so animating it then is pure wasted work —
+  // and there can be dozens of tiles (marquees/lists). Only animate it while it's
+  // actually visible (placeholder, or image still loading).
+  const animateGradient = enabled && !(showImage && loaded);
+
   return (
     <div className={cn("relative overflow-hidden [container-type:inline-size]", rounded, className)}>
       {/* Animated gradient base — always present as fallback */}
-      {enabled ? (
+      {animateGradient ? (
         <motion.div
           className="absolute inset-0"
           animate={{ backgroundPosition: ["0% 40%", "100% 60%", "0% 40%"] }}
@@ -132,7 +124,6 @@ export function GameArt({
           </motion.div>
         </AnimatePresence>
       )}
-      {variant === "cover" && steamAppId != null && steamAppId > 0 ? <SteamCornerBadge /> : null}
     </div>
   );
 }

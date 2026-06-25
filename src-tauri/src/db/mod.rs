@@ -305,6 +305,17 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 16;
     }
 
+    if version < 17 {
+        // Up to five YouTube OST tracks per game for the in-app jukebox mix.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE games ADD COLUMN theme_track_ids TEXT NOT NULL DEFAULT '[]';
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 17;")?;
+        version = 17;
+    }
+
     let _ = version;
     Ok(())
 }
