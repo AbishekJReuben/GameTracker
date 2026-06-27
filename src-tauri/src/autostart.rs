@@ -43,21 +43,39 @@ pub fn set(enabled: bool) -> AppResult<()> {
         return Ok(());
     }
     if enabled {
-        let exe = std::env::current_exe().map_err(|e| AppError::msg(e.to_string()))?;
-        // Launch minimized to tray, elevated, at every logon.
-        let tr = format!("\"{}\" --minimized", exe.display());
-        let out = run_schtasks(&[
-            "/Create", "/TN", TASK_NAME, "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
-        ])?;
-        if !out.status.success() {
-            return Err(AppError::msg(format!(
-                "Could not register startup task: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
+        register_task()?;
     } else {
         // Best-effort removal; succeed even if it wasn't there.
         let _ = run_schtasks(&["/Delete", "/TN", TASK_NAME, "/F"]);
     }
     Ok(())
+}
+
+/// Register (or overwrite) the logon task so it points at the **current** binary.
+/// Safe to call on every launch and after reinstalling to a new folder.
+#[cfg(windows)]
+fn register_task() -> AppResult<()> {
+    let exe = std::env::current_exe().map_err(|e| AppError::msg(e.to_string()))?;
+    // Launch minimized to tray, elevated, at every logon. /F overwrites stale paths.
+    let tr = format!("\"{}\" --minimized", exe.display());
+    let out = run_schtasks(&[
+        "/Create", "/TN", TASK_NAME, "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
+    ])?;
+    if !out.status.success() {
+        return Err(AppError::msg(format!(
+            "Could not register startup task: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn register_task() -> AppResult<()> {
+    Ok(())
+}
+
+/// Apply the `start_with_windows` setting — creates/updates or removes the task.
+pub fn sync_from_setting(enabled: bool) -> AppResult<()> {
+    set(enabled)
 }

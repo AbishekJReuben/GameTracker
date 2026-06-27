@@ -406,6 +406,20 @@ pub fn build_ost_library(app: tauri::AppHandle, state: State<AppState>) -> AppRe
     Ok(total)
 }
 
+/// The game's top live Twitch stream right now (keyless, public web GQL). Returns
+/// `None` when online metadata is off or the category can't be resolved; a result
+/// with `channel: None` means the game has a Twitch category but nobody is live.
+#[tauri::command]
+pub async fn fetch_twitch_live(
+    state: State<'_, AppState>,
+    game_name: String,
+) -> AppResult<Option<metadata::TwitchLive>> {
+    if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
+        return Ok(None);
+    }
+    run_blocking(move || Ok(metadata::twitch_top_live(&game_name))).await
+}
+
 /// Cached live stats served instantly from the DB, plus when they were fetched.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

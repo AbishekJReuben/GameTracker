@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { motion, AnimatePresence } from "motion/react";
+import { motion } from "motion/react";
 import { listen } from "@tauri-apps/api/event";
 import { openExternalUrl, isTauri } from "@/lib/tauri";
 import {
@@ -63,8 +63,10 @@ export function ThemePlaylist({ games }: { games: Game[] }) {
   const [query, setQuery] = useState("");
 
   const jukeboxActive = useJukebox((s) => s.active);
+  const jukeboxTracks = useJukebox((s) => s.tracks);
   const jukeboxIndex = useJukebox((s) => s.index);
   const start = useJukebox((s) => s.start);
+  const playFromList = useJukebox((s) => s.playFromList);
   const seek = useJukebox((s) => s.seek);
   const enqueue = useJukebox((s) => s.enqueue);
   const pushToast = useApp((s) => s.pushToast);
@@ -109,6 +111,8 @@ export function ThemePlaylist({ games }: { games: Game[] }) {
       ),
     [games]
   );
+
+  const currentTrack = jukeboxActive ? jukeboxTracks[jukeboxIndex] : null;
 
   if (!hasMusic) return null;
 
@@ -312,55 +316,70 @@ export function ThemePlaylist({ games }: { games: Game[] }) {
             </div>
           )}
 
-          <div className="-mx-1 mt-4 flex gap-3 overflow-x-auto px-1 pb-2 [scrollbar-width:thin]">
-            {tracks.map((t, i) => (
-              <div key={`${t.gameId}-${t.vid}-${i}`} className="group relative w-[104px] shrink-0">
-                <button
-                  type="button"
-                  onClick={() => (jukeboxActive ? seek(i) : start(tracks, i))}
-                  className="block w-full text-left"
-                >
-                  <motion.div
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: Math.min(i * 0.025, 0.4), duration: 0.35 }}
-                    className={cn(
-                      "relative aspect-[3/4] overflow-hidden rounded-xl border transition group-hover:-translate-y-1 group-hover:shadow-float",
-                      jukeboxActive && jukeboxIndex === i ? "border-accent ring-1 ring-accent/40" : "border-line"
-                    )}
-                  >
-                    <GameArt
-                      id={t.gameId}
-                      name={t.gameName}
-                      cover={t.coverPath}
-                      icon={t.iconPath}
-                      accent={t.accentColor}
-                      className="absolute inset-0 h-full w-full"
-                      rounded="rounded-xl"
-                    />
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/10 to-transparent" />
-                    <div className="absolute left-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-black/55 text-[10px] font-900 text-white backdrop-blur">
-                      {i + 1}
-                    </div>
-                    <div className="absolute inset-x-0 bottom-0 truncate p-1.5 text-[10px] font-700 text-white">{t.label}</div>
-                  </motion.div>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const n = enqueue([t]);
-                    pushToast({ kind: n ? "success" : "info", title: n ? "Added to queue" : "Already in queue" });
-                  }}
-                  className="absolute right-1.5 top-1.5 grid h-6 w-6 place-items-center rounded-full bg-black/60 text-white opacity-0 backdrop-blur transition hover:bg-accent group-hover:opacity-100"
-                  title="Add to queue"
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                </button>
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            {/* The built mix (left half) */}
+            <div className="rounded-2xl border border-line bg-white/[0.015] p-2.5">
+              <div className="mb-2 flex items-center gap-2 px-1 text-[11px] font-800 uppercase tracking-wider text-ink-dim">
+                <ListMusic className="h-3.5 w-3.5" /> Mix · {tracks.length}
               </div>
-            ))}
-          </div>
+              <ul className="max-h-[340px] space-y-0.5 overflow-y-auto pr-1 [scrollbar-width:thin]">
+                {tracks.map((t, i) => {
+                  const isCurrent = !!currentTrack && currentTrack.gameId === t.gameId && currentTrack.vid === t.vid;
+                  return (
+                    <motion.li
+                      key={`${t.gameId}-${t.vid}-${i}`}
+                      initial={{ opacity: 0, x: -6 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      transition={{ delay: Math.min(i * 0.012, 0.25), duration: 0.25 }}
+                      className={cn(
+                        "group flex cursor-pointer items-center gap-2.5 rounded-xl px-2 py-1.5 transition",
+                        isCurrent ? "bg-accent/10 ring-1 ring-accent/30" : "hover:bg-white/[0.04]"
+                      )}
+                      onClick={() => playFromList(tracks, i)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          playFromList(tracks, i);
+                        }
+                      }}
+                    >
+                      <span className="w-5 shrink-0 text-center text-[11px] font-800 tabular-nums text-ink-faint">{i + 1}</span>
+                      <GameArt
+                        id={t.gameId}
+                        name={t.gameName}
+                        cover={t.coverPath}
+                        icon={t.iconPath}
+                        accent={t.accentColor}
+                        className="h-9 w-7 shrink-0"
+                        rounded="rounded-md"
+                      />
+                      <div className="min-w-0 flex-1 text-left">
+                        <div className={cn("truncate text-xs font-700", isCurrent ? "text-accent" : "text-ink-soft")}>{t.label}</div>
+                        <div className="truncate text-[10px] text-ink-faint">{t.gameName}</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const n = enqueue([t]);
+                          pushToast({ kind: n ? "success" : "info", title: n ? "Added to queue" : "Already in queue" });
+                        }}
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-faint opacity-0 transition hover:bg-white/[0.08] hover:text-ink group-hover:opacity-100"
+                        title="Add to queue"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                      </button>
+                    </motion.li>
+                  );
+                })}
+              </ul>
+            </div>
 
-          {jukeboxActive && <QueueList />}
+            {/* The live queue (right half) */}
+            <QueueList />
+          </div>
         </>
       )}
     </Panel>
@@ -477,76 +496,77 @@ function NowPlayingBar() {
   );
 }
 
-/** The live play queue — jump to or remove any track. */
+/** The live play queue (right half) — jump to or remove any track. */
 function QueueList() {
   const tracks = useJukebox((s) => s.tracks);
   const index = useJukebox((s) => s.index);
   const playing = useJukebox((s) => s.playing);
+  const active = useJukebox((s) => s.active);
   const seek = useJukebox((s) => s.seek);
   const removeAt = useJukebox((s) => s.removeAt);
-  const [open, setOpen] = useState(true);
-
-  if (tracks.length === 0) return null;
 
   return (
-    <div className="mt-5">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="mb-2 flex items-center gap-2 text-[11px] font-800 uppercase tracking-wider text-ink-dim transition hover:text-ink"
-      >
-        <ListMusic className="h-3.5 w-3.5" /> Queue · {tracks.length}
-        <span className="text-ink-faint">{open ? "▾" : "▸"}</span>
-      </button>
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.ul
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            className="max-h-[320px] space-y-0.5 overflow-y-auto pr-1 [scrollbar-width:thin]"
-          >
-            {tracks.map((t, i) => {
-              const isCurrent = i === index;
-              return (
-                <li
-                  key={`${t.gameId}-${t.vid}-${i}`}
-                  className={cn(
-                    "group flex items-center gap-3 rounded-xl px-2 py-1.5 transition",
-                    isCurrent ? "bg-accent/10 ring-1 ring-accent/30" : "hover:bg-white/[0.04]"
-                  )}
+    <div className="rounded-2xl border border-line bg-white/[0.015] p-2.5">
+      <div className="mb-2 flex items-center gap-2 px-1 text-[11px] font-800 uppercase tracking-wider text-ink-dim">
+        <ListMusic className="h-3.5 w-3.5" /> Queue{tracks.length ? ` · ${tracks.length}` : ""}
+      </div>
+      {tracks.length === 0 || !active ? (
+        <div className="grid h-[120px] place-items-center px-4 text-center text-xs text-ink-faint">
+          Nothing queued yet — press Play, or add tracks from the mix.
+        </div>
+      ) : (
+        <ul className="max-h-[340px] space-y-0.5 overflow-y-auto pr-1 [scrollbar-width:thin]">
+          {tracks.map((t, i) => {
+            const isCurrent = i === index;
+            return (
+              <li
+                key={`${t.gameId}-${t.vid}-${i}`}
+                className={cn(
+                  "group flex cursor-pointer items-center gap-2.5 rounded-xl px-2 py-1.5 transition",
+                  isCurrent ? "bg-accent/10 ring-1 ring-accent/30" : "hover:bg-white/[0.04]"
+                )}
+                onClick={() => seek(i)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    seek(i);
+                  }
+                }}
+              >
+                <span className="w-5 shrink-0 text-center text-[11px] font-800 tabular-nums text-ink-faint">
+                  {isCurrent && playing ? "♪" : i + 1}
+                </span>
+                <GameArt
+                  id={t.gameId}
+                  name={t.gameName}
+                  cover={t.coverPath}
+                  icon={t.iconPath}
+                  accent={t.accentColor}
+                  className="h-9 w-7 shrink-0"
+                  rounded="rounded-md"
+                />
+                <div className="min-w-0 flex-1 text-left">
+                  <div className={cn("truncate text-xs font-700", isCurrent ? "text-accent" : "text-ink-soft")}>{t.label}</div>
+                  <div className="truncate text-[10px] text-ink-faint">{t.gameName}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    removeAt(i);
+                  }}
+                  className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-faint opacity-0 transition hover:bg-white/[0.08] hover:text-ink group-hover:opacity-100"
+                  title="Remove from queue"
                 >
-                  <span className="w-5 shrink-0 text-center text-[11px] font-800 tabular-nums text-ink-faint">
-                    {isCurrent && playing ? "♪" : i + 1}
-                  </span>
-                  <GameArt
-                    id={t.gameId}
-                    name={t.gameName}
-                    cover={t.coverPath}
-                    icon={t.iconPath}
-                    accent={t.accentColor}
-                    className="h-8 w-6 shrink-0"
-                    rounded="rounded"
-                  />
-                  <button onClick={() => seek(i)} className="min-w-0 flex-1 text-left">
-                    <div className={cn("truncate text-xs font-700", isCurrent ? "text-accent" : "text-ink-soft")}>{t.label}</div>
-                    <div className="truncate text-[10px] text-ink-faint">{t.gameName}</div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => removeAt(i)}
-                    className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-faint opacity-0 transition hover:bg-white/[0.08] hover:text-ink group-hover:opacity-100"
-                    title="Remove from queue"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </li>
-              );
-            })}
-          </motion.ul>
-        )}
-      </AnimatePresence>
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }

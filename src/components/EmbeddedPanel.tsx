@@ -8,6 +8,8 @@ type Props = {
   title: string;
   url: string;
   height?: number;
+  /** When set, the body uses this aspect-ratio class instead of a fixed height. */
+  aspectClass?: string;
 };
 
 /** Logical bounds of the host placeholder relative to the main window viewport. */
@@ -22,7 +24,7 @@ function hostBounds(host: HTMLElement) {
   };
 }
 
-export function EmbeddedPanel({ title, url, height = 640 }: Props) {
+export function EmbeddedPanel({ title, url, height = 640, aspectClass }: Props) {
   const id = useId().replace(/:/g, "");
   const label = `embed-${id}`;
   const hostRef = useRef<HTMLDivElement>(null);
@@ -123,7 +125,11 @@ export function EmbeddedPanel({ title, url, height = 640 }: Props) {
         </span>
       </button>
       {open && (
-        <div ref={hostRef} style={{ height }} className="relative bg-bg-850">
+        <div
+          ref={hostRef}
+          style={aspectClass ? undefined : { height }}
+          className={`relative bg-bg-850${aspectClass ? ` ${aspectClass}` : ""}`}
+        >
           {!tauri && (
             <div className="grid h-full place-items-center p-6 text-center text-sm text-ink-dim">
               Embedded site panel is available in the desktop app.

@@ -133,6 +133,17 @@ pub fn run() {
 
             tracking::spawn(handle.clone(), pool.clone(), shared, media_dir);
 
+            // Keep the elevated logon task pointed at this install folder (survives
+            // reinstalls / custom install paths without requiring a Settings toggle).
+            {
+                let pool_sync = pool.clone();
+                std::thread::spawn(move || {
+                    let enabled =
+                        db::settings::get_bool(&pool_sync, "start_with_windows").unwrap_or(true);
+                    let _ = autostart::sync_from_setting(enabled);
+                });
+            }
+
             // Background system monitor (CPU/GPU/RAM/disk + the sensor sidecar).
             system::spawn(pool, sys_shared, None);
 
@@ -205,6 +216,7 @@ pub fn run() {
             commands::refresh_game_stats,
             commands::fetch_full_ost,
             commands::build_ost_library,
+            commands::fetch_twitch_live,
             commands::launch_game,
             embed::open_embed,
             embed::set_embed_bounds,

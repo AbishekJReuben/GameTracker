@@ -41,6 +41,7 @@ function Equalizer() {
 export function SoundtrackPanel({ game }: { game: Game }) {
   const tracks = useMemo(() => buildGameTrackList(game), [game]);
   const start = useJukebox((s) => s.start);
+  const playFromList = useJukebox((s) => s.playFromList);
   const enqueue = useJukebox((s) => s.enqueue);
   const playNext = useJukebox((s) => s.playNext);
   const toggleShuffle = useJukebox((s) => s.toggleShuffle);
@@ -69,7 +70,7 @@ export function SoundtrackPanel({ game }: { game: Game }) {
   };
   const playTrack = (i: number) => {
     setPref("themeMuted", false);
-    start(tracks, i);
+    playFromList(tracks, i);
   };
   const queueTrack = (i: number) => {
     const n = enqueue([tracks[i]]);
@@ -162,32 +163,40 @@ export function SoundtrackPanel({ game }: { game: Game }) {
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ delay: Math.min(i * 0.015, 0.3), duration: 0.3 }}
                   className={cn(
-                    "group flex items-center gap-3 rounded-xl px-2.5 py-2 transition",
+                    "group flex cursor-pointer items-center gap-3 rounded-xl px-2.5 py-2 transition",
                     playingThis ? "bg-accent/10 ring-1 ring-accent/30" : "hover:bg-white/[0.04]"
                   )}
+                  onClick={() => playTrack(i)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      playTrack(i);
+                    }
+                  }}
                 >
-                  <button
-                    type="button"
-                    onClick={() => playTrack(i)}
+                  <span
                     className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/[0.06] text-[11px] font-800 tabular-nums text-ink-dim transition group-hover:bg-accent/20 group-hover:text-accent"
-                    title="Play"
                   >
                     {playingThis && playing ? <Equalizer /> : <span className="group-hover:hidden">{i + 1}</span>}
                     {!(playingThis && playing) && <Play className="hidden h-3.5 w-3.5 group-hover:block" />}
-                  </button>
+                  </span>
                   <span
                     className={cn(
-                      "min-w-0 flex-1 cursor-pointer truncate text-sm font-600",
+                      "min-w-0 flex-1 truncate text-sm font-600",
                       playingThis ? "text-accent" : "text-ink-soft"
                     )}
-                    onClick={() => playTrack(i)}
                   >
                     {t.label}
                   </span>
                   <div className="flex shrink-0 items-center gap-1 opacity-0 transition group-hover:opacity-100">
                     <button
                       type="button"
-                      onClick={() => playTrackNext(i)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        playTrackNext(i);
+                      }}
                       className="grid h-7 w-7 place-items-center rounded-lg text-ink-faint transition hover:bg-white/[0.08] hover:text-ink"
                       title="Play next"
                     >
@@ -195,7 +204,10 @@ export function SoundtrackPanel({ game }: { game: Game }) {
                     </button>
                     <button
                       type="button"
-                      onClick={() => queueTrack(i)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        queueTrack(i);
+                      }}
                       className="grid h-7 w-7 place-items-center rounded-lg text-ink-faint transition hover:bg-white/[0.08] hover:text-ink"
                       title="Add to queue"
                     >

@@ -19,6 +19,14 @@
   ${If} $TrackerDesktopState == ${BST_CHECKED}
     Call CreateOrUpdateDesktopShortcut
   ${EndIf}
+  ; If the user already had elevated autostart, repoint the scheduled task at this
+  ; install folder (reinstall / moved directory — the old path would 404 at logon).
+  nsExec::ExecToStack 'schtasks /Query /TN "GameTracker Autostart"'
+  Pop $0
+  Pop $1
+  ${If} $0 = 0
+    nsExec::Exec 'schtasks /Create /TN "GameTracker Autostart" /TR "\"$INSTDIR\${MAINBINARYNAME}.exe\" --minimized" /SC ONLOGON /RL HIGHEST /F'
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

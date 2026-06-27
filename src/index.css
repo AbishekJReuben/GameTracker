@@ -258,6 +258,75 @@
   cursor: pointer;
 }
 
+/* Floating jukebox — glass shell, ambient art, title marquee */
+.jukebox-floater {
+  touch-action: none;
+  will-change: left, top;
+}
+.jukebox-floater-shell {
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--accent-1) 8%, rgba(12, 14, 26, 0.92)),
+    rgba(8, 10, 20, 0.94)
+  );
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent-1) 22%, transparent),
+    0 1px 0 0 rgba(255, 255, 255, 0.08) inset,
+    0 28px 70px -24px rgba(0, 0, 0, 0.88),
+    0 0 48px -16px color-mix(in srgb, var(--accent-1) 35%, transparent);
+}
+.jukebox-floater-shell::before {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 38%);
+}
+.jukebox-floater-ambient img {
+  filter: blur(28px) saturate(1.35);
+  transform: scale(1.45);
+}
+.jukebox-marquee {
+  animation: jukebox-marquee 14s linear infinite;
+}
+@keyframes jukebox-marquee {
+  0%,
+  12% {
+    transform: translateX(0);
+  }
+  45%,
+  55% {
+    transform: translateX(calc(-100% + 168px));
+  }
+  88%,
+  100% {
+    transform: translateX(0);
+  }
+}
+.jukebox-progress-live {
+  background: linear-gradient(
+    90deg,
+    var(--accent-1),
+    var(--accent-3),
+    var(--accent-1)
+  );
+  background-size: 200% 100%;
+  animation: jukebox-progress-sheen 2.8s ease-in-out infinite;
+}
+@keyframes jukebox-progress-sheen {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+.jukebox-disc-spin {
+  animation: spin 18s linear infinite;
+}
+
 /* Seamless horizontal marquee: the strip is duplicated, so -50% scrolls exactly
    one copy. Pure CSS so it starts on mount regardless of route-transition timing
    (a JS percentage-transform animation didn't kick off until a remount). */

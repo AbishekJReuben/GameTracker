@@ -298,6 +298,18 @@ export interface CachedGameStats {
   fetchedUtc: string | null;
 }
 
+export interface TwitchLive {
+  /** Resolved canonical Twitch category name. */
+  game: string;
+  /** Twitch directory slug (for deep-linking even when nobody is live). */
+  slug: string;
+  /** Top live channel login, or null when no one is streaming the game. */
+  channel: string | null;
+  channelName: string | null;
+  title: string | null;
+  viewers: number;
+}
+
 export interface Candidate {
   name: string;
   installFolder: string | null;
@@ -753,6 +765,8 @@ export const api = {
   fetchFullOst: (gameId: string) => call<void>("fetch_full_ost", { gameId }),
   /** Backfill full OSTs across the library; returns the count queued, progress via `ost://progress`. */
   buildOstLibrary: () => call<number>("build_ost_library"),
+  /** The game's top live Twitch stream right now (keyless); null if offline/unresolved. */
+  fetchTwitchLive: (gameName: string) => call<TwitchLive | null>("fetch_twitch_live", { gameName }),
   launchGame: (id: string) => call<void>("launch_game", { id }),
   openEmbed: (label: string, url: string, x: number, y: number, w: number, h: number) =>
     call<void>("open_embed", { label, url, x, y, w, h }),

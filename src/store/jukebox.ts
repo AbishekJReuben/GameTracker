@@ -106,6 +106,8 @@ interface JukeboxStore {
   ended: () => void;
   /** Jump to a specific track index in the queue. */
   seek: (index: number) => void;
+  /** Play a track from a list — seeks if already in the queue, otherwise starts that list. */
+  playFromList: (tracks: JukeboxTrack[], index: number) => void;
   /** Append tracks to the end of the queue (starts playback if idle). Returns # added. */
   enqueue: (tracks: JukeboxTrack[]) => number;
   /** Insert tracks right after the current one (starts playback if idle). Returns # added. */
@@ -272,6 +274,21 @@ export const useJukebox = create<JukeboxStore>((set, get) => ({
     });
   },
 
+  playFromList: (list, index) => {
+    if (!list.length) return;
+    const i = Math.max(0, Math.min(index, list.length - 1));
+    const target = list[i];
+    const { tracks, active } = get();
+    if (active && tracks.length) {
+      const qi = tracks.findIndex((t) => t.gameId === target.gameId && t.vid === target.vid);
+      if (qi >= 0) {
+        get().seek(qi);
+        return;
+      }
+    }
+    get().start(list, i);
+  },
+
   enqueue: (newTracks) => {
     const { tracks, active } = get();
     const have = new Set(tracks.map(keyOf));
@@ -329,8 +346,9 @@ export const useJukebox = create<JukeboxStore>((set, get) => ({
 
   setProgress: (progress, duration) => set({ progress, duration }),
 
+  // Seek preserves the current play/pause state (the engine only resumes if playing).
   seekTo: (seconds) =>
-    set((s) => ({ seekNonce: s.seekNonce + 1, seekSeconds: Math.max(0, seconds), playing: true })),
+    set((s) => ({ seekNonce: s.seekNonce + 1, seekSeconds: Math.max(0, seconds) })),
 
   setVolume: (v) => {
     const volume = Math.min(100, Math.max(0, Math.round(v)));

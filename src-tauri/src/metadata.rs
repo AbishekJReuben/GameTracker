@@ -2429,6 +2429,99 @@ fn fetch_rawg_game_info(
     }))
 }
 
+// ---------- Twitch live streams (keyless, public web GQL) ----------
+
+const TWITCH_GQL: &str = "https://gql.twitch.tv/gql";
+/// Twitch's public web Client-Id (used by twitch.tv itself); enables anonymous,
+/// keyless GraphQL reads. No OAuth, no API key, no new `.env` entry.
+const TWITCH_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+
+/// A game's top live Twitch stream right now (plus the resolved category, so the
+/// UI can deep-link the directory even when nobody is live).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwitchLive {
+    pub game: String,
+    pub slug: String,
+    pub channel: Option<String>,
+    pub channel_name: Option<String>,
+    pub title: Option<String>,
+    pub viewers: i64,
+}
+
+fn twitch_gql(body: serde_json::Value) -> Option<serde_json::Value> {
+    ureq::post(TWITCH_GQL)
+        .set("Client-Id", TWITCH_CLIENT_ID)
+        .set("User-Agent", UA)
+        .timeout(TIMEOUT)
+        .send_json(body)
+        .ok()?
+        .into_json()
+        .ok()
+}
+
+/// Best category match for a (possibly imperfect) game name → (canonical name, slug).
+fn parse_search_categories(json: &serde_json::Value) -> Option<(String, String)> {
+    let node = json
+        .get("data")?
+        .get("searchCategories")?
+        .get("edges")?
+        .get(0)?
+        .get("node")?;
+    let name = node.get("name")?.as_str()?.to_string();
+    let slug = node.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    Some((name, slug))
+}
+
+/// Top live stream from a batched `DirectoryPage_Game` response.
+fn parse_top_stream(json: &serde_json::Value) -> Option<(String, String, String, i64)> {
+    let node = json
+        .get(0)?
+        .get("data")?
+        .get("game")?
+        .get("streams")?
+        .get("edges")?
+        .get(0)?
+        .get("node")?;
+    let login = node.get("broadcaster")?.get("login")?.as_str()?.to_string();
+    let display = node
+        .get("broadcaster")?
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&login)
+        .to_string();
+    let title = node.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let viewers = node.get("viewersCount").and_then(|v| v.as_i64()).unwrap_or(0);
+    Some((login, display, title, viewers))
+}
+
+/// Resolve the game's Twitch category, then its current top live stream. Keyless.
+pub fn twitch_top_live(query: &str) -> Option<TwitchLive> {
+    // 1. Resolve the canonical category (tolerates casing/punctuation differences).
+    let search = twitch_gql(serde_json::json!({
+        "query": "query($q:String!){searchCategories(query:$q,first:1){edges{node{name slug}}}}",
+        "variables": { "q": query }
+    }))?;
+    let (game, slug) = parse_search_categories(&search)?;
+
+    // 2. Top live stream for that category (batched op, mirroring the web client).
+    let streams = twitch_gql(serde_json::json!([{
+        "operationName": "DirectoryPage_Game",
+        "variables": { "name": game, "options": { "sort": "VIEWER_COUNT" }, "limit": 1, "includeIsDJ": false },
+        "query": "query DirectoryPage_Game($name: String!, $options: GameStreamOptions, $limit: Int){game(name:$name){displayName streams(first:$limit,options:$options){edges{node{broadcaster{login displayName} title viewersCount}}}}}"
+    }]));
+
+    let top = streams.as_ref().and_then(parse_top_stream);
+    Some(TwitchLive {
+        game,
+        slug,
+        channel: top.as_ref().map(|t| t.0.clone()),
+        channel_name: top.as_ref().map(|t| t.1.clone()),
+        title: top.as_ref().map(|t| t.2.clone()),
+        viewers: top.as_ref().map(|t| t.3).unwrap_or(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2544,6 +2637,46 @@ mod tests {
                 theme.track_ids.len()
             );
         }
+    }
+
+    /// Live, network-gated end-to-end check of the Twitch resolver. Run with
+    /// `cargo test --lib -- --ignored twitch_top_live_live --nocapture`.
+    #[test]
+    #[ignore]
+    fn twitch_top_live_live() {
+        for name in ["Black Myth Wukong", "Elden Ring", "Baldur's Gate 3"] {
+            let live = twitch_top_live(name);
+            println!("{name} => {live:?}");
+            let live = live.expect("should resolve a Twitch category");
+            assert!(!live.slug.is_empty(), "{name} should resolve a slug");
+        }
+    }
+
+    #[test]
+    fn parses_twitch_search_and_stream() {
+        let search = serde_json::json!({
+            "data": { "searchCategories": { "edges": [
+                { "node": { "name": "Black Myth: Wukong", "slug": "black-myth-wukong" } }
+            ] } }
+        });
+        assert_eq!(
+            parse_search_categories(&search),
+            Some(("Black Myth: Wukong".to_string(), "black-myth-wukong".to_string()))
+        );
+
+        let streams = serde_json::json!([{
+            "data": { "game": { "displayName": "Black Myth: Wukong", "streams": { "edges": [
+                { "node": { "broadcaster": { "login": "zarkevich", "displayName": "Zarkevich" }, "title": "wukong run", "viewersCount": 39 } }
+            ] } } }
+        }]);
+        assert_eq!(
+            parse_top_stream(&streams),
+            Some(("zarkevich".to_string(), "Zarkevich".to_string(), "wukong run".to_string(), 39))
+        );
+
+        // No live streams → None (UI then shows the directory fallback).
+        let empty = serde_json::json!([{ "data": { "game": { "streams": { "edges": [] } } } }]);
+        assert_eq!(parse_top_stream(&empty), None);
     }
 
     #[test]

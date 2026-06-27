@@ -43,6 +43,7 @@ import { TrailerPanel } from "@/components/TrailerPanel";
 import { GameStatsPanel } from "@/components/GameStatsPanel";
 import { ThemePlayer, ThemeToggleButton } from "@/components/ThemePlayer";
 import { SoundtrackPanel } from "@/components/SoundtrackPanel";
+import { TwitchPanel } from "@/components/TwitchPanel";
 import { ActivityLog } from "@/components/ActivityLog";
 import { EmbeddedPanel } from "@/components/EmbeddedPanel";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
@@ -805,9 +806,16 @@ export default function GameDetail() {
           {game.trailerUrl && (
             <TrailerPanel url={game.trailerUrl} poster={game.backgroundUrl ?? game.coverPath} name={game.displayName} onPlayingChange={setTrailerPlaying} />
           )}
-          {game.website && !game.website.includes("steampowered.com") && (
-            <EmbeddedPanel title="Official website" url={game.website} height={640} />
-          )}
+          {/* Live streams (left) + official website (right) — a 16:9 row split in half. */}
+          {(() => {
+            const showWebsite = !!game.website && !game.website.includes("steampowered.com");
+            return (
+              <div className={cn("grid gap-4", showWebsite && "lg:grid-cols-2")}>
+                <TwitchPanel game={game} />
+                {showWebsite && <EmbeddedPanel title="Official website" url={game.website!} aspectClass="aspect-[8/9]" />}
+              </div>
+            );
+          })()}
         </div>
       )}
 

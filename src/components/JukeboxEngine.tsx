@@ -30,6 +30,7 @@ export function JukeboxEngine() {
   const ready = useRef(false);
   const didGesture = useRef(false);
   const lastEndedAt = useRef(0);
+  const lastTick = useRef(0);
   const track = tracks[index];
 
   const ytCommand = useCallback((func: string, args: unknown[] = []) => {
@@ -82,19 +83,33 @@ export function JukeboxEngine() {
   // Honor explicit seek requests from the store (seek bar, repeat-one, prev-restart).
   useEffect(() => {
     if (!seekNonce) return;
-    const { seekSeconds } = useJukebox.getState();
+    const { seekSeconds, playing: isPlaying } = useJukebox.getState();
     ytCommand("seekTo", [seekSeconds, true]);
-    ytCommand("playVideo");
-    ytCommand("getVideoData");
+    if (isPlaying) ytCommand("playVideo");
+    lastTick.current = performance.now(); // resync the local ticker to the new position
   }, [seekNonce, ytCommand]);
 
-  // YouTube only pushes infoDelivery on demand — poll while playing so the seek bar moves.
+  // Smoothly advance the seek bar from the local clock while playing, so it tracks
+  // the song's real duration even when YouTube's infoDelivery messages are sparse.
+  // The periodic getVideoData below reconciles any drift against the true position.
   useEffect(() => {
-    if (!active || !playing || !ready.current) return;
+    if (!active || !playing || duration <= 0) return;
+    lastTick.current = performance.now();
+    const tick = window.setInterval(() => {
+      const st = useJukebox.getState();
+      if (!st.playing || st.duration <= 0) return;
+      const now = performance.now();
+      const dt = (now - lastTick.current) / 1000;
+      lastTick.current = now;
+      st.setProgress(Math.min(st.duration, st.progress + dt), st.duration);
+    }, 250);
+    const reconcile = window.setInterval(() => ytCommand("getVideoData"), 2000);
     ytCommand("getVideoData");
-    const id = window.setInterval(() => ytCommand("getVideoData"), 400);
-    return () => clearInterval(id);
-  }, [active, playing, track?.vid, ytCommand]);
+    return () => {
+      clearInterval(tick);
+      clearInterval(reconcile);
+    };
+  }, [active, playing, duration, track?.vid, ytCommand]);
 
   // Progress + auto-advance from the player's postMessages.
   useEffect(() => {
@@ -117,6 +132,7 @@ export function JukeboxEngine() {
         const info = d.info as { currentTime?: number; duration?: number; playerState?: number };
         if (typeof info.currentTime === "number" && typeof info.duration === "number" && info.duration > 0) {
           setProgress(info.currentTime, info.duration);
+          lastTick.current = performance.now(); // anchor the local ticker to the true position
         }
         if (info.playerState === 0) fireEnded();
       } else if (d.event === "onStateChange" && d.info === 0) {
