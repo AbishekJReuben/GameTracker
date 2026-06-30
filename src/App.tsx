@@ -23,6 +23,7 @@ import SystemsPage from "./routes/Systems";
 import GameDetail from "./routes/GameDetail";
 import TimelinePage from "./routes/Timeline";
 import SessionsPage from "./routes/Sessions";
+import MusicPage from "./routes/Music";
 import CollectionPage from "./routes/Collection";
 import TagsPage from "./routes/Tags";
 import SuggestedPage from "./routes/Suggested";
@@ -107,6 +108,7 @@ export default function App() {
         <Route path="/game/:id" element={<GameDetail />} />
         <Route path="/timeline" element={<TimelinePage />} />
         <Route path="/sessions" element={<SessionsPage />} />
+        <Route path="/music" element={<MusicPage />} />
         <Route path="/collection" element={<CollectionPage />} />
         {/* Insights merged into Collection — keep old links working. */}
         <Route path="/insights" element={<Navigate to="/collection" replace />} />

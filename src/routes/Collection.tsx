@@ -24,6 +24,7 @@ import { Trophy, Star, Gauge, Scale, TrendingUp, TrendingDown, Tag, History, Rad
 import { Page } from "@/components/Page";
 import { SectionTitle, EmptyState, Skeleton, statusLabel } from "@/components/ui";
 import { Panel } from "@/components/Panel";
+import { MusicGamingPanel } from "@/components/MusicWidgets";
 import { RadialGauge, LevelBar } from "@/components/RadialGauge";
 import { RadarChart } from "@/components/Charts";
 import { Reveal } from "@/components/Reveal";
@@ -457,6 +458,10 @@ export default function CollectionPage() {
             )}
           </Panel>
         </div>
+        </Reveal>
+
+        <Reveal delay={0.12}>
+          <MusicGamingPanel />
         </Reveal>
 
         <Reveal delay={0.14}>

@@ -260,6 +260,15 @@ export function SteamSyncPanel() {
 
       </p>
 
+      <div className="rounded-xl border border-line bg-white/[0.02] p-3 text-xs text-ink-dim">
+        <span className="font-700 text-ink-soft">Family Sharing:</span> games you've installed from
+        a shared library are detected in <span className="text-ink-soft">Detect games</span> and
+        tracked locally just like your own — playtime, sessions and the timeline all work. Steam's
+        Web API does not expose <span className="text-ink-soft">borrowed</span> playtime or
+        achievements for the person borrowing, so those can't be back-synced from Steam; Tracker
+        records everything you play from now on instead.
+      </div>
+
 
 
       {!apiReady && (

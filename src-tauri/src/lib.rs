@@ -265,6 +265,25 @@ pub fn run() {
             commands::launcher_capabilities,
             commands::local_launcher_library,
             commands::local_launcher_import,
+            commands::media_overview,
+            commands::media_heatmap,
+            commands::media_hour_of_day,
+            commands::media_top,
+            commands::media_insights,
+            commands::media_timeline,
+            commands::media_recent,
+            commands::record_media_play,
+            commands::stop_media_play,
+            commands::foreground_spans,
+            commands::playlists_list,
+            commands::playlist_get,
+            commands::playlist_create,
+            commands::playlist_rename,
+            commands::playlist_delete,
+            commands::playlist_add_tracks,
+            commands::playlist_remove_track,
+            commands::playlist_reorder,
+            commands::backfill_metacritic,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tracker")
@@ -279,6 +298,8 @@ pub fn run() {
             ) {
                 if let Some(state) = handle.try_state::<AppState>() {
                     let _ = db::sessions::close_orphans(&state.pool);
+                    let _ = db::media::close_orphans(&state.pool);
+                    let _ = db::foreground::close_orphans(&state.pool);
                 }
             }
         });

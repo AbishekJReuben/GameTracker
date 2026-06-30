@@ -190,6 +190,8 @@ export default function SystemsPage() {
             range={range}
             compact
             hideStepper
+            groupByKind
+            showActiveApp
             emptyLabel="No games or apps in this window — start tracking to see them here."
             footer={<HistoryUsageChart history={history} metric={histMetric} lookbackMs={lookbackMs} />}
           />

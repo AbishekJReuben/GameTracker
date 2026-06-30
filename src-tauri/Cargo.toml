@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.1.9"
+version = "3.2.0"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -43,6 +43,11 @@ image = { version = "0.25", default-features = false, features = ["png", "ico", 
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
+  "Foundation",
+  "Foundation_Collections",
+  "Media",
+  "Media_Control",
+  "Storage_Streams",
   "Win32_Foundation",
   "Win32_System_SystemInformation",
   "Win32_System_Registry",

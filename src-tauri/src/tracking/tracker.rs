@@ -1,6 +1,6 @@
-use crate::db::{games, screenshots, sessions, settings, DbPool};
+use crate::db::{foreground as fg_db, games, media as media_db, screenshots, sessions, settings, DbPool};
 use crate::db::games::MatchGame;
-use crate::tracking::{activity, foreground, idle, matcher, screenshot};
+use crate::tracking::{activity, foreground, idle, matcher, media, screenshot};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -14,6 +14,10 @@ const TICK_SECS: u64 = 2;
 const MERGE_WINDOW_SECS: i64 = 120;
 const RELOAD_EVERY: u32 = 8; // reload registered games roughly every 16s
 const DEFAULT_SHOT_INTERVAL_MIN: i64 = 30;
+/// Resume a media play after a brief pause/skip; close it after this much silence.
+const MEDIA_MERGE_SECS: u64 = 45;
+/// Retain media + foreground history for this many days.
+const HISTORY_RETENTION_DAYS: i64 = 420;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +73,46 @@ struct BreakEvent {
     minutes: i64,
 }
 
+/// Live "now listening" snapshot pushed to the UI each tick (SMTC media).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaState {
+    playing: bool,
+    source: Option<String>,
+    app: Option<String>,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    media_type: Option<String>,
+    thumb_path: Option<String>,
+}
+
+/// An open media play we're accruing time into (keyed by source app).
+struct OpenMedia {
+    id: String,
+    track_key: String,
+    app: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    media_type: String,
+    thumb_path: Option<String>,
+}
+
+/// Save SMTC thumbnail bytes under media/, deduped by content hash. Returns path.
+fn save_thumb(media_dir: &std::path::Path, bytes: &[u8]) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let dir = media_dir.join("media");
+    std::fs::create_dir_all(&dir).ok()?;
+    let dest = dir.join(format!("mt_{:016x}.jpg", h.finish()));
+    if !dest.exists() {
+        std::fs::write(&dest, bytes).ok()?;
+    }
+    Some(dest.to_string_lossy().to_string())
+}
+
 /// Shared snapshot the UI/tray can read synchronously.
 pub struct TrackingShared {
     pub state: Mutex<TrackingState>,
@@ -115,6 +159,17 @@ pub fn spawn(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_di
 
 fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir: PathBuf) {
     let _ = sessions::close_orphans(&pool);
+    let _ = media_db::close_orphans(&pool);
+    let _ = fg_db::close_orphans(&pool);
+    let _ = media_db::prune(&pool, HISTORY_RETENTION_DAYS);
+    let _ = fg_db::prune(&pool, HISTORY_RETENTION_DAYS);
+
+    // Media listening (SMTC) + global foreground log state.
+    let media_reader = media::MediaReader::new();
+    let mut open_media: HashMap<String, OpenMedia> = HashMap::new();
+    let mut media_last_play: HashMap<String, Instant> = HashMap::new();
+    let mut open_fg: Option<(String, String)> = None; // (span_id, app_key)
+    let mut fg_icon_tried: HashSet<String> = HashSet::new();
 
     let mut sys = System::new();
     let mut games_cache = games::match_candidates(&pool).unwrap_or_default();
@@ -143,6 +198,14 @@ fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir
             for (_gid, sid) in active.drain() {
                 let _ = sessions::end(&pool, &sid, false);
             }
+            if let Some((id, _)) = open_fg.take() {
+                let _ = fg_db::end(&pool, &id);
+            }
+            for (_k, om) in open_media.drain() {
+                let _ = media_db::end(&pool, &om.id);
+            }
+            media_last_play.clear();
+            let _ = app.emit("media://state", &MediaState::default());
             publish(
                 &app,
                 &shared,
@@ -361,6 +424,184 @@ fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir
         } else {
             break_accum = 0;
         }
+
+        // --- Global foreground-app log (drives the timeline "Active app" lane) ---
+        if is_idle {
+            if let Some((id, _)) = open_fg.take() {
+                let _ = fg_db::end(&pool, &id);
+            }
+        } else if let Some(exe) = fg_exe.as_deref() {
+            let app_key = activity::exe_file_name(exe);
+            if !app_key.is_empty() {
+                let same = open_fg.as_ref().map(|(_, k)| k == &app_key).unwrap_or(false);
+                if same {
+                    if let Some((id, _)) = open_fg.as_ref() {
+                        let _ = fg_db::touch(&pool, id);
+                    }
+                } else {
+                    if let Some((id, _)) = open_fg.take() {
+                        let _ = fg_db::end(&pool, &id);
+                    }
+                    let matched = fg_game_id.as_ref().and_then(|g| cache_by_id.get(g));
+                    let name = matched
+                        .map(|g| g.display_name.clone())
+                        .unwrap_or_else(|| crate::util::name_from_exe(exe));
+                    let icon = matched.and_then(|g| g.icon_path.clone()).or_else(|| {
+                        let safe: String = app_key
+                            .chars()
+                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                            .collect();
+                        let cache_id = format!("app_{safe}");
+                        let dest = media_dir.join(format!("icon_{cache_id}.png"));
+                        if dest.exists() {
+                            return Some(dest.to_string_lossy().to_string());
+                        }
+                        if !fg_icon_tried.insert(app_key.clone()) {
+                            return None; // already attempted this run
+                        }
+                        crate::icons::extract_icon_png(exe, &media_dir, &cache_id)
+                            .ok()
+                            .flatten()
+                    });
+                    if let Ok(id) = fg_db::start(
+                        &pool,
+                        &app_key,
+                        &name,
+                        Some(exe),
+                        icon.as_deref(),
+                        fg_game_id.as_deref(),
+                    ) {
+                        open_fg = Some((id, app_key));
+                    }
+                }
+            }
+        } else if let Some((id, _)) = open_fg.take() {
+            let _ = fg_db::end(&pool, &id);
+        }
+
+        // --- Media listening via Windows SMTC (Spotify, browsers, podcasts…) ---
+        let mut media_state = MediaState::default();
+        if settings::get_bool(&pool, "media_tracking_enabled").unwrap_or(true) {
+            // The in-app jukebox has no SMTC session driving accrual; while its row
+            // is open (frontend closes it on pause/stop) it's actively playing.
+            let _ = media_db::accrue_open_for_source(&pool, "jukebox", TICK_SECS as i64);
+            let overrides: HashMap<String, String> = settings::get(&pool, "media_app_types")
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            for snap in media_reader.sessions() {
+                // Our own playback is recorded explicitly via record_media_play, so
+                // skip its SMTC session to avoid double-counting / miscategorizing it.
+                // It surfaces either under our app id or the WebView2 host process.
+                let app_lc = snap.source_app.to_lowercase();
+                if app_lc.contains("gametracker")
+                    || app_lc.contains("chilloutgames")
+                    || app_lc.contains("msedgewebview2")
+                    || app_lc.contains("webview2")
+                {
+                    continue;
+                }
+                if !snap.has_content() {
+                    continue;
+                }
+                let key = snap.source_app.clone();
+                let tkey = snap.track_key();
+                let same = open_media.get(&key).map(|om| om.track_key == tkey).unwrap_or(false);
+                if snap.playing {
+                    if same {
+                        if let Some(om) = open_media.get(&key) {
+                            let _ = media_db::accrue(&pool, &om.id, TICK_SECS as i64);
+                        }
+                    } else {
+                        if let Some(om) = open_media.remove(&key) {
+                            let _ = media_db::end(&pool, &om.id);
+                        }
+                        let media_type = overrides.get(&key).cloned().unwrap_or_else(|| {
+                            media::classify(
+                                &key,
+                                snap.artist.as_deref(),
+                                snap.album.as_deref(),
+                                snap.playback_type,
+                            )
+                            .to_string()
+                        });
+                        let thumb_path = media_reader
+                            .thumbnail_for(&key)
+                            .and_then(|b| save_thumb(&media_dir, &b));
+                        let new = media_db::NewMediaPlay {
+                            source: "smtc".into(),
+                            source_app: Some(key.clone()),
+                            app_name: Some(snap.app_name.clone()),
+                            media_type: media_type.clone(),
+                            title: snap.title.clone(),
+                            artist: snap.artist.clone(),
+                            album: snap.album.clone(),
+                            thumb_path: thumb_path.clone(),
+                            game_id: None,
+                            vid: None,
+                        };
+                        if let Ok(id) = media_db::start_play(&pool, &new) {
+                            open_media.insert(
+                                key.clone(),
+                                OpenMedia {
+                                    id,
+                                    track_key: tkey,
+                                    app: snap.app_name.clone(),
+                                    title: snap.title.clone(),
+                                    artist: snap.artist.clone(),
+                                    album: snap.album.clone(),
+                                    media_type,
+                                    thumb_path,
+                                },
+                            );
+                        }
+                    }
+                    media_last_play.insert(key.clone(), Instant::now());
+                    if !media_state.playing {
+                        if let Some(om) = open_media.get(&key) {
+                            media_state = MediaState {
+                                playing: true,
+                                source: Some("smtc".into()),
+                                app: Some(om.app.clone()),
+                                title: om.title.clone(),
+                                artist: om.artist.clone(),
+                                album: om.album.clone(),
+                                media_type: Some(om.media_type.clone()),
+                                thumb_path: om.thumb_path.clone(),
+                            };
+                        }
+                    }
+                } else if same {
+                    if let Some(om) = open_media.get(&key) {
+                        let _ = media_db::touch(&pool, &om.id);
+                    }
+                }
+            }
+            // Close plays with no playback within the merge window.
+            let stale: Vec<String> = open_media
+                .keys()
+                .filter(|k| {
+                    media_last_play
+                        .get(*k)
+                        .map(|t| t.elapsed().as_secs() > MEDIA_MERGE_SECS)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+            for k in stale {
+                if let Some(om) = open_media.remove(&k) {
+                    let _ = media_db::end(&pool, &om.id);
+                }
+                media_last_play.remove(&k);
+            }
+        } else {
+            for (_k, om) in open_media.drain() {
+                let _ = media_db::end(&pool, &om.id);
+            }
+            media_last_play.clear();
+        }
+        let _ = app.emit("media://state", &media_state);
 
         // Partition the live sessions by kind so games and apps never mix in the UI.
         let is_kind = |gid: &str, kind: &str| {

@@ -14,6 +14,7 @@ import {
 import { api, type Game } from "@/lib/api";
 import { Panel } from "./Panel";
 import { SectionTitle, EmptyState } from "./ui";
+import { AddToPlaylist } from "./AddToPlaylist";
 import { useJukebox } from "@/store/jukebox";
 import { useApp } from "@/store/app";
 import { buildGameTrackList, buildWatchVideosUrl, playlistUrl } from "@/lib/jukeboxTracks";
@@ -191,6 +192,9 @@ export function SoundtrackPanel({ game }: { game: Game }) {
                     {t.label}
                   </span>
                   <div className="flex shrink-0 items-center gap-1 opacity-0 transition group-hover:opacity-100">
+                    <AddToPlaylist
+                      tracks={[{ vid: t.vid, gameId: t.gameId, title: t.label, artist: t.gameName, coverPath: t.coverPath, iconPath: t.iconPath }]}
+                    />
                     <button
                       type="button"
                       onClick={(e) => {

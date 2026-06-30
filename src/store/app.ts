@@ -36,6 +36,8 @@ export type LibraryView = "grid" | "list" | "compact" | "album" | "theatre";
 /** Marquee backdrop intensity: off = none, compact = only the original/base
  *  marquees, full = base + the extra decorative backdrops on most panels. */
 export type MarqueeLevel = "off" | "compact" | "full";
+/** Frontend effects budget: auto (detect), high (all effects), lite (max smoothness). */
+export type PerfMode = "auto" | "high" | "lite";
 export type LibraryStatusFilter = "all" | GameStatus;
 export type LibrarySort = "recent" | "name" | "playtime" | "score" | "manual";
 
@@ -60,6 +62,8 @@ export interface Prefs {
   /** The three hex stops used when `accent === "custom"`. */
   customAccent: CustomAccent;
   motion: MotionLevel;
+  /** Heavy-effects budget (blur, shaders, ambient, marquees). */
+  perfMode: PerfMode;
   density: Density;
   background: boolean;
   landing: string;
@@ -92,6 +96,7 @@ const DEFAULT_PREFS: Prefs = {
   accent: "aurora",
   customAccent: ["#7c5cff", "#3b82f6", "#22d3ee"],
   motion: "full",
+  perfMode: "auto",
   density: "cozy",
   background: true,
   landing: "/",
@@ -170,12 +175,28 @@ export async function hydratePrefs() {
   }
 }
 
+/** Detect a weaker machine so "auto" can dial effects down without user action. */
+function isLowEndDevice(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const cores = navigator.hardwareConcurrency || 8;
+  const mem = (navigator as unknown as { deviceMemory?: number }).deviceMemory ?? 8;
+  return cores <= 4 || mem <= 4;
+}
+
+/** Resolve the effective effects budget for the current pref. */
+export function effectivePerf(p: Prefs): "high" | "lite" {
+  if (p.perfMode === "lite") return "lite";
+  if (p.perfMode === "high") return "high";
+  return isLowEndDevice() ? "lite" : "high";
+}
+
 /** Reflect appearance prefs onto <html> so CSS variables / safety valves react live. */
 export function applyPrefsToDom(p: Prefs) {
   if (typeof document === "undefined") return;
   const el = document.documentElement;
   el.dataset.accent = p.accent;
   el.dataset.motion = p.motion === "off" ? "off" : "on";
+  el.dataset.perf = effectivePerf(p);
   el.dataset.density = p.density;
   // A custom accent overrides the three palette vars inline; any preset clears
   // the overrides so its [data-accent] stylesheet rule takes effect again.
@@ -264,6 +285,11 @@ export function useMotionEnabled() {
   return useApp((s) => s.prefs.motion === "full");
 }
 
+/** True when heavy effects (blur, WebGL shaders, ambient, marquees) should be cut. */
+export function useReduceEffects() {
+  return useApp((s) => effectivePerf(s.prefs) === "lite");
+}
+
 /**
  * Whether a marquee of the given tier should be shown for the current pref:
  * - "base"  — the original marquees: shown unless the level is "off".
@@ -271,6 +297,8 @@ export function useMotionEnabled() {
  */
 export function useMarqueeTier(tier: "base" | "extra" = "extra") {
   return useApp((s) => {
+    // Lite effects budget hides all decorative marquees for smoothness.
+    if (effectivePerf(s.prefs) === "lite") return false;
     const lvl = s.prefs.marquee ?? "full";
     if (lvl === "off") return false;
     if (lvl === "full") return true;

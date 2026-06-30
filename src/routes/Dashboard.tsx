@@ -6,6 +6,7 @@ import { NowPlaying } from "@/components/NowPlaying";
 import { StatTile } from "@/components/StatTile";
 import { Heatmap } from "@/components/Heatmap";
 import { LibraryPlaytimeChart } from "@/components/LibraryPlaytimeChart";
+import { ListeningTodayCard } from "@/components/MusicWidgets";
 import { Sparkline } from "@/components/Sparkline";
 import { GameArt } from "@/components/GameArt";
 import { Timeline } from "@/components/Timeline";
@@ -294,6 +295,8 @@ export default function Dashboard() {
                 range="24h"
                 compact
                 maxLanes={8}
+                groupByKind
+                showActiveApp
                 colorFor={(s) =>
                   s.kind === "app" ? "#22d3ee" : s.accentColor || accentFor(s.gameId)[0]
                 }
@@ -337,6 +340,10 @@ export default function Dashboard() {
               </div>
             </Panel>
           )}
+        </motion.div>
+
+        <motion.div variants={motionOn ? fadeUp : undefined}>
+          <ListeningTodayCard />
         </motion.div>
 
         {widgets.patterns && (

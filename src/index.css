@@ -838,3 +838,33 @@
     transition-duration: 0.001ms !important;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Performance: "lite" effects budget. Drops GPU-expensive backdrop blur and
+   large glows — the main WebView2 jank sources — and gives translucent panels
+   an opaque fallback so they stay readable without the blur behind them.
+--------------------------------------------------------------------------- */
+html[data-perf="lite"] .card,
+html[data-perf="lite"] .glass,
+html[data-perf="lite"] .hud-panel,
+html[data-perf="lite"] [class*="backdrop-blur"] {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+html[data-perf="lite"] .card,
+html[data-perf="lite"] .hud-panel {
+  background: rgba(14, 16, 24, 0.9) !important;
+}
+html[data-perf="lite"] .glass {
+  background: rgba(14, 16, 24, 0.88) !important;
+}
+html[data-perf="lite"] aside {
+  background: rgba(11, 13, 20, 0.96) !important;
+}
+html[data-perf="lite"] .shadow-glow,
+html[data-perf="lite"] .shadow-float {
+  box-shadow: none !important;
+}
+html[data-perf="lite"] .animate-scan {
+  animation: none !important;
+}

@@ -2,10 +2,11 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
-import { Session } from "@/lib/api";
+import { ForegroundSpan, Session } from "@/lib/api";
 import { accentFor, dur, hourLabel } from "@/lib/format";
 import { appendLiveFocusSpan, clipFocusSpans } from "@/lib/focusSpans";
 import { useApp, useMotionEnabled } from "@/store/app";
+import { useForegroundSpans } from "@/lib/queries";
 import { type TimelineRange, rangeToMinutes } from "@/lib/timelineZoom";
 
 export type { TimelineRange } from "@/lib/timelineZoom";
@@ -113,7 +114,13 @@ interface Placed {
   endMs: number;
 }
 
-function placeSessions(sessions: Session[], win: Window, colorFor: (s: Session) => string): { placed: Placed[]; lanes: number } {
+/** Lane-pack one set of sessions by overlap. Lanes start at `laneOffset`. */
+function packOne(
+  sessions: Session[],
+  win: Window,
+  colorFor: (s: Session) => string,
+  laneOffset = 0
+): { placed: Placed[]; lanes: number } {
   const span = win.end - win.start || 1;
   const inWindow = sessions
     .map((s) => {
@@ -138,7 +145,7 @@ function placeSessions(sessions: Session[], win: Window, colorFor: (s: Session) 
     }
     placed.push({
       s: x.s,
-      lane,
+      lane: lane + laneOffset,
       left: ((cs - win.start) / span) * 100,
       width: Math.max(0.6, ((ce - cs) / span) * 100),
       color: colorFor(x.s),
@@ -148,7 +155,61 @@ function placeSessions(sessions: Session[], win: Window, colorFor: (s: Session) 
       endMs: x.endMs,
     });
   }
-  return { placed, lanes: Math.max(1, laneEnds.length) };
+  return { placed, lanes: laneEnds.length };
+}
+
+/** Place sessions; when `groupByKind`, games occupy their own lane block above apps. */
+function placeSessions(
+  sessions: Session[],
+  win: Window,
+  colorFor: (s: Session) => string,
+  groupByKind = false
+): { placed: Placed[]; lanes: number; gameLanes: number } {
+  if (!groupByKind) {
+    const r = packOne(sessions, win, colorFor);
+    return { placed: r.placed, lanes: Math.max(1, r.lanes), gameLanes: r.lanes };
+  }
+  const games = sessions.filter((s) => (s.kind ?? "game") === "game");
+  const apps = sessions.filter((s) => s.kind === "app");
+  const g = packOne(games, win, colorFor, 0);
+  const a = packOne(apps, win, colorFor, g.lanes);
+  return {
+    placed: [...g.placed, ...a.placed],
+    lanes: Math.max(1, g.lanes + a.lanes),
+    gameLanes: g.lanes,
+  };
+}
+
+interface ActivePlaced {
+  span: ForegroundSpan;
+  left: number;
+  width: number;
+  color: string;
+  startMs: number;
+  endMs: number;
+}
+
+function placeForeground(spans: ForegroundSpan[], win: Window): ActivePlaced[] {
+  const span = win.end - win.start || 1;
+  return spans
+    .map((fs) => {
+      const startMs = new Date(fs.startUtc).getTime();
+      const endMs = fs.endUtc ? new Date(fs.endUtc).getTime() : Date.now();
+      return { fs, startMs, endMs: Math.max(endMs, startMs + 1000) };
+    })
+    .filter((x) => x.endMs > win.start && x.startMs < win.end)
+    .map((x) => {
+      const cs = Math.max(x.startMs, win.start);
+      const ce = Math.min(x.endMs, win.end);
+      return {
+        span: x.fs,
+        left: ((cs - win.start) / span) * 100,
+        width: Math.max(0.4, ((ce - cs) / span) * 100),
+        color: accentFor(x.fs.gameId ?? x.fs.appKey)[0],
+        startMs: x.startMs,
+        endMs: x.endMs,
+      };
+    });
 }
 
 function hostOf(url?: string | null): string | null {
@@ -195,6 +256,9 @@ export function Timeline({
   compact = false,
   footer,
   emptyLabel = "No play recorded in this window",
+  groupByKind = false,
+  showActiveApp = false,
+  activeAppSpans,
 }: {
   sessions: Session[];
   range?: TimelineRange;
@@ -206,6 +270,12 @@ export function Timeline({
   compact?: boolean;
   footer?: ReactNode;
   emptyLabel?: string;
+  /** Pack games and apps into separate lane blocks (never the same row). */
+  groupByKind?: boolean;
+  /** Fetch + render a dedicated top "Active app" lane for the visible window. */
+  showActiveApp?: boolean;
+  /** Provide foreground spans directly instead of self-fetching. */
+  activeAppSpans?: ForegroundSpan[];
 }) {
   const navigate = useNavigate();
   const use24 = useApp((s) => s.prefs.timeFormat === "24h");
@@ -241,12 +311,35 @@ export function Timeline({
     return buildWindow(range ?? "1h", offset, use24);
   }, [fixedRangeMinutes, nowMs, use24, range, offset]);
 
-  const { placed, lanes } = useMemo(() => placeSessions(sessions, win, color), [sessions, win, color]);
+  const { placed, lanes, gameLanes } = useMemo(
+    () => placeSessions(sessions, win, color, groupByKind),
+    [sessions, win, color, groupByKind]
+  );
+
+  // The active-app row is only meaningful (and bounded) for windows up to ~8 days.
+  const activeEligible = win.end - win.start <= 8 * DAY;
+  const fetchActive = showActiveApp && !activeAppSpans && activeEligible;
+  const fromISO = useMemo(() => new Date(win.start).toISOString(), [win.start]);
+  const toISO = useMemo(() => new Date(win.end).toISOString(), [win.end]);
+  const { data: fgData } = useForegroundSpans(fromISO, toISO, fetchActive);
+  const spansForRow = activeAppSpans ?? (fetchActive ? fgData : undefined);
+  const hasActiveRow = (showActiveApp && activeEligible) || !!activeAppSpans;
+
+  const activePlaced = useMemo(
+    () => (spansForRow && spansForRow.length ? placeForeground(spansForRow, win) : []),
+    [spansForRow, win]
+  );
 
   const shownLanes = Math.min(lanes, maxLanes);
   const barH = compact ? BAR_H_COMPACT : BAR_H;
   const laneGap = compact ? LANE_GAP_COMPACT : LANE_GAP;
-  const trackH = shownLanes * (barH + laneGap) + (compact ? 2 : 6);
+  const activeRowH = hasActiveRow ? barH + (compact ? 8 : 12) : 0;
+  const trackH = activeRowH + shownLanes * (barH + laneGap) + (compact ? 2 : 6);
+  // Divider position between the games block and apps block (grouped mode).
+  const dividerTop =
+    groupByKind && gameLanes > 0 && gameLanes < shownLanes
+      ? activeRowH + gameLanes * (barH + laneGap) + (compact ? 2 : 4) - laneGap / 2
+      : null;
   const tooltipClass =
     "pointer-events-none absolute left-1/2 z-[250] w-max max-w-[min(320px,90vw)] -translate-x-1/2 rounded-xl border border-line bg-bg-850 px-2.5 py-1.5 text-[11px] shadow-float";
   const actTooltipClass =
@@ -339,6 +432,46 @@ export function Timeline({
         )}
 
         <div className="relative" style={{ height: trackH }}>
+          {/* Active-app lane: whichever app was in the foreground at each moment. */}
+          {hasActiveRow && (
+            <div
+              className="absolute inset-x-0 rounded-lg border border-line/70 bg-white/[0.015]"
+              style={{ top: compact ? 2 : 4, height: barH }}
+            >
+              <span className="pointer-events-none absolute left-1.5 top-1/2 z-[3] -translate-y-1/2 text-[9px] font-700 uppercase tracking-wider text-ink-faint">
+                Active
+              </span>
+              {activePlaced.map((a, ai) => {
+                const wide = a.width > 9;
+                return (
+                  <button
+                    key={`${a.span.id}-${ai}`}
+                    onClick={() => a.span.gameId && link && navigate(`/game/${a.span.gameId}`)}
+                    className="group/act absolute inset-y-[3px] overflow-visible rounded-md text-left hover:z-[40]"
+                    style={{ left: `${a.left}%`, width: `${a.width}%` }}
+                    title={`${a.span.name} · ${new Date(a.startMs).toLocaleTimeString(undefined, { hour: use24 ? "2-digit" : "numeric", minute: "2-digit", hour12: !use24 })} → ${new Date(a.endMs).toLocaleTimeString(undefined, { hour: use24 ? "2-digit" : "numeric", minute: "2-digit", hour12: !use24 })}`}
+                  >
+                    <span
+                      className="absolute inset-0 rounded-md"
+                      style={{
+                        background: `linear-gradient(180deg, color-mix(in srgb, ${a.color} 46%, #07080f), color-mix(in srgb, ${a.color} 26%, #07080f))`,
+                        boxShadow: `inset 0 0 0 1px color-mix(in srgb, ${a.color} 38%, transparent)`,
+                      }}
+                    />
+                    {wide && (
+                      <span className="relative z-[2] block truncate px-1.5 leading-[var(--bar)] text-[10px] font-700 text-white/95" style={{ ["--bar" as string]: `${barH - 6}px` }}>
+                        {a.span.name}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {/* Faint divider between the games block and the apps block. */}
+          {dividerTop != null && (
+            <div className="pointer-events-none absolute inset-x-0 z-[2] border-t border-dashed border-line/60" style={{ top: dividerTop }} />
+          )}
           {placed
             .filter((p) => p.lane < shownLanes)
             .map((p, i) => {
@@ -359,7 +492,7 @@ export function Timeline({
                   style={{
                     left: `${p.left}%`,
                     width: `${p.width}%`,
-                    top: p.lane * (barH + laneGap) + (compact ? 2 : 4),
+                    top: activeRowH + p.lane * (barH + laneGap) + (compact ? 2 : 4),
                     height: barH,
                   }}
                   initial={enabled ? { scaleX: 0, opacity: 0, x: -8 } : false}
@@ -465,7 +598,7 @@ export function Timeline({
             })}
         </div>
 
-        {placed.length === 0 && (
+        {placed.length === 0 && activePlaced.length === 0 && (
           <div className="absolute inset-0 grid place-items-center text-xs text-ink-faint">{emptyLabel}</div>
         )}
         {lanes > shownLanes && (

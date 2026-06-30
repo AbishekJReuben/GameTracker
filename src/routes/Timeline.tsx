@@ -177,7 +177,7 @@ function TimelineSection({
           {isLoading ? (
             <Skeleton className="h-40 w-full" />
           ) : sessions.length > 0 ? (
-            <Timeline sessions={sessions} range={range} compact maxLanes={8} colorFor={(s) => colorFor(s.gameId, s.accentColor)} />
+            <Timeline sessions={sessions} range={range} compact maxLanes={8} showActiveApp colorFor={(s) => colorFor(s.gameId, s.accentColor)} />
           ) : (
             <EmptyState title={`No ${title.toLowerCase()} sessions`} message={emptyMessage} />
           )}

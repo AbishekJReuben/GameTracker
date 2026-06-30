@@ -660,7 +660,7 @@ export default function GameDetail() {
       {game.isTracked && (
         <Panel panelKey="game-detail.timeline" game={game} games={allGames ?? []} sessions={sessionList} className="mb-6 overflow-visible">
           <SectionTitle title={isApp ? "Usage timeline" : "Play timeline"} subtitle={isApp ? "When you used this app" : "When you played this game"} right={<Segmented value={range} onChange={setRange} options={RANGE_OPTS} size="sm" />} />
-          <Timeline sessions={sessionList} range={range} colorFor={() => accent} />
+          <Timeline sessions={sessionList} range={range} showActiveApp colorFor={() => accent} />
         </Panel>
       )}
 

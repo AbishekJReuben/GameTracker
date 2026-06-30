@@ -1560,3 +1560,195 @@ pub fn local_launcher_import(
         }
     })
 }
+
+// ---------- media listening (SMTC) + global foreground log ----------
+
+#[tauri::command]
+pub fn media_overview(state: State<AppState>) -> AppResult<crate::db::music::MusicOverview> {
+    crate::db::music::overview(&state.pool)
+}
+
+#[tauri::command]
+pub fn media_heatmap(state: State<AppState>, days: Option<i64>) -> AppResult<Vec<crate::db::stats::DayValue>> {
+    crate::db::music::heatmap(&state.pool, days.unwrap_or(140).clamp(7, 800))
+}
+
+#[tauri::command]
+pub fn media_hour_of_day(state: State<AppState>) -> AppResult<Vec<i64>> {
+    crate::db::music::hour_of_day(&state.pool)
+}
+
+#[tauri::command]
+pub fn media_top(state: State<AppState>, limit: Option<i64>) -> AppResult<crate::db::music::MusicTop> {
+    crate::db::music::top(&state.pool, limit.unwrap_or(10))
+}
+
+#[tauri::command]
+pub fn media_insights(state: State<AppState>) -> AppResult<crate::db::music::MusicInsights> {
+    crate::db::music::insights(&state.pool)
+}
+
+#[tauri::command]
+pub fn media_timeline(
+    state: State<AppState>,
+    from_utc: Option<String>,
+    to_utc: Option<String>,
+) -> AppResult<Vec<crate::db::media::MediaPlayDto>> {
+    crate::db::media::list_plays(&state.pool, from_utc.as_deref(), to_utc.as_deref())
+}
+
+#[tauri::command]
+pub fn media_recent(state: State<AppState>, limit: Option<i64>) -> AppResult<Vec<crate::db::media::MediaPlayDto>> {
+    crate::db::media::recent(&state.pool, limit.unwrap_or(12).clamp(1, 100))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JukeboxPlayInput {
+    pub vid: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub game_id: Option<String>,
+    pub cover_path: Option<String>,
+}
+
+/// Record an in-app jukebox play. Closes the previous jukebox row first so each
+/// track is its own play. Independent of the SMTC bridge (which skips our app).
+#[tauri::command]
+pub fn record_media_play(state: State<AppState>, track: JukeboxPlayInput) -> AppResult<()> {
+    crate::db::media::close_open_for_source(&state.pool, "jukebox")?;
+    let m = crate::db::media::NewMediaPlay {
+        source: "jukebox".into(),
+        source_app: Some("gametracker".into()),
+        app_name: Some("GameTracker Jukebox".into()),
+        media_type: "music".into(),
+        title: track.title,
+        artist: track.artist,
+        album: None,
+        thumb_path: track.cover_path,
+        game_id: track.game_id,
+        vid: Some(track.vid),
+    };
+    crate::db::media::start_play(&state.pool, &m)?;
+    Ok(())
+}
+
+/// Stop accruing for the in-app jukebox (pause / stop / closed).
+#[tauri::command]
+pub fn stop_media_play(state: State<AppState>) -> AppResult<()> {
+    crate::db::media::close_open_for_source(&state.pool, "jukebox")
+}
+
+#[tauri::command]
+pub fn foreground_spans(
+    state: State<AppState>,
+    from_utc: Option<String>,
+    to_utc: Option<String>,
+) -> AppResult<Vec<crate::db::foreground::ForegroundSpanDto>> {
+    crate::db::foreground::list(&state.pool, from_utc.as_deref(), to_utc.as_deref())
+}
+
+// ---------- playlists ----------
+
+#[tauri::command]
+pub fn playlists_list(state: State<AppState>) -> AppResult<Vec<crate::db::playlists::PlaylistDto>> {
+    crate::db::playlists::list(&state.pool)
+}
+
+#[tauri::command]
+pub fn playlist_get(state: State<AppState>, id: String) -> AppResult<Option<crate::db::playlists::PlaylistDto>> {
+    crate::db::playlists::get(&state.pool, &id)
+}
+
+#[tauri::command]
+pub fn playlist_create(state: State<AppState>, name: String) -> AppResult<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::msg("Playlist name can't be empty"));
+    }
+    crate::db::playlists::create(&state.pool, trimmed)
+}
+
+#[tauri::command]
+pub fn playlist_rename(state: State<AppState>, id: String, name: String) -> AppResult<()> {
+    crate::db::playlists::rename(&state.pool, &id, &name)
+}
+
+#[tauri::command]
+pub fn playlist_delete(state: State<AppState>, id: String) -> AppResult<()> {
+    crate::db::playlists::delete(&state.pool, &id)
+}
+
+#[tauri::command]
+pub fn playlist_add_tracks(
+    state: State<AppState>,
+    id: String,
+    tracks: Vec<crate::db::playlists::PlaylistTrack>,
+) -> AppResult<()> {
+    crate::db::playlists::add_tracks(&state.pool, &id, &tracks)
+}
+
+#[tauri::command]
+pub fn playlist_remove_track(state: State<AppState>, id: String, vid: String) -> AppResult<()> {
+    crate::db::playlists::remove_track(&state.pool, &id, &vid)
+}
+
+#[tauri::command]
+pub fn playlist_reorder(state: State<AppState>, id: String, vids: Vec<String>) -> AppResult<()> {
+    crate::db::playlists::reorder(&state.pool, &id, &vids)
+}
+
+// ---------- metacritic backfill ----------
+
+/// Backfill Metacritic scores for games that have none. Spawns a throttled worker
+/// (network) that resolves each title and stores its score (only when missing —
+/// never overwrites a user/CSV value), emitting `metacritic://progress` per game
+/// and `metacritic://done` at the end. Gated by the online-metadata opt-in.
+#[tauri::command]
+pub fn backfill_metacritic(app: tauri::AppHandle, state: State<AppState>) -> AppResult<usize> {
+    if !settings::get_bool(&state.pool, "online_metadata_enabled")? {
+        return Err(AppError::msg(
+            "Turn on Online metadata in Settings to fetch Metacritic scores.",
+        ));
+    }
+    let pool = state.pool.clone();
+    let media_dir = state.media_dir.clone();
+    let pending: Vec<crate::db::models::GameDto> = games::list(&pool)?
+        .into_iter()
+        .filter(|g| g.kind == "game" && g.metacritic.is_none())
+        .collect();
+    let total = pending.len();
+    std::thread::spawn(move || {
+        let mut updated = 0usize;
+        for (i, game) in pending.into_iter().enumerate() {
+            let meta = if let Some(appid) = game.steam_app_id {
+                metadata::fetch_game_info_by_appid(appid as u64, &media_dir, &game.id, false)
+                    .ok()
+                    .flatten()
+            } else {
+                metadata::fetch_game_info(&game.display_name, &media_dir, &game.id, false)
+                    .ok()
+                    .flatten()
+            };
+            if let Some(meta) = meta {
+                if meta.metacritic.is_some() {
+                    let _ = games::apply_metadata(
+                        &pool, &game.id, None, None, meta.metacritic, None, &[], None,
+                    );
+                    updated += 1;
+                }
+            }
+            let _ = app.emit(
+                "metacritic://progress",
+                serde_json::json!({ "done": i + 1, "total": total, "name": game.display_name }),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+        let _ = app.emit(
+            "metacritic://done",
+            serde_json::json!({ "count": total, "updated": updated }),
+        );
+        let _ = app.emit("game://enriched", serde_json::json!({ "id": "" }));
+    });
+    Ok(total)
+}

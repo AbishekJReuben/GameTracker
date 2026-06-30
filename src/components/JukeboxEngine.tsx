@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import { assetUrl } from "@/lib/api";
+import { api, assetUrl } from "@/lib/api";
 import { useJukebox } from "@/store/jukebox";
 import { useApp } from "@/store/app";
 
@@ -31,7 +31,33 @@ export function JukeboxEngine() {
   const didGesture = useRef(false);
   const lastEndedAt = useRef(0);
   const lastTick = useRef(0);
+  const lastRecorded = useRef("");
   const track = tracks[index];
+
+  // Record in-app jukebox listening into media_plays (for the music analytics).
+  useEffect(() => {
+    if (!active || !track || !playing) return;
+    if (lastRecorded.current === track.vid) return;
+    lastRecorded.current = track.vid;
+    api
+      .recordMediaPlay({
+        vid: track.vid,
+        title: track.label,
+        artist: track.gameName,
+        gameId: track.gameId,
+        coverPath: track.coverPath ?? track.iconPath,
+      })
+      .catch(() => {});
+  }, [active, track, playing]);
+
+  // Stop accruing when paused / stopped, and on unmount.
+  useEffect(() => {
+    if (!playing) {
+      lastRecorded.current = "";
+      api.stopMediaPlay().catch(() => {});
+    }
+  }, [playing]);
+  useEffect(() => () => void api.stopMediaPlay().catch(() => {}), []);
 
   const ytCommand = useCallback((func: string, args: unknown[] = []) => {
     iframeRef.current?.contentWindow?.postMessage(

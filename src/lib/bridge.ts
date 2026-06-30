@@ -1,10 +1,11 @@
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
-import { api, TrackingState } from "./api";
+import { api, MediaState, TrackingState } from "./api";
 import { isTauri } from "./tauri";
 import { useApp } from "@/store/app";
 import { useProgress } from "@/store/progress";
+import { useMediaStore } from "@/store/media";
 
 interface SessionEvent {
   kind: "start" | "end";
@@ -25,6 +26,8 @@ export function useTauriBridge() {
   const pushToast = useApp((s) => s.pushToast);
   const qc = useQueryClient();
   const lastLiveRefresh = useRef(0);
+  const lastMediaRefresh = useRef(0);
+  const lastMediaKey = useRef("");
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -45,6 +48,20 @@ export function useTauriBridge() {
           qc.invalidateQueries({ queryKey: ["sessions"] });
           qc.invalidateQueries({ queryKey: ["systemHistory"] });
         }
+      }
+    });
+
+    // Live "now listening" (SMTC). Update the store every tick; refresh the
+    // music analytics queries only when the track actually changes (throttled).
+    const unlistenMedia = listen<MediaState>("media://state", (e) => {
+      const st = e.payload;
+      useMediaStore.getState().setMedia(st);
+      const key = `${st.title ?? ""}|${st.artist ?? ""}|${st.playing}`;
+      const now = Date.now();
+      if (key !== lastMediaKey.current && now - lastMediaRefresh.current > 4000) {
+        lastMediaKey.current = key;
+        lastMediaRefresh.current = now;
+        qc.invalidateQueries({ queryKey: ["music"] });
       }
     });
 
@@ -101,6 +118,7 @@ export function useTauriBridge() {
     return () => {
       mounted = false;
       unlistenState.then((f) => f());
+      unlistenMedia.then((f) => f());
       unlistenSession.then((f) => f());
       unlistenShot.then((f) => f());
       unlistenEnriched.then((f) => f());

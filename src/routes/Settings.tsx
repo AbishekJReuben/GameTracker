@@ -23,6 +23,7 @@ import {
   CalendarRange,
   Home,
   Waves,
+  Zap,
   ScanLine,
   ImageDown,
   Target,
@@ -46,6 +47,7 @@ import type { AccentTheme, CustomAccent } from "@/store/app";
 import { api, type Settings } from "@/lib/api";
 import { runCsvImport } from "@/lib/bulkTasks";
 import { ContentAuditPanel } from "@/components/ContentAuditPanel";
+import { MetacriticBackfill } from "@/components/MetacriticBackfill";
 import { LauncherSyncSection } from "@/components/LauncherSyncSection";
 
 const ACCENTS: { id: AccentTheme; label: string; colors: [string, string, string] }[] = [
@@ -224,6 +226,18 @@ export default function SettingsPage() {
               ]}
             />
           </SettingRow>
+          <SettingRow icon={<Zap className="h-4 w-4" />} title="Performance" desc="Lite drops glass blur, shaders, ambient orbs & marquees for maximum smoothness. Auto picks based on your hardware.">
+            <Segmented
+              value={prefs.perfMode}
+              onChange={(v) => setPref("perfMode", v)}
+              size="sm"
+              options={[
+                { value: "auto", label: "Auto" },
+                { value: "high", label: "High" },
+                { value: "lite", label: "Lite" },
+              ]}
+            />
+          </SettingRow>
           <SettingRow icon={<Waves className="h-4 w-4" />} title="Animated background" desc="Drifting accent orbs behind the app.">
             <SpringToggle checked={prefs.background} onChange={(v) => setPref("background", v)} />
           </SettingRow>
@@ -389,6 +403,7 @@ export default function SettingsPage() {
           <SettingRow icon={<ImageDown className="h-4 w-4" />} title="Cover art" desc="Local-first. Fetch on demand from Library, or drag-drop your own.">
             <span className="text-xs text-ink-faint">On demand</span>
           </SettingRow>
+          <MetacriticBackfill />
           <ContentAuditPanel />
         </div>
       ),

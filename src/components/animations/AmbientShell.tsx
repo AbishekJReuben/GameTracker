@@ -1,12 +1,17 @@
 import { motion } from "motion/react";
-import { useApp, useMotionEnabled } from "@/store/app";
+import { useApp, useMotionEnabled, useReduceEffects } from "@/store/app";
+import { useDocumentVisible } from "@/lib/useVisible";
 import { FloatingParticles } from "./FloatingParticles";
 
 /** Full-bleed living backdrop: orbs, grid, noise, particles, vignette, optional scanlines. */
 export function AmbientShell() {
-  const fx = useApp((s) => s.prefs.background);
-  const scan = useApp((s) => s.prefs.scanlines);
-  const animate = useMotionEnabled();
+  const reduce = useReduceEffects();
+  const visible = useDocumentVisible();
+  const fx = useApp((s) => s.prefs.background) && !reduce;
+  const scan = useApp((s) => s.prefs.scanlines) && !reduce;
+  // Pause drift when the window is hidden — animating blurred orbs behind blurred
+  // panels is the main background-jank source, and it's wasted while backgrounded.
+  const animate = useMotionEnabled() && !reduce && visible;
 
   return (
     <div className="pointer-events-none fixed inset-0 -z-10 overflow-hidden">

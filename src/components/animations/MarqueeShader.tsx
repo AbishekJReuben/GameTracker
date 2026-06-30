@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { useMotionEnabled } from "@/store/app";
+import { useMotionEnabled, useReduceEffects } from "@/store/app";
 import { cn } from "@/lib/cn";
 
 /* A self-contained WebGL overlay used by the "shader" marquee variant and other
@@ -105,7 +105,7 @@ const FRAGS: Record<ShaderKind, string> = {
 
 export function MarqueeShader({ className, kind }: { className?: string; kind?: ShaderKind }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const enabled = useMotionEnabled();
+  const enabled = useMotionEnabled() && !useReduceEffects();
   // Pick a stable effect for this instance if the caller didn't specify one, so
   // different panels get visibly different shaders.
   const seeded = useMemo<ShaderKind>(() => kind ?? SHADER_KINDS[Math.floor(Math.random() * SHADER_KINDS.length)]!, [kind]);

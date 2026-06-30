@@ -10,6 +10,7 @@ import { Panel } from "@/components/Panel";
 import { ShaderImageTransition } from "@/components/animations";
 import { useSessions, useGames } from "@/lib/queries";
 import { ThemePlaylist } from "@/components/ThemePlaylist";
+import { Playlists } from "@/components/Playlists";
 import { useApp, useMarqueeTier, useMotionEnabled } from "@/store/app";
 import { api, assetUrl, EntryKind, SessionFilter } from "@/lib/api";
 import { dur, dateLabel, timeLabel } from "@/lib/format";
@@ -123,6 +124,8 @@ export default function SessionsPage() {
       {showMarquee && marqueeImages.length >= 2 && (
         <ShaderImageTransition images={marqueeImages} className="mb-5 h-36 md:h-44" />
       )}
+
+      <Playlists />
 
       <ThemePlaylist games={games ?? []} />
 

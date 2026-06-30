@@ -20,6 +20,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("screenshot_interval_minutes", "1"),
     ("theme_music_enabled", "true"),
     ("system_monitor_enabled", "true"),
+    ("media_tracking_enabled", "true"),
+    ("media_app_types", "{}"),
     ("steam_id", ""),
     ("steam_persona_name", ""),
     ("steam_avatar_url", ""),

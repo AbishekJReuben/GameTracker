@@ -28,6 +28,7 @@ import { api, type Game } from "@/lib/api";
 import { Panel } from "./Panel";
 import { SectionTitle, EmptyState, Segmented } from "./ui";
 import { GameArt } from "./GameArt";
+import { AddToPlaylist } from "./AddToPlaylist";
 import { useJukebox } from "@/store/jukebox";
 import { useApp } from "@/store/app";
 import {
@@ -359,18 +360,23 @@ export function ThemePlaylist({ games }: { games: Game[] }) {
                         <div className={cn("truncate text-xs font-700", isCurrent ? "text-accent" : "text-ink-soft")}>{t.label}</div>
                         <div className="truncate text-[10px] text-ink-faint">{t.gameName}</div>
                       </div>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const n = enqueue([t]);
-                          pushToast({ kind: n ? "success" : "info", title: n ? "Added to queue" : "Already in queue" });
-                        }}
-                        className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-faint opacity-0 transition hover:bg-white/[0.08] hover:text-ink group-hover:opacity-100"
-                        title="Add to queue"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                      </button>
+                      <div className="flex shrink-0 items-center gap-1 opacity-0 transition group-hover:opacity-100">
+                        <AddToPlaylist
+                          tracks={[{ vid: t.vid, gameId: t.gameId, title: t.label, artist: t.gameName, coverPath: t.coverPath, iconPath: t.iconPath }]}
+                        />
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const n = enqueue([t]);
+                            pushToast({ kind: n ? "success" : "info", title: n ? "Added to queue" : "Already in queue" });
+                          }}
+                          className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-faint transition hover:bg-white/[0.08] hover:text-ink"
+                          title="Add to queue"
+                        >
+                          <Plus className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </motion.li>
                   );
                 })}

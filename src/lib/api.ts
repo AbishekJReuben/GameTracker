@@ -471,6 +471,125 @@ export interface TrackingState {
   appActiveCount: number;
 }
 
+// ---------- Media listening / music ----------
+
+export type MediaType = "music" | "video" | "podcast" | "other";
+
+export interface MediaPlay {
+  id: string;
+  source: string; // 'smtc' | 'jukebox'
+  sourceApp: string | null;
+  appName: string | null;
+  mediaType: MediaType | string;
+  title: string | null;
+  artist: string | null;
+  album: string | null;
+  thumbPath: string | null;
+  gameId: string | null;
+  vid: string | null;
+  startUtc: string;
+  endUtc: string | null;
+  lastSeenUtc: string;
+  playedSeconds: number;
+}
+
+/** Live "now listening" event payload (`media://state`). */
+export interface MediaState {
+  playing: boolean;
+  source: string | null;
+  app: string | null;
+  title: string | null;
+  artist: string | null;
+  album: string | null;
+  mediaType: string | null;
+  thumbPath: string | null;
+}
+
+export interface TypeSlice {
+  mediaType: string;
+  seconds: number;
+  count: number;
+}
+
+export interface MusicOverview {
+  totalSeconds: number;
+  todaySeconds: number;
+  weekSeconds: number;
+  monthSeconds: number;
+  playCount: number;
+  distinctArtists: number;
+  distinctTracks: number;
+  distinctAlbums: number;
+  distinctApps: number;
+  activeDays: number;
+  currentStreak: number;
+  longestStreak: number;
+  avgPerActiveDay: number;
+  byType: TypeSlice[];
+}
+
+export interface MusicEntry {
+  key: string;
+  label: string;
+  secondary: string | null;
+  seconds: number;
+  count: number;
+  art: string | null;
+}
+
+export interface MusicTop {
+  artists: MusicEntry[];
+  tracks: MusicEntry[];
+  albums: MusicEntry[];
+  apps: MusicEntry[];
+}
+
+export interface MusicInsights {
+  mostRepeated: MusicEntry | null;
+  longestPlaySeconds: number;
+  longestPlayLabel: string | null;
+  nightOwlSeconds: number;
+  peakHour: number;
+  newArtistsThisMonth: number;
+  gamingWithMusicPct: number;
+  busiestDay: DayValue | null;
+  firstListenUtc: string | null;
+}
+
+export interface ForegroundSpan {
+  id: string;
+  appKey: string;
+  name: string;
+  exePath: string | null;
+  iconPath: string | null;
+  gameId: string | null;
+  startUtc: string;
+  endUtc: string | null;
+  lastSeenUtc: string;
+}
+
+// ---------- Playlists ----------
+
+export interface PlaylistTrack {
+  vid: string;
+  gameId?: string | null;
+  title?: string | null;
+  artist?: string | null;
+  coverPath?: string | null;
+  iconPath?: string | null;
+  position?: number;
+}
+
+export interface Playlist {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  trackCount: number;
+  covers: string[];
+  tracks: PlaylistTrack[];
+}
+
 // ---------- System monitor ----------
 
 export interface DiskSpec {
@@ -843,6 +962,36 @@ export const api = {
     call<LocalLauncherGame[]>("local_launcher_library", { platform }),
   localLauncherImport: (platform: string, names: string[]) =>
     call<[number, number]>("local_launcher_import", { platform, names }),
+
+  // media listening / music
+  mediaOverview: () => call<MusicOverview>("media_overview"),
+  mediaHeatmap: (days?: number) => call<DayValue[]>("media_heatmap", { days }),
+  mediaHourOfDay: () => call<number[]>("media_hour_of_day"),
+  mediaTop: (limit?: number) => call<MusicTop>("media_top", { limit }),
+  mediaInsights: () => call<MusicInsights>("media_insights"),
+  mediaTimeline: (fromUtc?: string | null, toUtc?: string | null) =>
+    call<MediaPlay[]>("media_timeline", { fromUtc: fromUtc ?? null, toUtc: toUtc ?? null }),
+  mediaRecent: (limit?: number) => call<MediaPlay[]>("media_recent", { limit }),
+  recordMediaPlay: (track: { vid: string; title?: string | null; artist?: string | null; gameId?: string | null; coverPath?: string | null }) =>
+    call<void>("record_media_play", { track }),
+  stopMediaPlay: () => call<void>("stop_media_play"),
+  foregroundSpans: (fromUtc?: string | null, toUtc?: string | null) =>
+    call<ForegroundSpan[]>("foreground_spans", { fromUtc: fromUtc ?? null, toUtc: toUtc ?? null }),
+
+  // playlists
+  playlistsList: () => call<Playlist[]>("playlists_list"),
+  playlistGet: (id: string) => call<Playlist | null>("playlist_get", { id }),
+  playlistCreate: (name: string) => call<string>("playlist_create", { name }),
+  playlistRename: (id: string, name: string) => call<void>("playlist_rename", { id, name }),
+  playlistDelete: (id: string) => call<void>("playlist_delete", { id }),
+  playlistAddTracks: (id: string, tracks: PlaylistTrack[]) =>
+    call<void>("playlist_add_tracks", { id, tracks }),
+  playlistRemoveTrack: (id: string, vid: string) =>
+    call<void>("playlist_remove_track", { id, vid }),
+  playlistReorder: (id: string, vids: string[]) => call<void>("playlist_reorder", { id, vids }),
+
+  // metacritic
+  backfillMetacritic: () => call<number>("backfill_metacritic"),
 };
 
 /** Convert a stored absolute file path to a webview-loadable asset URL. */

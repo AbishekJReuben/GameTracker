@@ -1,5 +1,9 @@
+pub mod foreground;
 pub mod games;
+pub mod media;
 pub mod models;
+pub mod music;
+pub mod playlists;
 pub mod screenshots;
 pub mod sessions;
 pub mod settings;
@@ -338,6 +342,114 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         )?;
         conn.execute_batch("PRAGMA user_version = 19;")?;
         version = 19;
+    }
+
+    if version < 20 {
+        // Music/media listening tracking, a global foreground-app log (for the
+        // "active app" timeline lane), and user-curated playlists.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE media_plays (
+                id             TEXT PRIMARY KEY,
+                source         TEXT NOT NULL,            -- 'smtc' | 'jukebox'
+                source_app     TEXT,                     -- AUMID / exe (smtc) or 'gametracker'
+                app_name       TEXT,                     -- friendly (Spotify, Chrome…)
+                media_type     TEXT NOT NULL,            -- 'music' | 'video' | 'podcast' | 'other'
+                title          TEXT,
+                artist         TEXT,
+                album          TEXT,
+                thumb_path     TEXT,
+                game_id        TEXT,
+                vid            TEXT,
+                start_utc      TEXT NOT NULL,
+                end_utc        TEXT,
+                last_seen_utc  TEXT NOT NULL,
+                played_seconds INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_media_start ON media_plays(start_utc);
+            CREATE INDEX idx_media_artist ON media_plays(artist);
+
+            CREATE TABLE foreground_spans (
+                id            TEXT PRIMARY KEY,
+                app_key       TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                exe_path      TEXT,
+                icon_path     TEXT,
+                game_id       TEXT,
+                start_utc     TEXT NOT NULL,
+                end_utc       TEXT,
+                last_seen_utc TEXT NOT NULL
+            );
+            CREATE INDEX idx_fg_start ON foreground_spans(start_utc);
+
+            CREATE TABLE playlists (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE playlist_tracks (
+                playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+                position    INTEGER NOT NULL,
+                vid         TEXT NOT NULL,
+                game_id     TEXT,
+                title       TEXT,
+                artist      TEXT,
+                cover_path  TEXT,
+                icon_path   TEXT,
+                PRIMARY KEY (playlist_id, vid)
+            );
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 20;")?;
+        version = 20;
+    }
+
+    if version < 21 {
+        // Re-classify existing SMTC media plays with the improved heuristic: a
+        // browser session counts as music only when it carries an album (real
+        // music services), so plain YouTube videos — channel name in `artist`,
+        // no album — are corrected from 'music' to 'video'. Honors the user's
+        // per-app type overrides, mirroring the live tracker.
+        use crate::tracking::media::classify;
+        let overrides: std::collections::HashMap<String, String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'media_app_types'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(&s).ok())
+            .unwrap_or_default();
+
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, source_app, artist, album FROM media_plays WHERE source = 'smtc'",
+            )?;
+            let mapped = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, source_app, artist, album) in rows {
+            let app = source_app.unwrap_or_default();
+            // Old rows predate the playback-type hint; classify from metadata only.
+            let media_type = overrides.get(&app).cloned().unwrap_or_else(|| {
+                classify(&app, artist.as_deref(), album.as_deref(), None).to_string()
+            });
+            conn.execute(
+                "UPDATE media_plays SET media_type = ?1 WHERE id = ?2",
+                rusqlite::params![media_type, id],
+            )?;
+        }
+
+        conn.execute_batch("PRAGMA user_version = 21;")?;
+        version = 21;
     }
 
     let _ = version;

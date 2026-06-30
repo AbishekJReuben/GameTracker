@@ -20,6 +20,18 @@ export const keys = {
   systemHistory: (m: number) => ["systemHistory", m] as const,
   steamAchievements: (id: string) => ["steamAchievements", id] as const,
   steamAchievementsOverview: ["steamAchievementsOverview"] as const,
+  musicOverview: ["music", "overview"] as const,
+  musicHeatmap: (d: number) => ["music", "heatmap", d] as const,
+  musicHourOfDay: ["music", "hourOfDay"] as const,
+  musicTop: (l: number) => ["music", "top", l] as const,
+  musicInsights: ["music", "insights"] as const,
+  mediaTimeline: (from?: string | null, to?: string | null) =>
+    ["music", "timeline", from ?? null, to ?? null] as const,
+  mediaRecent: (l: number) => ["music", "recent", l] as const,
+  foregroundSpans: (from?: string | null, to?: string | null) =>
+    ["foregroundSpans", from ?? null, to ?? null] as const,
+  playlists: ["playlists"] as const,
+  playlist: (id: string) => ["playlist", id] as const,
 };
 
 export function useSettings() {
@@ -134,6 +146,83 @@ export function useSuggestions(enabled = true) {
     staleTime: 1000 * 60 * 60,
     retry: false,
   });
+}
+
+// ---------- Music / media listening ----------
+
+export function useMusicOverview() {
+  return useQuery({ queryKey: keys.musicOverview, queryFn: api.mediaOverview });
+}
+export function useMusicHeatmap(days: number) {
+  return useQuery({ queryKey: keys.musicHeatmap(days), queryFn: () => api.mediaHeatmap(days) });
+}
+export function useMusicHourOfDay() {
+  return useQuery({ queryKey: keys.musicHourOfDay, queryFn: () => api.mediaHourOfDay() });
+}
+export function useMusicTop(limit = 10) {
+  return useQuery({ queryKey: keys.musicTop(limit), queryFn: () => api.mediaTop(limit) });
+}
+export function useMusicInsights() {
+  return useQuery({ queryKey: keys.musicInsights, queryFn: api.mediaInsights });
+}
+export function useMediaTimeline(fromUtc?: string | null, toUtc?: string | null) {
+  return useQuery({
+    queryKey: keys.mediaTimeline(fromUtc, toUtc),
+    queryFn: () => api.mediaTimeline(fromUtc, toUtc),
+  });
+}
+export function useMediaRecent(limit = 12) {
+  return useQuery({ queryKey: keys.mediaRecent(limit), queryFn: () => api.mediaRecent(limit) });
+}
+
+export function useForegroundSpans(fromUtc?: string | null, toUtc?: string | null, enabled = true) {
+  return useQuery({
+    queryKey: keys.foregroundSpans(fromUtc, toUtc),
+    queryFn: () => api.foregroundSpans(fromUtc, toUtc),
+    enabled,
+  });
+}
+
+// ---------- Playlists ----------
+
+export function usePlaylists() {
+  return useQuery({ queryKey: keys.playlists, queryFn: api.playlistsList });
+}
+export function usePlaylist(id: string | undefined) {
+  return useQuery({
+    queryKey: keys.playlist(id ?? ""),
+    queryFn: () => api.playlistGet(id!),
+    enabled: !!id,
+  });
+}
+
+export function usePlaylistMutations() {
+  const qc = useQueryClient();
+  const refresh = (id?: string) => {
+    qc.invalidateQueries({ queryKey: keys.playlists });
+    if (id) qc.invalidateQueries({ queryKey: keys.playlist(id) });
+  };
+  return {
+    create: useMutation({ mutationFn: (name: string) => api.playlistCreate(name), onSuccess: () => refresh() }),
+    rename: useMutation({
+      mutationFn: (v: { id: string; name: string }) => api.playlistRename(v.id, v.name),
+      onSuccess: (_d, v) => refresh(v.id),
+    }),
+    remove: useMutation({ mutationFn: (id: string) => api.playlistDelete(id), onSuccess: () => refresh() }),
+    addTracks: useMutation({
+      mutationFn: (v: { id: string; tracks: import("./api").PlaylistTrack[] }) =>
+        api.playlistAddTracks(v.id, v.tracks),
+      onSuccess: (_d, v) => refresh(v.id),
+    }),
+    removeTrack: useMutation({
+      mutationFn: (v: { id: string; vid: string }) => api.playlistRemoveTrack(v.id, v.vid),
+      onSuccess: (_d, v) => refresh(v.id),
+    }),
+    reorder: useMutation({
+      mutationFn: (v: { id: string; vids: string[] }) => api.playlistReorder(v.id, v.vids),
+      onSuccess: (_d, v) => refresh(v.id),
+    }),
+  };
 }
 
 /** Invalidate everything that depends on games/sessions after a mutation. */

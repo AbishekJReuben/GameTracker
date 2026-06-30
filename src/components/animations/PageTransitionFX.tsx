@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useLocation } from "react-router-dom";
-import { useMotionEnabled } from "@/store/app";
+import { useMotionEnabled, useReduceEffects } from "@/store/app";
 
 /**
  * Futuristic route-change overlay — a WebGL "energy tear" sweeps across the
@@ -95,7 +95,8 @@ interface GLState {
 const DURATION = 720;
 
 export function PageTransitionFX() {
-  const enabled = useMotionEnabled();
+  const reduce = useReduceEffects();
+  const enabled = useMotionEnabled() && !reduce;
   const { pathname } = useLocation();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stateRef = useRef<GLState | null>(null);
