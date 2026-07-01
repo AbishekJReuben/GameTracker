@@ -12,6 +12,8 @@ use serde::Deserialize;
 pub enum ControlEvent {
     /// Move the cursor to a normalized position.
     Move { x: f32, y: f32 },
+    /// Move relatively (like trackpad).
+    Moverel { dx: i32, dy: i32 },
     /// Press-and-release a mouse button (optionally after moving there first).
     Click {
         x: Option<f32>,
@@ -81,6 +83,9 @@ impl Controller {
             ControlEvent::Move { x, y } => {
                 let (px, py) = self.to_abs(x, y);
                 self.enigo.move_mouse(px, py, Coordinate::Abs)
+            }
+            ControlEvent::Moverel { dx, dy } => {
+                self.enigo.move_mouse(dx, dy, Coordinate::Rel)
             }
             ControlEvent::Click { x, y, button } => {
                 if let (Some(x), Some(y)) = (x, y) {

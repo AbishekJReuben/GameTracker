@@ -9,6 +9,8 @@ import type { CloudConn } from "./cloud";
 
 export type ControlMsg =
   | { type: "move"; x: number; y: number }
+  | { type: "moverel"; dx: number; dy: number }
+  | { type: "click"; x?: number; y?: number; button?: string }
   | { type: "down"; button?: string }
   | { type: "up"; button?: string }
   | { type: "scroll"; dy: number }

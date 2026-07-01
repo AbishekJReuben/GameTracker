@@ -41,45 +41,57 @@ export function CompanionApp() {
       ? "Cloud · peer-to-peer"
       : remoteBase().replace(/^https?:\/\//, "");
 
+  const isControlTab = tab === "control";
+
   return (
     <div className="flex h-[100dvh] flex-col bg-bg-base text-ink">
-      <header className="flex items-center justify-between border-b border-line px-4 py-3">
-        <div>
-          <div className="font-display text-lg font-800 accent-text">GameTracker</div>
-          <div className="flex items-center gap-1.5 text-[11px] text-ink-faint">
-            {conn.mode === "cloud" ? <Globe className="h-3 w-3" /> : <Network className="h-3 w-3" />}
-            {subtitle}
+      {!isControlTab && (
+        <header className="flex items-center justify-between border-b border-line px-4 py-3">
+          <div>
+            <div className="font-display text-lg font-800 accent-text">GameTracker</div>
+            <div className="flex items-center gap-1.5 text-[11px] text-ink-faint">
+              {conn.mode === "cloud" ? <Globe className="h-3 w-3" /> : <Network className="h-3 w-3" />}
+              {subtitle}
+            </div>
           </div>
-        </div>
-        <button onClick={disconnect} className="btn btn-ghost h-9" title="Disconnect">
-          <LogOut className="h-4 w-4" /> Disconnect
-        </button>
-      </header>
+          <button onClick={disconnect} className="btn btn-ghost h-9" title="Disconnect">
+            <LogOut className="h-4 w-4" /> Disconnect
+          </button>
+        </header>
+      )}
 
-      <main className="min-h-0 flex-1 overflow-y-auto">
+      <main className={`min-h-0 flex-1 ${isControlTab ? "" : "overflow-y-auto"}`}>
         {tab === "stats" && <StatsScreen />}
         {tab === "music" && <MusicScreen />}
         {/* Mounted only on the Control tab so screen capture runs only while viewed. */}
-        {tab === "control" && <ControlTab conn={conn} />}
+        {tab === "control" && (
+          <ControlTab
+            conn={conn}
+            onNavigate={(targetTab: Tab) => setTab(targetTab)}
+            onDisconnect={disconnect}
+          />
+        )}
       </main>
 
-      <nav className="grid grid-cols-3 border-t border-line bg-bg-900/70 backdrop-blur">
-        {TABS.map((t) => {
-          const active = tab === t.id;
-          return (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`flex flex-col items-center gap-1 py-2.5 text-[11px] font-700 transition ${
-                active ? "text-accent-3" : "text-ink-dim"
-              }`}
-            >
-              <t.icon className="h-5 w-5" />
-              {t.label}
-            </button>
-          );
-        })}
-      </nav>
+      {!isControlTab && (
+        <nav className="grid grid-cols-3 border-t border-line bg-bg-900/70 backdrop-blur">
+          {TABS.map((t) => {
+            const active = tab === t.id;
+            return (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className={`flex flex-col items-center gap-1 py-2.5 text-[11px] font-700 transition ${
+                  active ? "text-accent-3" : "text-ink-dim"
+                }`}
+              >
+                <t.icon className="h-5 w-5" />
+                {t.label}
+              </button>
+            );
+          })}
+        </nav>
+      )}
     </div>
   );
 }
@@ -89,11 +101,19 @@ export function CompanionApp() {
  * when the Control tab is left — LAN opens its screen WebSocket, cloud reuses the
  * already-connected WebRTC data channels.
  */
-function ControlTab({ conn }: { conn: Connected }) {
+function ControlTab({
+  conn,
+  onNavigate,
+  onDisconnect,
+}: {
+  conn: Connected;
+  onNavigate: (t: Tab) => void;
+  onDisconnect: () => void;
+}) {
   const link: RemoteLink = useMemo(
     () => (conn.mode === "cloud" ? makeRtcLink(conn.conn) : makeWsLink()),
     [conn],
   );
   useEffect(() => () => link.close(), [link]);
-  return <ControlScreen link={link} />;
+  return <ControlScreen link={link} onNavigate={onNavigate} onDisconnect={onDisconnect} />;
 }
