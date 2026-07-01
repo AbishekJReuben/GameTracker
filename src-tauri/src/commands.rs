@@ -1752,3 +1752,63 @@ pub fn backfill_metacritic(app: tauri::AppHandle, state: State<AppState>) -> App
     });
     Ok(total)
 }
+
+// ---------- remote access (companion phone app) ----------
+
+use std::sync::atomic::Ordering;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteStatus {
+    pub enabled: bool,
+    pub running: bool,
+    pub port: u16,
+    pub pin: String,
+    pub host: Option<String>,
+    pub clients: usize,
+}
+
+fn remote_snapshot(state: &State<AppState>) -> RemoteStatus {
+    let r = &state.remote;
+    RemoteStatus {
+        enabled: r.enabled.load(Ordering::SeqCst),
+        running: r.running.load(Ordering::SeqCst),
+        port: r.port.load(Ordering::SeqCst),
+        pin: r.pin.lock().clone(),
+        host: crate::remote::best_host_ip(),
+        clients: r.clients.load(Ordering::SeqCst),
+    }
+}
+
+/// Current remote-server status for the Remote screen (poll for live client count).
+#[tauri::command]
+pub fn remote_status(state: State<AppState>) -> RemoteStatus {
+    remote_snapshot(&state)
+}
+
+/// Turn the remote server on or off. Enabling rotates the pairing PIN and starts
+/// the listener; disabling signals graceful shutdown. Persisted across restarts.
+#[tauri::command]
+pub fn remote_set_enabled(state: State<AppState>, enabled: bool) -> AppResult<RemoteStatus> {
+    settings::set(&state.pool, "remote_enabled", if enabled { "true" } else { "false" })?;
+    state.remote.enabled.store(enabled, Ordering::SeqCst);
+    if enabled {
+        state.remote.rotate_pin();
+        crate::remote::start(crate::remote::ApiState {
+            pool: state.pool.clone(),
+            tracking: state.shared.clone(),
+            media_dir: std::sync::Arc::new(state.media_dir.clone()),
+            remote: state.remote.clone(),
+        });
+    } else {
+        crate::remote::stop(&state.remote);
+    }
+    Ok(remote_snapshot(&state))
+}
+
+/// Generate a fresh pairing PIN and invalidate any devices paired with the old one.
+#[tauri::command]
+pub fn remote_regen_pin(state: State<AppState>) -> RemoteStatus {
+    state.remote.rotate_pin();
+    remote_snapshot(&state)
+}

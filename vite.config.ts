@@ -30,5 +30,13 @@ export default defineConfig(async () => ({
   build: {
     target: "esnext",
     chunkSizeWarningLimit: 1500,
+    rollupOptions: {
+      // Two entry points: the desktop app (index.html) and the phone companion
+      // (companion.html). The companion Tauri Android app ships the latter.
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        companion: path.resolve(__dirname, "companion.html"),
+      },
+    },
   },
 }));

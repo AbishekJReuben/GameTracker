@@ -22,8 +22,8 @@ import AppsPage from "./routes/Apps";
 import SystemsPage from "./routes/Systems";
 import GameDetail from "./routes/GameDetail";
 import TimelinePage from "./routes/Timeline";
-import SessionsPage from "./routes/Sessions";
 import MusicPage from "./routes/Music";
+import RemotePage from "./routes/Remote";
 import CollectionPage from "./routes/Collection";
 import TagsPage from "./routes/Tags";
 import SuggestedPage from "./routes/Suggested";
@@ -107,8 +107,10 @@ export default function App() {
         <Route path="/system" element={<SystemsPage />} />
         <Route path="/game/:id" element={<GameDetail />} />
         <Route path="/timeline" element={<TimelinePage />} />
-        <Route path="/sessions" element={<SessionsPage />} />
+        {/* Replay merged into Timeline (logs) + Music (playlists) — keep old links working. */}
+        <Route path="/sessions" element={<Navigate to="/timeline" replace />} />
         <Route path="/music" element={<MusicPage />} />
+        <Route path="/remote" element={<RemotePage />} />
         <Route path="/collection" element={<CollectionPage />} />
         {/* Insights merged into Collection — keep old links working. */}
         <Route path="/insights" element={<Navigate to="/collection" replace />} />

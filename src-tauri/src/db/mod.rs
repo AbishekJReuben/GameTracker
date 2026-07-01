@@ -406,52 +406,64 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
     }
 
     if version < 21 {
-        // Re-classify existing SMTC media plays with the improved heuristic: a
-        // browser session counts as music only when it carries an album (real
-        // music services), so plain YouTube videos — channel name in `artist`,
-        // no album — are corrected from 'music' to 'video'. Honors the user's
-        // per-app type overrides, mirroring the live tracker.
-        use crate::tracking::media::classify;
-        let overrides: std::collections::HashMap<String, String> = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'media_app_types'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(&s).ok())
-            .unwrap_or_default();
-
-        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, source_app, artist, album FROM media_plays WHERE source = 'smtc'",
-            )?;
-            let mapped = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                ))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, source_app, artist, album) in rows {
-            let app = source_app.unwrap_or_default();
-            // Old rows predate the playback-type hint; classify from metadata only.
-            let media_type = overrides.get(&app).cloned().unwrap_or_else(|| {
-                classify(&app, artist.as_deref(), album.as_deref(), None).to_string()
-            });
-            conn.execute(
-                "UPDATE media_plays SET media_type = ?1 WHERE id = ?2",
-                rusqlite::params![media_type, id],
-            )?;
-        }
-
+        // Backfill: re-classify existing SMTC media plays so old rows match the
+        // current heuristic (YouTube/browser videos that were tagged 'music' get
+        // corrected to 'video'). Honors the user's per-app type overrides.
+        reclassify_smtc_plays(conn)?;
         conn.execute_batch("PRAGMA user_version = 21;")?;
         version = 21;
     }
 
+    if version < 22 {
+        // Re-run the backfill: v21 ran an earlier, weaker rule (Firefox-family
+        // browsers like Zen — opaque hex AUMIDs — slipped through as 'music').
+        // The classifier now catches them, so reclassify once more.
+        reclassify_smtc_plays(conn)?;
+        conn.execute_batch("PRAGMA user_version = 22;")?;
+        version = 22;
+    }
+
     let _ = version;
+    Ok(())
+}
+
+/// Re-classify every SMTC media play in place using the current `classify` rule,
+/// honoring the user's per-app type overrides. Used by backfill migrations.
+fn reclassify_smtc_plays(conn: &rusqlite::Connection) -> AppResult<()> {
+    use crate::tracking::media::classify;
+    let overrides: std::collections::HashMap<String, String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'media_app_types'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(&s).ok())
+        .unwrap_or_default();
+
+    let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, source_app, artist, album FROM media_plays WHERE source = 'smtc'")?;
+        let mapped = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, source_app, artist, album) in rows {
+        let app = source_app.unwrap_or_default();
+        // Historical rows have no stored playback-type; classify from metadata.
+        let media_type = overrides.get(&app).cloned().unwrap_or_else(|| {
+            classify(&app, artist.as_deref(), album.as_deref(), None).to_string()
+        });
+        conn.execute(
+            "UPDATE media_plays SET media_type = ?1 WHERE id = ?2",
+            rusqlite::params![media_type, id],
+        )?;
+    }
     Ok(())
 }

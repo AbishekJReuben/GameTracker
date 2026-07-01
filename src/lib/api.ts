@@ -992,7 +992,21 @@ export const api = {
 
   // metacritic
   backfillMetacritic: () => call<number>("backfill_metacritic"),
+
+  // remote access (companion phone app)
+  remoteStatus: () => call<RemoteStatus>("remote_status"),
+  remoteSetEnabled: (enabled: boolean) => call<RemoteStatus>("remote_set_enabled", { enabled }),
+  remoteRegenPin: () => call<RemoteStatus>("remote_regen_pin"),
 };
+
+export interface RemoteStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  pin: string;
+  host: string | null;
+  clients: number;
+}
 
 /** Convert a stored absolute file path to a webview-loadable asset URL. */
 export function assetUrl(path: string | null | undefined): string | null {

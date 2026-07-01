@@ -22,6 +22,8 @@ import { Panel } from "@/components/Panel";
 import { SectionTitle, Segmented, EmptyState, Skeleton } from "@/components/ui";
 import { Heatmap } from "@/components/Heatmap";
 import { buildFixedWindow } from "@/components/Timeline";
+import { ThemePlaylist } from "@/components/ThemePlaylist";
+import { Playlists } from "@/components/Playlists";
 import {
   useMusicOverview,
   useMusicTop,
@@ -30,6 +32,7 @@ import {
   useMusicHourOfDay,
   useMediaTimeline,
   useMediaRecent,
+  useGames,
 } from "@/lib/queries";
 import { assetUrl, MediaPlay, MusicEntry } from "@/lib/api";
 import { dur, hourLabel, relativeTime } from "@/lib/format";
@@ -57,6 +60,7 @@ export default function MusicPage() {
   const { data: top } = useMusicTop(12);
   const { data: insights } = useMusicInsights();
   const { data: heat } = useMusicHeatmap(140);
+  const { data: games } = useGames();
 
   const empty = !isLoading && overview && overview.playCount === 0;
 
@@ -70,6 +74,10 @@ export default function MusicPage() {
       }
     >
       <NowListeningHero />
+
+      <Playlists />
+
+      <ThemePlaylist games={games ?? []} />
 
       {isLoading ? (
         <div className="grid gap-4 md:grid-cols-4">

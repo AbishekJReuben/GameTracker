@@ -1,7 +1,7 @@
 {
   "name": "gametracker",
   "private": true,
-  "version": "3.2.0",
+  "version": "3.2.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "companion:init": "cd companion && tauri android init",
+    "companion:android": "npm run build && cd companion && tauri android build",
+    "companion:android:dev": "cd companion && tauri android dev"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.0",

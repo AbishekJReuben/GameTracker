@@ -79,15 +79,25 @@ pub fn friendly_app_name(aumid: &str) -> String {
     }
 }
 
+/// True for the opaque 16-char hex AUMID that Firefox-family browsers (Firefox,
+/// Zen, LibreWolf, Waterfox…) expose instead of a readable name — e.g.
+/// "308046B0AF4A39CB" (Firefox) or "F0DC299D809B9700" (Zen). Lets us treat them
+/// as browsers by shape, since we can't enumerate every fork by name.
+fn is_browser_hash_aumid(aumid: &str) -> bool {
+    aumid.len() == 16 && aumid.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Classify a media session into music / video / podcast / other.
 ///
-/// Order of evidence: a dedicated app's identity wins (Spotify is always music,
-/// VLC always video). Otherwise we trust Windows' own `playback_type` hint
-/// (1=Music, 2=Video) — Chromium tags each browser media element, so this is
-/// what tells a YouTube Music track apart from a YouTube vlog even though both
-/// arrive through the same browser with a channel name in `artist`. Only when
-/// the OS gives no hint do we fall back to metadata heuristics (album ⇒ a real
-/// music service; otherwise browser playback is treated as video).
+/// There is no SMTC field that separates a YouTube song from a YouTube vlog:
+/// both arrive with a title + the channel name as `artist`, no album, and a
+/// `PlaybackType` of Music — browsers (Chrome via IMusicDisplayProperties,
+/// Firefox/Zen) tag *every* tab as Music, so that hint is useless. The only
+/// reliable evidence is: a dedicated app's identity, or an album (real music
+/// services — Spotify, YouTube Music, Tidal, Apple Music — always set one;
+/// YouTube never does). Everything else, browser tabs included, defaults to
+/// video. `playback_type` is accepted for API stability but intentionally not
+/// trusted as a music signal.
 pub fn classify(
     source_app: &str,
     artist: Option<&str>,
@@ -108,6 +118,8 @@ pub fn classify(
         "chrome", "msedge", "firefox", "308046b0af4a39cb", "brave", "opera",
         "vivaldi", "chromium",
     ];
+    let _ = playback_type; // deliberately ignored (browsers report all tabs as Music)
+
     // 1. Dedicated apps: identity is definitive.
     if MUSIC.iter().any(|n| lower.contains(n)) {
         return "music";
@@ -118,25 +130,20 @@ pub fn classify(
     if VIDEO.iter().any(|n| lower.contains(n)) {
         return "video";
     }
-    // 2. The OS's own per-track hint (set by Chromium for browser playback).
-    match playback_type {
-        Some(1) => return "music",
-        Some(2) => return "video",
-        _ => {}
-    }
-    // 3. No hint — fall back to metadata.
-    let has_artist = artist.map(|a| !a.trim().is_empty()).unwrap_or(false);
+    // 2. An album is the one field real music services reliably fill; YouTube
+    //    (song or vlog) never sets one. Strongest cross-app "music" signal.
     let has_album = album.map(|a| !a.trim().is_empty()).unwrap_or(false);
-    if BROWSER.iter().any(|n| lower.contains(n)) {
-        // A channel name lands in `artist` for ordinary videos too, so artist alone
-        // can't tell a song from a vlog. An album means it came from a real music
-        // service; without one, treat browser playback as video.
-        if has_album {
-            "music"
-        } else {
-            "video"
-        }
-    } else if has_artist {
+    if has_album {
+        return "music";
+    }
+    // 3. Browser playback without an album is treated as video (covers YouTube
+    //    vlogs and music videos alike — both are "watching" in a browser).
+    if BROWSER.iter().any(|n| lower.contains(n)) || is_browser_hash_aumid(source_app) {
+        return "video";
+    }
+    // 4. A native app carrying track metadata is most likely a music player.
+    let has_artist = artist.map(|a| !a.trim().is_empty()).unwrap_or(false);
+    if has_artist {
         "music"
     } else {
         "other"

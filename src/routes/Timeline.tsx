@@ -1,17 +1,19 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { AnimatePresence, motion } from "motion/react";
-import { AppWindow, Gamepad2 } from "lucide-react";
+import { AppWindow, Gamepad2, Download, FileJson, Moon, Zap, Clock } from "lucide-react";
+import { save } from "@tauri-apps/plugin-dialog";
 import { Page } from "@/components/Page";
+import { GameArt } from "@/components/GameArt";
 import { Timeline, type TimelineRange } from "@/components/Timeline";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
-import { SectionTitle, Segmented, EmptyState, Skeleton } from "@/components/ui";
+import { SectionTitle, Segmented, EmptyState, Skeleton, Toggle } from "@/components/ui";
 import { Panel } from "@/components/Panel";
 import { useLiveSessionBonus } from "@/lib/liveStats";
 import { useSessions, useGames } from "@/lib/queries";
 import { useApp, useMotionEnabled } from "@/store/app";
-import { accentFor, dur, hourLabel, partialDate } from "@/lib/format";
-import { EntryKind, Game, Session } from "@/lib/api";
+import { accentFor, dur, hourLabel, partialDate, dateLabel, timeLabel } from "@/lib/format";
+import { api, EntryKind, Game, Session, SessionFilter } from "@/lib/api";
 import { GameScores, scoreTooltip } from "@/components/GameScores";
 
 type Mode = "sessions" | "completions";
@@ -112,6 +114,8 @@ export default function TimelinePage() {
             barClassName="opacity-90 [background-image:linear-gradient(90deg,transparent,rgba(255,255,255,0.04))]"
           />
           <TimelineInsights sessions={appSessions} games={legendApps} colorFor={colorFor} kind="app" title="Apps insights" />
+
+          <SessionLogSection />
           </motion.div>
         ) : (
           <motion.div
@@ -132,6 +136,181 @@ export default function TimelinePage() {
         )}
       </AnimatePresence>
     </Page>
+  );
+}
+
+function SessionLogSection() {
+  const { data: games } = useGames();
+  const pushToast = useApp((s) => s.pushToast);
+  const use24 = useApp((s) => s.prefs.timeFormat === "24h");
+  const setPref = useApp((s) => s.setPref);
+  const enabled = useMotionEnabled();
+  const [gameId, setGameId] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  // kind / min-minutes / hide-AFK are remembered; the specific game & dates stay transient.
+  const sf = useApp((s) => s.prefs.sessionFilters);
+  const kind = sf.kind;
+  const minMinutes = sf.minMinutes;
+  const excludeIdle = sf.excludeIdle;
+  const patchSf = (p: Partial<typeof sf>) =>
+    setPref("sessionFilters", { ...useApp.getState().prefs.sessionFilters, ...p });
+  const setMinMinutes = (v: string) => patchSf({ minMinutes: v });
+  const setExcludeIdle = (v: boolean) => patchSf({ excludeIdle: v });
+  const setKind = (v: EntryKind) => patchSf({ kind: v });
+
+  const filteredGames = useMemo(() => (games ?? []).filter((g) => g.kind === kind), [games, kind]);
+
+  const filter: SessionFilter = useMemo(
+    () => ({
+      kind,
+      gameId: gameId || null,
+      fromUtc: from ? new Date(from).toISOString() : null,
+      toUtc: to ? new Date(to + "T23:59:59").toISOString() : null,
+      minSeconds: minMinutes ? parseInt(minMinutes, 10) * 60 : null,
+      excludeIdleEnded: excludeIdle,
+    }),
+    [kind, gameId, from, to, minMinutes, excludeIdle]
+  );
+
+  const { data: sessions, isLoading } = useSessions(filter);
+
+  const totals = useMemo(() => {
+    const runtime = sessions?.reduce((a, s) => a + s.runtimeSeconds, 0) ?? 0;
+    const active = sessions?.reduce((a, s) => a + s.activeSeconds, 0) ?? 0;
+    return { runtime, active };
+  }, [sessions]);
+
+  const exportCsv = async () => {
+    const path = await save({ defaultPath: "tracker-sessions.csv", filters: [{ name: "CSV", extensions: ["csv"] }] });
+    if (!path) return;
+    const n = await api.exportSessionsCsv(path);
+    pushToast({ kind: "success", title: `Exported ${n} sessions` });
+  };
+  const exportJson = async () => {
+    const path = await save({ defaultPath: "tracker-data.json", filters: [{ name: "JSON", extensions: ["json"] }] });
+    if (!path) return;
+    await api.exportDataJson(path);
+    pushToast({ kind: "success", title: "Exported full data" });
+  };
+
+  return (
+    <div className="mt-4">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="font-display text-lg font-800 tracking-tight">Session log</h2>
+          <p className="text-sm text-ink-dim">
+            {sessions ? `${sessions.length} sessions · ${dur(totals.active)} active` : "Your full play log"}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={exportJson} className="btn btn-ghost h-10">
+            <FileJson className="h-4 w-4" /> JSON
+          </button>
+          <button onClick={exportCsv} className="btn btn-primary h-10">
+            <Download className="h-4 w-4" /> Export CSV
+          </button>
+        </div>
+      </div>
+
+      <Panel panelKey="timeline.log.filters" games={games ?? []} sessions={sessions} className="mb-5 p-4">
+        <div className="mb-4">
+          <Segmented
+            value={kind}
+            onChange={(v) => { setKind(v); setGameId(""); }}
+            options={[
+              { value: "game" as const, label: "Games" },
+              { value: "app" as const, label: "Apps" },
+            ]}
+          />
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <SessionLogFilter label={kind === "game" ? "Game" : "App"}>
+            <select className="input" value={gameId} onChange={(e) => setGameId(e.target.value)}>
+              <option value="">{kind === "game" ? "All games" : "All apps"}</option>
+              {filteredGames.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.displayName}
+                </option>
+              ))}
+            </select>
+          </SessionLogFilter>
+          <SessionLogFilter label="From">
+            <input type="date" className="input" value={from} onChange={(e) => setFrom(e.target.value)} />
+          </SessionLogFilter>
+          <SessionLogFilter label="To">
+            <input type="date" className="input" value={to} onChange={(e) => setTo(e.target.value)} />
+          </SessionLogFilter>
+          <SessionLogFilter label="Min minutes">
+            <input className="input w-28" inputMode="numeric" placeholder="0" value={minMinutes} onChange={(e) => setMinMinutes(e.target.value.replace(/\D/g, ""))} />
+          </SessionLogFilter>
+          <div className="pb-2">
+            <Toggle checked={excludeIdle} onChange={setExcludeIdle} label="Hide AFK-ended" />
+          </div>
+        </div>
+      </Panel>
+
+      <Panel panelKey="timeline.log.table" games={games ?? []} sessions={sessions} className="p-0">
+        {isLoading ? (
+          <div className="space-y-2 p-4">
+            {Array.from({ length: 8 }).map((_, i) => (
+              <Skeleton key={i} className="h-12 w-full" />
+            ))}
+          </div>
+        ) : sessions && sessions.length > 0 ? (
+          <div className="overflow-hidden">
+            <div className="grid grid-cols-[1fr_auto_auto_auto] gap-4 border-b border-line px-5 py-3 text-[11px] font-800 uppercase tracking-wider text-ink-dim">
+              <span>Game</span>
+              <span className="w-32 text-right">When</span>
+              <span className="w-20 text-right">Active</span>
+              <span className="w-20 text-right">Runtime</span>
+            </div>
+            <div className="max-h-[60vh] divide-y divide-line overflow-y-auto">
+              {sessions.map((s, i) => (
+                <motion.div
+                  key={s.id}
+                  className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-4 px-5 py-2.5 transition hover:bg-white/[0.02]"
+                  initial={enabled ? { opacity: 0, x: -12 } : false}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: Math.min(i * 0.02, 0.3), duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
+                >
+                  <Link to={`/game/${s.gameId}`} className="flex min-w-0 items-center gap-3">
+                    <GameArt id={s.gameId} name={s.gameName} cover={s.coverPath} icon={s.iconPath} accent={s.accentColor} className="h-8 w-8" rounded="rounded-lg" />
+                    <span className="truncate text-sm font-700">{s.gameName}</span>
+                    {s.wasIdleEnded && <Moon className="h-3.5 w-3.5 shrink-0 text-amber" />}
+                  </Link>
+                  <div className="w-32 text-right text-xs text-ink-dim">
+                    {dateLabel(s.startUtc)}
+                    <div className="text-[11px] text-ink-faint">{timeLabel(s.startUtc, use24)}</div>
+                  </div>
+                  <span className="flex w-20 items-center justify-end gap-1 text-right text-sm font-800 tabular-nums">
+                    <Zap className="h-3 w-3 text-green" />
+                    {dur(s.activeSeconds)}
+                  </span>
+                  <span className="flex w-20 items-center justify-end gap-1 text-right text-sm tabular-nums text-ink-soft">
+                    <Clock className="h-3 w-3 text-ink-faint" />
+                    {dur(s.runtimeSeconds)}
+                  </span>
+                </motion.div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="p-4">
+            <EmptyState title="No sessions match" message="Adjust your filters or play a tracked game." />
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+function SessionLogFilter({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <div className="mb-1.5 text-[11px] font-700 text-ink-dim">{label}</div>
+      {children}
+    </label>
   );
 }
 

@@ -13,6 +13,7 @@ mod suggestions;
 mod metadata;
 #[cfg(windows)]
 mod registry;
+mod remote;
 mod state;
 mod gog;
 mod gog_auth;
@@ -109,14 +110,31 @@ pub fn run() {
             let shared = Arc::new(TrackingShared::new());
             let sys_shared = Arc::new(SystemShared::new());
 
+            let remote_port = db::settings::get_i64(&pool, "remote_port", 47800)
+                .unwrap_or(47800)
+                .clamp(1024, 65535) as u16;
+            let remote_shared = Arc::new(remote::RemoteShared::new(remote_port));
+
             app.manage(AppState {
                 pool: pool.clone(),
                 shared: shared.clone(),
                 sys: sys_shared.clone(),
+                remote: remote_shared.clone(),
                 data_dir,
                 media_dir: media_dir.clone(),
                 db_path,
             });
+
+            // If the remote server was left enabled, start it on launch.
+            if db::settings::get_bool(&pool, "remote_enabled").unwrap_or(false) {
+                remote_shared.enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+                remote::start(remote::ApiState {
+                    pool: pool.clone(),
+                    tracking: shared.clone(),
+                    media_dir: Arc::new(media_dir.clone()),
+                    remote: remote_shared.clone(),
+                });
+            }
 
             tray::build(handle)?;
 
@@ -284,6 +302,9 @@ pub fn run() {
             commands::playlist_remove_track,
             commands::playlist_reorder,
             commands::backfill_metacritic,
+            commands::remote_status,
+            commands::remote_set_enabled,
+            commands::remote_regen_pin,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tracker")

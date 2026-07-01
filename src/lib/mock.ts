@@ -533,6 +533,9 @@ function oneSample(d: Date, cpu: number, gpu: number, ram: number, disk: number)
   };
 }
 
+const mockPin = () => String(Math.floor(100000 + Math.random() * 899999));
+const mockRemote = { enabled: false, running: false, port: 47800, pin: mockPin(), host: "100.101.102.103", clients: 0 };
+
 export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   switch (cmd) {
     case "get_settings":
@@ -1005,6 +1008,15 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return [] as T;
     case "local_launcher_import":
       return [0, 0] as T;
+    case "remote_set_enabled":
+      mockRemote.enabled = (args?.enabled as boolean) ?? false;
+      if (mockRemote.enabled) mockRemote.pin = mockPin();
+      return { ...mockRemote, running: mockRemote.enabled } as T;
+    case "remote_regen_pin":
+      mockRemote.pin = mockPin();
+      return { ...mockRemote, running: mockRemote.enabled } as T;
+    case "remote_status":
+      return { ...mockRemote, running: mockRemote.enabled } as T;
     default:
       throw new Error(`Mock invoke not implemented: ${cmd}`);
   }

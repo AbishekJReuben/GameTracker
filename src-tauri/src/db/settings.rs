@@ -26,6 +26,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("steam_persona_name", ""),
     ("steam_avatar_url", ""),
     ("steam_linked", "false"),
+    ("remote_enabled", "false"),
+    ("remote_port", "47800"),
 ];
 
 fn default_for(key: &str) -> Option<&'static str> {

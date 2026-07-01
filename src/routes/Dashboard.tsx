@@ -392,7 +392,7 @@ export default function Dashboard() {
               sheen
               title="Recent sessions"
               right={
-                <Link to="/sessions" className="text-xs font-700 text-accent-3 hover:underline">
+                <Link to="/timeline" className="text-xs font-700 text-accent-3 hover:underline">
                   View all <ArrowUpRight className="inline h-3.5 w-3.5" />
                 </Link>
               }
