@@ -40,6 +40,7 @@ export class Signaling {
   private ws: WebSocket | null = null;
   private handlers: ((m: SignalMsg) => void)[] = [];
   private openResolvers: (() => void)[] = [];
+  private closeHandlers: (() => void)[] = [];
 
   constructor(private url: string, private room: string, private role: Role) {}
 
@@ -55,6 +56,7 @@ export class Signaling {
         /* ignore non-JSON */
       }
     };
+    this.ws.onclose = () => this.closeHandlers.forEach((h) => h());
     return new Promise((resolve, reject) => {
       if (!this.ws) return reject(new Error("no socket"));
       this.ws.onopen = () => {
@@ -67,6 +69,11 @@ export class Signaling {
 
   onMessage(h: (m: SignalMsg) => void) {
     this.handlers.push(h);
+  }
+
+  /** Fires when the signaling socket closes (used to auto-reconnect). */
+  onClose(h: () => void) {
+    this.closeHandlers.push(h);
   }
 
   send(m: SignalMsg) {

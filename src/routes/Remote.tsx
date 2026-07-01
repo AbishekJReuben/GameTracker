@@ -16,16 +16,18 @@ import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
 import { SectionTitle, Toggle, Skeleton } from "@/components/ui";
 import { api, RemoteStatus } from "@/lib/api";
-import { startHost } from "@/lib/rtcHost";
 import { DEFAULT_SIGNAL_URL, SIGNAL_PORT } from "@/lib/remoteConfig";
 import { useApp } from "@/store/app";
+import { useRemoteHost } from "@/store/remote";
 
 export default function RemotePage() {
   const pushToast = useApp((s) => s.pushToast);
   const [status, setStatus] = useState<RemoteStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [signalDraft, setSignalDraft] = useState(DEFAULT_SIGNAL_URL);
-  const [cloudClients, setCloudClients] = useState(0);
+  // The WebRTC host now runs app-wide (see RemoteHostManager) so the phone can
+  // connect no matter which page is open; we just read its live client count.
+  const cloudClients = useRemoteHost((s) => s.cloudClients);
   // Keep the latest signaling URL from the backend without clobbering the user's
   // in-progress edit (only seed the draft once, when it's still empty).
   const seededSignal = useRef(false);
@@ -50,26 +52,7 @@ export default function RemotePage() {
     return () => clearInterval(id);
   }, [refresh]);
 
-  // When cloud mode is on and configured, run the WebRTC host from the webview.
-  // Re-runs (tearing down and restarting) whenever the URL or code changes.
   const cloudOn = status?.cloudEnabled ?? false;
-  const cloudUrl = status?.signalUrl ?? "";
-  const cloudCode = status?.code ?? "";
-  useEffect(() => {
-    if (!cloudOn || !cloudUrl || !cloudCode) {
-      setCloudClients(0);
-      return;
-    }
-    const stop = startHost({
-      signalUrl: cloudUrl,
-      code: cloudCode,
-      onClients: setCloudClients,
-    });
-    return () => {
-      stop();
-      setCloudClients(0);
-    };
-  }, [cloudOn, cloudUrl, cloudCode]);
 
   const toggle = async (enabled: boolean) => {
     setBusy(true);
@@ -280,42 +263,9 @@ export default function RemotePage() {
           )}
 
           {on && (
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="grid grid-cols-1 gap-5 lg:grid-cols-2"
-            >
-              <Panel panelKey="remote.connect" className="p-5">
-                <SectionTitle title="Connect your phone" subtitle="Enter these in the companion app" right={<Wifi className="h-4 w-4" />} />
-                <div className="mt-4 space-y-4">
-                  <Field
-                    label="Address"
-                    icon={<Wifi className="h-4 w-4" />}
-                    value={address ?? "No network address found"}
-                    canCopy={!!address}
-                    mono
-                  />
-                  <div>
-                    <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
-                      <KeyRound className="h-3.5 w-3.5" /> Pairing PIN
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <div className="font-display text-4xl font-800 tabular-nums tracking-[0.3em] accent-text">
-                        {status.pin}
-                      </div>
-                      <button onClick={regen} disabled={busy} className="btn btn-ghost h-9" title="Generate a new PIN">
-                        <RefreshCw className="h-4 w-4" /> New PIN
-                      </button>
-                    </div>
-                    <p className="mt-1.5 text-xs text-ink-faint">
-                      Generating a new PIN disconnects devices paired with the old one.
-                    </p>
-                  </div>
-                </div>
-              </Panel>
-
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
               <Panel panelKey="remote.setup" className="p-5">
-                <SectionTitle title="How to connect" subtitle="One-time setup" right={<ShieldCheck className="h-4 w-4" />} />
+                <SectionTitle title="How to connect" subtitle="One-time setup — the app remembers it afterwards" right={<ShieldCheck className="h-4 w-4" />} />
                 <ol className="mt-4 space-y-3">
                   <Step n={1}>
                     Install the <b>GameTracker companion</b> app on your Android phone
@@ -325,19 +275,19 @@ export default function RemotePage() {
                     .
                   </Step>
                   <Step n={2}>
-                    <b>From anywhere (one-time):</b> run the signaling server on this PC and point a
+                    <b>One-time host setup:</b> run the signaling server on this PC and point a
                     <b> Cloudflare Tunnel</b> at <span className="font-mono">localhost:{SIGNAL_PORT}</span> for
                     <span className="font-mono"> {DEFAULT_SIGNAL_URL.replace(/^wss:\/\//, "")}</span>. See
                     signaling/README.md for the exact commands.
                   </Step>
                   <Step n={3}>
-                    Turn on <b>cloud access</b> above, then in the app pick “From anywhere” and enter the
-                    <b> connection code</b> (the signaling address is already baked in). Screen and control
-                    then run <b>directly peer-to-peer</b>.
+                    Turn on <b>cloud access</b> above, then in the app enter the <b>connection code</b>
+                    shown here (the signaling address is already baked in). Screen and control run
+                    <b> directly peer-to-peer</b>.
                   </Step>
                   <Step n={4}>
-                    <b>Same network:</b> on the same WiFi/Tailscale, pick “Same network” in the app and
-                    enter the <b>address</b> and <b>PIN</b> shown here — no signaling server needed.
+                    That's it — the app <b>remembers the code</b> and reconnects automatically every time,
+                    even after a PC restart. You won't need to enter it again.
                   </Step>
                 </ol>
               </Panel>

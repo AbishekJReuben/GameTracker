@@ -82,6 +82,26 @@ export async function remoteGet<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** Authenticated POST returning JSON. Clears the session on 401. */
+export async function remotePost<T>(path: string, body?: any): Promise<T> {
+  const res = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) {
+    clearRemote();
+    throw new Error("Session expired — pair again.");
+  }
+  if (!res.ok) throw new Error(`Request failed (${res.status}).`);
+  const text = await res.text();
+  if (!text) return undefined as unknown as T;
+  return JSON.parse(text) as T;
+}
+
 /** Rewrite an absolute local media path to a URL the phone can load. */
 export function remoteMediaUrl(absPath: string | null | undefined): string | null {
   if (!absPath) return null;

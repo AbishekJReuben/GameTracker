@@ -119,6 +119,16 @@ pub fn run() {
                     .cloud_enabled
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            // Restore the persisted connection code so it stays STABLE across restarts
+            // and crashes — otherwise the phone's remembered code would break every
+            // launch. Generate + persist one on first run.
+            match db::settings::get(&pool, "remote_code").ok().flatten() {
+                Some(code) if !code.is_empty() => *remote_shared.code.lock() = code,
+                _ => {
+                    let code = remote_shared.code.lock().clone();
+                    let _ = db::settings::set(&pool, "remote_code", &code);
+                }
+            }
 
             app.manage(AppState {
                 pool: pool.clone(),
@@ -138,6 +148,7 @@ pub fn run() {
                     tracking: shared.clone(),
                     media_dir: Arc::new(media_dir.clone()),
                     remote: remote_shared.clone(),
+                    sys: sys_shared.clone(),
                 });
             }
 
@@ -313,6 +324,13 @@ pub fn run() {
             commands::remote_set_cloud,
             commands::remote_regen_code,
             commands::remote_grab_frame,
+            commands::remote_grab_delta,
+            commands::remote_start_capture,
+            commands::remote_set_capture_quality,
+            commands::remote_stop_capture,
+            commands::remote_textfield_active,
+            commands::remote_list_monitors,
+            commands::remote_read_media,
             commands::remote_inject,
         ])
         .build(tauri::generate_context!())

@@ -13,14 +13,27 @@ export type ControlMsg =
   | { type: "click"; x?: number; y?: number; button?: string }
   | { type: "down"; button?: string }
   | { type: "up"; button?: string }
-  | { type: "scroll"; dy: number }
+  | { type: "scroll"; dx?: number; dy: number }
   | { type: "text"; value: string }
-  | { type: "key"; name: string };
+  | { type: "key"; name: string }
+  | { type: "keydown"; name: string }
+  | { type: "keyup"; name: string }
+  | { type: "monitor"; index: number };
+
+/** Live stream-quality knobs the phone pushes to the desktop. */
+export type QualitySettings = { maxW: number; quality: number; fps: number };
 
 export interface RemoteLink {
-  onFrame(cb: (frame: Blob) => void): void;
+  /** Deliver a raw tile wire-frame (LAN fallback; see capture.rs `TileEncoder`). */
+  onFrame(cb: (frame: Uint8Array) => void): void;
+  /** Deliver the inbound screen as a WebRTC media stream (cloud video-track path). */
+  onStream(cb: (stream: MediaStream) => void): void;
+  /** Unsolicited host events (e.g. PC text-field focus). */
+  onEvent(cb: (e: { event: string; [k: string]: unknown }) => void): void;
   onStatus(cb: (connected: boolean) => void): void;
   send(msg: ControlMsg): void;
+  /** Re-tune the live screen stream (resolution / JPEG quality / frame rate). */
+  setQuality(q: QualitySettings): void;
   close(): void;
 }
 
@@ -28,22 +41,33 @@ export interface RemoteLink {
 export function makeWsLink(): RemoteLink {
   let screenWs: WebSocket | null = null;
   let controlWs: WebSocket | null = null;
-  let frameCb: ((b: Blob) => void) | null = null;
+  let frameCb: ((b: Uint8Array) => void) | null = null;
   let statusCb: ((c: boolean) => void) | null = null;
   let alive = true;
+  let connected = false;
+  let quality: QualitySettings | null = null;
   let retry: number | undefined;
+
+  const setConnected = (c: boolean) => {
+    connected = c;
+    statusCb?.(c);
+  };
 
   const connectScreen = () => {
     if (!alive) return;
     const ws = new WebSocket(remoteWsUrl("/screen"));
     ws.binaryType = "arraybuffer";
     screenWs = ws;
-    ws.onopen = () => statusCb?.(true);
+    ws.onopen = () => {
+      setConnected(true);
+      // Re-apply the chosen quality on every (re)connect.
+      if (quality) ws.send(JSON.stringify({ type: "quality", ...quality }));
+    };
     ws.onmessage = (ev) => {
-      if (ev.data instanceof ArrayBuffer) frameCb?.(new Blob([ev.data], { type: "image/jpeg" }));
+      if (ev.data instanceof ArrayBuffer) frameCb?.(new Uint8Array(ev.data));
     };
     ws.onclose = () => {
-      statusCb?.(false);
+      setConnected(false);
       if (alive) retry = window.setTimeout(connectScreen, 1500);
     };
     ws.onerror = () => ws.close();
@@ -65,11 +89,22 @@ export function makeWsLink(): RemoteLink {
     onFrame(cb) {
       frameCb = cb;
     },
+    onStream() {
+      /* LAN uses JPEG frames over onFrame, not a media stream. */
+    },
+    onEvent() {
+      /* LAN has no focus events. */
+    },
     onStatus(cb) {
       statusCb = cb;
+      cb(connected); // Report current state immediately (socket may already be open).
     },
     send(msg) {
       if (controlWs?.readyState === WebSocket.OPEN) controlWs.send(JSON.stringify(msg));
+    },
+    setQuality(q) {
+      quality = q;
+      if (screenWs?.readyState === WebSocket.OPEN) screenWs.send(JSON.stringify({ type: "quality", ...q }));
     },
     close() {
       alive = false;
@@ -88,21 +123,32 @@ function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   return arr;
 }
 
-/** Cloud transport: frames + control over an established WebRTC connection. */
+/** Cloud transport: video stream + control over an established WebRTC connection. */
 export function makeRtcLink(conn: CloudConn): RemoteLink {
-  let frameCb: ((b: Blob) => void) | null = null;
+  let frameCb: ((b: Uint8Array) => void) | null = null;
   conn.onFrame((b64) => {
-    if (frameCb) frameCb(new Blob([base64ToBytes(b64)], { type: "image/jpeg" }));
+    if (frameCb) frameCb(base64ToBytes(b64));
   });
   return {
     onFrame(cb) {
       frameCb = cb;
+    },
+    onStream(cb) {
+      conn.onStream(cb);
+    },
+    onEvent(cb) {
+      conn.onEvent(cb);
     },
     onStatus(cb) {
       conn.onStatus((s) => cb(s === "connected"));
     },
     send(msg) {
       conn.sendControl(msg);
+    },
+    setQuality(q) {
+      // The host intercepts `quality` messages on the control channel and re-tunes
+      // its capture loop; they never reach the input injector.
+      conn.sendControl({ type: "quality", ...q });
     },
     close() {
       // The CloudConn is owned by CompanionApp; closing it happens on disconnect.

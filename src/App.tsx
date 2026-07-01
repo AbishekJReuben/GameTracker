@@ -9,6 +9,7 @@ import { Toasts } from "./components/Toasts";
 import { ProgressDock } from "./components/ProgressDock";
 import { JukeboxEngine } from "./components/JukeboxEngine";
 import { JukeboxFloater } from "./components/JukeboxFloater";
+import { RemoteHostManager } from "./components/RemoteHostManager";
 import { Onboarding } from "./components/Onboarding";
 import { SplashScreen } from "./components/SplashScreen";
 import { GameModal } from "./components/GameModal";
@@ -65,6 +66,7 @@ function AppShell() {
       <ProgressDock />
       <JukeboxEngine />
       <JukeboxFloater />
+      <RemoteHostManager />
       <GameModal />
       <DropZone />
       {settings && !onboarded && <Onboarding />}

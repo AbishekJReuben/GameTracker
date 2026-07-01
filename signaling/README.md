@@ -31,6 +31,13 @@ phone only needs the **connection code** — nothing to paste.
    npm run signal:serve        # builds + runs on localhost:8080
    # or: npm run signal:run
    ```
+   **Start it automatically at every logon** (recommended, so "from anywhere" always works
+   after a reboot) — registers a hidden, auto-restarting Scheduled Task:
+   ```sh
+   npm run signal:install-startup     # remove with: npm run signal:uninstall-startup
+   ```
+   (Run from an elevated shell if Windows reports access denied. Verify with
+   `Get-ScheduledTask -TaskName 'GameTracker Signaling'`.)
 2. **Expose it via Cloudflare Tunnel** → `discovery.chilloutgamestudio.com` → `http://localhost:8080`.
    If you already run `cloudflared`, just add the hostname rule to your `config.yml` `ingress:` list
    and restart. Otherwise see `cloudflared-config.example.yml` here for the full first-time steps

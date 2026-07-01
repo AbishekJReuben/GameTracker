@@ -14,10 +14,12 @@
 //!   `spawn_blocking` so rusqlite never blocks the async runtime.
 
 pub(crate) mod capture;
+pub(crate) mod focus;
 pub(crate) mod input;
 
-use crate::db::{games, media as mediadb, music, sessions, stats, DbPool};
-use crate::db::models::SessionFilter;
+use crate::db::{games, media as mediadb, music, playlists, screenshots, sessions, settings, stats, DbPool};
+use crate::db::models::{GameInput, SessionFilter};
+use crate::db::playlists::PlaylistTrack;
 use crate::error::AppResult;
 use crate::tracking::TrackingShared;
 use axum::{
@@ -35,7 +37,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -91,6 +93,7 @@ pub struct ApiState {
     pub tracking: Arc<TrackingShared>,
     pub media_dir: Arc<PathBuf>,
     pub remote: Arc<RemoteShared>,
+    pub sys: Arc<crate::system::SystemShared>,
 }
 
 /// A 6-digit numeric pairing PIN, derived from UUID randomness (no extra dep).
@@ -165,9 +168,25 @@ fn build_router(state: ApiState) -> Router {
     // Routes that require a valid bearer token.
     let protected = Router::new()
         .route("/api/tracking", get(tracking_now))
+        .route("/api/tracking/pause", post(set_paused))
         .route("/api/dashboard", get(dashboard))
         .route("/api/apps", get(apps_overview))
         .route("/api/games", get(list_games))
+        .route("/api/games/:id", get(get_game))
+        .route("/api/games/:id/stats", get(get_game_stats))
+        .route("/api/games/:id/screenshots", get(get_game_screenshots))
+        .route("/api/games/:id/achievements/steam", get(get_steam_achievements))
+        .route("/api/games/:id/achievements/gog", get(get_gog_achievements))
+        .route("/api/games/achievements/steam/overview", get(get_steam_achievements_overview))
+        .route("/api/games/:id/launch", post(launch_game))
+        .route("/api/games/:id/status", post(set_game_status))
+        .route("/api/games/:id/save", post(save_game))
+        .route("/api/games/:id/delete", post(delete_game))
+        .route("/api/screenshots/:id/delete", post(delete_screenshot))
+        .route("/api/catalog", get(catalog_analytics))
+        .route("/api/insights", get(insights))
+        .route("/api/hourofday", get(hour_of_day))
+        .route("/api/tags", get(list_tags))
         .route("/api/sessions", get(list_sessions))
         .route("/api/heatmap", get(heatmap))
         .route("/api/music/overview", get(music_overview))
@@ -175,6 +194,22 @@ fn build_router(state: ApiState) -> Router {
         .route("/api/music/insights", get(music_insights))
         .route("/api/music/recent", get(music_recent))
         .route("/api/music/timeline", get(music_timeline))
+        .route("/api/music/heatmap", get(media_heatmap))
+        .route("/api/music/hourofday", get(media_hour_of_day))
+        .route("/api/music/stop", post(stop_media_play))
+        .route("/api/playlists", get(playlists_list))
+        .route("/api/playlists/create", post(playlist_create))
+        .route("/api/playlists/:id", get(playlist_get))
+        .route("/api/playlists/:id/rename", post(playlist_rename))
+        .route("/api/playlists/:id/delete", post(playlist_delete))
+        .route("/api/playlists/:id/add_tracks", post(playlist_add_tracks))
+        .route("/api/playlists/:id/remove_track", post(playlist_remove_track))
+        .route("/api/playlists/:id/reorder", post(playlist_reorder))
+        .route("/api/monitors", get(monitors_list))
+        .route("/api/system/specs", get(system_specs))
+        .route("/api/system/live", get(system_live))
+        .route("/api/system/history", get(system_history))
+        .route("/api/settings", get(get_settings))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Public routes: health check, pairing, live socket, media files, and the
@@ -308,6 +343,138 @@ async fn list_games(State(s): State<ApiState>) -> ApiResult<Vec<crate::db::model
     blocking(move || games::list(&pool)).await
 }
 
+async fn get_game(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<Option<crate::db::models::GameDto>> {
+    let pool = s.pool.clone();
+    blocking(move || games::get(&pool, &id)).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedGameStatsResp {
+    stats: Option<crate::metadata::GameStats>,
+    fetched_utc: Option<String>,
+}
+async fn get_game_stats(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<CachedGameStatsResp> {
+    let pool = s.pool.clone();
+    blocking(move || {
+        let (json, fetched_utc) = games::get_stats_cache(&pool, &id)?;
+        let stats = json.and_then(|j| serde_json::from_str::<crate::metadata::GameStats>(&j).ok());
+        Ok(CachedGameStatsResp { stats, fetched_utc })
+    }).await
+}
+
+async fn get_game_screenshots(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<Vec<crate::db::models::ScreenshotDto>> {
+    let pool = s.pool.clone();
+    blocking(move || screenshots::list(&pool, &id)).await
+}
+
+#[derive(Deserialize)]
+struct AchievementsQuery {
+    refresh: Option<bool>,
+}
+
+async fn get_steam_achievements(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<AchievementsQuery>,
+) -> ApiResult<Vec<crate::steam::SteamAchievement>> {
+    let pool = s.pool.clone();
+    let force = q.refresh.unwrap_or(false);
+    blocking(move || {
+        if !force {
+            let cached = crate::steam::achievements_for_game(&pool, &id)?;
+            if !cached.is_empty() {
+                return Ok(cached);
+            }
+        }
+        let game = games::get(&pool, &id)?.ok_or_else(|| crate::error::AppError::msg("Game not found."))?;
+        let appid = game
+            .steam_app_id
+            .filter(|&a| a > 0)
+            .ok_or_else(|| crate::error::AppError::msg("This game has no linked Steam app ID."))?;
+        let api_key = crate::steam::steam_api_key()?;
+        let steam_id = settings::get(&pool, "steam_id")?.unwrap_or_default();
+        let install_folder = game.install_folder.clone();
+
+        crate::steam::refresh_achievements_for_game(
+            &pool,
+            &id,
+            &api_key,
+            &steam_id,
+            appid as u64,
+            install_folder.as_deref(),
+        )
+    }).await
+}
+
+async fn get_gog_achievements(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<AchievementsQuery>,
+) -> ApiResult<Vec<crate::gog::GogAchievement>> {
+    let pool = s.pool.clone();
+    let refresh = q.refresh.unwrap_or(false);
+    blocking(move || crate::gog::game_achievements(&pool, &id, refresh)).await
+}
+
+async fn get_steam_achievements_overview(
+    State(s): State<ApiState>,
+) -> ApiResult<crate::steam::SteamAchievementsOverview> {
+    let pool = s.pool.clone();
+    blocking(move || crate::steam::achievements_overview(&pool)).await
+}
+
+async fn catalog_analytics(State(s): State<ApiState>) -> ApiResult<stats::CatalogAnalytics> {
+    let pool = s.pool.clone();
+    blocking(move || stats::catalog_analytics(&pool)).await
+}
+
+#[derive(Deserialize)]
+struct InsightsQuery {
+    year: i64,
+    kind: Option<String>,
+}
+async fn insights(
+    State(s): State<ApiState>,
+    Query(q): Query<InsightsQuery>,
+) -> ApiResult<stats::Insights> {
+    let pool = s.pool.clone();
+    let kind = q.kind;
+    blocking(move || stats::insights(&pool, q.year, kind.as_deref())).await
+}
+
+#[derive(Deserialize)]
+struct HourOfDayQuery {
+    kind: Option<String>,
+}
+async fn hour_of_day(
+    State(s): State<ApiState>,
+    Query(q): Query<HourOfDayQuery>,
+) -> ApiResult<Vec<i64>> {
+    let pool = s.pool.clone();
+    let kind = q.kind;
+    blocking(move || stats::hour_of_day(&pool, kind.as_deref())).await
+}
+
+async fn list_tags(State(s): State<ApiState>) -> ApiResult<Vec<String>> {
+    let pool = s.pool.clone();
+    blocking(move || stats::list_tags(&pool)).await
+}
+
+async fn tag_analytics(State(s): State<ApiState>) -> ApiResult<Vec<stats::TagStat>> {
+    let pool = s.pool.clone();
+    blocking(move || stats::tag_analytics(&pool)).await
+}
+
 #[derive(Deserialize)]
 struct HeatmapQuery {
     days: Option<i64>,
@@ -391,6 +558,245 @@ async fn music_timeline(
 ) -> ApiResult<Vec<mediadb::MediaPlayDto>> {
     let pool = s.pool.clone();
     blocking(move || mediadb::list_plays(&pool, q.from.as_deref(), q.to.as_deref())).await
+}
+
+#[derive(Deserialize)]
+struct DaysQuery {
+    days: Option<i64>,
+}
+async fn media_heatmap(
+    State(s): State<ApiState>,
+    Query(q): Query<DaysQuery>,
+) -> ApiResult<Vec<stats::DayValue>> {
+    let pool = s.pool.clone();
+    let days = q.days.unwrap_or(140).clamp(7, 400);
+    blocking(move || music::heatmap(&pool, days)).await
+}
+
+async fn media_hour_of_day(State(s): State<ApiState>) -> ApiResult<Vec<i64>> {
+    let pool = s.pool.clone();
+    blocking(move || music::hour_of_day(&pool)).await
+}
+
+async fn playlists_list(State(s): State<ApiState>) -> ApiResult<Vec<playlists::PlaylistDto>> {
+    let pool = s.pool.clone();
+    blocking(move || playlists::list(&pool)).await
+}
+
+async fn playlist_get(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<Option<playlists::PlaylistDto>> {
+    let pool = s.pool.clone();
+    blocking(move || playlists::get(&pool, &id)).await
+}
+
+async fn monitors_list() -> Json<Vec<capture::MonitorInfo>> {
+    Json(capture::list_monitors())
+}
+
+async fn system_specs(State(s): State<ApiState>) -> Json<crate::system::SystemSpecs> {
+    Json(crate::system::specs(&s.sys))
+}
+
+async fn system_live(State(s): State<ApiState>) -> Json<crate::system::SystemLive> {
+    Json(crate::system::live(&s.sys))
+}
+
+#[derive(Deserialize)]
+struct MinutesQuery {
+    minutes: Option<i64>,
+}
+async fn system_history(
+    State(s): State<ApiState>,
+    Query(q): Query<MinutesQuery>,
+) -> ApiResult<crate::system::SystemHistory> {
+    let pool = s.pool.clone();
+    let sys = s.sys.clone();
+    let min = q.minutes.unwrap_or(60).clamp(5, 1440);
+    blocking(move || crate::system::history(&pool, &sys, min)).await
+}
+
+async fn get_settings(State(s): State<ApiState>) -> ApiResult<std::collections::HashMap<String, String>> {
+    let pool = s.pool.clone();
+    blocking(move || settings::all(&pool)).await
+}
+
+// ---------- write endpoints ----------
+
+#[derive(Deserialize)]
+struct SetPausedReq {
+    paused: bool,
+}
+async fn set_paused(State(s): State<ApiState>, Json(body): Json<SetPausedReq>) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || {
+        settings::set(&pool, "tracking_paused", if body.paused { "true" } else { "false" })?;
+        Ok(())
+    }).await
+}
+
+async fn launch_game(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || {
+        let game = games::get(&pool, &id)?.ok_or_else(|| crate::error::AppError::msg("Game not found."))?;
+        if game.kind != "game" {
+            return Err(crate::error::AppError::msg("Only games can be launched."));
+        }
+        let exe = crate::util::first_existing_exe(&game.exe_paths)
+            .ok_or_else(|| crate::error::AppError::msg("Executable not found. The file may have been moved or deleted."))?;
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x00000008;
+            let work_dir = exe.parent().unwrap_or(Path::new("."));
+            std::process::Command::new(&exe)
+                .current_dir(work_dir)
+                .creation_flags(DETACHED_PROCESS)
+                .spawn()
+                .map_err(|e| crate::error::AppError::msg(format!("Failed to launch: {e}")))?;
+        }
+        Ok(())
+    }).await
+}
+
+#[derive(Deserialize)]
+struct SetGameStatusReq {
+    status: String,
+}
+async fn set_game_status(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<SetGameStatusReq>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || {
+        games::set_status(&pool, &id, &body.status)?;
+        Ok(())
+    }).await
+}
+
+#[derive(Deserialize)]
+struct SaveGameReq {
+    game: GameInput,
+}
+async fn save_game(
+    State(s): State<ApiState>,
+    Json(body): Json<SaveGameReq>,
+) -> ApiResult<crate::db::models::GameDto> {
+    let pool = s.pool.clone();
+    blocking(move || {
+        let id = games::upsert(&pool, body.game)?;
+        games::get(&pool, &id)?.ok_or_else(|| crate::error::AppError::msg("Save failed, game not found."))
+    }).await
+}
+
+async fn delete_game(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || {
+        games::delete(&pool, &id)?;
+        Ok(())
+    }).await
+}
+
+async fn delete_screenshot(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || {
+        if let Some(path) = screenshots::delete(&pool, &id)? {
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(())
+    }).await
+}
+
+async fn stop_media_play(State(s): State<ApiState>) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || {
+        crate::db::media::close_open_for_source(&pool, "jukebox")?;
+        Ok(())
+    }).await
+}
+
+#[derive(Deserialize)]
+struct PlaylistCreateReq {
+    name: String,
+}
+async fn playlist_create(
+    State(s): State<ApiState>,
+    Json(body): Json<PlaylistCreateReq>,
+) -> ApiResult<String> {
+    let pool = s.pool.clone();
+    blocking(move || playlists::create(&pool, &body.name)).await
+}
+
+#[derive(Deserialize)]
+struct PlaylistRenameReq {
+    name: String,
+}
+async fn playlist_rename(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<PlaylistRenameReq>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || playlists::rename(&pool, &id, &body.name)).await
+}
+
+async fn playlist_delete(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || playlists::delete(&pool, &id)).await
+}
+
+#[derive(Deserialize)]
+struct PlaylistAddTracksReq {
+    tracks: Vec<PlaylistTrack>,
+}
+async fn playlist_add_tracks(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<PlaylistAddTracksReq>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || playlists::add_tracks(&pool, &id, &body.tracks)).await
+}
+
+#[derive(Deserialize)]
+struct PlaylistRemoveTrackReq {
+    vid: String,
+}
+async fn playlist_remove_track(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<PlaylistRemoveTrackReq>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || playlists::remove_track(&pool, &id, &body.vid)).await
+}
+
+#[derive(Deserialize)]
+struct PlaylistReorderReq {
+    vids: Vec<String>,
+}
+async fn playlist_reorder(
+    State(s): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<PlaylistReorderReq>,
+) -> ApiResult<()> {
+    let pool = s.pool.clone();
+    blocking(move || playlists::reorder(&pool, &id, &body.vids)).await
 }
 
 // ---------- media files ----------
@@ -485,19 +891,80 @@ async fn screen_ws(State(s): State<ApiState>, Query(q): Query<WsQuery>, ws: WebS
     ws.on_upgrade(screen_socket)
 }
 
-/// Stream the primary monitor as JPEG frames (~12 fps). Capture + encode run on a
-/// blocking worker so the async runtime is never stalled.
+/// Runtime stream-quality config the phone can push over the screen socket to
+/// trade sharpness (resolution + JPEG quality) against bandwidth and frame rate.
+#[derive(Deserialize, Clone, Copy)]
+struct QualityCfg {
+    #[serde(rename = "maxW")]
+    max_w: u32,
+    quality: u8,
+    fps: u32,
+}
+
+impl QualityCfg {
+    fn clamped(self) -> Self {
+        Self {
+            max_w: self.max_w.clamp(320, 3840),
+            quality: self.quality.clamp(20, 95),
+            fps: self.fps.clamp(1, 60),
+        }
+    }
+    fn frame_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis((1000 / self.fps.max(1)) as u64)
+    }
+}
+
+impl Default for QualityCfg {
+    fn default() -> Self {
+        Self { max_w: 1280, quality: 60, fps: 12 }
+    }
+}
+
+/// Stream the primary monitor as JPEG frames. The phone may send a `QualityCfg`
+/// JSON text message at any time to re-tune resolution/quality/fps live. Capture +
+/// encode run on a blocking worker so the async runtime is never stalled.
 async fn screen_socket(mut socket: WebSocket) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+    let mut cfg = QualityCfg::default();
+    let mut ticker = tokio::time::interval(cfg.frame_interval());
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Stateful delta encoder for this connection (only changed tiles are sent).
+    let mut enc = capture::TileEncoder::new();
     loop {
-        ticker.tick().await;
-        let frame = tokio::task::spawn_blocking(|| capture::grab_primary_jpeg(1280, 60))
-            .await
-            .ok()
-            .flatten();
-        let Some(bytes) = frame else { continue };
-        if socket.send(Message::Binary(bytes.into())).await.is_err() {
-            break;
+        tokio::select! {
+            _ = ticker.tick() => {
+                let (w, q) = (cfg.max_w, cfg.quality);
+                let mon = capture::selected_monitor();
+                // The encoder holds the previous frame, so hand it into the blocking
+                // task and take it back out (it's Send, but not borrowable across await).
+                let mut taken = std::mem::replace(&mut enc, capture::TileEncoder::new());
+                let (frame, back) = tokio::task::spawn_blocking(move || {
+                    let f = taken.encode(mon, w, q, false);
+                    (f, taken)
+                })
+                .await
+                .unwrap_or_else(|_| (None, capture::TileEncoder::new()));
+                enc = back;
+                let Some(bytes) = frame else { continue }; // None = nothing changed
+                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                    break;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(t))) => {
+                        if let Ok(next) = serde_json::from_str::<QualityCfg>(&t) {
+                            let next = next.clamped();
+                            if next.fps != cfg.fps {
+                                ticker = tokio::time::interval(next.frame_interval());
+                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            }
+                            cfg = next;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
         }
     }
 }

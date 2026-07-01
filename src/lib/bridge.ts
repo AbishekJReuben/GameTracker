@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, MediaState, TrackingState } from "./api";
 import { isTauri } from "./tauri";
+import { isCompanion } from "./remoteClient";
 import { useApp } from "@/store/app";
 import { useProgress } from "@/store/progress";
 import { useMediaStore } from "@/store/media";
@@ -30,7 +31,7 @@ export function useTauriBridge() {
   const lastMediaKey = useRef("");
 
   useEffect(() => {
-    if (!isTauri()) return;
+    if (isCompanion() || !isTauri()) return;
     let mounted = true;
 
     // Seed initial state.

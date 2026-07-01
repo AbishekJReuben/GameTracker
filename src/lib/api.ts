@@ -1,9 +1,174 @@
 import { invoke } from "@tauri-apps/api/core";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, type Channel } from "@tauri-apps/api/core";
 import { mockInvoke } from "./mock";
 import { isTauri } from "./tauri";
+import { isCompanion, remoteMediaUrl } from "./remoteClient";
+
+function isPcOnlyCommand(cmd: string): boolean {
+  const pcOnly = [
+    "complete_onboarding",
+    "check_for_updates",
+    "install_update",
+    "add_from_path",
+    "add_app_from_path",
+    "detect_games",
+    "detect_apps",
+    "import_detected",
+    "import_detected_apps",
+    "import_games_csv",
+    "audit_online_content",
+    "repair_library_content",
+    "backup_db",
+    "restore_db",
+    "steam_login",
+    "steam_logout",
+    "steam_validate",
+    "steam_library",
+    "steam_import",
+    "steam_sync",
+    "gog_login_url",
+    "gog_login_finish",
+    "gog_login",
+    "gog_logout",
+    "gog_validate",
+    "gog_library",
+    "gog_import",
+    "gog_sync",
+    "local_launcher_library",
+    "local_launcher_import",
+    "remote_status",
+    "remote_set_enabled",
+    "remote_regen_pin",
+    "remote_set_cloud",
+    "remote_regen_code"
+  ];
+  return pcOnly.includes(cmd);
+}
+
+function mapCommandToPath(cmd: string, args?: Record<string, unknown>): string {
+  switch (cmd) {
+    case "get_settings": return "/api/settings";
+    case "list_games": return "/api/games";
+    case "get_game": return `/api/games/${args?.id}`;
+    case "list_sessions": {
+      const f = args?.filter as any;
+      const q = new URLSearchParams();
+      if (f?.kind) q.append("kind", f.kind);
+      if (f?.limit) q.append("limit", String(f.limit));
+      return `/api/sessions?${q.toString()}`;
+    }
+    case "dashboard": return "/api/dashboard";
+    case "apps_overview": return "/api/apps";
+    case "heatmap": {
+      const q = new URLSearchParams();
+      if (args?.days) q.append("days", String(args.days));
+      if (args?.kind) q.append("kind", String(args.kind));
+      return `/api/heatmap?${q.toString()}`;
+    }
+    case "hour_of_day": {
+      const q = new URLSearchParams();
+      if (args?.kind) q.append("kind", String(args.kind));
+      return `/api/hourofday?${q.toString()}`;
+    }
+    case "catalog_analytics": return "/api/catalog";
+    case "insights": {
+      const q = new URLSearchParams();
+      if (args?.year) q.append("year", String(args.year));
+      if (args?.kind) q.append("kind", String(args.kind));
+      return `/api/insights?${q.toString()}`;
+    }
+    case "tag_analytics": return "/api/tags";
+    case "list_tags": return "/api/tags/list";
+    case "system_specs": return "/api/system/specs";
+    case "system_live": return "/api/system/live";
+    case "system_history": return `/api/system/history?minutes=${args?.minutes || 60}`;
+    case "steam_game_achievements": return `/api/games/${args?.gameId}/achievements/steam?refresh=${args?.refresh || false}`;
+    case "steam_achievements_overview": return "/api/games/achievements/steam/overview";
+    case "gog_game_achievements": return `/api/games/${args?.gameId}/achievements/gog?refresh=${args?.refresh || false}`;
+    case "list_screenshots": return `/api/games/${args?.gameId}/screenshots`;
+    case "get_game_stats": return `/api/games/${args?.gameId}/stats`;
+    case "media_overview": return "/api/music/overview";
+    case "media_heatmap": return `/api/music/heatmap?days=${args?.days || 140}`;
+    case "media_hour_of_day": return "/api/music/hourofday";
+    case "media_top": return `/api/music/top?limit=${args?.limit || 10}`;
+    case "media_insights": return "/api/music/insights";
+    case "media_timeline": {
+      const q = new URLSearchParams();
+      if (args?.fromUtc) q.append("from", String(args.fromUtc));
+      if (args?.toUtc) q.append("to", String(args.toUtc));
+      return `/api/music/timeline?${q.toString()}`;
+    }
+    case "media_recent": return `/api/music/recent?limit=${args?.limit || 16}`;
+    case "playlists_list": return "/api/playlists";
+    case "playlist_get": return `/api/playlists/${args?.id}`;
+
+    // Write commands
+    case "set_paused": return "/api/tracking/pause";
+    case "launch_game": return `/api/games/${args?.id}/launch`;
+    case "set_game_status": return `/api/games/${args?.id}/status`;
+    case "save_game": return `/api/games/${(args?.game as any)?.id}/save`;
+    case "delete_game": return `/api/games/${args?.id}/delete`;
+    case "delete_screenshot": return `/api/screenshots/${args?.id}/delete`;
+    case "stop_media_play": return "/api/music/stop";
+    case "playlist_create": return "/api/playlists/create";
+    case "playlist_rename": return `/api/playlists/${args?.id}/rename`;
+    case "playlist_delete": return `/api/playlists/${args?.id}/delete`;
+    case "playlist_add_tracks": return `/api/playlists/${args?.id}/add_tracks`;
+    case "playlist_remove_track": return `/api/playlists/${args?.id}/remove_track`;
+    case "playlist_reorder": return `/api/playlists/${args?.id}/reorder`;
+
+    default:
+      throw new Error(`Command ${cmd} is not mapped to an API path.`);
+  }
+}
+
+function isWriteCommand(cmd: string): boolean {
+  const writes = [
+    "set_paused",
+    "launch_game",
+    "set_game_status",
+    "save_game",
+    "delete_game",
+    "delete_screenshot",
+    "stop_media_play",
+    "playlist_create",
+    "playlist_rename",
+    "playlist_delete",
+    "playlist_add_tracks",
+    "playlist_remove_track",
+    "playlist_reorder"
+  ];
+  return writes.includes(cmd);
+}
+
+function mapCommandToBody(cmd: string, args?: Record<string, unknown>): any {
+  switch (cmd) {
+    case "set_paused": return { paused: args?.paused };
+    case "set_game_status": return { status: args?.status };
+    case "save_game": return { game: args?.game };
+    case "playlist_create": return { name: args?.name };
+    case "playlist_rename": return { name: args?.name };
+    case "playlist_add_tracks": return { tracks: args?.tracks };
+    case "playlist_remove_track": return { vid: args?.vid };
+    case "playlist_reorder": return { vids: args?.vids };
+    default: return undefined;
+  }
+}
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (isCompanion()) {
+    if (isPcOnlyCommand(cmd)) {
+      throw new Error(`This command is only available on the PC.`);
+    }
+    const path = mapCommandToPath(cmd, args);
+    const { apiGet, apiPost } = await import("@/companion/link");
+    if (isWriteCommand(cmd)) {
+      const body = mapCommandToBody(cmd, args);
+      return apiPost<T>(path, body);
+    }
+    return apiGet<T>(path);
+  }
+
   if (isTauri()) {
     return invoke<T>(cmd, args);
   }
@@ -1002,8 +1167,28 @@ export const api = {
   remoteRegenCode: () => call<RemoteStatus>("remote_regen_code"),
   remoteGrabFrame: (maxW?: number, quality?: number) =>
     call<string | null>("remote_grab_frame", { maxW, quality }),
+  remoteGrabDelta: (maxW?: number, quality?: number, key?: boolean) =>
+    call<string | null>("remote_grab_delta", { maxW, quality, key }),
+  // Streaming capture for the cloud WebRTC video-track path (frames arrive as
+  // ArrayBuffer JPEGs over the channel; no per-frame invoke round-trip).
+  remoteStartCapture: (onFrame: Channel<ArrayBuffer>, maxW: number, fps: number, quality: number) =>
+    call<void>("remote_start_capture", { onFrame, maxW, fps, quality }),
+  remoteSetCaptureQuality: (maxW: number, fps: number, quality: number) =>
+    call<void>("remote_set_capture_quality", { maxW, fps, quality }),
+  remoteStopCapture: () => call<void>("remote_stop_capture"),
+  remoteTextfieldActive: () => call<boolean>("remote_textfield_active"),
+  remoteListMonitors: () => call<RemoteMonitor[]>("remote_list_monitors"),
+  remoteReadMedia: (path: string) => call<string | null>("remote_read_media", { path }),
   remoteInject: (event: Record<string, unknown>) => call<void>("remote_inject", { event }),
 };
+
+export interface RemoteMonitor {
+  index: number;
+  name: string;
+  width: number;
+  height: number;
+  isPrimary: boolean;
+}
 
 export interface RemoteStatus {
   enabled: boolean;
@@ -1021,6 +1206,9 @@ export interface RemoteStatus {
 export function assetUrl(path: string | null | undefined): string | null {
   if (!path) return null;
   if (/^https?:\/\//i.test(path)) return path;
+  if (isCompanion()) {
+    return remoteMediaUrl(path);
+  }
   try {
     return convertFileSrc(path);
   } catch {

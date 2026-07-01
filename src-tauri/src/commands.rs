@@ -1808,6 +1808,7 @@ pub fn remote_set_enabled(state: State<AppState>, enabled: bool) -> AppResult<Re
             tracking: state.shared.clone(),
             media_dir: std::sync::Arc::new(state.media_dir.clone()),
             remote: state.remote.clone(),
+            sys: state.sys.clone(),
         });
     } else {
         crate::remote::stop(&state.remote);
@@ -1833,16 +1834,17 @@ pub fn remote_set_cloud(
     settings::set(&state.pool, "remote_cloud_enabled", if enabled { "true" } else { "false" })?;
     settings::set(&state.pool, "remote_signal_url", signal_url.trim())?;
     state.remote.cloud_enabled.store(enabled, Ordering::SeqCst);
-    if enabled {
-        state.remote.rotate_code();
-    }
+    // Deliberately do NOT rotate the code here — it must stay stable so the phone
+    // keeps auto-connecting. Toggling cloud off/on reuses the same code; the user
+    // rotates it explicitly via "New code" (remote_regen_code) only when they want to.
     Ok(remote_snapshot(&state))
 }
 
 /// Generate a fresh cloud connection code (invalidates the old one).
 #[tauri::command]
 pub fn remote_regen_code(state: State<AppState>) -> RemoteStatus {
-    state.remote.rotate_code();
+    let code = state.remote.rotate_code();
+    let _ = settings::set(&state.pool, "remote_code", &code);
     remote_snapshot(&state)
 }
 
@@ -1857,7 +1859,7 @@ use base64::Engine as _;
 #[tauri::command]
 pub async fn remote_grab_frame(max_w: Option<u32>, quality: Option<u8>) -> Option<String> {
     let w = max_w.unwrap_or(1280).clamp(320, 3840);
-    let q = quality.unwrap_or(60).clamp(20, 90);
+    let q = quality.unwrap_or(60).clamp(20, 95);
     run_blocking(move || {
         Ok(crate::remote::capture::grab_primary_jpeg(w, q)
             .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
@@ -1870,4 +1872,140 @@ pub async fn remote_grab_frame(max_w: Option<u32>, quality: Option<u8>) -> Optio
 #[tauri::command]
 pub fn remote_inject(event: crate::remote::input::ControlEvent) {
     crate::remote::input::inject(event);
+}
+
+/// Process-wide delta encoder for the cloud (WebRTC) screen path. There is at most
+/// one cloud viewer, so a single shared encoder is enough.
+static CLOUD_ENC: once_cell::sync::Lazy<parking_lot::Mutex<crate::remote::capture::TileEncoder>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(crate::remote::capture::TileEncoder::new()));
+
+/// Capture the selected monitor as a **delta** frame (only changed tiles, plus a
+/// periodic keyframe) and return it base64-encoded for the WebRTC screen channel.
+/// Returns `None` when nothing changed, so the host can skip sending. Pass
+/// `key=true` to force a full keyframe (e.g. right after a viewer connects).
+#[tauri::command]
+pub async fn remote_grab_delta(
+    max_w: Option<u32>,
+    quality: Option<u8>,
+    key: Option<bool>,
+) -> Option<String> {
+    let w = max_w.unwrap_or(1280).clamp(320, 3840);
+    let q = quality.unwrap_or(60).clamp(20, 95);
+    let force = key.unwrap_or(false);
+    run_blocking(move || {
+        let mon = crate::remote::capture::selected_monitor();
+        let mut enc = CLOUD_ENC.lock();
+        Ok(enc
+            .encode(mon, w, q, force)
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Start the streaming screen capture for the cloud (WebRTC video-track) path.
+/// A dedicated thread pushes full-frame JPEGs to the webview over a binary
+/// channel; the host draws them to a canvas and feeds `captureStream()` into a
+/// real WebRTC video track (hardware H.264/VP9). Frames arrive as raw bytes
+/// (`InvokeResponseBody::Raw`), i.e. `ArrayBuffer` on the JS side — no base64.
+#[tauri::command]
+pub fn remote_start_capture(
+    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+    max_w: Option<u32>,
+    fps: Option<u32>,
+    quality: Option<u32>,
+) {
+    let w = max_w.unwrap_or(1600);
+    let f = fps.unwrap_or(30);
+    let q = quality.unwrap_or(70);
+    crate::remote::capture::start_capture(w, f, q, move |jpg| {
+        let _ = on_frame.send(tauri::ipc::InvokeResponseBody::Raw(jpg));
+    });
+}
+
+/// Live-retune the streaming capture (resolution / fps / JPEG quality).
+#[tauri::command]
+pub fn remote_set_capture_quality(max_w: u32, fps: u32, quality: u32) {
+    crate::remote::capture::set_capture_quality(max_w, fps, quality);
+}
+
+/// Stop the streaming screen capture (on disconnect / teardown).
+#[tauri::command]
+pub fn remote_stop_capture() {
+    crate::remote::capture::stop_capture();
+}
+
+/// True when the foreground app has a text field focused (blinking caret), so the
+/// phone can auto-open its keyboard the moment you click into a PC input.
+#[tauri::command]
+pub fn remote_textfield_active() -> bool {
+    crate::remote::focus::foreground_text_field_active()
+}
+
+/// List the PC's monitors so the phone can offer a display switcher.
+#[tauri::command]
+pub fn remote_list_monitors() -> Vec<crate::remote::capture::MonitorInfo> {
+    crate::remote::capture::list_monitors()
+}
+
+/// Read a media file (cover/icon/screenshot) as a base64 data URL, for the cloud
+/// path where artwork can't be served over HTTP. Path-checked: the file must live
+/// under `media_dir`, and oversized files are refused, so nothing else leaks.
+#[tauri::command]
+pub async fn remote_read_media(state: State<'_, AppState>, path: String) -> Result<Option<String>, ()> {
+    let media_dir = state.media_dir.clone();
+    let out = run_blocking(move || {
+        let base = match media_dir.canonicalize() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let safe = std::path::Path::new(&path)
+            .canonicalize()
+            .ok()
+            .filter(|p| p.starts_with(&base));
+        let Some(p) = safe else { return Ok(None) };
+        let meta = match std::fs::metadata(&p) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        if meta.len() > 32 * 1024 * 1024 {
+            return Ok(None); // guard against pathological files before decode
+        }
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        // Cover art / screenshots: decode + downscale to a small JPEG so the
+        // cloud data channel only ever carries a few KB per tile. Falls through
+        // to the raw-bytes path if the image can't be decoded.
+        let is_image = matches!(
+            ext.as_deref(),
+            Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "avif")
+        );
+        if is_image {
+            if let Some(url) = crate::remote::capture::thumbnail_data_url(&p, 480) {
+                return Ok(Some(url));
+            }
+        }
+        // Non-image (or undecodable) fallback: ship raw bytes, size-capped.
+        if meta.len() > 8 * 1024 * 1024 {
+            return Ok(None);
+        }
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let mime = match ext.as_deref() {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("webp") => "image/webp",
+            Some("gif") => "image/gif",
+            _ => "application/octet-stream",
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Ok(Some(format!("data:{mime};base64,{b64}")))
+    })
+    .await
+    .unwrap_or(None);
+    Ok(out)
 }
