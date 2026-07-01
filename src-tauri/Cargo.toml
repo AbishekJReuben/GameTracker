@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.2.3"
+version = "3.2.4"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -47,6 +47,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 local-ip-address = "0.6"
 xcap = "0.9.6"
 enigo = "0.3.0"
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

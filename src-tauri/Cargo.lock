@@ -1610,10 +1610,11 @@ dependencies = [
 
 [[package]]
 name = "gametracker"
-version = "3.2.3"
+version = "3.2.4"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "csv",
  "dirs 5.0.1",

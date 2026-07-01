@@ -133,3 +133,23 @@ pub fn spawn_controller() -> Option<std::sync::mpsc::Sender<ControlEvent>> {
     });
     Some(tx)
 }
+
+/// A process-wide input controller for the command-based (WebRTC) path, where
+/// events arrive one Tauri command at a time rather than over a single socket.
+/// Lazily spawns the injection thread and respawns it if it ever dies.
+static CONTROLLER: once_cell::sync::Lazy<parking_lot::Mutex<Option<std::sync::mpsc::Sender<ControlEvent>>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+/// Inject a single control event via the shared controller (used by the
+/// `remote_inject` command when driving input over a WebRTC data channel).
+pub fn inject(ev: ControlEvent) {
+    let mut guard = CONTROLLER.lock();
+    if guard.is_none() {
+        *guard = spawn_controller();
+    }
+    if let Some(tx) = guard.as_ref() {
+        if tx.send(ev).is_err() {
+            *guard = None; // Thread died; a fresh one spawns on the next event.
+        }
+    }
+}

@@ -136,3 +136,4 @@ dist
 .pnp.*
 /src-tauri/target
 src-tauri/target/release/deps/gametracker_lib.lib
+/signaling/target

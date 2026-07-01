@@ -29,7 +29,13 @@ export function remoteBase(): string {
 
 function normBase(input: string): string {
   let b = input.trim();
-  if (!/^https?:\/\//i.test(b)) b = `http://${b}`;
+  if (!/^https?:\/\//i.test(b)) {
+    // Bare host: assume TLS for domain names (the Cloudflare-tunnelled endpoint),
+    // plain http for a raw LAN/Tailscale IP address.
+    const host = b.split("/")[0].split(":")[0];
+    const isIp = /^[0-9.]+$/.test(host);
+    b = `${isIp ? "http" : "https"}://${b}`;
+  }
   return b.replace(/\/+$/, "");
 }
 

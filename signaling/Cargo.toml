@@ -1,0 +1,20 @@
+[package]
+name = "gametracker-signal"
+version = "0.1.0"
+edition = "2021"
+description = "Rendezvous/signaling server for GameTracker Remote WebRTC connections"
+
+[[bin]]
+name = "gametracker-signal"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

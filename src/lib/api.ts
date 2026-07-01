@@ -997,6 +997,12 @@ export const api = {
   remoteStatus: () => call<RemoteStatus>("remote_status"),
   remoteSetEnabled: (enabled: boolean) => call<RemoteStatus>("remote_set_enabled", { enabled }),
   remoteRegenPin: () => call<RemoteStatus>("remote_regen_pin"),
+  remoteSetCloud: (enabled: boolean, signalUrl: string) =>
+    call<RemoteStatus>("remote_set_cloud", { enabled, signalUrl }),
+  remoteRegenCode: () => call<RemoteStatus>("remote_regen_code"),
+  remoteGrabFrame: (maxW?: number, quality?: number) =>
+    call<string | null>("remote_grab_frame", { maxW, quality }),
+  remoteInject: (event: Record<string, unknown>) => call<void>("remote_inject", { event }),
 };
 
 export interface RemoteStatus {
@@ -1006,6 +1012,9 @@ export interface RemoteStatus {
   pin: string;
   host: string | null;
   clients: number;
+  cloudEnabled: boolean;
+  signalUrl: string;
+  code: string;
 }
 
 /** Convert a stored absolute file path to a webview-loadable asset URL. */

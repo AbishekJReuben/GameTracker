@@ -1766,6 +1766,9 @@ pub struct RemoteStatus {
     pub pin: String,
     pub host: Option<String>,
     pub clients: usize,
+    pub cloud_enabled: bool,
+    pub signal_url: String,
+    pub code: String,
 }
 
 fn remote_snapshot(state: &State<AppState>) -> RemoteStatus {
@@ -1777,6 +1780,12 @@ fn remote_snapshot(state: &State<AppState>) -> RemoteStatus {
         pin: r.pin.lock().clone(),
         host: crate::remote::best_host_ip(),
         clients: r.clients.load(Ordering::SeqCst),
+        cloud_enabled: r.cloud_enabled.load(Ordering::SeqCst),
+        signal_url: settings::get(&state.pool, "remote_signal_url")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        code: r.code.lock().clone(),
     }
 }
 
@@ -1811,4 +1820,54 @@ pub fn remote_set_enabled(state: State<AppState>, enabled: bool) -> AppResult<Re
 pub fn remote_regen_pin(state: State<AppState>) -> RemoteStatus {
     state.remote.rotate_pin();
     remote_snapshot(&state)
+}
+
+/// Enable/disable cloud (WebRTC-from-anywhere) mode and set the signaling server
+/// URL. Enabling rotates the connection code. Persisted across restarts.
+#[tauri::command]
+pub fn remote_set_cloud(
+    state: State<AppState>,
+    enabled: bool,
+    signal_url: String,
+) -> AppResult<RemoteStatus> {
+    settings::set(&state.pool, "remote_cloud_enabled", if enabled { "true" } else { "false" })?;
+    settings::set(&state.pool, "remote_signal_url", signal_url.trim())?;
+    state.remote.cloud_enabled.store(enabled, Ordering::SeqCst);
+    if enabled {
+        state.remote.rotate_code();
+    }
+    Ok(remote_snapshot(&state))
+}
+
+/// Generate a fresh cloud connection code (invalidates the old one).
+#[tauri::command]
+pub fn remote_regen_code(state: State<AppState>) -> RemoteStatus {
+    state.remote.rotate_code();
+    remote_snapshot(&state)
+}
+
+// ---- WebRTC path (screen/input driven over a peer-to-peer data channel) ----
+// The WebRTC peer itself lives in the webview (browser-native RTCPeerConnection);
+// Rust only supplies the pixels and performs the input injection.
+
+use base64::Engine as _;
+
+/// Capture the primary monitor as a JPEG and return it base64-encoded, for
+/// sending over a WebRTC data channel. Runs off the main thread.
+#[tauri::command]
+pub async fn remote_grab_frame(max_w: Option<u32>, quality: Option<u8>) -> Option<String> {
+    let w = max_w.unwrap_or(1280).clamp(320, 3840);
+    let q = quality.unwrap_or(60).clamp(20, 90);
+    run_blocking(move || {
+        Ok(crate::remote::capture::grab_primary_jpeg(w, q)
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Inject one remote input event (mouse/keyboard) received over the data channel.
+#[tauri::command]
+pub fn remote_inject(event: crate::remote::input::ControlEvent) {
+    crate::remote::input::inject(event);
 }

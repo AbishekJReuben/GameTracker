@@ -1,7 +1,7 @@
 import { Music2, Mic2, Disc3, Headphones, Clock } from "lucide-react";
 import { MediaPlay, MusicOverview, MusicTop } from "@/lib/api";
 import { dur, relativeTime } from "@/lib/format";
-import { remoteMediaUrl } from "@/lib/remoteClient";
+import { mediaUrl as remoteMediaUrl } from "../link";
 import { useRemote } from "../useRemote";
 
 export function MusicScreen() {

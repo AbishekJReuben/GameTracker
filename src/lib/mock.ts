@@ -534,7 +534,8 @@ function oneSample(d: Date, cpu: number, gpu: number, ram: number, disk: number)
 }
 
 const mockPin = () => String(Math.floor(100000 + Math.random() * 899999));
-const mockRemote = { enabled: false, running: false, port: 47800, pin: mockPin(), host: "100.101.102.103", clients: 0 };
+const mockCode = () => Array.from({ length: 8 }, () => "ABCDEFGHJKMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 30)]).join("");
+const mockRemote = { enabled: false, running: false, port: 47800, pin: mockPin(), host: "100.101.102.103", clients: 0, cloudEnabled: false, signalUrl: "", code: mockCode() };
 
 export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   switch (cmd) {
@@ -1015,8 +1016,20 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
     case "remote_regen_pin":
       mockRemote.pin = mockPin();
       return { ...mockRemote, running: mockRemote.enabled } as T;
+    case "remote_set_cloud":
+      mockRemote.cloudEnabled = (args?.enabled as boolean) ?? false;
+      mockRemote.signalUrl = (args?.signalUrl as string) ?? "";
+      if (mockRemote.cloudEnabled) mockRemote.code = mockCode();
+      return { ...mockRemote, running: mockRemote.enabled } as T;
+    case "remote_regen_code":
+      mockRemote.code = mockCode();
+      return { ...mockRemote, running: mockRemote.enabled } as T;
     case "remote_status":
       return { ...mockRemote, running: mockRemote.enabled } as T;
+    case "remote_grab_frame":
+      return null as T;
+    case "remote_inject":
+      return undefined as T;
     default:
       throw new Error(`Mock invoke not implemented: ${cmd}`);
   }

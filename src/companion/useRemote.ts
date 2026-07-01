@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { remoteGet } from "@/lib/remoteClient";
+import { apiGet } from "./link";
 
 /**
  * Poll a remote GET endpoint on an interval. Returns the latest data, a loading
@@ -16,7 +16,7 @@ export function useRemote<T>(path: string, intervalMs = 5000) {
     const tick = async () => {
       if (document.hidden) return;
       try {
-        const d = await remoteGet<T>(path);
+        const d = await apiGet<T>(path);
         if (alive) {
           setData(d);
           setError(null);

@@ -13,8 +13,8 @@
 //! - DB reads reuse the exact same `db::*` functions the Tauri commands use, wrapped in
 //!   `spawn_blocking` so rusqlite never blocks the async runtime.
 
-mod capture;
-mod input;
+pub(crate) mod capture;
+pub(crate) mod input;
 
 use crate::db::{games, media as mediadb, music, sessions, stats, DbPool};
 use crate::db::models::SessionFilter;
@@ -44,9 +44,11 @@ use tower_http::cors::{Any, CorsLayer};
 pub struct RemoteShared {
     pub enabled: AtomicBool,
     pub running: AtomicBool,
+    pub cloud_enabled: AtomicBool,
     pub port: AtomicU16,
     pub clients: AtomicUsize,
     pub pin: Mutex<String>,
+    pub code: Mutex<String>,
     pub tokens: Mutex<HashSet<String>>,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -56,9 +58,11 @@ impl RemoteShared {
         Self {
             enabled: AtomicBool::new(false),
             running: AtomicBool::new(false),
+            cloud_enabled: AtomicBool::new(false),
             port: AtomicU16::new(port),
             clients: AtomicUsize::new(0),
             pin: Mutex::new(gen_pin()),
+            code: Mutex::new(gen_code()),
             tokens: Mutex::new(HashSet::new()),
             shutdown: Mutex::new(None),
         }
@@ -70,6 +74,13 @@ impl RemoteShared {
         *self.pin.lock() = pin.clone();
         self.tokens.lock().clear();
         pin
+    }
+
+    /// Rotate the cloud connection code (the WebRTC signaling room id / secret).
+    pub fn rotate_code(&self) -> String {
+        let code = gen_code();
+        *self.code.lock() = code.clone();
+        code
     }
 }
 
@@ -86,6 +97,19 @@ pub struct ApiState {
 fn gen_pin() -> String {
     let n = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as u32;
     format!("{n:06}")
+}
+
+/// An 8-char connection code for cloud mode — used as the signaling room id and
+/// shared secret. ~41 bits from an unambiguous alphabet (no 0/O/1/I/L).
+fn gen_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    let mut n = uuid::Uuid::new_v4().as_u128();
+    let mut out = String::with_capacity(8);
+    for _ in 0..8 {
+        out.push(ALPHABET[(n % ALPHABET.len() as u128) as usize] as char);
+        n /= ALPHABET.len() as u128;
+    }
+    out
 }
 
 fn gen_token() -> String {

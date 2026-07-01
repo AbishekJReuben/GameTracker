@@ -1,7 +1,12 @@
 # GameTracker Remote — Android companion
 
 A thin Tauri Android app that connects to the desktop GameTracker's **Remote** server
-(over Tailscale or your LAN) to show live stats/music and remote-control the PC.
+to show live stats/music and remote-control the PC. Two ways to connect:
+
+- **Same network** — over your LAN or Tailscale, using the PC's address + PIN.
+- **From anywhere** — WebRTC peer-to-peer, brokered by a small signaling server (baked in as
+  `wss://discovery.chilloutgamestudio.com`); you only enter the **connection code**. See
+  `../signaling/README.md` for hosting that (a Cloudflare Tunnel from the PC).
 
 The UI is the shared React bundle built from `companion.html` (`src/companion/**`), so
 it reuses the same design system, types, and helpers as the desktop app. This crate is
@@ -63,11 +68,20 @@ PC's LAN/Tailscale IP (e.g. `http://100.x.y.z:1420`) so the phone can reach Vite
 
 ## Using it
 
-1. On the PC, open GameTracker → **Remote** → toggle it on. Note the **address** and **PIN**.
-2. Install Tailscale on the PC and phone (same account) so they can reach each other anywhere.
-3. Open **GameTracker Remote** on the phone, enter the address + PIN, and pair.
-4. **Stats** and **Music** mirror your PC live; **Control** streams the screen and lets you
-   drive the mouse/keyboard.
+On the PC, open GameTracker → **Remote** → toggle it on. Then pick one:
+
+**From anywhere (cloud, recommended):**
+1. One-time: run the signaling server + Cloudflare Tunnel (see `../signaling/README.md`) so
+   `discovery.chilloutgamestudio.com` reaches your PC. Turn on **cloud access** in Remote.
+2. In the app, pick **From anywhere** and enter the **connection code** shown on the PC (the
+   signaling address is already baked in). It connects **directly peer-to-peer**.
+
+**Same network:**
+1. Pick **Same network**, enter the PC's **address** + **PIN** (Tailscale address works too, from
+   anywhere both devices are on the tailnet).
+
+Either way: **Stats** and **Music** mirror your PC live; **Control** streams the screen and lets you
+drive the mouse/keyboard.
 
 ## Notes / gotchas
 

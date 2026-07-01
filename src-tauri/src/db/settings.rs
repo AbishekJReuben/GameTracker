@@ -28,6 +28,11 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("steam_linked", "false"),
     ("remote_enabled", "false"),
     ("remote_port", "47800"),
+    ("remote_cloud_enabled", "false"),
+    // Default signaling server (WebRTC rendezvous). Kept in sync with
+    // DEFAULT_SIGNAL_URL in src/lib/remoteConfig.ts. Self-hosted on this PC and
+    // exposed via a Cloudflare Tunnel; the phone connects here, then P2P takes over.
+    ("remote_signal_url", "wss://discovery.chilloutgamestudio.com"),
 ];
 
 fn default_for(key: &str) -> Option<&'static str> {

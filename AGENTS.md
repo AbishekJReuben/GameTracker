@@ -413,3 +413,51 @@ host panel must be `relative` and its content lifted to `relative z-10` — exac
 `ArtCard`/`MarqueeCard` do. **Do not** add `overflow-hidden` to the host `Card` when it has hover
 tooltips (Timeline / Heatmap): the backdrop already clips itself, and clipping the Card would cut
 off the tooltips.
+
+---
+
+## 13. Remote access + phone companion (v3.2.x) — `/remote`, companion app, signaling
+
+A **Remote** feature lets an Android phone view live stats and control this PC's screen. Two
+transports share one UI; the whole feature is gated behind the **`remote_enabled`** setting
+(default off), same "one toggle" convention as other network features.
+
+**Desktop remote server** — `src-tauri/src/remote/` (`mod.rs`, `capture.rs`, `input.rs`). An
+embedded **axum** HTTP+WS server on **port 47800** (`remote_port`), bound `0.0.0.0`, permissive
+CORS. Pairing: a 6-digit **PIN** (shown on `/remote`) → `POST /pair` returns a bearer token; every
+`/api/*` needs it. WS channels carry the token as a `?token=` query (browsers can't set WS headers).
+Endpoints reuse the exact `db::*` functions via `spawn_blocking`. `/screen` streams JPEG frames
+(**xcap** capture, ≤1280px, ~12fps); `/control` injects mouse/keyboard (**enigo**, on its own OS
+thread since `Enigo` isn't `Send`); `/media?path=<abs>` serves artwork (path-checked under
+`media_dir`). `best_host_ip()` prefers a Tailscale 100.64/10 address, else LAN.
+
+**Two ways the phone connects:**
+1. **Same network** — phone enters the LAN/Tailscale address + PIN; talks straight to the server
+   over http/ws (or over Tailscale from anywhere those are both on the tailnet).
+2. **From anywhere (cloud)** — **WebRTC P2P**. A tiny **signaling server** (`signaling/`, standalone
+   axum crate, port 8080) brokers only the SDP/ICE handshake; screen + control then flow **directly
+   peer-to-peer** (never through signaling). Desktop is the **host** (`src/lib/rtcHost.ts`), phone is
+   the **guest** (`src/companion/cloud.ts`), shared helpers in `src/lib/rtc.ts`. Both peers use the
+   browser-native `RTCPeerConnection` — **no native webrtc crate**. Data channels: `screen`
+   (host→guest base64 JPEG), `control` (guest→host input), `data` (id-correlated stats req/resp).
+   Backend state adds `cloud_enabled`/`code` (8-char room id, `remote_regen_code`); the host grabs
+   frames via `remote_grab_frame` and injects via `remote_inject` (see `commands.rs`).
+
+**Self-hosting the signaling server (the current setup): Cloudflare Tunnel.** The signaling server
+runs on this PC (`npm run signal:serve` → `signaling/serve.ps1`, builds+runs on `localhost:8080`)
+and is exposed at **`discovery.chilloutgamestudio.com`** via a Cloudflare Tunnel
+(`ingress: discovery.chilloutgamestudio.com → http://localhost:8080`; see
+`signaling/cloudflared-config.example.yml`). **The signaling URL is baked in**, so the phone/desktop
+"From anywhere" screens need no pasting — only the connection code. Single source of truth:
+`src/lib/remoteConfig.ts` (`DEFAULT_SIGNAL_URL`) mirrored by the `remote_signal_url` default in
+`src-tauri/src/db/settings.rs` — change both together. STUN is the public Google server; hard NATs
+(CGNAT/symmetric) would need a TURN relay (not bundled) for P2P to succeed.
+
+**Phone companion** — a **second Vite entry** `companion.html` → `src/companion/**` (Stats / Music /
+Control tabs; `Pairing.tsx` has the two tabs; `link.ts`/`links.ts` dispatch data + the screen link
+across LAN-WS vs WebRTC). Reuses the desktop design system + types but talks straight to the server
+/ data channel (never proxies desktop `invoke`). Packaged as a **Tauri Android app** under
+`companion/src-tauri/`. Build: `npm run companion:android` (see `companion/README.md`). Gotchas:
+`companion/` needs its own `package.json` (Gradle's generated task runs `npm run tauri` with cwd
+there); release APKs are **unsigned** — sign with the debug keystore (zipalign + apksigner) for
+sideloading. Input into elevated apps/games needs the desktop app run as admin.

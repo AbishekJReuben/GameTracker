@@ -1,7 +1,7 @@
 import { Gamepad2, Clock, Flame, Trophy, Zap, Radio } from "lucide-react";
 import { Dashboard, TrackingState } from "@/lib/api";
 import { dur, relativeTime } from "@/lib/format";
-import { remoteMediaUrl } from "@/lib/remoteClient";
+import { mediaUrl as remoteMediaUrl } from "../link";
 import { useRemote } from "../useRemote";
 
 export function StatsScreen() {

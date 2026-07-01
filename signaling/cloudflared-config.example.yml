@@ -1,0 +1,27 @@
+# Example Cloudflare Tunnel config for the GameTracker signaling server.
+#
+# This exposes the tiny signaling server (running locally on this PC, port 8080)
+# to the internet at a stable hostname, with TLS handled by Cloudflare. The phone
+# reaches the signaling server here; the actual screen/control stream then goes
+# directly peer-to-peer (it does NOT flow through this tunnel).
+#
+# If you already run cloudflared for other sites, just add the `discovery.*`
+# hostname rule below to your existing config.yml's `ingress:` list (before the
+# final http_status:404 catch-all) and restart cloudflared. Otherwise:
+#
+#   1. cloudflared tunnel login
+#   2. cloudflared tunnel create gametracker
+#   3. cloudflared tunnel route dns gametracker discovery.chilloutgamestudio.com
+#   4. Fill in the tunnel id + credentials path below, save as config.yml
+#   5. cloudflared tunnel run gametracker
+#
+# WebSockets pass through cloudflared automatically — no extra flags needed.
+
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: C:\Users\abish\.cloudflared\REPLACE_WITH_TUNNEL_ID.json
+
+ingress:
+  - hostname: discovery.chilloutgamestudio.com
+    service: http://localhost:8080
+  # ...your other sites' ingress rules can go here...
+  - service: http_status:404

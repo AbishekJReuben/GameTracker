@@ -114,6 +114,11 @@ pub fn run() {
                 .unwrap_or(47800)
                 .clamp(1024, 65535) as u16;
             let remote_shared = Arc::new(remote::RemoteShared::new(remote_port));
+            if db::settings::get_bool(&pool, "remote_cloud_enabled").unwrap_or(false) {
+                remote_shared
+                    .cloud_enabled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
 
             app.manage(AppState {
                 pool: pool.clone(),
@@ -305,6 +310,10 @@ pub fn run() {
             commands::remote_status,
             commands::remote_set_enabled,
             commands::remote_regen_pin,
+            commands::remote_set_cloud,
+            commands::remote_regen_code,
+            commands::remote_grab_frame,
+            commands::remote_inject,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tracker")

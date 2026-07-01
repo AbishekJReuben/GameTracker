@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   MousePointer2,
   MousePointerClick,
@@ -13,20 +13,10 @@ import {
   Keyboard,
   Loader2,
 } from "lucide-react";
-import { remoteWsUrl } from "@/lib/remoteClient";
+import type { RemoteLink } from "../links";
 
-type ControlMsg =
-  | { type: "move"; x: number; y: number }
-  | { type: "down"; button?: string }
-  | { type: "up"; button?: string }
-  | { type: "scroll"; dy: number }
-  | { type: "text"; value: string }
-  | { type: "key"; name: string };
-
-export function ControlScreen() {
+export function ControlScreen({ link }: { link: RemoteLink }) {
   const imgRef = useRef<HTMLImageElement | null>(null);
-  const screenWs = useRef<WebSocket | null>(null);
-  const controlWs = useRef<WebSocket | null>(null);
   const lastUrl = useRef<string | null>(null);
   const dragging = useRef(false);
   const lastMove = useRef(0);
@@ -36,56 +26,20 @@ export function ControlScreen() {
   const [button, setButton] = useState<"left" | "right">("left");
   const [kbdOpen, setKbdOpen] = useState(false);
 
-  const send = useCallback((msg: ControlMsg) => {
-    const ws = controlWs.current;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-  }, []);
-
-  // Screen stream: render incoming JPEG frames into the <img>.
+  // Render frames from whichever transport the link wraps (LAN WS or cloud WebRTC).
   useEffect(() => {
-    let alive = true;
-    let retry: number | undefined;
-
-    const connectScreen = () => {
-      if (!alive) return;
-      const ws = new WebSocket(remoteWsUrl("/screen"));
-      ws.binaryType = "arraybuffer";
-      screenWs.current = ws;
-      ws.onopen = () => setConnected(true);
-      ws.onmessage = (ev) => {
-        if (!(ev.data instanceof ArrayBuffer) || !imgRef.current) return;
-        const url = URL.createObjectURL(new Blob([ev.data], { type: "image/jpeg" }));
-        imgRef.current.src = url;
-        if (lastUrl.current) URL.revokeObjectURL(lastUrl.current);
-        lastUrl.current = url;
-      };
-      ws.onclose = () => {
-        setConnected(false);
-        if (alive) retry = window.setTimeout(connectScreen, 1500);
-      };
-      ws.onerror = () => ws.close();
-    };
-
-    const connectControl = () => {
-      if (!alive) return;
-      const ws = new WebSocket(remoteWsUrl("/control"));
-      controlWs.current = ws;
-      ws.onclose = () => {
-        if (alive) window.setTimeout(connectControl, 1500);
-      };
-      ws.onerror = () => ws.close();
-    };
-
-    connectScreen();
-    connectControl();
+    link.onStatus(setConnected);
+    link.onFrame((blob) => {
+      if (!imgRef.current) return;
+      const url = URL.createObjectURL(blob);
+      imgRef.current.src = url;
+      if (lastUrl.current) URL.revokeObjectURL(lastUrl.current);
+      lastUrl.current = url;
+    });
     return () => {
-      alive = false;
-      if (retry) window.clearTimeout(retry);
-      screenWs.current?.close();
-      controlWs.current?.close();
       if (lastUrl.current) URL.revokeObjectURL(lastUrl.current);
     };
-  }, []);
+  }, [link]);
 
   // Map a pointer event to normalized 0..1 coords inside the letterboxed image.
   const normFromEvent = (clientX: number, clientY: number): { x: number; y: number } | null => {
@@ -115,8 +69,8 @@ export function ControlScreen() {
     if (!n) return;
     dragging.current = true;
     (e.target as Element).setPointerCapture?.(e.pointerId);
-    send({ type: "move", x: n.x, y: n.y });
-    send({ type: "down", button });
+    link.send({ type: "move", x: n.x, y: n.y });
+    link.send({ type: "down", button });
   };
   const onPointerMove = (e: React.PointerEvent) => {
     if (!dragging.current) return;
@@ -124,19 +78,19 @@ export function ControlScreen() {
     if (t - lastMove.current < 25) return;
     lastMove.current = t;
     const n = normFromEvent(e.clientX, e.clientY);
-    if (n) send({ type: "move", x: n.x, y: n.y });
+    if (n) link.send({ type: "move", x: n.x, y: n.y });
   };
   const onPointerUp = () => {
     if (!dragging.current) return;
     dragging.current = false;
-    send({ type: "up", button });
+    link.send({ type: "up", button });
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     e.preventDefault();
     const k = e.key;
     if (k.length === 1) {
-      send({ type: "text", value: k });
+      link.send({ type: "text", value: k });
     } else {
       const map: Record<string, string> = {
         Enter: "enter",
@@ -155,7 +109,7 @@ export function ControlScreen() {
         " ": "space",
       };
       const name = map[k];
-      if (name) send({ type: "key", name });
+      if (name) link.send({ type: "key", name });
     }
   };
 
@@ -192,29 +146,26 @@ export function ControlScreen() {
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
-          onWheel={(e) => send({ type: "scroll", dy: e.deltaY > 0 ? 3 : -3 })}
+          onWheel={(e) => link.send({ type: "scroll", dy: e.deltaY > 0 ? 3 : -3 })}
         />
-        {/* Scroll controls */}
         <div className="absolute right-2 top-1/2 flex -translate-y-1/2 flex-col gap-2">
-          <IconBtn onClick={() => send({ type: "scroll", dy: -3 })}><ChevronUp className="h-5 w-5" /></IconBtn>
-          <IconBtn onClick={() => send({ type: "scroll", dy: 3 })}><ChevronDown className="h-5 w-5" /></IconBtn>
+          <IconBtn onClick={() => link.send({ type: "scroll", dy: -3 })}><ChevronUp className="h-5 w-5" /></IconBtn>
+          <IconBtn onClick={() => link.send({ type: "scroll", dy: 3 })}><ChevronDown className="h-5 w-5" /></IconBtn>
         </div>
       </div>
 
-      {/* Keyboard toolbar */}
       <div className="border-t border-line bg-bg-900/70 p-2">
         <div className="flex flex-wrap items-center gap-1.5">
           <IconBtn onClick={() => { setKbdOpen(true); kbdRef.current?.focus(); }}><Keyboard className="h-4 w-4" /></IconBtn>
-          <KeyBtn onClick={() => send({ type: "key", name: "escape" })}>Esc</KeyBtn>
-          <KeyBtn onClick={() => send({ type: "key", name: "tab" })}>Tab</KeyBtn>
-          <IconBtn onClick={() => send({ type: "key", name: "enter" })}><CornerDownLeft className="h-4 w-4" /></IconBtn>
-          <IconBtn onClick={() => send({ type: "key", name: "backspace" })}><Delete className="h-4 w-4" /></IconBtn>
-          <IconBtn onClick={() => send({ type: "key", name: "left" })}><ArrowLeft className="h-4 w-4" /></IconBtn>
-          <IconBtn onClick={() => send({ type: "key", name: "up" })}><ArrowUp className="h-4 w-4" /></IconBtn>
-          <IconBtn onClick={() => send({ type: "key", name: "down" })}><ArrowDown className="h-4 w-4" /></IconBtn>
-          <IconBtn onClick={() => send({ type: "key", name: "right" })}><ArrowRight className="h-4 w-4" /></IconBtn>
+          <KeyBtn onClick={() => link.send({ type: "key", name: "escape" })}>Esc</KeyBtn>
+          <KeyBtn onClick={() => link.send({ type: "key", name: "tab" })}>Tab</KeyBtn>
+          <IconBtn onClick={() => link.send({ type: "key", name: "enter" })}><CornerDownLeft className="h-4 w-4" /></IconBtn>
+          <IconBtn onClick={() => link.send({ type: "key", name: "backspace" })}><Delete className="h-4 w-4" /></IconBtn>
+          <IconBtn onClick={() => link.send({ type: "key", name: "left" })}><ArrowLeft className="h-4 w-4" /></IconBtn>
+          <IconBtn onClick={() => link.send({ type: "key", name: "up" })}><ArrowUp className="h-4 w-4" /></IconBtn>
+          <IconBtn onClick={() => link.send({ type: "key", name: "down" })}><ArrowDown className="h-4 w-4" /></IconBtn>
+          <IconBtn onClick={() => link.send({ type: "key", name: "right" })}><ArrowRight className="h-4 w-4" /></IconBtn>
         </div>
-        {/* Hidden input to capture hardware/soft keyboard typing */}
         <input
           ref={kbdRef}
           value=""

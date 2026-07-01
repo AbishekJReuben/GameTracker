@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import {
   Smartphone,
@@ -10,21 +10,34 @@ import {
   Copy,
   Check,
   Download,
+  Globe,
 } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
 import { SectionTitle, Toggle, Skeleton } from "@/components/ui";
 import { api, RemoteStatus } from "@/lib/api";
+import { startHost } from "@/lib/rtcHost";
+import { DEFAULT_SIGNAL_URL, SIGNAL_PORT } from "@/lib/remoteConfig";
 import { useApp } from "@/store/app";
 
 export default function RemotePage() {
   const pushToast = useApp((s) => s.pushToast);
   const [status, setStatus] = useState<RemoteStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  const [signalDraft, setSignalDraft] = useState(DEFAULT_SIGNAL_URL);
+  const [cloudClients, setCloudClients] = useState(0);
+  // Keep the latest signaling URL from the backend without clobbering the user's
+  // in-progress edit (only seed the draft once, when it's still empty).
+  const seededSignal = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
-      setStatus(await api.remoteStatus());
+      const s = await api.remoteStatus();
+      setStatus(s);
+      if (!seededSignal.current && s.signalUrl) {
+        setSignalDraft(s.signalUrl);
+        seededSignal.current = true;
+      }
     } catch {
       /* ignore transient poll errors */
     }
@@ -36,6 +49,27 @@ export default function RemotePage() {
     const id = setInterval(refresh, 2000);
     return () => clearInterval(id);
   }, [refresh]);
+
+  // When cloud mode is on and configured, run the WebRTC host from the webview.
+  // Re-runs (tearing down and restarting) whenever the URL or code changes.
+  const cloudOn = status?.cloudEnabled ?? false;
+  const cloudUrl = status?.signalUrl ?? "";
+  const cloudCode = status?.code ?? "";
+  useEffect(() => {
+    if (!cloudOn || !cloudUrl || !cloudCode) {
+      setCloudClients(0);
+      return;
+    }
+    const stop = startHost({
+      signalUrl: cloudUrl,
+      code: cloudCode,
+      onClients: setCloudClients,
+    });
+    return () => {
+      stop();
+      setCloudClients(0);
+    };
+  }, [cloudOn, cloudUrl, cloudCode]);
 
   const toggle = async (enabled: boolean) => {
     setBusy(true);
@@ -59,6 +93,49 @@ export default function RemotePage() {
       pushToast({ kind: "success", title: "New pairing PIN generated" });
     } catch (e) {
       pushToast({ kind: "info", title: "Couldn't regenerate PIN", message: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setCloud = async (enabled: boolean) => {
+    if (enabled && !signalDraft.trim()) {
+      pushToast({ kind: "info", title: "Enter a signaling server first" });
+      return;
+    }
+    setBusy(true);
+    try {
+      setStatus(await api.remoteSetCloud(enabled, signalDraft.trim()));
+      pushToast({
+        kind: "success",
+        title: enabled ? "Cloud access on" : "Cloud access off",
+      });
+    } catch (e) {
+      pushToast({ kind: "info", title: "Couldn't change cloud access", message: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveSignal = async () => {
+    setBusy(true);
+    try {
+      setStatus(await api.remoteSetCloud(status?.cloudEnabled ?? false, signalDraft.trim()));
+      pushToast({ kind: "success", title: "Signaling server saved" });
+    } catch (e) {
+      pushToast({ kind: "info", title: "Couldn't save signaling server", message: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const regenCode = async () => {
+    setBusy(true);
+    try {
+      setStatus(await api.remoteRegenCode());
+      pushToast({ kind: "success", title: "New connection code generated" });
+    } catch (e) {
+      pushToast({ kind: "info", title: "Couldn't regenerate code", message: String(e) });
     } finally {
       setBusy(false);
     }
@@ -119,6 +196,93 @@ export default function RemotePage() {
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
+              className="mb-5"
+            >
+              <Panel panelKey="remote.cloud" className="p-5">
+                <div className="flex flex-wrap items-center justify-between gap-4">
+                  <SectionTitle
+                    title="From anywhere (cloud)"
+                    subtitle="Connect over the internet — no Tailscale needed"
+                    right={<Globe className="h-4 w-4" />}
+                  />
+                  <div className="flex items-center gap-3">
+                    {cloudOn && (
+                      <span className="flex items-center gap-1.5 text-sm text-ink-dim">
+                        <span
+                          className="h-2 w-2 rounded-full"
+                          style={{
+                            background: cloudClients > 0 ? "#34d399" : "#64748b",
+                            boxShadow: cloudClients > 0 ? "0 0 10px #34d399" : undefined,
+                          }}
+                        />
+                        {cloudClients > 0 ? "Phone connected" : "Waiting for phone"}
+                      </span>
+                    )}
+                    <Toggle
+                      checked={cloudOn}
+                      onChange={(v) => !busy && setCloud(v)}
+                      label={cloudOn ? "On" : "Off"}
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                  <div>
+                    <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+                      <Globe className="h-3.5 w-3.5" /> Signaling server
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        className="flex-1 rounded-xl border border-line bg-white/[0.03] px-3 py-2.5 font-mono text-sm outline-none focus:border-accent-1/60"
+                        placeholder="wss://discovery.chilloutgamestudio.com"
+                        spellCheck={false}
+                        autoCapitalize="none"
+                        autoCorrect="off"
+                        value={signalDraft}
+                        onChange={(e) => setSignalDraft(e.target.value)}
+                      />
+                      <button
+                        onClick={saveSignal}
+                        disabled={busy || signalDraft.trim() === (status?.signalUrl ?? "")}
+                        className="btn btn-ghost h-10"
+                        title="Save signaling server"
+                      >
+                        <Check className="h-4 w-4" /> Save
+                      </button>
+                    </div>
+                    <p className="mt-1.5 text-xs text-ink-faint">
+                      Pre-filled with the default. It only brokers the handshake — screen and
+                      control then flow directly peer-to-peer. Run it on this PC and expose it with a
+                      Cloudflare Tunnel to <span className="font-mono">localhost:{SIGNAL_PORT}</span>.
+                    </p>
+                  </div>
+
+                  <div>
+                    <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+                      <KeyRound className="h-3.5 w-3.5" /> Connection code
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <div className="font-display text-3xl font-800 uppercase tracking-[0.3em] accent-text">
+                        {status.code || "—"}
+                      </div>
+                      <button onClick={regenCode} disabled={busy} className="btn btn-ghost h-9" title="Generate a new code">
+                        <RefreshCw className="h-4 w-4" /> New code
+                      </button>
+                    </div>
+                    <p className="mt-1.5 text-xs text-ink-faint">
+                      Enter this in the companion app under “From anywhere.” A new code disconnects the
+                      old session.
+                    </p>
+                  </div>
+                </div>
+              </Panel>
+            </motion.div>
+          )}
+
+          {on && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
               className="grid grid-cols-1 gap-5 lg:grid-cols-2"
             >
               <Panel panelKey="remote.connect" className="p-5">
@@ -154,23 +318,26 @@ export default function RemotePage() {
                 <SectionTitle title="How to connect" subtitle="One-time setup" right={<ShieldCheck className="h-4 w-4" />} />
                 <ol className="mt-4 space-y-3">
                   <Step n={1}>
-                    Install <b>Tailscale</b> on this PC and your phone, sign into both with the same
-                    account. This creates a private, encrypted link so you can connect from anywhere —
-                    no ports to open.
-                  </Step>
-                  <Step n={2}>
                     Install the <b>GameTracker companion</b> app on your Android phone
                     <span className="ml-1 inline-flex items-center gap-1 text-ink-faint">
-                      <Download className="h-3.5 w-3.5" /> (APK — coming with this feature)
+                      <Download className="h-3.5 w-3.5" /> (build the APK — see companion/README.md)
                     </span>
                     .
                   </Step>
+                  <Step n={2}>
+                    <b>From anywhere (one-time):</b> run the signaling server on this PC and point a
+                    <b> Cloudflare Tunnel</b> at <span className="font-mono">localhost:{SIGNAL_PORT}</span> for
+                    <span className="font-mono"> {DEFAULT_SIGNAL_URL.replace(/^wss:\/\//, "")}</span>. See
+                    signaling/README.md for the exact commands.
+                  </Step>
                   <Step n={3}>
-                    Open the companion app, enter the <b>address</b> and <b>PIN</b> shown here, and pair.
+                    Turn on <b>cloud access</b> above, then in the app pick “From anywhere” and enter the
+                    <b> connection code</b> (the signaling address is already baked in). Screen and control
+                    then run <b>directly peer-to-peer</b>.
                   </Step>
                   <Step n={4}>
-                    You'll see all your stats live, and can control this PC's screen once that phase
-                    ships.
+                    <b>Same network:</b> on the same WiFi/Tailscale, pick “Same network” in the app and
+                    enter the <b>address</b> and <b>PIN</b> shown here — no signaling server needed.
                   </Step>
                 </ol>
               </Panel>
@@ -183,9 +350,9 @@ export default function RemotePage() {
               <p className="mt-3 max-w-2xl text-sm leading-relaxed text-ink-soft">
                 Turn this on to run a small, secure server on this PC that the GameTracker phone app
                 connects to. You'll be able to browse all your play stats, music, and timeline from
-                your phone — and remotely control the PC's screen — from home or anywhere, over an
-                encrypted Tailscale link. Everything stays on your own devices; nothing is sent to a
-                third-party server.
+                your phone — and remotely control the PC's screen — on the same network, or from
+                anywhere via an encrypted peer-to-peer link. Everything stays on your own devices;
+                nothing is stored on a third-party server.
               </p>
             </Panel>
           )}
