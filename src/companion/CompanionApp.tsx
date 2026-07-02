@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
+import { listen } from "@tauri-apps/api/event";
 import {
   BarChart3,
   Library,
@@ -12,6 +13,8 @@ import {
   KeyRound,
   Plug,
   Power,
+  Download,
+  X,
 } from "lucide-react";
 import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { Pairing, type Connected } from "./Pairing";
@@ -22,6 +25,7 @@ import { StatsScreen } from "./screens/Stats";
 import { LibraryScreen } from "./screens/Library";
 import { MusicScreen } from "./screens/MusicView";
 import { ControlScreen } from "./screens/Control";
+import { checkForUpdate, installUpdate, type UpdateInfo } from "./update";
 
 type Tab = "stats" | "library" | "music" | "control";
 type Phase = "boot" | "pairing" | "autoconnecting" | "connected" | "paused";
@@ -85,6 +89,17 @@ export function CompanionApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // In-app updater: check GitHub for a newer APK on launch (Tauri's updater
+  // plugin doesn't support Android, so this is a small custom flow).
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+
+  useEffect(() => {
+    checkForUpdate().then((u) => {
+      if (u) setUpdate(u);
+    });
+  }, []);
+
   const onPaired = (c: Connected) => adopt(c.conn, c.code, c.signalUrl);
 
   const closeAll = () => {
@@ -109,14 +124,35 @@ export function CompanionApp() {
     setPhase("pairing");
   };
 
-  if (phase === "boot") return <FullscreenSpinner label="Starting…" />;
-  if (phase === "autoconnecting") return <Connecting code={activeCode} onCancel={forget} />;
-  if (phase === "paused") return <Paused onReconnect={beginAutoConnect} onForget={forget} />;
-  if (phase === "pairing" || !conn) return <Pairing onConnected={onPaired} initialCode={activeCode} />;
+  const updateBanner =
+    update && !updateDismissed ? (
+      <UpdateBanner info={update} onDismiss={() => setUpdateDismissed(true)} />
+    ) : null;
+
+  let body: React.ReactNode;
+  if (phase === "boot") body = <FullscreenSpinner label="Starting…" />;
+  else if (phase === "autoconnecting") body = <Connecting code={activeCode} onCancel={forget} />;
+  else if (phase === "paused") body = <Paused onReconnect={beginAutoConnect} onForget={forget} />;
+  else if (phase === "pairing" || !conn)
+    body = <Pairing onConnected={onPaired} initialCode={activeCode} />;
+  else body = null;
+
+  if (body !== null) {
+    return (
+      <>
+        {updateBanner}
+        {body}
+      </>
+    );
+  }
+
+  if (!conn) return updateBanner; // unreachable (body handles !conn), narrows for TS
 
   const isControlTab = tab === "control";
 
   return (
+    <>
+    {updateBanner}
     <div className="flex h-[100dvh] flex-col bg-bg-base text-ink">
       {!isControlTab && (
         <header
@@ -168,6 +204,84 @@ export function CompanionApp() {
         </nav>
       )}
     </div>
+    </>
+  );
+}
+
+/**
+ * "Update available" banner shown at the top of the app when a newer companion
+ * APK is published. Tapping Update downloads it and hands it to the Android
+ * package installer; a small progress line reflects the download.
+ */
+function UpdateBanner({ info, onDismiss }: { info: UpdateInfo; onDismiss: () => void }) {
+  const [state, setState] = useState<"idle" | "working" | "error">("idle");
+  const [pct, setPct] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (state !== "working") return;
+    const un = listen<{ phase: string; received: number; total: number }>(
+      "apk-update://progress",
+      (e) => {
+        const { phase, received, total } = e.payload;
+        setPct(phase === "installing" ? 100 : total > 0 ? Math.round((received / total) * 100) : null);
+      },
+    );
+    return () => {
+      un.then((f) => f());
+    };
+  }, [state]);
+
+  const start = async () => {
+    setState("working");
+    setPct(null);
+    try {
+      await installUpdate(info.url);
+    } catch {
+      setState("error");
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ y: -60, opacity: 0 }}
+      animate={{ y: 0, opacity: 1 }}
+      className="fixed inset-x-0 top-0 z-50 border-b border-line bg-bg-900/95 backdrop-blur"
+      style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}
+    >
+      <div className="flex items-center gap-3 px-4 py-2.5">
+        <span className="grid h-9 w-9 flex-none place-items-center rounded-xl bg-accent-sheen shadow-glow">
+          <Download className="h-4 w-4 text-white" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-700">Update available · v{info.version}</div>
+          <div className="truncate text-[11px] text-ink-dim">
+            {state === "working"
+              ? pct == null
+                ? "Downloading…"
+                : pct >= 100
+                  ? "Opening installer…"
+                  : `Downloading… ${pct}%`
+              : state === "error"
+                ? "Update failed — tap to retry"
+                : "A newer version of the companion is ready."}
+          </div>
+        </div>
+        {state === "working" && pct != null && pct < 100 ? (
+          <span className="text-xs font-700 tabular-nums text-accent-3">{pct}%</span>
+        ) : state === "working" ? (
+          <Loader2 className="h-4 w-4 animate-spin text-accent-3" />
+        ) : (
+          <button onClick={start} className="btn btn-primary h-8 px-3 text-xs">
+            {state === "error" ? "Retry" : "Update"}
+          </button>
+        )}
+        {state !== "working" && (
+          <button onClick={onDismiss} className="btn btn-ghost h-8 w-8 p-0 text-ink-dim" title="Dismiss">
+            <X className="h-4 w-4" />
+          </button>
+        )}
+      </div>
+    </motion.div>
   );
 }
 

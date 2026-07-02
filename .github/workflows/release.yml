@@ -48,3 +48,81 @@ jobs:
           prerelease: false
           # Emit latest.json (the updater manifest) alongside the installer.
           includeUpdaterJson: true
+
+  # Build, sign, and attach the Android companion APK to the same Release, plus
+  # apk-latest.json (the manifest the phone polls for its own in-app updates).
+  # Tauri's updater plugin is desktop-only, so the phone uses a small custom flow
+  # (see companion/src-tauri/src/update.rs + src/companion/update.ts).
+  android:
+    runs-on: ubuntu-latest
+    needs: [release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK + build-tools
+        run: |
+          sdkmanager "ndk;27.2.12479018" "build-tools;35.0.0" "platform-tools"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build web bundle
+        run: npm run build
+
+      - name: Scaffold + patch the Android project
+        run: |
+          (cd companion && npx tauri android init --ci)
+          node scripts/patch-android.mjs
+
+      - name: Build APK
+        run: cd companion && npx tauri android build
+
+      - name: Sign APK with the release keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          UNSIGNED="companion/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+          test -f "$UNSIGNED" || { echo "Unsigned APK not found at $UNSIGNED"; exit 1; }
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > release.keystore
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" aligned.apk
+          "$BT/apksigner" sign \
+            --ks release.keystore --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" --key-pass "pass:$ANDROID_KEY_PASSWORD" \
+            --out GameTrackerRemote.apk aligned.apk
+          "$BT/apksigner" verify --print-certs GameTrackerRemote.apk
+          rm -f release.keystore aligned.apk
+
+      - name: Write apk-latest.json
+        env:
+          APK_URL: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/GameTrackerRemote.apk
+        run: |
+          node -e "const fs=require('fs'); const v=require('./companion/src-tauri/tauri.conf.json').version; fs.writeFileSync('apk-latest.json', JSON.stringify({ version: v, url: process.env.APK_URL, notes: '', pubDate: new Date().toISOString() }, null, 2))"
+          cat apk-latest.json
+
+      - name: Upload APK + manifest to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" GameTrackerRemote.apk apk-latest.json --clobber

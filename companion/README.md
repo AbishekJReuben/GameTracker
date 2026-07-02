@@ -104,6 +104,57 @@ BT="$ANDROID_HOME/build-tools/<version>"   # e.g. 35.0.0
 ```
 For a Play-Store release, use a real keystore and the `.aab` instead.
 
+## Automated releases (GitHub Actions)
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which — alongside the desktop
+installer — has an **`android` job** that builds, signs, and attaches
+`GameTrackerRemote.apk` **and** `apk-latest.json` to the same GitHub Release. The APK is
+signed in CI with a **dedicated release keystore** (not the debug keystore) so every
+release is signed with the same key and can install as an update over the previous one.
+
+The CI job re-runs `scripts/patch-android.mjs` after `tauri android init` (the same script
+`Build-Apk.ps1` runs locally) to re-apply the manifest customizations — cleartext traffic,
+the `REQUEST_INSTALL_PACKAGES` permission, and the `FileProvider` — since `gen/android` is
+regenerated and not committed.
+
+### One-time keystore setup (repo secrets)
+
+Generate a release keystore once and store it (base64) as GitHub Actions secrets:
+
+```sh
+keytool -genkey -v -keystore release.keystore -alias gtremote \
+  -keyalg RSA -keysize 2048 -validity 10000 -storepass <PW> -keypass <PW>
+base64 -w0 release.keystore   # value for ANDROID_KEYSTORE_BASE64
+```
+
+Add these repo secrets: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+`ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`.
+
+> **Switching signing keys is a one-time break:** a phone that already has a debug-signed
+> build installed must uninstall it once before the first release-signed APK will install
+> ("signatures do not match"). After that, all updates install cleanly.
+
+## In-app auto-update
+
+Tauri's updater plugin does **not** support Android, so the companion has a small custom
+updater:
+
+- On launch it fetches `apk-latest.json` from the Release's stable
+  `releases/latest/download/` URL and compares the version to the running app
+  (`src/companion/update.ts`).
+- If a newer version exists, an **"Update available"** banner appears. Tapping **Update**
+  calls the native `download_and_install_apk` command
+  (`companion/src-tauri/src/update.rs`), which downloads the APK into the app cache dir and
+  hands it to Android's package installer via a `FileProvider` content URI.
+- **Android never allows a fully silent sideload install** — the OS shows its own one-tap
+  install confirmation (and, the first time, prompts to allow "install unknown apps" for the
+  companion, which is why the `REQUEST_INSTALL_PACKAGES` permission is required). This is as
+  close to the desktop's silent self-update as stock Android permits.
+
+If you repoint releases at a different GitHub repo, update `MANIFEST_URL` in
+`src/companion/update.ts` to match (it must be the same host as the desktop updater's
+`latest.json`).
+
 ### Live-reload dev (optional)
 ```sh
 # terminal 1 — serve the web bundle

@@ -525,3 +525,22 @@ across LAN-WS vs WebRTC). Reuses the desktop design system + types but talks str
 `companion/` needs its own `package.json` (Gradle's generated task runs `npm run tauri` with cwd
 there); release APKs are **unsigned** — sign with the debug keystore (zipalign + apksigner) for
 sideloading. Input into elevated apps/games needs the desktop app run as admin.
+
+**CI APK release + phone auto-update (v3.2.8).** The `android` job in
+`.github/workflows/release.yml` builds/signs the companion APK on every `v*` tag and
+attaches `GameTrackerRemote.apk` + `apk-latest.json` to the same Release. It signs with a
+**dedicated release keystore** from repo secrets (`ANDROID_KEYSTORE_BASE64`,
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) — a stable key so
+updates install over each other (switching from debug-signed needs a one-time
+uninstall/reinstall). `gen/android` isn't committed, so both CI and `Build-Apk.ps1` run the
+idempotent, CRLF-safe **`scripts/patch-android.mjs`** after init to re-apply the manifest
+customizations (cleartext, `REQUEST_INSTALL_PACKAGES`, `FileProvider`). Tauri's updater
+plugin is desktop-only, so the phone self-updates via a **custom** flow:
+`src/companion/update.ts` fetches `apk-latest.json` on launch, compares to `getVersion()`,
+and shows an "Update available" banner; tapping it calls the native
+`download_and_install_apk` command (`companion/src-tauri/src/update.rs`) which downloads the
+APK (ureq) into the app cache dir and hands it to Android's package installer via a
+FileProvider content URI (JNI, no Kotlin plugin). **Stock Android can't fully silently
+install a sideload** — the OS always shows a one-tap install prompt. The APK URL/repo owner
+in `update.ts` (`MANIFEST_URL`) must match the desktop updater's release host
+(`AbishekJReuben/GameTracker`).
