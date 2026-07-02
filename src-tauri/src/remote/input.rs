@@ -132,15 +132,51 @@ impl Controller {
         (px, py)
     }
 
-    /// Move the cursor to an absolute virtual-desktop pixel. Uses `SetCursorPos` on
-    /// Windows so it works across all monitors (incl. negative offsets); elsewhere
+    /// Move the cursor to an absolute virtual-desktop pixel. On Windows this injects
+    /// a real mouse-move via `SendInput` (ABSOLUTE|VIRTUALDESK) rather than
+    /// `SetCursorPos`: `SetCursorPos` only teleports the pointer, so the shell never
+    /// starts its hover timer and taskbar thumbnail previews (Aero Peek) never appear
+    /// under the remote cursor. `SendInput` posts a genuine move into the input queue
+    /// (like AnyDesk/RDP), so hover/preview works; normalizing to the 0..65535
+    /// virtual-desktop range preserves multi-monitor + negative offsets. Elsewhere,
     /// falls back to enigo's absolute move.
     fn move_abs(&mut self, px: i32, py: i32) {
         #[cfg(windows)]
         {
-            use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+                MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+                SM_YVIRTUALSCREEN,
+            };
             unsafe {
-                let _ = SetCursorPos(px, py);
+                let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as i64;
+                let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as i64;
+                // Normalize to the 0..65535 range MOUSEEVENTF_ABSOLUTE|VIRTUALDESK
+                // expects, rounding to the intended pixel. Denominator is (extent-1)
+                // per the Win32 mapping.
+                let denom_x = (vw - 1).max(1);
+                let denom_y = (vh - 1).max(1);
+                let nx = (((px - vx) as i64 * 65535 + denom_x / 2) / denom_x) as i32;
+                let ny = (((py - vy) as i64 * 65535 + denom_y / 2) / denom_y) as i32;
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: nx,
+                            dy: ny,
+                            mouseData: 0,
+                            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
             }
         }
         #[cfg(not(windows))]

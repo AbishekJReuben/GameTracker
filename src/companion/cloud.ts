@@ -68,6 +68,12 @@ export class CloudConn {
   private streamCb: ((s: MediaStream) => void) | null = null;
   private eventCb: ((e: HostEvent) => void) | null = null;
   private statusCb: ((s: Status) => void) | null = null;
+  // A dedicated terminal-denial callback the *app shell* owns for the whole life
+  // of the connection. `statusCb` gets reassigned by whichever screen subscribes
+  // last (Control overwrites the shell's subscription), so a "denied" arriving
+  // while the Control screen is up would otherwise be observed by nobody and the
+  // UI would sit on "Reconnecting…" forever. This is never reassigned by screens.
+  private deniedCb: (() => void) | null = null;
   private stream: MediaStream | null = null;
   private lastStatus: Status | null = null;
   private closed = false;
@@ -372,8 +378,15 @@ export class CloudConn {
     this.lastHealthyAt = Date.now();
     this.watchdogTimer = window.setInterval(async () => {
       if (this.closed || this.denied) return;
-      const connected = this.pc?.connectionState === "connected" && this.authed;
-      if (connected) this.lastHealthyAt = Date.now();
+      const transportUp = this.pc?.connectionState === "connected";
+      const connected = transportUp && this.authed;
+      // Transport being up counts as healthy for the hard-reset timer even while
+      // we're still "pending" (awaiting the host's approval) — otherwise the link
+      // would tear down and rebuild every HARD_RESET_MS while the user is reading
+      // the approval prompt on the PC, and each rebuild races the approval (which
+      // was surfacing as a spurious "access refused"). The decode-stall check below
+      // still requires full authorization.
+      if (transportUp) this.lastHealthyAt = Date.now();
       // Backgrounded: timers throttle and getStats is meaningless — skip checks.
       if (document.hidden) {
         this.lastDecodeAdvanceAt = Date.now();
@@ -454,6 +467,7 @@ export class CloudConn {
           this.clearReconnect();
           this.emit("denied");
           this.pc?.close();
+          this.deniedCb?.();
         }
       }
       this.eventCb?.(msg as HostEvent);
@@ -563,6 +577,16 @@ export class CloudConn {
     // subscribes, the peer connection has usually already reached "connected"
     // (it was established during pairing), so no further state-change event fires.
     if (this.lastStatus) cb(this.lastStatus);
+  }
+  /**
+   * App-shell subscription for a terminal denial (host rejected this device). Owned
+   * by CompanionApp for the connection's whole life — unlike `onStatus`, screens
+   * never reassign it — so the app can always drop back to pairing even if the
+   * denial arrives while the Control screen holds the status subscription.
+   */
+  onDenied(cb: () => void) {
+    this.deniedCb = cb;
+    if (this.denied) cb();
   }
   close() {
     this.closed = true;

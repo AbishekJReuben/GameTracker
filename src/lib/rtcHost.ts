@@ -604,6 +604,12 @@ export function startHost(opts: HostOptions): () => void {
     };
 
     pc = new RTCPeerConnection({ iceServers: defaultIceServers(opts.iceServers) });
+    // Capture this session's connection so async handlers (auth/approval) can tell
+    // whether they're still the live session after an await. A superseded session's
+    // late-resolving approval must NOT send its verdict over the *current* session's
+    // channels — that was denying a freshly-connected phone before its own prompt
+    // even appeared (and the phone treats "denied" as fatal, giving up entirely).
+    const myPc = pc;
     pipeIce(pc, sig);
     pc.onconnectionstatechange = () => {
       const st = pc?.connectionState;
@@ -683,7 +689,7 @@ export function startHost(opts: HostOptions): () => void {
           } catch {
             level = "none";
           }
-          if (pc === null) return; // session torn down while we awaited
+          if (pc !== myPc) return; // session superseded/torn down while we awaited
           if (level !== "none") {
             await authorize();
             return;
@@ -693,7 +699,10 @@ export function startHost(opts: HostOptions): () => void {
           const decision: ApprovalDecision = opts.onApprovalRequest
             ? await opts.onApprovalRequest({ deviceId, name })
             : { kind: "deny" };
-          if (pc === null) return;
+          // Bail if this session was replaced while the prompt was open. The store
+          // auto-denies a superseded request, but that verdict belongs to the OLD
+          // session — forwarding it here would kill the new, healthy one.
+          if (pc !== myPc) return;
           if (decision.kind === "deny") {
             if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "denied" }));
             teardownPeer();

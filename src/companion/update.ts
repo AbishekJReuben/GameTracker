@@ -74,6 +74,44 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
   }
 }
 
+/** Outcome of a user-initiated update check (surfaces errors, unlike the silent
+ * launch check which collapses everything to null). */
+export type UpdateCheck =
+  | { status: "update-available"; info: UpdateInfo; current: string }
+  | { status: "up-to-date"; current: string }
+  | { status: "error"; current: string | null; message: string };
+
+/**
+ * Verbose update check for the Settings screen's "Check for updates" button. It
+ * reports *why* nothing happened (offline, malformed manifest, already current),
+ * so a stuck auto-update is diagnosable instead of silently doing nothing.
+ */
+export async function checkForUpdateVerbose(): Promise<UpdateCheck> {
+  if (!isCompanion()) {
+    return { status: "error", current: null, message: "Updates are only available in the installed app." };
+  }
+  let current: string | null = null;
+  try {
+    current = await getVersion();
+    const res = await fetch(MANIFEST_URL, { cache: "no-store" });
+    if (!res.ok) {
+      return { status: "error", current, message: `Update server returned HTTP ${res.status}.` };
+    }
+    const m = (await res.json()) as Manifest;
+    if (!m?.version || !m?.url) {
+      return { status: "error", current, message: "The update manifest was malformed." };
+    }
+    if (cmpVersion(m.version, current) <= 0) {
+      return { status: "up-to-date", current };
+    }
+    return { status: "update-available", info: { version: m.version, url: m.url, notes: m.notes }, current };
+  } catch (e) {
+    const message =
+      e instanceof Error && e.message ? e.message : "Couldn't reach the update server. Check your connection.";
+    return { status: "error", current, message };
+  }
+}
+
 /**
  * Download the APK and launch the system installer. Resolves once the installer
  * has been handed the file (the OS then shows its one-tap install prompt).

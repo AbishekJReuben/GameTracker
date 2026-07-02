@@ -6,6 +6,7 @@ import {
   Library,
   Headphones,
   MonitorSmartphone,
+  Settings as SettingsIcon,
   LogOut,
   Globe,
   Loader2,
@@ -26,9 +27,10 @@ import { StatsScreen } from "./screens/Stats";
 import { LibraryScreen } from "./screens/Library";
 import { MusicScreen } from "./screens/MusicView";
 import { ControlScreen } from "./screens/Control";
+import { SettingsScreen } from "./screens/Settings";
 import { checkForUpdate, installUpdate, type UpdateInfo } from "./update";
 
-type Tab = "stats" | "library" | "music" | "control";
+type Tab = "stats" | "library" | "music" | "control" | "settings";
 type Phase = "boot" | "pairing" | "autoconnecting" | "connected" | "paused";
 
 const LS_CODE = "gt.remote.code"; // remembered code → auto-connect on launch
@@ -40,6 +42,7 @@ const TABS: { id: Tab; label: string; icon: typeof BarChart3 }[] = [
   { id: "library", label: "Library", icon: Library },
   { id: "music", label: "Music", icon: Headphones },
   { id: "control", label: "Control", icon: MonitorSmartphone },
+  { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
 export function CompanionApp() {
@@ -57,6 +60,17 @@ export function CompanionApp() {
     }
     if (signalUrl) localStorage.setItem(LS_SIGNAL, signalUrl);
     if (secret !== undefined) localStorage.setItem(LS_SECRET, secret);
+    // Terminal denial can arrive at any time (e.g. the PC revokes this device, or
+    // the user declines a fresh prompt) — including while the Control screen owns
+    // the status subscription. Own this callback at the shell so we always fall
+    // back to pairing instead of sitting on "Reconnecting…" forever. The saved
+    // code is kept so the user can re-request access or enter the permanent key.
+    c.onDenied(() => {
+      c.close();
+      autoConnRef.current = null;
+      setConn(null);
+      setPhase("pairing");
+    });
     setCloudMode(c);
     setConn(c);
     setPhase("connected");
@@ -136,6 +150,14 @@ export function CompanionApp() {
     setPhase("pairing");
   };
 
+  // Save a permanent key for the saved PC and reconnect so the host re-runs auth
+  // with the key (a correct key auto-grants → no approval prompt next time).
+  const applyKey = (secret: string) => {
+    localStorage.setItem(LS_SECRET, secret);
+    closeAll();
+    beginAutoConnect();
+  };
+
   const updateBanner =
     update && !updateDismissed ? (
       <UpdateBanner info={update} onDismiss={() => setUpdateDismissed(true)} />
@@ -188,6 +210,9 @@ export function CompanionApp() {
         {tab === "stats" && <StatsScreen />}
         {tab === "library" && <LibraryScreen />}
         {tab === "music" && <MusicScreen />}
+        {tab === "settings" && (
+          <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} />
+        )}
         {tab === "control" && (
           <ControlTab conn={conn} onNavigate={(t) => setTab(t)} onDisconnect={disconnect} />
         )}
@@ -195,7 +220,7 @@ export function CompanionApp() {
 
       {!isControlTab && (
         <nav
-          className="grid grid-cols-4 border-t border-line bg-bg-900/70 backdrop-blur"
+          className="grid grid-cols-5 border-t border-line bg-bg-900/70 backdrop-blur"
           style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
         >
           {TABS.map((t) => {

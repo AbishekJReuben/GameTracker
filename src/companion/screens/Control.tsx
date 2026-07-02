@@ -35,6 +35,7 @@ import {
   BarChart3,
   Library as LibraryIcon,
   Headphones,
+  Settings as SettingsIcon,
   Send,
   Type as TypeIcon,
   Film,
@@ -61,7 +62,7 @@ const EDGE_SPEED = 0.016; // max cursor movement (fraction of the screen) per fr
 type Mode = "trackpad" | "touch";
 type Mod = "ctrl" | "alt" | "shift" | "win";
 type KbMode = "direct" | "buffered";
-type NavTab = "stats" | "library" | "music" | "control";
+type NavTab = "stats" | "library" | "music" | "control" | "settings";
 /** Which bottom control panel is expanded (null = collapsed to just the tab strip). */
 type Panel = "mouse" | "keys" | "shortcuts" | "quality" | "keyboard";
 
@@ -143,6 +144,42 @@ export function ControlScreen({
   // Expanded bottom panel (null = collapsed). It pushes the viewport up, never overlaps.
   const [panel, setPanel] = useState<Panel | null>(null);
   const [immersive, setImmersive] = useState(false);
+  // Collapse the whole bottom dock (tab strip + panels) so the viewport fills the
+  // screen, while keeping the top status bar. A small handle restores it. Distinct
+  // from `immersive`, which also hides the top bar. Persisted so it sticks.
+  const [dockCollapsed, setDockCollapsed] = useState(() => localStorage.getItem("gt.remote.dockCollapsed") === "1");
+  useEffect(() => {
+    localStorage.setItem("gt.remote.dockCollapsed", dockCollapsed ? "1" : "0");
+  }, [dockCollapsed]);
+
+  // Soft-keyboard inset. `interactive-widget=resizes-content` (companion.html) is
+  // supposed to shrink the layout viewport when the keyboard opens, but it isn't
+  // honored on every Android WebView — when it falls back to pan mode the browser
+  // scrolls the focused input into view and pushes the screen off the top. Measure
+  // the keyboard height off the VisualViewport and reserve it as bottom padding so
+  // the flex column simply *shrinks* the viewport to fit above the keyboard. When
+  // resizes-content DOES work, layout and visual heights shrink together and this
+  // computes ~0, so the two approaches never fight.
+  const [kbInset, setKbInset] = useState(0);
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+      // Ignore sub-100px noise (address bar, rounding) — only real keyboards.
+      setKbInset((prev) => {
+        const next = covered > 100 ? Math.round(covered) : 0;
+        return next === prev ? prev : next;
+      });
+    };
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    update();
+    return () => {
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+    };
+  }, []);
   const [kbMode, setKbMode] = useState<KbMode>("direct");
   const [pcTextField, setPcTextField] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
@@ -876,6 +913,7 @@ export function ControlScreen({
   // Open/close a bottom panel; the keyboard panel also focuses/blurs the input so
   // the soft keyboard follows. Tapping an already-open panel collapses it.
   const openPanel = (id: Panel) => {
+    setDockCollapsed(false); // opening any panel implies the dock is visible
     const next = panel === id ? null : id;
     setPanel(next);
     if (id === "keyboard") {
@@ -902,7 +940,10 @@ export function ControlScreen({
   }, [cursor, zoom, pan]);
 
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-black select-none">
+    <div
+      className="flex h-full w-full flex-col overflow-hidden bg-black select-none"
+      style={{ paddingBottom: kbInset || undefined }}
+    >
       {/* ==== viewport area — takes the remaining height; shrinks when a panel opens ==== */}
       <div className="relative min-h-0 flex-1">
       {/* ---- screen viewport ---- */}
@@ -976,6 +1017,7 @@ export function ControlScreen({
                     { id: "stats", label: "Stats", icon: BarChart3 },
                     { id: "library", label: "Library", icon: LibraryIcon },
                     { id: "music", label: "Music", icon: Headphones },
+                    { id: "settings", label: "Settings", icon: SettingsIcon },
                   ] as const).map((t) => (
                     <button
                       key={t.id}
@@ -1096,11 +1138,24 @@ export function ControlScreen({
           <Keyboard className="h-4 w-4" /> Tap to type on PC
         </button>
       )}
+
+      {/* ---- restore handle when the dock is collapsed (viewport is full-screen) ---- */}
+      {!immersive && dockCollapsed && (
+        <button
+          onClick={() => setDockCollapsed(false)}
+          className="absolute bottom-2 right-2 z-40 flex items-center gap-1.5 rounded-full bg-black/55 px-3 py-1.5 text-xs font-700 text-white backdrop-blur active:scale-95"
+          style={{ marginBottom: "env(safe-area-inset-bottom)" }}
+          title="Show controls"
+        >
+          <ChevronUp className="h-4 w-4" /> Controls
+        </button>
+      )}
       </div>{/* ==== end viewport area ==== */}
 
       {/* ==== bottom control bar — collapsed = just the icon tab strip; expanding a
-             panel grows this section and shrinks the viewport above (never overlaps) ==== */}
-      {!immersive && (
+             panel grows this section and shrinks the viewport above (never overlaps).
+             `dockCollapsed` removes the whole bar so the viewport fills the screen. ==== */}
+      {!immersive && !dockCollapsed && (
         <div className="shrink-0 border-t border-white/10 bg-base/95 backdrop-blur" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
           {/* keyboard compose row — always mounted so focus() works; height collapses to 0 when inactive */}
           <div className={`overflow-hidden transition-[max-height] duration-200 ${panel === "keyboard" ? "max-h-20" : "max-h-0"}`}>
@@ -1245,6 +1300,16 @@ export function ControlScreen({
             <Tab active={panel === "shortcuts"} onClick={() => openPanel("shortcuts")} title="Shortcuts"><Grip className="h-5 w-5" /></Tab>
             <Tab active={panel === "keyboard"} onClick={() => openPanel("keyboard")} title="Keyboard"><Keyboard className="h-5 w-5" /></Tab>
             <Tab active={panel === "quality"} onClick={() => openPanel("quality")} title="Quality"><Gauge className="h-5 w-5" /></Tab>
+            <button
+              onClick={() => {
+                setPanel(null);
+                setDockCollapsed(true);
+              }}
+              title="Hide controls (full-screen viewport)"
+              className="ml-auto grid h-9 w-9 shrink-0 place-items-center rounded-lg text-ink-soft active:bg-white/[0.08]"
+            >
+              <ChevronDown className="h-5 w-5" />
+            </button>
             {onDisconnect && (
               <button onClick={onDisconnect} title="Disconnect" className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-red/20 bg-red/5 text-red active:scale-95">
                 <LogOut className="h-4 w-4" />

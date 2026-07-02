@@ -47,9 +47,19 @@ fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result
     let apk_path = cache_dir.join("update.apk");
 
     emit(app, "downloading", 0, 0);
+    // GitHub's `releases/latest/download/<asset>` URL answers with a chain of 302
+    // redirects to a signed CDN object; ureq follows redirects by default. Send a
+    // User-Agent (GitHub can reject blank-UA clients) and surface a clear error if
+    // the final response isn't a 2xx so the UI can report *why* it failed.
     let resp = ureq::get(url)
+        .set("User-Agent", "GameTrackerRemote-Updater")
         .call()
-        .map_err(|e| format!("download failed: {e}"))?;
+        .map_err(|e| match e {
+            ureq::Error::Status(code, _) => {
+                format!("download failed: server returned HTTP {code}")
+            }
+            other => format!("download failed: {other}"),
+        })?;
     let total: u64 = resp
         .header("Content-Length")
         .and_then(|s| s.parse().ok())
@@ -69,6 +79,15 @@ fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result
         emit(app, "downloading", received, total);
     }
     drop(file);
+
+    // Guard against a truncated/HTML error body being handed to the package
+    // installer (which would fail with an opaque "parse error"). A real APK is a
+    // ZIP, comfortably larger than this floor.
+    if received < 1024 {
+        return Err(format!(
+            "downloaded file is too small ({received} bytes) — the update may not be published yet"
+        ));
+    }
 
     emit(app, "installing", received, total);
     launch_installer(apk_path.to_string_lossy().as_ref())?;
