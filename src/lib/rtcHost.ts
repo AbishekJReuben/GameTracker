@@ -508,25 +508,11 @@ export function startHost(opts: HostOptions): () => void {
     // Interleaved float32 chunks + a read head, acting as a bounded jitter buffer.
     let chunks: Float32Array[] = [];
     let head = 0;
-    let avail = 0;
+    let avail = 0; // interleaved samples currently buffered
     // WASAPI shared-mode loopback is 48 kHz stereo in practice; we build the graph
     // eagerly (for the offer) at that assumption and correct the channel count when
     // capture actually starts. Capture is DEFERRED until the guest is authorized.
     let channels = 2;
-
-    const ch = new Channel<ArrayBuffer>();
-    ch.onmessage = (buf) => {
-      const f32 = new Float32Array(buf as unknown as ArrayBuffer);
-      chunks.push(f32);
-      avail += f32.length;
-      // Keep at most ~400ms of audio buffered (drop oldest) so it stays in sync.
-      const cap = (audioCtx?.sampleRate ?? 48000) * channels * 0.4;
-      while (avail > cap && chunks.length > 1) {
-        avail -= chunks[0].length - head;
-        chunks.shift();
-        head = 0;
-      }
-    };
 
     try {
       audioCtx = new AudioContext({ sampleRate: 48000 });
@@ -535,8 +521,50 @@ export function startHost(opts: HostOptions): () => void {
     }
     audioCtx.resume().catch(() => {}); // webview autoplay policy may suspend it
     const dest = audioCtx.createMediaStreamDestination();
+    const sr = audioCtx.sampleRate || 48000;
     const FRAME = 2048;
 
+    // Jitter-buffer envelope (ms → interleaved samples). The old code kept up to
+    // 400ms and, when it overflowed, dumped whole chunks — which added latency AND
+    // popped on every dump. Instead: PRIME before (re)starting playback so bursts
+    // are absorbed, hold a low TARGET for latency, and only trim when we drift past
+    // MAX (host audio clock slightly faster than ours) so lag can't run away.
+    const ms = (m: number) => Math.round((sr * m) / 1000) * channels;
+    let primeSamples = ms(90);
+    let targetSamples = ms(120);
+    let maxSamples = ms(240);
+    const recalcEnvelope = () => {
+      primeSamples = ms(90);
+      targetSamples = ms(120);
+      maxSamples = ms(240);
+    };
+
+    const ch = new Channel<ArrayBuffer>();
+    ch.onmessage = (buf) => {
+      const f32 = new Float32Array(buf as unknown as ArrayBuffer);
+      chunks.push(f32);
+      avail += f32.length;
+      // Runaway-latency guard: only kicks in past MAX, and trims down to TARGET in
+      // one splice (rare) rather than constantly shedding at a high ceiling.
+      if (avail > maxSamples) {
+        let drop = avail - targetSamples;
+        while (drop > 0 && chunks.length) {
+          const c = chunks[0];
+          const take = Math.min(drop, c.length - head);
+          head += take;
+          avail -= take;
+          drop -= take;
+          if (head >= c.length) {
+            chunks.shift();
+            head = 0;
+          }
+        }
+      }
+    };
+
+    // Pull `need` interleaved samples; `lastGot` reports how many were real (the
+    // remainder is left as silence on underrun so the caller can fade it out).
+    let lastGot = 0;
     const pullInterleaved = (need: number): Float32Array => {
       const out = new Float32Array(need);
       let got = 0;
@@ -552,17 +580,46 @@ export function startHost(opts: HostOptions): () => void {
           head = 0;
         }
       }
-      return out; // remainder stays zero (silence) on underrun
+      lastGot = got;
+      return out;
     };
+
+    // Priming + a slew-limited gain ramp make every silence↔audio transition
+    // click-free: hard zero-fills (the source of the "popping") are ramped instead
+    // of stepped, and after an underrun we re-prime before resuming.
+    let priming = true;
+    let gain = 0;
+    const slew = 1 / Math.max(1, 0.006 * sr); // ~6ms to ramp fully in/out
 
     const node = audioCtx.createScriptProcessor(FRAME, 0, channels);
     node.onaudioprocess = (e) => {
       const out = e.outputBuffer;
-      const inter = pullInterleaved(FRAME * channels);
-      for (let c = 0; c < channels; c++) {
-        const od = out.getChannelData(c);
-        for (let i = 0; i < FRAME; i++) od[i] = inter[i * channels + c];
+      const nch = out.numberOfChannels;
+      // Stay silent (and faded down) until enough is buffered to play cleanly.
+      if (priming) {
+        if (avail >= primeSamples) priming = false;
+        else {
+          for (let c = 0; c < nch; c++) out.getChannelData(c).fill(0);
+          gain = 0;
+          return;
+        }
       }
+      const inter = pullInterleaved(FRAME * channels);
+      const realFrames = Math.min(FRAME, Math.floor(lastGot / channels));
+      for (let c = 0; c < nch; c++) {
+        const od = out.getChannelData(c);
+        const src = Math.min(c, channels - 1);
+        let g = gain;
+        for (let i = 0; i < FRAME; i++) {
+          const tgt = i < realFrames ? 1 : 0;
+          g += Math.max(-slew, Math.min(slew, tgt - g));
+          od[i] = inter[i * channels + src] * g;
+        }
+        if (c === nch - 1) gain = g;
+      }
+      // Underran this buffer → refill to PRIME before resuming (keeps it from
+      // machine-gun clicking when the network briefly starves the stream).
+      if (realFrames < FRAME) priming = true;
     };
     node.connect(dest);
     audioNode = node;
@@ -571,6 +628,7 @@ export function startHost(opts: HostOptions): () => void {
     const start = async () => {
       const fmt = await api.remoteStartAudio(ch);
       if (fmt) channels = Math.max(1, Math.min(2, fmt.channels));
+      recalcEnvelope(); // channel count now known → size the buffer correctly
     };
     return { track, start };
   };

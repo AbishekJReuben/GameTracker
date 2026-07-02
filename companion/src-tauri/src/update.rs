@@ -35,6 +35,29 @@ pub async fn download_and_install_apk(app: AppHandle, url: String) -> Result<(),
         .map_err(|e| format!("update task panicked: {e}"))?
 }
 
+/// Fetch the update manifest JSON over HTTP and return it as a string.
+///
+/// The webview's own `fetch()` is subject to CORS, and GitHub's release-asset host
+/// doesn't send `Access-Control-Allow-Origin` for the app's origin, so an in-page
+/// fetch fails with "Failed to fetch". Doing it here (ureq, like the APK download)
+/// sidesteps CORS entirely — the manifest is tiny, so the round-trip is cheap.
+#[tauri::command]
+pub async fn fetch_update_manifest(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let resp = ureq::get(&url)
+            .set("User-Agent", "GameTrackerRemote-Updater")
+            .call()
+            .map_err(|e| match e {
+                ureq::Error::Status(code, _) => format!("update server returned HTTP {code}"),
+                other => format!("could not reach the update server: {other}"),
+            })?;
+        resp.into_string()
+            .map_err(|e| format!("could not read the update manifest: {e}"))
+    })
+    .await
+    .map_err(|e| format!("manifest fetch task panicked: {e}"))?
+}
+
 fn emit(app: &AppHandle, phase: &str, received: u64, total: u64) {
     let _ = app.emit(
         "apk-update://progress",

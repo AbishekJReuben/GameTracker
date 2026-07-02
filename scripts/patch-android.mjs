@@ -16,6 +16,8 @@
 //      content:// URI — required on modern Android).
 //   3. Cleartext traffic in the release build (the companion always talks to the
 //      desktop over plain http/ws on the LAN/Tailscale).
+//   4. Immersive full-screen MainActivity (hide the status/navigation bars) so the
+//      remote screen gets the whole display and the notification panel stays out.
 //
 // Usage: node scripts/patch-android.mjs
 
@@ -140,6 +142,61 @@ const save = (path, before, after, msg) => {
     }
   }
   save(gradlePath, before, g, "set usesCleartextTraffic in defaultConfig");
+}
+
+// --- 4: MainActivity.kt — immersive full-screen ------------------------------
+// `tauri android init` regenerates a stock MainActivity that shows the system bars,
+// so the immersive customization is re-applied here (otherwise CI/fresh builds ship
+// with the notification panel visible). Package path derives from the identifier.
+{
+  const conf = JSON.parse(
+    readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"),
+  );
+  const pkg = String(conf.identifier || "");
+  const mainActivityPath = join(
+    androidDir,
+    "app",
+    "src",
+    "main",
+    "java",
+    ...pkg.split("."),
+    "MainActivity.kt",
+  );
+  if (!pkg) {
+    console.warn("[patch-android] no identifier in tauri.conf.json — skipping MainActivity patch.");
+  } else if (!existsSync(mainActivityPath)) {
+    console.warn(`[patch-android] ${mainActivityPath} not found — skipping MainActivity patch.`);
+  } else {
+    const before = readFileSync(mainActivityPath, "utf8");
+    if (!before.includes("WindowInsetsControllerCompat")) {
+      const content =
+        `package ${pkg}\n\n` +
+        `import android.os.Bundle\n` +
+        `import androidx.activity.enableEdgeToEdge\n` +
+        `import androidx.core.view.WindowInsetsCompat\n` +
+        `import androidx.core.view.WindowInsetsControllerCompat\n\n` +
+        `class MainActivity : TauriActivity() {\n` +
+        `  override fun onCreate(savedInstanceState: Bundle?) {\n` +
+        `    enableEdgeToEdge()\n` +
+        `    super.onCreate(savedInstanceState)\n` +
+        `    hideSystemBars()\n` +
+        `  }\n\n` +
+        `  override fun onWindowFocusChanged(hasFocus: Boolean) {\n` +
+        `    super.onWindowFocusChanged(hasFocus)\n` +
+        `    // Re-hide after the bars are transiently shown (keyboard, app resume).\n` +
+        `    if (hasFocus) hideSystemBars()\n` +
+        `  }\n\n` +
+        `  private fun hideSystemBars() {\n` +
+        `    val controller = WindowInsetsControllerCompat(window, window.decorView)\n` +
+        `    controller.hide(WindowInsetsCompat.Type.systemBars())\n` +
+        `    controller.systemBarsBehavior =\n` +
+        `      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE\n` +
+        `  }\n` +
+        `}\n`;
+      writeFileSync(mainActivityPath, content);
+      note("rewrote MainActivity.kt (immersive full-screen)");
+    }
+  }
 }
 
 console.log(

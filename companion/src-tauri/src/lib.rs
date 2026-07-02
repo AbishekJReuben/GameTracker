@@ -12,7 +12,10 @@ mod update;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![update::download_and_install_apk])
+        .invoke_handler(tauri::generate_handler![
+            update::download_and_install_apk,
+            update::fetch_update_manifest
+        ])
         .run(tauri::generate_context!())
         .expect("error while running GameTracker Remote");
 }

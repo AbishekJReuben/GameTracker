@@ -36,6 +36,17 @@ function isCompanion(): boolean {
   return Boolean((window as unknown as { __GT_COMPANION__?: boolean }).__GT_COMPANION__);
 }
 
+/**
+ * Fetch + parse the update manifest through the native side (ureq), not the
+ * webview `fetch`: GitHub's asset host doesn't send CORS headers for our origin,
+ * so an in-page fetch fails with "Failed to fetch". The native command has no
+ * such restriction.
+ */
+async function loadManifest(): Promise<Manifest> {
+  const text = await invoke<string>("fetch_update_manifest", { url: MANIFEST_URL });
+  return JSON.parse(text) as Manifest;
+}
+
 /** Compare dotted versions (ignoring any `-prerelease` suffix). >0 if a>b. */
 function cmpVersion(a: string, b: string): number {
   const norm = (v: string) =>
@@ -63,9 +74,7 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
   if (!isCompanion()) return null;
   try {
     const current = await getVersion();
-    const res = await fetch(MANIFEST_URL, { cache: "no-store" });
-    if (!res.ok) return null;
-    const m = (await res.json()) as Manifest;
+    const m = await loadManifest();
     if (!m?.version || !m?.url) return null;
     if (cmpVersion(m.version, current) <= 0) return null;
     return { version: m.version, url: m.url, notes: m.notes };
@@ -93,11 +102,7 @@ export async function checkForUpdateVerbose(): Promise<UpdateCheck> {
   let current: string | null = null;
   try {
     current = await getVersion();
-    const res = await fetch(MANIFEST_URL, { cache: "no-store" });
-    if (!res.ok) {
-      return { status: "error", current, message: `Update server returned HTTP ${res.status}.` };
-    }
-    const m = (await res.json()) as Manifest;
+    const m = await loadManifest();
     if (!m?.version || !m?.url) {
       return { status: "error", current, message: "The update manifest was malformed." };
     }
