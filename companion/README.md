@@ -175,6 +175,13 @@ In the app, enter the **connection code** shown on the PC (the signaling address
 baked in). It connects **directly peer-to-peer** and **remembers the code** — every later launch
 auto-connects. To pair with a different PC, use **Disconnect** (which forgets the saved code).
 
+**Access approval:** with only the connection code, the PC shows a prompt the first time this
+device connects — choose **Temporary** (pick a duration; a live countdown shows on the PC's
+Remote page), **Permanent** (remembered across restarts), or **Cancel**. To skip the prompt
+entirely, also enter the PC's **permanent key** (the value behind the eye toggle on the Remote
+page) in the app's optional "Permanent key" field — that device is then trusted automatically.
+Manage or revoke devices in the PC's Remote → **Devices** panel.
+
 **Stats** and **Music** mirror your PC live; **Control** streams the screen and drives the
 mouse/keyboard (see *Remote control features* above).
 

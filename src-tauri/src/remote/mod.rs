@@ -13,6 +13,7 @@
 //! - DB reads reuse the exact same `db::*` functions the Tauri commands use, wrapped in
 //!   `spawn_blocking` so rusqlite never blocks the async runtime.
 
+pub(crate) mod adb;
 pub(crate) mod audio;
 pub(crate) mod capture;
 #[cfg(windows)]
@@ -54,6 +55,8 @@ pub struct RemoteShared {
     pub clients: AtomicUsize,
     pub pin: Mutex<String>,
     pub code: Mutex<String>,
+    /// The secret "permanent key" (code 2). A phone that presents it is auto-trusted.
+    pub secret: Mutex<String>,
     pub tokens: Mutex<HashSet<String>>,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -68,6 +71,7 @@ impl RemoteShared {
             clients: AtomicUsize::new(0),
             pin: Mutex::new(gen_pin()),
             code: Mutex::new(gen_code()),
+            secret: Mutex::new(gen_code()),
             tokens: Mutex::new(HashSet::new()),
             shutdown: Mutex::new(None),
         }
@@ -86,6 +90,13 @@ impl RemoteShared {
         let code = gen_code();
         *self.code.lock() = code.clone();
         code
+    }
+
+    /// Rotate the secret permanent key (code 2).
+    pub fn rotate_secret(&self) -> String {
+        let secret = gen_code();
+        *self.secret.lock() = secret.clone();
+        secret
     }
 }
 

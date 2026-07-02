@@ -21,14 +21,18 @@ import {
   Clapperboard,
   Sparkles,
 } from "lucide-react";
+import { Eye, EyeOff, ExternalLink, DownloadCloud, Usb, Trash2, ShieldCheck as ShieldIcon, Clock, Loader2 } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
 import { SectionTitle, Toggle, Skeleton } from "@/components/ui";
-import { api, RemoteStatus } from "@/lib/api";
+import { api, RemoteStatus, RemoteGrants } from "@/lib/api";
 import { DEFAULT_SIGNAL_URL, SIGNAL_PORT } from "@/lib/remoteConfig";
 import { useApp } from "@/store/app";
 import { useRemoteHost } from "@/store/remote";
 import type { HostLiveStats } from "@/lib/rtcHost";
+
+const RELEASES_URL = "https://github.com/AbishekJReuben/GameTracker/releases";
 
 export default function RemotePage() {
   const pushToast = useApp((s) => s.pushToast);
@@ -39,6 +43,10 @@ export default function RemotePage() {
   // connect no matter which page is open; we just read its live client count.
   const cloudClients = useRemoteHost((s) => s.cloudClients);
   const hostStats = useRemoteHost((s) => s.hostStats);
+  const [showSecret, setShowSecret] = useState(false);
+  const [grants, setGrants] = useState<RemoteGrants | null>(null);
+  const [usbDevices, setUsbDevices] = useState<string[]>([]);
+  const [installing, setInstalling] = useState(false);
   // Keep the latest signaling URL from the backend without clobbering the user's
   // in-progress edit (only seed the draft once, when it's still empty).
   const seededSignal = useRef(false);
@@ -51,6 +59,9 @@ export default function RemotePage() {
         setSignalDraft(s.signalUrl);
         seededSignal.current = true;
       }
+      // Grants (for the live countdown) + USB devices (for the install button).
+      api.remoteListGrants().then(setGrants).catch(() => {});
+      api.remoteAdbDevices().then(setUsbDevices).catch(() => setUsbDevices([]));
     } catch {
       /* ignore transient poll errors */
     }
@@ -62,8 +73,6 @@ export default function RemotePage() {
     const id = setInterval(refresh, 2000);
     return () => clearInterval(id);
   }, [refresh]);
-
-  const cloudOn = status?.cloudEnabled ?? false;
 
   const toggle = async (enabled: boolean) => {
     setBusy(true);
@@ -92,22 +101,41 @@ export default function RemotePage() {
     }
   };
 
-  const setCloud = async (enabled: boolean) => {
-    if (enabled && !signalDraft.trim()) {
-      pushToast({ kind: "info", title: "Enter a signaling server first" });
-      return;
-    }
+  const regenSecret = async () => {
     setBusy(true);
     try {
-      setStatus(await api.remoteSetCloud(enabled, signalDraft.trim()));
-      pushToast({
-        kind: "success",
-        title: enabled ? "Cloud access on" : "Cloud access off",
-      });
+      setStatus(await api.remoteRegenSecret());
+      pushToast({ kind: "success", title: "New permanent key generated" });
     } catch (e) {
-      pushToast({ kind: "info", title: "Couldn't change cloud access", message: String(e) });
+      pushToast({ kind: "info", title: "Couldn't regenerate key", message: String(e) });
     } finally {
       setBusy(false);
+    }
+  };
+
+  const revokeDevice = async (id: string) => {
+    try {
+      setGrants(await api.remoteRevoke(id));
+      pushToast({ kind: "success", title: "Device revoked" });
+    } catch (e) {
+      pushToast({ kind: "info", title: "Couldn't revoke device", message: String(e) });
+    }
+  };
+
+  const openReleases = () => {
+    openUrl(RELEASES_URL).catch(() => {});
+  };
+
+  const installOnUsb = async () => {
+    setInstalling(true);
+    pushToast({ kind: "info", title: "Installing on phone…", message: "Downloading the latest APK" });
+    try {
+      const msg = await api.remoteAdbInstall();
+      pushToast({ kind: "success", title: "Installed", message: msg });
+    } catch (e) {
+      pushToast({ kind: "info", title: "USB install failed", message: String(e) });
+    } finally {
+      setInstalling(false);
     }
   };
 
@@ -195,62 +223,23 @@ export default function RemotePage() {
               <Panel panelKey="remote.cloud" className="p-5">
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <SectionTitle
-                    title="From anywhere (cloud)"
-                    subtitle="Connect over the internet — no Tailscale needed"
+                    title="Connect from anywhere"
+                    subtitle="Enter these on the phone — screen & control then flow peer-to-peer"
                     right={<Globe className="h-4 w-4" />}
                   />
-                  <div className="flex items-center gap-3">
-                    {cloudOn && (
-                      <span className="flex items-center gap-1.5 text-sm text-ink-dim">
-                        <span
-                          className="h-2 w-2 rounded-full"
-                          style={{
-                            background: cloudClients > 0 ? "#34d399" : "#64748b",
-                            boxShadow: cloudClients > 0 ? "0 0 10px #34d399" : undefined,
-                          }}
-                        />
-                        {cloudClients > 0 ? "Phone connected" : "Waiting for phone"}
-                      </span>
-                    )}
-                    <Toggle
-                      checked={cloudOn}
-                      onChange={(v) => !busy && setCloud(v)}
-                      label={cloudOn ? "On" : "Off"}
+                  <span className="flex items-center gap-1.5 text-sm text-ink-dim">
+                    <span
+                      className="h-2 w-2 rounded-full"
+                      style={{
+                        background: cloudClients > 0 ? "#34d399" : "#64748b",
+                        boxShadow: cloudClients > 0 ? "0 0 10px #34d399" : undefined,
+                      }}
                     />
-                  </div>
+                    {cloudClients > 0 ? "Phone connected" : "Waiting for phone"}
+                  </span>
                 </div>
 
                 <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
-                  <div>
-                    <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
-                      <Globe className="h-3.5 w-3.5" /> Signaling server
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <input
-                        className="flex-1 rounded-xl border border-line bg-white/[0.03] px-3 py-2.5 font-mono text-sm outline-none focus:border-accent-1/60"
-                        placeholder="wss://discovery.chilloutgamestudio.com"
-                        spellCheck={false}
-                        autoCapitalize="none"
-                        autoCorrect="off"
-                        value={signalDraft}
-                        onChange={(e) => setSignalDraft(e.target.value)}
-                      />
-                      <button
-                        onClick={saveSignal}
-                        disabled={busy || signalDraft.trim() === (status?.signalUrl ?? "")}
-                        className="btn btn-ghost h-10"
-                        title="Save signaling server"
-                      >
-                        <Check className="h-4 w-4" /> Save
-                      </button>
-                    </div>
-                    <p className="mt-1.5 text-xs text-ink-faint">
-                      Pre-filled with the default. It only brokers the handshake — screen and
-                      control then flow directly peer-to-peer. Run it on this PC and expose it with a
-                      Cloudflare Tunnel to <span className="font-mono">localhost:{SIGNAL_PORT}</span>.
-                    </p>
-                  </div>
-
                   <div>
                     <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
                       <KeyRound className="h-3.5 w-3.5" /> Connection code
@@ -264,16 +253,93 @@ export default function RemotePage() {
                       </button>
                     </div>
                     <p className="mt-1.5 text-xs text-ink-faint">
-                      Enter this in the companion app under “From anywhere.” A new code disconnects the
-                      old session.
+                      Required to reach this PC. A device with only this code asks for your approval here.
                     </p>
                   </div>
+
+                  <div>
+                    <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+                      <ShieldIcon className="h-3.5 w-3.5" /> Permanent key
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="font-display text-3xl font-800 uppercase tracking-[0.3em] accent-text">
+                        {showSecret ? status.secretCode || "—" : "••••••••"}
+                      </div>
+                      <button onClick={() => setShowSecret((v) => !v)} className="btn btn-ghost h-9 w-9 p-0" title={showSecret ? "Hide" : "Reveal"}>
+                        {showSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      </button>
+                      <button onClick={regenSecret} disabled={busy} className="btn btn-ghost h-9" title="Generate a new key">
+                        <RefreshCw className="h-4 w-4" /> New key
+                      </button>
+                    </div>
+                    <p className="mt-1.5 text-xs text-ink-faint">
+                      Optional. A phone that also enters this key is trusted <b>permanently</b> with no prompt.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-4 border-t border-line pt-4">
+                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+                    <Globe className="h-3.5 w-3.5" /> Signaling server
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="flex-1 rounded-xl border border-line bg-white/[0.03] px-3 py-2.5 font-mono text-sm outline-none focus:border-accent-1/60"
+                      placeholder="wss://discovery.chilloutgamestudio.com"
+                      spellCheck={false}
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      value={signalDraft}
+                      onChange={(e) => setSignalDraft(e.target.value)}
+                    />
+                    <button
+                      onClick={saveSignal}
+                      disabled={busy || signalDraft.trim() === (status?.signalUrl ?? "")}
+                      className="btn btn-ghost h-10"
+                      title="Save signaling server"
+                    >
+                      <Check className="h-4 w-4" /> Save
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-xs text-ink-faint">
+                    Pre-filled with the default. It only brokers the handshake — run it on this PC and expose
+                    it with a Cloudflare Tunnel to <span className="font-mono">localhost:{SIGNAL_PORT}</span>.
+                  </p>
                 </div>
               </Panel>
             </motion.div>
           )}
 
-          {on && cloudOn && (
+          {on && (
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mb-5">
+              <DevicesPanel grants={grants} onRevoke={revokeDevice} />
+            </motion.div>
+          )}
+
+          {on && (
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mb-5">
+              <Panel panelKey="remote.getapp" className="p-5">
+                <SectionTitle title="Get the phone app" subtitle="Install the companion APK on your Android phone" right={<Download className="h-4 w-4" />} />
+                <div className="mt-4 flex flex-wrap items-center gap-2.5">
+                  <button onClick={openReleases} className="btn btn-subtle h-10 gap-2">
+                    <ExternalLink className="h-4 w-4" /> Open releases page
+                  </button>
+                  <button onClick={installOnUsb} disabled={installing || usbDevices.length === 0} className="btn btn-primary h-10 gap-2">
+                    {installing ? <Loader2 className="h-4 w-4 animate-spin" /> : <DownloadCloud className="h-4 w-4" />}
+                    {installing ? "Installing…" : "Install on USB phone"}
+                  </button>
+                  <span className="flex items-center gap-1.5 text-xs text-ink-faint">
+                    <Usb className="h-3.5 w-3.5" />
+                    {usbDevices.length > 0
+                      ? `${usbDevices.length} phone${usbDevices.length === 1 ? "" : "s"} connected via USB`
+                      : "No USB phone (enable USB debugging)"}
+                  </span>
+                </div>
+              </Panel>
+            </motion.div>
+          )}
+
+          {on && (
             <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mb-5">
               <LiveSessionPanel stats={hostStats} connected={cloudClients > 0} />
             </motion.div>
@@ -298,9 +364,9 @@ export default function RemotePage() {
                     signaling/README.md for the exact commands.
                   </Step>
                   <Step n={3}>
-                    Turn on <b>cloud access</b> above, then in the app enter the <b>connection code</b>
-                    shown here (the signaling address is already baked in). Screen and control run
-                    <b> directly peer-to-peer</b>.
+                    Turn <b>Remote access</b> on above, then in the app enter the <b>connection code</b>
+                    shown here (add the <b>permanent key</b> too to skip the approval prompt). Screen and
+                    control run <b>directly peer-to-peer</b>.
                   </Step>
                   <Step n={4}>
                     That's it — the app <b>remembers the code</b> and reconnects automatically every time,
@@ -472,6 +538,79 @@ function Field({
             {copied ? <Check className="h-4 w-4 text-green" /> : <Copy className="h-4 w-4" />}
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+/** Human "time left" for a temporary grant (updated every ~2s by the page poll). */
+function fmtRemaining(expiresUtc: string): string {
+  const ms = new Date(expiresUtc).getTime() - Date.now();
+  if (ms <= 0) return "expired";
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m left`;
+  if (m > 0) return `${m}m ${s % 60}s left`;
+  return `${s % 60}s left`;
+}
+
+/** Trusted (permanent) + active temporary devices, each revocable. */
+function DevicesPanel({ grants, onRevoke }: { grants: RemoteGrants | null; onRevoke: (id: string) => void }) {
+  const trusted = grants?.trusted ?? [];
+  const temporary = grants?.temporary ?? [];
+  const empty = trusted.length === 0 && temporary.length === 0;
+  return (
+    <Panel panelKey="remote.devices" className="p-5">
+      <SectionTitle title="Devices" subtitle="Who can connect to this PC" right={<ShieldIcon className="h-4 w-4" />} />
+      {empty ? (
+        <p className="mt-3 text-sm text-ink-faint">
+          No devices yet. Approve a phone when it connects, or share the permanent key for automatic trust.
+        </p>
+      ) : (
+        <div className="mt-4 flex flex-col gap-2">
+          {trusted.map((d) => (
+            <DeviceRow
+              key={d.id}
+              name={d.name}
+              badge={
+                <span className="pill flex items-center gap-1 text-green">
+                  <ShieldIcon className="h-3 w-3" /> Permanent
+                </span>
+              }
+              onRevoke={() => onRevoke(d.id)}
+            />
+          ))}
+          {temporary.map((d) => (
+            <DeviceRow
+              key={d.id}
+              name={d.name}
+              badge={
+                <span className="pill flex items-center gap-1 text-accent-3">
+                  <Clock className="h-3 w-3" /> {fmtRemaining(d.expiresUtc)}
+                </span>
+              }
+              onRevoke={() => onRevoke(d.id)}
+            />
+          ))}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function DeviceRow({ name, badge, onRevoke }: { name: string; badge: React.ReactNode; onRevoke: () => void }) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-xl border border-line bg-white/[0.02] px-3 py-2.5">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <Smartphone className="h-4 w-4 flex-none text-ink-dim" />
+        <span className="truncate text-sm font-600 text-ink">{name}</span>
+      </div>
+      <div className="flex items-center gap-2">
+        {badge}
+        <button onClick={onRevoke} className="btn btn-ghost h-8 w-8 p-0 text-ink-dim hover:text-pink" title="Revoke access">
+          <Trash2 className="h-4 w-4" />
+        </button>
       </div>
     </div>
   );

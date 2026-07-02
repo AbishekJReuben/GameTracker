@@ -10,6 +10,7 @@ import { ProgressDock } from "./components/ProgressDock";
 import { JukeboxEngine } from "./components/JukeboxEngine";
 import { JukeboxFloater } from "./components/JukeboxFloater";
 import { RemoteHostManager } from "./components/RemoteHostManager";
+import { RemoteApprovalModal } from "./components/RemoteApprovalModal";
 import { Onboarding } from "./components/Onboarding";
 import { SplashScreen } from "./components/SplashScreen";
 import { GameModal } from "./components/GameModal";
@@ -67,6 +68,7 @@ function AppShell() {
       <JukeboxEngine />
       <JukeboxFloater />
       <RemoteHostManager />
+      <RemoteApprovalModal />
       <GameModal />
       <DropZone />
       {settings && !onboarded && <Onboarding />}

@@ -1165,6 +1165,17 @@ export const api = {
   remoteSetCloud: (enabled: boolean, signalUrl: string) =>
     call<RemoteStatus>("remote_set_cloud", { enabled, signalUrl }),
   remoteRegenCode: () => call<RemoteStatus>("remote_regen_code"),
+  remoteRegenSecret: () => call<RemoteStatus>("remote_regen_secret"),
+  // Per-device access grants (permanent trust + temporary timed grants).
+  remoteListGrants: () => call<RemoteGrants>("remote_list_grants"),
+  remoteGrant: (deviceId: string, name: string, kind: "permanent" | "temporary", durationSecs?: number) =>
+    call<RemoteGrants>("remote_grant", { deviceId, name, kind, durationSecs }),
+  remoteRevoke: (deviceId: string) => call<RemoteGrants>("remote_revoke", { deviceId }),
+  remoteCheckAuth: (deviceId: string, name?: string, secret?: string) =>
+    call<"secret" | "permanent" | "temporary" | "none">("remote_check_auth", { deviceId, name, secret }),
+  // USB direct-install via adb.
+  remoteAdbDevices: () => call<string[]>("remote_adb_devices"),
+  remoteAdbInstall: () => call<string>("remote_adb_install"),
   remoteGrabFrame: (maxW?: number, quality?: number) =>
     call<string | null>("remote_grab_frame", { maxW, quality }),
   remoteGrabDelta: (maxW?: number, quality?: number, key?: boolean) =>
@@ -1231,6 +1242,25 @@ export interface RemoteStatus {
   cloudEnabled: boolean;
   signalUrl: string;
   code: string;
+  /** Secret "permanent key" (code 2), revealed behind the eye toggle. */
+  secretCode: string;
+}
+
+export interface TrustedDevice {
+  id: string;
+  name: string;
+  addedUtc: string;
+}
+
+export interface TempGrant {
+  id: string;
+  name: string;
+  expiresUtc: string;
+}
+
+export interface RemoteGrants {
+  trusted: TrustedDevice[];
+  temporary: TempGrant[];
 }
 
 /** Convert a stored absolute file path to a webview-loadable asset URL. */

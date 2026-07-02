@@ -1,12 +1,14 @@
 import { useState } from "react";
 import { motion } from "motion/react";
-import { Smartphone, KeyRound, Loader2, Globe } from "lucide-react";
+import { Smartphone, KeyRound, Loader2, Globe, ShieldCheck, Eye, EyeOff } from "lucide-react";
 import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { CloudConn } from "./cloud";
+import { deviceId, deviceName } from "./device";
 
-export type Connected = { conn: CloudConn; code: string; signalUrl: string };
+export type Connected = { conn: CloudConn; code: string; signalUrl: string; secret: string };
 
 const LS_SIGNAL = "gt.remote.signal";
+const LS_SECRET = "gt.remote.secret";
 
 /**
  * First-run pairing: the user enters the 8-char connection code shown on the PC.
@@ -21,26 +23,42 @@ export function Pairing({
 }) {
   const [signalUrl, setSignalUrl] = useState(localStorage.getItem(LS_SIGNAL) || DEFAULT_SIGNAL_URL);
   const [code, setCode] = useState(initialCode);
+  const [secret, setSecret] = useState(localStorage.getItem(LS_SECRET) || "");
+  const [showSecret, setShowSecret] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [waiting, setWaiting] = useState(false); // host is showing its approval prompt
   const [error, setError] = useState<string | null>(null);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
+    setWaiting(false);
     setError(null);
     const url = signalUrl.trim();
     const c = code.trim().toUpperCase();
+    const key = secret.trim().toUpperCase();
     localStorage.setItem(LS_SIGNAL, url);
-    const conn = new CloudConn(url, c);
+    localStorage.setItem(LS_SECRET, key);
+    const conn = new CloudConn(url, c, { deviceId: deviceId(), name: deviceName(), secret: key || undefined });
     const timeout = window.setTimeout(() => {
-      setError("Couldn't reach your PC. Make sure the PC app is on with cloud mode enabled, and the code is right.");
+      setError("Couldn't reach your PC. Make sure the PC app is on with Remote access enabled, and the code is right.");
       setBusy(false);
       conn.close();
     }, 15000);
     conn.onStatus((s) => {
       if (s === "connected") {
         window.clearTimeout(timeout);
-        onConnected({ conn, code: c, signalUrl: url });
+        onConnected({ conn, code: c, signalUrl: url, secret: key });
+      } else if (s === "pending") {
+        // The PC is asking its user to approve — wait (no timeout) with a hint.
+        window.clearTimeout(timeout);
+        setWaiting(true);
+      } else if (s === "denied") {
+        window.clearTimeout(timeout);
+        setError("Access was declined on the PC. Ask to be allowed, or enter the permanent key.");
+        setBusy(false);
+        setWaiting(false);
+        conn.close();
       } else if (s === "error") {
         window.clearTimeout(timeout);
         setError("That code was rejected. Check the code on your PC and try again.");
@@ -83,6 +101,35 @@ export function Pairing({
             value={code}
             onChange={(e) => setCode(e.target.value.replace(/[^A-Za-z0-9]/g, "").toUpperCase())}
           />
+          <Label icon={<ShieldCheck className="h-3.5 w-3.5" />}>Permanent key (optional)</Label>
+          <div className="relative mb-4">
+            <input
+              className="input w-full pr-11 text-center font-display text-xl uppercase tracking-[0.3em]"
+              placeholder="skip for one-time"
+              maxLength={8}
+              type={showSecret ? "text" : "password"}
+              autoCapitalize="characters"
+              autoCorrect="off"
+              value={secret}
+              onChange={(e) => setSecret(e.target.value.replace(/[^A-Za-z0-9]/g, "").toUpperCase())}
+            />
+            <button
+              type="button"
+              onClick={() => setShowSecret((v) => !v)}
+              className="absolute right-2 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-lg text-ink-dim active:bg-white/[0.08]"
+              title={showSecret ? "Hide" : "Show"}
+            >
+              {showSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
+          <p className="-mt-2 mb-4 text-xs text-ink-faint">
+            Enter the key from the PC to be trusted automatically. Leave blank to ask for approval instead.
+          </p>
+          {waiting && (
+            <div className="mb-4 flex items-center gap-2 rounded-xl border border-accent-3/40 bg-accent-3/10 px-3 py-2.5 text-sm text-accent-3">
+              <Loader2 className="h-4 w-4 animate-spin" /> Waiting for approval on your PC…
+            </div>
+          )}
           {error && <ErrorBox>{error}</ErrorBox>}
           <button type="submit" disabled={busy || !signalUrl || code.length < 8} className="btn btn-primary h-12 w-full">
             {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : "Connect"}

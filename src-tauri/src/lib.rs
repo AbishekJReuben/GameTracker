@@ -129,6 +129,14 @@ pub fn run() {
                     let _ = db::settings::set(&pool, "remote_code", &code);
                 }
             }
+            // Same for the secret permanent key (code 2) — stable across restarts.
+            match db::settings::get(&pool, "remote_secret_code").ok().flatten() {
+                Some(secret) if !secret.is_empty() => *remote_shared.secret.lock() = secret,
+                _ => {
+                    let secret = remote_shared.secret.lock().clone();
+                    let _ = db::settings::set(&pool, "remote_secret_code", &secret);
+                }
+            }
 
             app.manage(AppState {
                 pool: pool.clone(),
@@ -323,6 +331,13 @@ pub fn run() {
             commands::remote_regen_pin,
             commands::remote_set_cloud,
             commands::remote_regen_code,
+            commands::remote_regen_secret,
+            commands::remote_list_grants,
+            commands::remote_grant,
+            commands::remote_revoke,
+            commands::remote_check_auth,
+            commands::remote_adb_devices,
+            commands::remote_adb_install,
             commands::remote_grab_frame,
             commands::remote_grab_delta,
             commands::remote_start_capture,

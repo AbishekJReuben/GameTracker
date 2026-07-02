@@ -29,7 +29,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -43,6 +43,9 @@ struct Peer {
     id: u64,
     role: String,
     tx: mpsc::UnboundedSender<Message>,
+    /// Set when this peer was kicked out by a newer same-role connection, so its
+    /// own leave-cleanup skips the misleading "peer-left" notice to the room.
+    evicted: Arc<AtomicBool>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +91,7 @@ async fn handle(socket: WebSocket, q: JoinQuery, state: AppState) {
     let id = state.next_id.fetch_add(1, Ordering::SeqCst);
     let role = q.role.unwrap_or_else(|| "guest".into());
     let room = q.room.clone();
+    let evicted = Arc::new(AtomicBool::new(false));
 
     // Join the room (cap at 2 peers to keep it a 1:1 rendezvous). Notify BOTH
     // directions so the WebRTC "host" can initiate regardless of who connected
@@ -98,6 +102,18 @@ async fn handle(socket: WebSocket, q: JoinQuery, state: AppState) {
     {
         let mut rooms = state.rooms.lock().await;
         let peers = rooms.entry(room.clone()).or_default();
+        // Replace any existing peer with the SAME role: a reconnecting phone (new
+        // "guest") almost always means its previous socket is a zombie the server
+        // hasn't noticed dying yet (common when Android switches Wi‑Fi). Evicting it
+        // — instead of rejecting the newcomer with room-full — is what lets the phone
+        // reattach on its own without a force-stop + new code. The evicted peer is
+        // flagged (so its cleanup won't emit a spurious peer-left) and sent a Close.
+        for stale in peers.iter().filter(|p| p.role == role) {
+            stale.evicted.store(true, Ordering::SeqCst);
+            let _ = stale.tx.send(Message::Text("{\"type\":\"replaced\"}".to_string().into()));
+            let _ = stale.tx.send(Message::Close(None));
+        }
+        peers.retain(|p| p.role != role);
         if peers.len() >= 2 {
             let _ = sink
                 .send(Message::Text("{\"type\":\"room-full\"}".to_string().into()))
@@ -118,6 +134,7 @@ async fn handle(socket: WebSocket, q: JoinQuery, state: AppState) {
             id,
             role: role.clone(),
             tx: tx.clone(),
+            evicted: evicted.clone(),
         });
     }
 
@@ -149,13 +166,17 @@ async fn handle(socket: WebSocket, q: JoinQuery, state: AppState) {
             }
         }
     }
-    relay(
-        &state,
-        &room,
-        id,
-        Message::Text("{\"type\":\"peer-left\"}".to_string().into()),
-    )
-    .await;
+    // If we were evicted by a newer same-role peer, stay quiet: a "peer-left" here
+    // would tell the host the guest is gone right as its replacement is joining.
+    if !evicted.load(Ordering::SeqCst) {
+        relay(
+            &state,
+            &room,
+            id,
+            Message::Text("{\"type\":\"peer-left\"}".to_string().into()),
+        )
+        .await;
+    }
     send_task.abort();
 }
 

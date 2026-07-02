@@ -161,10 +161,11 @@ export function ControlScreen({
   const layoutRef = useRef<Layout | null>(null);
   const natRef = useRef({ w: 0, h: 0 });
 
-  // Live stream quality (sliders only). `bitrate` is kbps.
-  const [streamQ, setStreamQ] = useState({ maxW: 1600, quality: 55, fps: 40, bitrate: 12000 });
+  // Live stream quality (sliders only). `bitrate` is kbps. Defaults tuned for a
+  // crisp desktop: 1920-wide, Text mode, max sharpness.
+  const [streamQ, setStreamQ] = useState({ maxW: 1920, quality: 100, fps: 40, bitrate: 12000 });
   // Content optimization: sharpen for text/UI, smooth for video, or auto.
-  const [contentMode, setContentMode] = useState<ContentMode>("auto");
+  const [contentMode, setContentMode] = useState<ContentMode>("text");
   const [showStats, setShowStats] = useState(false);
   const [fps, setFps] = useState(0);
   const [res, setRes] = useState("");
@@ -1000,9 +1001,9 @@ export function ControlScreen({
                 <Loader2 className="h-3 w-3 animate-spin" /> Connecting
               </span>
             )}
-            {showStats && (
+            {connected && (
               <span className="flex items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-ink-faint">
-                <Wifi className="h-3 w-3" /> {fps} fps{res && <span className="text-ink-dim"> · {res}</span>}
+                <Wifi className="h-3 w-3" /> {fps} fps
               </span>
             )}
             {pcTextField && (

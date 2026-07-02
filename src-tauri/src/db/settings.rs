@@ -33,6 +33,12 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // DEFAULT_SIGNAL_URL in src/lib/remoteConfig.ts. Self-hosted on this PC and
     // exposed via a Cloudflare Tunnel; the phone connects here, then P2P takes over.
     ("remote_signal_url", "wss://discovery.chilloutgamestudio.com"),
+    // Secret "permanent key" (code 2): a phone that supplies it is auto-trusted.
+    // Empty by default → generated + persisted on first launch (see lib.rs setup).
+    ("remote_secret_code", ""),
+    // Per-device access grants (JSON). Trusted = permanent; temp = time-boxed.
+    ("remote_trusted_devices", "[]"),
+    ("remote_temp_grants", "[]"),
 ];
 
 fn default_for(key: &str) -> Option<&'static str> {

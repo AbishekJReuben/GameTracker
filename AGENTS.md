@@ -544,3 +544,24 @@ FileProvider content URI (JNI, no Kotlin plugin). **Stock Android can't fully si
 install a sideload** — the OS always shows a one-tap install prompt. The APK URL/repo owner
 in `update.ts` (`MANIFEST_URL`) must match the desktop updater's release host
 (`AbishekJReuben/GameTracker`).
+
+**Per-device auth + resilience + decode (v3.2.8).** The Remote page now has a **single**
+toggle (`remote_set_enabled` flips both `remote_enabled` and `remote_cloud_enabled`). Access
+uses **two codes**: the connection code (code 1 = signaling room) and a secret **permanent
+key** (code 2, `remote_secret_code`, shown behind an eye toggle). The guest sends
+`{type:"auth", deviceId, name, secret?}` on the control channel; the host **defers Rust
+capture** (`startCaptureNow` in `rtcHost.ts`) and gates input/data until authorized. Auth is
+decided by `remote_check_auth`: correct secret or a prior grant → allowed; otherwise the host
+raises an app-wide approval prompt (`RemoteApprovalModal` via `useRemoteHost.pendingApproval`)
+offering **Temporary** (custom-timer grant) / **Permanent** (confirm) / **Cancel**. Grants
+persist in DB settings (`remote_trusted_devices`, `remote_temp_grants`, pruned on read);
+`remote_grant`/`remote_revoke`/`remote_list_grants` manage them and the page shows a live
+countdown. The desktop can also **`adb install`** the latest release APK to a USB phone
+(`remote/adb.rs`, `remote_adb_devices`/`remote_adb_install`). **Reconnect-loop fix:** the
+signaling server now **evicts a stale same-role peer** on join (no more `room-full` dead-end
+when Android switches Wi‑Fi), the guest **retries** on `room-full` and has hard-reset +
+decode-stall **watchdogs** (`cloud.ts`), and the host restarts capture if it produces 0 fps.
+**Decode:** the receiver jitter buffer was raised from 20ms to an adaptive ~120–300ms (was
+dropping ~30% of frames on Android); companion default quality is **1920 / Text / sharpness
+100**; the phone always shows fps by the "Live" label and `companion.html` uses
+`interactive-widget=resizes-content` so the keyboard doesn't push the top bar off-screen.

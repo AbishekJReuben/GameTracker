@@ -16,8 +16,16 @@
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc";
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
-type Status = RTCPeerConnectionState | "error";
+/** "pending" = link up, awaiting host approval; "denied" = host rejected us. */
+type Status = RTCPeerConnectionState | "error" | "pending" | "denied";
 type HostEvent = { event: string; [k: string]: unknown };
+
+/** Identity + optional secret key the host uses to authorize this device. */
+export interface AuthInfo {
+  deviceId: string;
+  name: string;
+  secret?: string;
+}
 
 /** Decode-side WebRTC video telemetry, sampled from `RTCPeerConnection.getStats`. */
 export type RtcInboundVideoStats = {
@@ -38,6 +46,14 @@ const HEARTBEAT_DEAD_MS = 13000; // no pong within this → treat link as dead
 const OFFER_TIMEOUT_MS = 8000; // joined the room but no offer arrived → rejoin
 const BACKOFF_MIN = 1500;
 const BACKOFF_MAX = 30000;
+const WATCHDOG_MS = 3000; // health-check cadence
+const HARD_RESET_MS = 60000; // unhealthy this long → full teardown + rebuild
+const STALL_MS = 10000; // authorized+connected but no decoded frames → rebuild
+// Receiver jitter buffer (ms): the old 20ms was so tight that late frames were
+// dropped (≈30% on Android). A larger buffer trades a little latency for far
+// fewer drops; it adapts up when the decoder falls behind and eases back.
+const JITTER_BASE = 120;
+const JITTER_MAX = 300;
 
 export class CloudConn {
   private sig: Signaling | null = null;
@@ -61,8 +77,22 @@ export class CloudConn {
   private hbTimer: number | null = null;
   private lastPong = 0;
   private offerTimer: number | null = null;
+  // Auth + resilience state.
+  private authed = false; // host approved this device (streaming allowed)
+  private denied = false; // host rejected us — stop auto-reconnecting
+  private videoReceiver: RTCRtpReceiver | null = null;
+  private jitterTarget = JITTER_BASE;
+  private watchdogTimer: number | null = null;
+  private lastHealthyAt = Date.now();
+  private lastDecoded = -1;
+  private lastDecodeAdvanceAt = Date.now();
 
-  constructor(private signalUrl: string, private code: string, private iceServers?: IceServer[]) {
+  constructor(
+    private signalUrl: string,
+    private code: string,
+    private auth?: AuthInfo,
+    private iceServers?: IceServer[],
+  ) {
     // Android throttles/suspends timers while the app is backgrounded, so on
     // resume `lastPong` looks ancient and the heartbeat would declare a healthy
     // link dead and force a visible reconnect. Give the link a fresh window and
@@ -93,14 +123,17 @@ export class CloudConn {
     if (s === "connected") {
       this.connectedOnce = true;
       this.backoff = BACKOFF_MIN; // reset backoff on success
+      this.lastHealthyAt = Date.now();
       this.clearReconnect();
     }
     this.statusCb?.(s);
-    if (!this.closed && (s === "failed" || s === "closed")) this.scheduleReconnect();
+    if (!this.closed && !this.denied && (s === "failed" || s === "closed")) this.scheduleReconnect();
   }
 
   async connect(): Promise<void> {
     this.closed = false;
+    this.denied = false;
+    this.startWatchdog();
     await this.openSignaling(true);
   }
 
@@ -137,7 +170,12 @@ export class CloudConn {
           this.emit("disconnected");
           this.scheduleReconnect();
         }
-      } else if (m.type === "room-full") this.emit("error");
+      } else if (m.type === "room-full") {
+        // The room briefly still holds our stale socket (the signaling server now
+        // evicts same-role zombies, but a race is possible). Retry instead of
+        // dead-ending — this is what made a Wi‑Fi switch require a new code before.
+        this.scheduleReconnect();
+      }
     });
     sig.onClose(() => {
       if (this.sig === sig && !this.closed && !this.connectedViaPeer()) this.scheduleReconnect();
@@ -175,7 +213,7 @@ export class CloudConn {
   }
 
   private scheduleReconnect() {
-    if (this.closed || this.reconnectTimer !== null) return;
+    if (this.closed || this.denied || this.reconnectTimer !== null) return;
     const wait = this.backoff;
     this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX);
     this.reconnectTimer = window.setTimeout(() => {
@@ -195,11 +233,20 @@ export class CloudConn {
     this.clearOfferTimeout();
     this.pc?.close(); // a fresh offer supersedes any prior/wedged session
     this.stream = null; // new session → new tracks; don't accumulate dead ones
+    this.authed = false; // every fresh peer requires re-authorization by the host
+    this.videoReceiver = null;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers) });
     this.pc = pc;
     pipeIce(pc, this.sig!);
-    // Guard every handler against firing for a superseded connection.
-    pc.onconnectionstatechange = () => this.pc === pc && this.emit(pc.connectionState);
+    // Guard every handler against firing for a superseded connection. The peer
+    // reaching "connected" only means the transport is up — we stay in "pending"
+    // (authenticating) until the host sends {event:"auth", state:"ok"}.
+    pc.onconnectionstatechange = () => {
+      if (this.pc !== pc) return;
+      const st = pc.connectionState;
+      if (st === "connected") this.emit(this.authed ? "connected" : "pending");
+      else this.emit(st);
+    };
     // ICE can wedge without a connectionState change; nudge a reconnect on failure.
     pc.oniceconnectionstatechange = () => {
       if (this.pc === pc && pc.iceConnectionState === "failed" && !this.closed) this.scheduleReconnect();
@@ -216,17 +263,9 @@ export class CloudConn {
       // trade a little jitter resilience for responsiveness. Not 0 (that stutters at
       // high resolution) — a small target keeps the decoder from buffering ahead.
       if (e.track.kind === "video") {
-        const rx = e.receiver as unknown as { jitterBufferTarget?: number; playoutDelayHint?: number };
-        try {
-          rx.jitterBufferTarget = 20; // ms (modern Chromium)
-        } catch {
-          /* unsupported */
-        }
-        try {
-          rx.playoutDelayHint = 0.02; // seconds (legacy fallback name)
-        } catch {
-          /* unsupported */
-        }
+        this.videoReceiver = e.receiver;
+        this.jitterTarget = JITTER_BASE;
+        this.applyJitter();
       }
       this.streamCb?.(this.stream);
     };
@@ -238,6 +277,9 @@ export class CloudConn {
         ch.onmessage = (ev) => this.frameCb?.(ev.data as string);
       } else if (ch.label === "control") {
         this.chControl = ch;
+        // Send the auth handshake as soon as the guest→host channel is open.
+        if (ch.readyState === "open") this.sendAuth();
+        ch.onopen = () => this.sendAuth();
       } else if (ch.label === "data") {
         this.chData = ch;
         ch.onmessage = (ev) => this.onData(ev.data as string);
@@ -286,6 +328,96 @@ export class CloudConn {
     }
   }
 
+  /** Send the identity + optional secret so the host can authorize this device. */
+  private sendAuth() {
+    if (this.chControl?.readyState !== "open") return;
+    const a = this.auth;
+    try {
+      this.chControl.send(
+        JSON.stringify({
+          type: "auth",
+          deviceId: a?.deviceId ?? "",
+          name: a?.name ?? "Phone",
+          secret: a?.secret || undefined,
+        }),
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Apply the current jitter-buffer target to the inbound video receiver. */
+  private applyJitter() {
+    const rx = this.videoReceiver as unknown as { jitterBufferTarget?: number; playoutDelayHint?: number } | null;
+    if (!rx) return;
+    try {
+      rx.jitterBufferTarget = this.jitterTarget; // ms (modern Chromium)
+    } catch {
+      /* unsupported */
+    }
+    try {
+      rx.playoutDelayHint = this.jitterTarget / 1000; // seconds (legacy name)
+    } catch {
+      /* unsupported */
+    }
+  }
+
+  /**
+   * Health watchdog: auto-recovers from wedged links the soft reconnect can't (the
+   * Wi‑Fi-switch case), and adapts the receiver jitter buffer to the decoder so
+   * fewer frames are dropped.
+   */
+  private startWatchdog() {
+    this.stopWatchdog();
+    this.lastHealthyAt = Date.now();
+    this.watchdogTimer = window.setInterval(async () => {
+      if (this.closed || this.denied) return;
+      const connected = this.pc?.connectionState === "connected" && this.authed;
+      if (connected) this.lastHealthyAt = Date.now();
+      // Backgrounded: timers throttle and getStats is meaningless — skip checks.
+      if (document.hidden) {
+        this.lastDecodeAdvanceAt = Date.now();
+        return;
+      }
+      // Hard reset: unhealthy for too long → tear down and rebuild from scratch.
+      if (Date.now() - this.lastHealthyAt > HARD_RESET_MS) {
+        this.lastHealthyAt = Date.now();
+        this.backoff = BACKOFF_MIN;
+        this.clearReconnect();
+        this.openSignaling(false).catch(() => this.scheduleReconnect());
+        return;
+      }
+      if (!connected) return;
+      // Decode-stall + adaptive jitter: sample inbound video stats.
+      const st = await this.videoStats().catch(() => null);
+      if (!st) return;
+      if (st.framesDecoded > this.lastDecoded) {
+        this.lastDecoded = st.framesDecoded;
+        this.lastDecodeAdvanceAt = Date.now();
+      } else if (Date.now() - this.lastDecodeAdvanceAt > STALL_MS) {
+        // Connected + approved but no new frames for 10s → the stream is wedged.
+        this.lastDecodeAdvanceAt = Date.now();
+        this.emit("disconnected");
+        this.openSignaling(false).catch(() => this.scheduleReconnect());
+        return;
+      }
+      // Adapt the jitter buffer to the observed drop rate.
+      const total = st.framesDecoded + st.framesDropped;
+      const ratio = total > 0 ? st.framesDropped / total : 0;
+      const prev = this.jitterTarget;
+      if (ratio > 0.15) this.jitterTarget = Math.min(JITTER_MAX, this.jitterTarget + 40);
+      else if (ratio < 0.03) this.jitterTarget = Math.max(JITTER_BASE, this.jitterTarget - 20);
+      if (this.jitterTarget !== prev) this.applyJitter();
+    }, WATCHDOG_MS);
+  }
+
+  private stopWatchdog() {
+    if (this.watchdogTimer !== null) {
+      window.clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
   private onData(raw: string) {
     let msg: {
       id?: number;
@@ -309,6 +441,21 @@ export class CloudConn {
       return;
     }
     if (typeof msg.event === "string") {
+      // Auth handshake result from the host gates the "connected" status.
+      if (msg.event === "auth") {
+        const state = (msg as { state?: string }).state;
+        if (state === "ok") {
+          this.authed = true;
+          this.emit("connected");
+        } else if (state === "pending") {
+          this.emit("pending");
+        } else if (state === "denied") {
+          this.denied = true;
+          this.clearReconnect();
+          this.emit("denied");
+          this.pc?.close();
+        }
+      }
       this.eventCb?.(msg as HostEvent);
       return;
     }
@@ -430,6 +577,7 @@ export class CloudConn {
     this.clearReconnect();
     this.clearOfferTimeout();
     this.stopHeartbeat();
+    this.stopWatchdog();
     this.pc?.close();
     this.pc = null;
     this.sig?.close();

@@ -21,6 +21,7 @@ import { Pairing, type Connected } from "./Pairing";
 import { setCloudMode } from "./link";
 import { makeRtcLink, type RemoteLink } from "./links";
 import { CloudConn } from "./cloud";
+import { deviceId, deviceName } from "./device";
 import { StatsScreen } from "./screens/Stats";
 import { LibraryScreen } from "./screens/Library";
 import { MusicScreen } from "./screens/MusicView";
@@ -32,6 +33,7 @@ type Phase = "boot" | "pairing" | "autoconnecting" | "connected" | "paused";
 
 const LS_CODE = "gt.remote.code"; // remembered code → auto-connect on launch
 const LS_SIGNAL = "gt.remote.signal";
+const LS_SECRET = "gt.remote.secret"; // remembered permanent key (optional)
 
 const TABS: { id: Tab; label: string; icon: typeof BarChart3 }[] = [
   { id: "stats", label: "Stats", icon: BarChart3 },
@@ -47,13 +49,14 @@ export function CompanionApp() {
   const [activeCode, setActiveCode] = useState(() => localStorage.getItem(LS_CODE) || "");
   const autoConnRef = useRef<CloudConn | null>(null);
 
-  const adopt = useCallback((c: CloudConn, code?: string, signalUrl?: string) => {
+  const adopt = useCallback((c: CloudConn, code?: string, signalUrl?: string, secret?: string) => {
     autoConnRef.current = null; // hand ownership to app state; skip cleanup close
     if (code) {
       localStorage.setItem(LS_CODE, code);
       setActiveCode(code);
     }
     if (signalUrl) localStorage.setItem(LS_SIGNAL, signalUrl);
+    if (secret !== undefined) localStorage.setItem(LS_SECRET, secret);
     setCloudMode(c);
     setConn(c);
     setPhase("connected");
@@ -69,11 +72,19 @@ export function CompanionApp() {
     }
     setActiveCode(code);
     const signalUrl = localStorage.getItem(LS_SIGNAL) || DEFAULT_SIGNAL_URL;
-    const c = new CloudConn(signalUrl, code);
+    const secret = localStorage.getItem(LS_SECRET) || undefined;
+    const c = new CloudConn(signalUrl, code, { deviceId: deviceId(), name: deviceName(), secret });
     autoConnRef.current = c;
     setPhase("autoconnecting");
     c.onStatus((s) => {
       if (s === "connected") adopt(c);
+      // Approval declined on the PC — drop back to pairing so the user can enter
+      // the permanent key or ask to be allowed again.
+      else if (s === "denied") {
+        c.close();
+        autoConnRef.current = null;
+        setPhase("pairing");
+      }
     });
     c.connect().catch(() => {
       /* CloudConn keeps retrying on its own */
@@ -100,7 +111,7 @@ export function CompanionApp() {
     });
   }, []);
 
-  const onPaired = (c: Connected) => adopt(c.conn, c.code, c.signalUrl);
+  const onPaired = (c: Connected) => adopt(c.conn, c.code, c.signalUrl, c.secret);
 
   const closeAll = () => {
     conn?.close();
@@ -120,6 +131,7 @@ export function CompanionApp() {
   const forget = () => {
     closeAll();
     localStorage.removeItem(LS_CODE);
+    localStorage.removeItem(LS_SECRET);
     setActiveCode("");
     setPhase("pairing");
   };

@@ -32,6 +32,18 @@ export interface HostLiveStats {
   encoderMaxKbps: number;
 }
 
+/** What the desktop approval prompt resolves to for an untrusted device. */
+export type ApprovalDecision =
+  | { kind: "temporary"; durationSecs: number }
+  | { kind: "permanent" }
+  | { kind: "deny" };
+
+/** A device asking to connect that isn't trusted yet (needs the prompt). */
+export interface ApprovalRequest {
+  deviceId: string;
+  name: string;
+}
+
 interface HostOptions {
   signalUrl: string;
   code: string;
@@ -40,6 +52,8 @@ interface HostOptions {
   onClients?: (n: number) => void;
   /** Push live capture + link telemetry to the desktop UI while a phone is attached. */
   onStats?: (s: HostLiveStats | null) => void;
+  /** Ask the desktop UI to approve an untrusted device; resolves the user's choice. */
+  onApprovalRequest?: (req: ApprovalRequest) => Promise<ApprovalDecision>;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -348,7 +362,7 @@ export function startHost(opts: HostOptions): () => void {
    * each finished frame is pushed straight into the encoder, which
    * hardware-encodes with inter-frame compression and adaptive bitrate.
    */
-  const buildVideoTrack = async (): Promise<MediaStreamTrack | null> => {
+  const buildVideoTrack = async (): Promise<{ track: MediaStreamTrack; start: () => Promise<void> } | null> => {
     const canvas = document.createElement("canvas");
     canvas.width = 1280;
     canvas.height = 720;
@@ -462,11 +476,6 @@ export function startHost(opts: HostOptions): () => void {
       }
       pump(bytes);
     };
-    try {
-      await api.remoteStartCapture(ch, quality.maxW, quality.fps, quality.jpeg);
-    } catch {
-      return null;
-    }
     // Generator path: frames are pushed explicitly, so delivery tracks the Rust
     // capture thread exactly. Fallback captureStream() with no fps arg does the
     // same via draw-sampling (encoder fps ceiling is set via setParameters).
@@ -475,14 +484,17 @@ export function startHost(opts: HostOptions): () => void {
       const stream = canvas.captureStream?.();
       track = stream?.getVideoTracks?.()[0] ?? null;
     }
-    if (track) {
-      try {
-        (track as MediaStreamTrack & { contentHint: string }).contentHint = trackTuning(quality.mode).hint;
-      } catch {
-        /* not supported */
-      }
+    if (!track) return null;
+    try {
+      (track as MediaStreamTrack & { contentHint: string }).contentHint = trackTuning(quality.mode).hint;
+    } catch {
+      /* not supported */
     }
-    return track;
+    // Capture is DEFERRED: the track is added to the offer immediately (so no
+    // renegotiation), but the Rust screen capture only starts once the guest is
+    // authorized. Until then the track carries no frames, so the phone sees nothing.
+    const start = () => api.remoteStartCapture(ch, quality.maxW, quality.fps, quality.jpeg);
+    return { track, start };
   };
 
   /**
@@ -492,11 +504,14 @@ export function startHost(opts: HostOptions): () => void {
    * peer connection. Underruns emit silence (no glitchy repeats); we cap the buffer
    * so audio can't drift far behind the screen.
    */
-  const buildAudioTrack = async (): Promise<MediaStreamTrack | null> => {
+  const buildAudioTrack = async (): Promise<{ track: MediaStreamTrack; start: () => Promise<void> } | null> => {
     // Interleaved float32 chunks + a read head, acting as a bounded jitter buffer.
     let chunks: Float32Array[] = [];
     let head = 0;
     let avail = 0;
+    // WASAPI shared-mode loopback is 48 kHz stereo in practice; we build the graph
+    // eagerly (for the offer) at that assumption and correct the channel count when
+    // capture actually starts. Capture is DEFERRED until the guest is authorized.
     let channels = 2;
 
     const ch = new Channel<ArrayBuffer>();
@@ -513,17 +528,8 @@ export function startHost(opts: HostOptions): () => void {
       }
     };
 
-    let fmt: Awaited<ReturnType<typeof api.remoteStartAudio>>;
     try {
-      fmt = await api.remoteStartAudio(ch);
-    } catch {
-      return null;
-    }
-    if (!fmt) return null;
-    channels = Math.max(1, Math.min(2, fmt.channels));
-
-    try {
-      audioCtx = new AudioContext({ sampleRate: fmt.sampleRate });
+      audioCtx = new AudioContext({ sampleRate: 48000 });
     } catch {
       audioCtx = new AudioContext();
     }
@@ -560,12 +566,43 @@ export function startHost(opts: HostOptions): () => void {
     };
     node.connect(dest);
     audioNode = node;
-    return dest.stream.getAudioTracks()[0] ?? null;
+    const track = dest.stream.getAudioTracks()[0] ?? null;
+    if (!track) return null;
+    const start = async () => {
+      const fmt = await api.remoteStartAudio(ch);
+      if (fmt) channels = Math.max(1, Math.min(2, fmt.channels));
+    };
+    return { track, start };
   };
 
   const startPeer = async () => {
     teardownPeer(); // reset any prior session
     if (!sig) return;
+    // Access gate: the screen/audio capture and input injection stay off until the
+    // guest is authorized (trusted device, correct secret, or user approval).
+    let authorized = false;
+    let startVideoCapture: (() => Promise<void>) | null = null;
+    let startAudioCapture: (() => Promise<void>) | null = null;
+    // Capture-stall watchdog bookkeeping (restart capture if it wedges).
+    let lastProduced = -1;
+    let zeroSince = 0;
+
+    const authorize = async () => {
+      if (authorized) return;
+      authorized = true;
+      try {
+        await startVideoCapture?.();
+      } catch (e) {
+        console.warn("[remote] start capture failed:", e);
+      }
+      try {
+        await startAudioCapture?.();
+      } catch {
+        /* audio is optional */
+      }
+      if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "ok" }));
+    };
+
     pc = new RTCPeerConnection({ iceServers: defaultIceServers(opts.iceServers) });
     pipeIce(pc, sig);
     pc.onconnectionstatechange = () => {
@@ -592,13 +629,17 @@ export function startHost(opts: HostOptions): () => void {
     // lip-sync tracks grouped in the same signaled stream, and that sync makes
     // video wait for the audio jitter buffer. For screen control the freshest
     // frame beats A/V alignment; the phone re-merges them locally for playback.
-    videoTrack = await buildVideoTrack();
-    if (videoTrack) {
+    const v = await buildVideoTrack();
+    if (v) {
+      videoTrack = v.track;
       videoSender = pc.addTrack(videoTrack, new MediaStream([videoTrack]));
+      startVideoCapture = v.start;
     }
-    audioTrack = await buildAudioTrack();
-    if (audioTrack) {
+    const a = await buildAudioTrack();
+    if (a) {
+      audioTrack = a.track;
       pc.addTrack(audioTrack, new MediaStream([audioTrack]));
+      startAudioCapture = a.start;
     }
 
     // Prefer H.264 for the screen: hardware encode on the PC and hardware decode
@@ -620,7 +661,7 @@ export function startHost(opts: HostOptions): () => void {
       }
     }
 
-    const onControlMsg = (e: MessageEvent) => {
+    const onControlMsg = async (e: MessageEvent) => {
       try {
         const msg = JSON.parse(e.data as string);
         lastGuestMsg = Date.now();
@@ -628,6 +669,47 @@ export function startHost(opts: HostOptions): () => void {
         // instead of waiting ~30s for ICE to notice the peer is gone.
         if (msg && msg.type === "bye") {
           teardownPeer();
+          return;
+        }
+        // Auth handshake: the guest sends this on connect. Decide access, and (if
+        // the device isn't already trusted) ask the desktop UI to approve it.
+        if (msg && msg.type === "auth") {
+          const deviceId = String(msg.deviceId ?? "");
+          const name = String(msg.name ?? "Phone");
+          const secret = typeof msg.secret === "string" ? msg.secret : undefined;
+          let level: string;
+          try {
+            level = await api.remoteCheckAuth(deviceId, name, secret);
+          } catch {
+            level = "none";
+          }
+          if (pc === null) return; // session torn down while we awaited
+          if (level !== "none") {
+            await authorize();
+            return;
+          }
+          // Untrusted → prompt the user on the desktop.
+          if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "pending" }));
+          const decision: ApprovalDecision = opts.onApprovalRequest
+            ? await opts.onApprovalRequest({ deviceId, name })
+            : { kind: "deny" };
+          if (pc === null) return;
+          if (decision.kind === "deny") {
+            if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "denied" }));
+            teardownPeer();
+          } else {
+            try {
+              await api.remoteGrant(
+                deviceId,
+                name,
+                decision.kind,
+                decision.kind === "temporary" ? decision.durationSecs : undefined,
+              );
+            } catch {
+              /* grant persistence best-effort */
+            }
+            await authorize();
+          }
           return;
         }
         // The `quality` message re-tunes the capture + encoder; not an input event.
@@ -646,6 +728,8 @@ export function startHost(opts: HostOptions): () => void {
           applyBitrate();
           return;
         }
+        // Everything else is an input event — never inject before authorization.
+        if (!authorized) return;
         api.remoteInject(msg);
         // A click can move focus into (or out of) a PC text field. Poll focus a few
         // times right after so the phone learns to pop its keyboard with minimal
@@ -672,6 +756,11 @@ export function startHost(opts: HostOptions): () => void {
       }
       if (typeof req.id !== "number" || typeof req.path !== "string") return;
       const id = req.id;
+      // Don't answer stats/data requests until the device is authorized.
+      if (!authorized) {
+        if (data.readyState === "open") data.send(JSON.stringify({ id, ok: false, error: "awaiting approval" }));
+        return;
+      }
       // Responses can exceed the SCTP max message size (e.g. base64 cover art).
       // Split anything large into ordered chunks the guest reassembles by id.
       const respond = (payloadObj: unknown) => {
@@ -725,6 +814,9 @@ export function startHost(opts: HostOptions): () => void {
       return { kbps, fps: Math.round(out?.framesPerSecond ?? 0), rtt: Math.round(rtt * 1000) };
     };
     data.onopen = () => {
+      // If authorization somehow completed before this channel opened, make sure
+      // the guest still learns it's allowed (otherwise it stays "pending").
+      if (authorized && data.readyState === "open") data.send(JSON.stringify({ event: "auth", state: "ok" }));
       focusTimer = window.setInterval(async () => {
         try {
           const active = await api.remoteTextfieldActive();
@@ -745,6 +837,27 @@ export function startHost(opts: HostOptions): () => void {
             if (data.readyState === "open") data.send(JSON.stringify({ event: "capstats", stats: cs, at: Date.now() }));
           } catch {
             /* ignore */
+          }
+          // Capture-stall watchdog: if we're authorized and connected but the Rust
+          // capture stops producing frames (internal error / device change), restart
+          // it in place so the session self-heals without a full rebuild.
+          if (cs && authorized && pc?.connectionState === "connected") {
+            if (cs.producedFrames === lastProduced) {
+              if (!zeroSince) zeroSince = Date.now();
+              else if (Date.now() - zeroSince > 5000) {
+                zeroSince = 0;
+                lastProduced = -1;
+                try {
+                  api.remoteStopCapture();
+                  await startVideoCapture?.();
+                } catch {
+                  /* retry next tick */
+                }
+              }
+            } else {
+              lastProduced = cs.producedFrames;
+              zeroSince = 0;
+            }
           }
           if (opts.onStats) {
             const link = await readSendStats();

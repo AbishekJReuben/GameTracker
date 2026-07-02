@@ -16,6 +16,7 @@ import { useRemoteHost } from "@/store/remote";
 export function RemoteHostManager() {
   const setCloudClients = useRemoteHost((s) => s.setCloudClients);
   const setHostStats = useRemoteHost((s) => s.setHostStats);
+  const setPendingApproval = useRemoteHost((s) => s.setPendingApproval);
   const cfg = useRef({ on: false, url: "", code: "" });
   const stopRef = useRef<null | (() => void)>(null);
 
@@ -33,6 +34,10 @@ export function RemoteHostManager() {
           code,
           onClients: (n) => alive && setCloudClients(n),
           onStats: (s) => alive && setHostStats(s),
+          // An untrusted device raises the app-wide approval prompt; the modal
+          // (RemoteApprovalModal) resolves this promise with the user's choice.
+          onApprovalRequest: (request) =>
+            new Promise((resolve) => setPendingApproval({ request, resolve })),
         });
       }
     };
@@ -62,7 +67,7 @@ export function RemoteHostManager() {
       stopRef.current = null;
       setHostStats(null);
     };
-  }, [setCloudClients, setHostStats]);
+  }, [setCloudClients, setHostStats, setPendingApproval]);
 
   return null;
 }

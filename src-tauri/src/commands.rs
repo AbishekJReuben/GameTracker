@@ -1769,6 +1769,8 @@ pub struct RemoteStatus {
     pub cloud_enabled: bool,
     pub signal_url: String,
     pub code: String,
+    /// Secret "permanent key" (code 2), shown behind the eye toggle on the page.
+    pub secret_code: String,
 }
 
 fn remote_snapshot(state: &State<AppState>) -> RemoteStatus {
@@ -1786,6 +1788,7 @@ fn remote_snapshot(state: &State<AppState>) -> RemoteStatus {
             .flatten()
             .unwrap_or_default(),
         code: r.code.lock().clone(),
+        secret_code: r.secret.lock().clone(),
     }
 }
 
@@ -1795,12 +1798,17 @@ pub fn remote_status(state: State<AppState>) -> RemoteStatus {
     remote_snapshot(&state)
 }
 
-/// Turn the remote server on or off. Enabling rotates the pairing PIN and starts
-/// the listener; disabling signals graceful shutdown. Persisted across restarts.
+/// The single Remote master switch. Turns on BOTH the local LAN server and cloud
+/// (from-anywhere) mode together — the companion always uses the cloud/WebRTC path,
+/// so the page shows one toggle. Enabling rotates the pairing PIN and starts the
+/// listener; disabling shuts down and turns cloud off. Persisted across restarts.
 #[tauri::command]
 pub fn remote_set_enabled(state: State<AppState>, enabled: bool) -> AppResult<RemoteStatus> {
     settings::set(&state.pool, "remote_enabled", if enabled { "true" } else { "false" })?;
+    settings::set(&state.pool, "remote_cloud_enabled", if enabled { "true" } else { "false" })?;
     state.remote.enabled.store(enabled, Ordering::SeqCst);
+    // Cloud host runs in the desktop webview (RemoteHostManager) gated on this flag.
+    state.remote.cloud_enabled.store(enabled, Ordering::SeqCst);
     if enabled {
         state.remote.rotate_pin();
         crate::remote::start(crate::remote::ApiState {
@@ -1846,6 +1854,226 @@ pub fn remote_regen_code(state: State<AppState>) -> RemoteStatus {
     let code = state.remote.rotate_code();
     let _ = settings::set(&state.pool, "remote_code", &code);
     remote_snapshot(&state)
+}
+
+/// Generate a fresh secret permanent key (code 2). Devices already trusted stay
+/// trusted; only the auto-grant secret changes.
+#[tauri::command]
+pub fn remote_regen_secret(state: State<AppState>) -> RemoteStatus {
+    let secret = state.remote.rotate_secret();
+    let _ = settings::set(&state.pool, "remote_secret_code", &secret);
+    remote_snapshot(&state)
+}
+
+// ---- per-device access grants (permanent trust + temporary timed grants) ----
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedDevice {
+    pub id: String,
+    pub name: String,
+    pub added_utc: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TempGrant {
+    pub id: String,
+    pub name: String,
+    pub expires_utc: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGrants {
+    pub trusted: Vec<TrustedDevice>,
+    pub temporary: Vec<TempGrant>,
+}
+
+fn read_trusted(pool: &crate::db::DbPool) -> Vec<TrustedDevice> {
+    settings::get(pool, "remote_trusted_devices")
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+
+/// Read the temp grants, dropping any that have expired (and persist the pruned
+/// list so it doesn't grow unbounded).
+fn read_temp_pruned(pool: &crate::db::DbPool) -> Vec<TempGrant> {
+    let now = chrono::Utc::now();
+    let all: Vec<TempGrant> = settings::get(pool, "remote_temp_grants")
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default();
+    let live: Vec<TempGrant> = all
+        .into_iter()
+        .filter(|g| {
+            chrono::DateTime::parse_from_rfc3339(&g.expires_utc)
+                .map(|t| t.with_timezone(&chrono::Utc) > now)
+                .unwrap_or(false)
+        })
+        .collect();
+    let _ = settings::set(
+        pool,
+        "remote_temp_grants",
+        &serde_json::to_string(&live).unwrap_or_else(|_| "[]".into()),
+    );
+    live
+}
+
+/// List trusted (permanent) devices and active temporary grants (expired pruned).
+#[tauri::command]
+pub fn remote_list_grants(state: State<AppState>) -> RemoteGrants {
+    RemoteGrants {
+        trusted: read_trusted(&state.pool),
+        temporary: read_temp_pruned(&state.pool),
+    }
+}
+
+/// Grant a device permanent trust or a temporary (timed) grant.
+#[tauri::command]
+pub fn remote_grant(
+    state: State<AppState>,
+    device_id: String,
+    name: String,
+    kind: String,
+    duration_secs: Option<i64>,
+) -> AppResult<RemoteGrants> {
+    let now = chrono::Utc::now();
+    if kind == "permanent" {
+        let mut trusted = read_trusted(&state.pool);
+        trusted.retain(|d| d.id != device_id);
+        trusted.push(TrustedDevice {
+            id: device_id.clone(),
+            name: name.clone(),
+            added_utc: now.to_rfc3339(),
+        });
+        settings::set(
+            &state.pool,
+            "remote_trusted_devices",
+            &serde_json::to_string(&trusted).unwrap_or_else(|_| "[]".into()),
+        )?;
+        // A permanent grant supersedes any temp grant for the same device.
+        let mut temp = read_temp_pruned(&state.pool);
+        temp.retain(|g| g.id != device_id);
+        settings::set(
+            &state.pool,
+            "remote_temp_grants",
+            &serde_json::to_string(&temp).unwrap_or_else(|_| "[]".into()),
+        )?;
+    } else {
+        let secs = duration_secs.unwrap_or(3600).clamp(60, 60 * 60 * 24 * 30);
+        let expires = now + chrono::Duration::seconds(secs);
+        let mut temp = read_temp_pruned(&state.pool);
+        temp.retain(|g| g.id != device_id);
+        temp.push(TempGrant {
+            id: device_id.clone(),
+            name,
+            expires_utc: expires.to_rfc3339(),
+        });
+        settings::set(
+            &state.pool,
+            "remote_temp_grants",
+            &serde_json::to_string(&temp).unwrap_or_else(|_| "[]".into()),
+        )?;
+    }
+    Ok(RemoteGrants {
+        trusted: read_trusted(&state.pool),
+        temporary: read_temp_pruned(&state.pool),
+    })
+}
+
+/// Revoke a device — removes it from both the trusted and temporary lists.
+#[tauri::command]
+pub fn remote_revoke(state: State<AppState>, device_id: String) -> AppResult<RemoteGrants> {
+    let mut trusted = read_trusted(&state.pool);
+    trusted.retain(|d| d.id != device_id);
+    settings::set(
+        &state.pool,
+        "remote_trusted_devices",
+        &serde_json::to_string(&trusted).unwrap_or_else(|_| "[]".into()),
+    )?;
+    let mut temp = read_temp_pruned(&state.pool);
+    temp.retain(|g| g.id != device_id);
+    settings::set(
+        &state.pool,
+        "remote_temp_grants",
+        &serde_json::to_string(&temp).unwrap_or_else(|_| "[]".into()),
+    )?;
+    Ok(RemoteGrants {
+        trusted: read_trusted(&state.pool),
+        temporary: read_temp_pruned(&state.pool),
+    })
+}
+
+/// Decide a connecting device's access level, used by the host handshake:
+/// `"secret"`  — supplied the correct secret key (auto-persisted as permanent),
+/// `"permanent"` / `"temporary"` — already granted,
+/// `"none"`    — needs the desktop approval prompt.
+#[tauri::command]
+pub fn remote_check_auth(
+    state: State<AppState>,
+    device_id: String,
+    name: Option<String>,
+    secret: Option<String>,
+) -> String {
+    let expected = state.remote.secret.lock().clone();
+    if let Some(s) = secret {
+        if !s.trim().is_empty() && s.trim().eq_ignore_ascii_case(expected.trim()) {
+            // Correct secret → remember this device permanently.
+            let now = chrono::Utc::now();
+            let mut trusted = read_trusted(&state.pool);
+            if !trusted.iter().any(|d| d.id == device_id) {
+                trusted.push(TrustedDevice {
+                    id: device_id.clone(),
+                    name: name.unwrap_or_else(|| "Phone".into()),
+                    added_utc: now.to_rfc3339(),
+                });
+                let _ = settings::set(
+                    &state.pool,
+                    "remote_trusted_devices",
+                    &serde_json::to_string(&trusted).unwrap_or_else(|_| "[]".into()),
+                );
+            }
+            return "secret".into();
+        }
+    }
+    if read_trusted(&state.pool).iter().any(|d| d.id == device_id) {
+        return "permanent".into();
+    }
+    if read_temp_pruned(&state.pool).iter().any(|g| g.id == device_id) {
+        return "temporary".into();
+    }
+    "none".into()
+}
+
+// ---- USB install (adb) ----
+
+/// Serial numbers of phones connected via USB debugging (state `device`).
+#[tauri::command]
+pub async fn remote_adb_devices() -> AppResult<Vec<String>> {
+    run_blocking(crate::remote::adb::devices).await
+}
+
+/// Download the latest companion APK and `adb install -r` it to the USB phone.
+#[tauri::command]
+pub async fn remote_adb_install() -> AppResult<String> {
+    run_blocking(|| {
+        let url = "https://github.com/AbishekJReuben/GameTracker/releases/latest/download/GameTrackerRemote.apk";
+        let resp = ureq::get(url)
+            .timeout(std::time::Duration::from_secs(60))
+            .call()
+            .map_err(|e| AppError::msg(format!("Couldn't download the APK: {e}")))?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)
+            .map_err(|e| AppError::msg(format!("Download failed: {e}")))?;
+        let tmp = std::env::temp_dir().join("GameTrackerRemote.apk");
+        std::fs::write(&tmp, &buf).map_err(|e| AppError::msg(format!("Couldn't save the APK: {e}")))?;
+        crate::remote::adb::install(&tmp)
+    })
+    .await
 }
 
 // ---- WebRTC path (screen/input driven over a peer-to-peer data channel) ----
