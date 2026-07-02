@@ -1173,10 +1173,16 @@ export const api = {
   // ArrayBuffer JPEGs over the channel; no per-frame invoke round-trip).
   remoteStartCapture: (onFrame: Channel<ArrayBuffer>, maxW: number, fps: number, quality: number) =>
     call<void>("remote_start_capture", { onFrame, maxW, fps, quality }),
-  remoteSetCaptureQuality: (maxW: number, fps: number, quality: number) =>
-    call<void>("remote_set_capture_quality", { maxW, fps, quality }),
+  remoteSetCaptureQuality: (maxW: number, fps: number, quality: number, content?: number) =>
+    call<void>("remote_set_capture_quality", { maxW, fps, quality, content }),
   remoteStopCapture: () => call<void>("remote_stop_capture"),
+  // Desktop-audio (WASAPI loopback) for the WebRTC audio track. PCM float32 frames
+  // arrive as ArrayBuffers; returns the mix format to decode them with.
+  remoteStartAudio: (onPcm: Channel<ArrayBuffer>) =>
+    call<RemoteAudioFormat | null>("remote_start_audio", { onPcm }),
+  remoteStopAudio: () => call<void>("remote_stop_audio"),
   remoteTextfieldActive: () => call<boolean>("remote_textfield_active"),
+  remoteCaptureStats: () => call<RemoteCaptureStats>("remote_capture_stats"),
   remoteListMonitors: () => call<RemoteMonitor[]>("remote_list_monitors"),
   remoteReadMedia: (path: string) => call<string | null>("remote_read_media", { path }),
   remoteInject: (event: Record<string, unknown>) => call<void>("remote_inject", { event }),
@@ -1188,6 +1194,31 @@ export interface RemoteMonitor {
   width: number;
   height: number;
   isPrimary: boolean;
+}
+
+/** Desktop-audio loopback PCM format (see remote_start_audio). */
+export interface RemoteAudioFormat {
+  sampleRate: number;
+  channels: number;
+}
+
+/** Host capture-pipeline telemetry (see remote_capture_stats). */
+export interface RemoteCaptureStats {
+  captureMs: number;
+  scaleMs: number;
+  encodeMs: number;
+  frameBytes: number;
+  nativeW: number;
+  nativeH: number;
+  outW: number;
+  outH: number;
+  producedFrames: number;
+  maxW: number;
+  fps: number;
+  quality: number;
+  /** Content-optimization mode: 0 auto / 1 text / 2 video. */
+  content: number;
+  running: boolean;
 }
 
 export interface RemoteStatus {

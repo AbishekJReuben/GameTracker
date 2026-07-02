@@ -11,6 +11,15 @@ import {
   Check,
   Download,
   Globe,
+  Activity,
+  Gauge,
+  Cpu,
+  ArrowDownUp,
+  Timer,
+  Monitor,
+  Type as TypeIcon,
+  Clapperboard,
+  Sparkles,
 } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
@@ -19,6 +28,7 @@ import { api, RemoteStatus } from "@/lib/api";
 import { DEFAULT_SIGNAL_URL, SIGNAL_PORT } from "@/lib/remoteConfig";
 import { useApp } from "@/store/app";
 import { useRemoteHost } from "@/store/remote";
+import type { HostLiveStats } from "@/lib/rtcHost";
 
 export default function RemotePage() {
   const pushToast = useApp((s) => s.pushToast);
@@ -28,6 +38,7 @@ export default function RemotePage() {
   // The WebRTC host now runs app-wide (see RemoteHostManager) so the phone can
   // connect no matter which page is open; we just read its live client count.
   const cloudClients = useRemoteHost((s) => s.cloudClients);
+  const hostStats = useRemoteHost((s) => s.hostStats);
   // Keep the latest signaling URL from the backend without clobbering the user's
   // in-progress edit (only seed the draft once, when it's still empty).
   const seededSignal = useRef(false);
@@ -262,6 +273,12 @@ export default function RemotePage() {
             </motion.div>
           )}
 
+          {on && cloudOn && (
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mb-5">
+              <LiveSessionPanel stats={hostStats} connected={cloudClients > 0} />
+            </motion.div>
+          )}
+
           {on && (
             <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
               <Panel panelKey="remote.setup" className="p-5">
@@ -309,6 +326,108 @@ export default function RemotePage() {
         </>
       )}
     </Page>
+  );
+}
+
+const CONTENT_META = [
+  { label: "Auto", icon: Sparkles, hint: "Balanced" },
+  { label: "Text", icon: TypeIcon, hint: "Sharp · 4:4:4" },
+  { label: "Video", icon: Clapperboard, hint: "Smooth · fast scale" },
+] as const;
+
+/** Live telemetry for the active peer-to-peer session, streamed from the host. */
+function LiveSessionPanel({ stats, connected }: { stats: HostLiveStats | null; connected: boolean }) {
+  const cap = stats?.capture ?? null;
+  const cm = CONTENT_META[stats?.content ?? 0] ?? CONTENT_META[0];
+  const kbps = stats?.sendKbps ?? 0;
+  const bitrate = kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbps` : `${kbps} kbps`;
+  const frameKB = cap ? `${(cap.frameBytes / 1024).toFixed(0)} KB` : "—";
+  const cpuMs = cap ? cap.captureMs + cap.scaleMs + cap.encodeMs : 0;
+
+  // Plain-language read on where the pipeline is spending its time / where it's limited.
+  const health = (() => {
+    if (!connected || !stats) return { text: "Waiting for a phone to connect…", tone: "dim" as const };
+    if (!cap || !cap.running) return { text: "Link up — starting capture…", tone: "dim" as const };
+    if (cpuMs > 16 && stats.sendFps > 0 && stats.sendFps < cap.fps * 0.75) {
+      const worst = cap.encodeMs >= cap.scaleMs && cap.encodeMs >= cap.captureMs ? "encode" : cap.scaleMs >= cap.captureMs ? "downscale" : "capture";
+      return { text: `Host CPU-bound (${worst}). Lower resolution or sharpness on the phone.`, tone: "warn" as const };
+    }
+    if (stats.rttMs > 120) return { text: `High round-trip (${stats.rttMs} ms) — network latency dominates.`, tone: "warn" as const };
+    return { text: "Pipeline healthy — streaming smoothly.", tone: "ok" as const };
+  })();
+
+  return (
+    <Panel panelKey="remote.live" className="p-5">
+      <SectionTitle
+        title="Live session"
+        subtitle={connected ? "Real-time capture & link telemetry" : "Shows here once a phone connects"}
+        right={<Activity className="h-4 w-4" />}
+      />
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <span
+          className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-700"
+          style={{
+            background: connected ? "color-mix(in srgb, #34d399 18%, transparent)" : "rgba(255,255,255,0.05)",
+            color: connected ? "#34d399" : "var(--ink-dim)",
+          }}
+        >
+          <span className="h-2 w-2 rounded-full" style={{ background: connected ? "#34d399" : "#64748b", boxShadow: connected ? "0 0 8px #34d399" : undefined }} />
+          {connected ? "Peer connected" : "Idle"}
+        </span>
+        <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-white/[0.03] px-2.5 py-1 text-xs font-700 text-ink-soft">
+          <cm.icon className="h-3.5 w-3.5" /> {cm.label}
+          <span className="text-ink-faint">· {cm.hint}</span>
+        </span>
+        {cap && (
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-white/[0.03] px-2.5 py-1 text-xs font-700 text-ink-soft">
+            <Monitor className="h-3.5 w-3.5" /> {cap.nativeW}×{cap.nativeH} → {cap.outW}×{cap.outH}
+          </span>
+        )}
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-4">
+        <Metric icon={<Gauge className="h-4 w-4" />} label="Encoder fps" value={stats ? `${stats.sendFps}` : "—"} sub={cap ? `target ${cap.fps}` : undefined} />
+        <Metric
+          icon={<ArrowDownUp className="h-4 w-4" />}
+          label="Send bitrate"
+          value={stats ? bitrate : "—"}
+          sub={stats && stats.encoderMaxKbps > 0 ? `cap ${(stats.encoderMaxKbps / 1000).toFixed(1)} Mbps` : undefined}
+        />
+        <Metric icon={<Timer className="h-4 w-4" />} label="Round-trip" value={stats ? `${stats.rttMs} ms` : "—"} />
+        <Metric icon={<Cpu className="h-4 w-4" />} label="Host CPU / frame" value={cap ? `${cpuMs.toFixed(1)} ms` : "—"} sub={cap ? `cap ${cap.captureMs.toFixed(0)} · scl ${cap.scaleMs.toFixed(0)} · enc ${cap.encodeMs.toFixed(0)}` : undefined} />
+        <Metric icon={<Wifi className="h-4 w-4" />} label="Capture" value={cap ? `${cap.captureMs.toFixed(1)} ms` : "—"} />
+        <Metric icon={<Sparkles className="h-4 w-4" />} label="Downscale" value={cap ? `${cap.scaleMs.toFixed(1)} ms` : "—"} />
+        <Metric icon={<Activity className="h-4 w-4" />} label="Encode" value={cap ? `${cap.encodeMs.toFixed(1)} ms` : "—"} />
+        <Metric icon={<Radio className="h-4 w-4" />} label="Frame size" value={frameKB} />
+      </div>
+
+      <div
+        className="mt-4 rounded-xl px-3 py-2 text-xs font-600"
+        style={{
+          background:
+            health.tone === "warn"
+              ? "color-mix(in srgb, #f59e0b 12%, transparent)"
+              : health.tone === "ok"
+                ? "color-mix(in srgb, #34d399 10%, transparent)"
+                : "rgba(255,255,255,0.03)",
+          color: health.tone === "warn" ? "#f59e0b" : health.tone === "ok" ? "#34d399" : "var(--ink-dim)",
+        }}
+      >
+        {health.text}
+      </div>
+    </Panel>
+  );
+}
+
+function Metric({ icon, label, value, sub }: { icon: React.ReactNode; label: string; value: string; sub?: string }) {
+  return (
+    <div className="rounded-xl border border-line bg-white/[0.02] p-3">
+      <div className="flex items-center gap-1.5 text-[11px] font-600 uppercase tracking-wide text-ink-dim">
+        <span className="text-ink-soft">{icon}</span> {label}
+      </div>
+      <div className="mt-1 font-display text-xl font-800 tabular-nums text-ink">{value}</div>
+      {sub && <div className="mt-0.5 text-[10px] tabular-nums text-ink-faint">{sub}</div>}
+    </div>
   );
 }
 

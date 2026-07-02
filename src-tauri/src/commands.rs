@@ -1923,10 +1923,14 @@ pub fn remote_start_capture(
     });
 }
 
-/// Live-retune the streaming capture (resolution / fps / JPEG quality).
+/// Live-retune the streaming capture (resolution / fps / JPEG quality, and the
+/// optional content-optimization mode: 0 auto / 1 text / 2 video).
 #[tauri::command]
-pub fn remote_set_capture_quality(max_w: u32, fps: u32, quality: u32) {
+pub fn remote_set_capture_quality(max_w: u32, fps: u32, quality: u32, content: Option<u32>) {
     crate::remote::capture::set_capture_quality(max_w, fps, quality);
+    if let Some(c) = content {
+        crate::remote::capture::set_capture_content(c);
+    }
 }
 
 /// Stop the streaming screen capture (on disconnect / teardown).
@@ -1935,11 +1939,37 @@ pub fn remote_stop_capture() {
     crate::remote::capture::stop_capture();
 }
 
+/// Start desktop-audio (WASAPI loopback) capture for the WebRTC audio track. PCM
+/// float32 frames arrive as raw ArrayBuffers over the channel; returns the mix
+/// format (sample rate / channels) the webview must decode with, or null if audio
+/// capture is unavailable.
+#[tauri::command]
+pub fn remote_start_audio(
+    on_pcm: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> Option<crate::remote::audio::AudioFormat> {
+    crate::remote::audio::start_audio(move |pcm| {
+        let _ = on_pcm.send(tauri::ipc::InvokeResponseBody::Raw(pcm));
+    })
+}
+
+/// Stop desktop-audio capture (on disconnect / teardown).
+#[tauri::command]
+pub fn remote_stop_audio() {
+    crate::remote::audio::stop_audio();
+}
+
 /// True when the foreground app has a text field focused (blinking caret), so the
 /// phone can auto-open its keyboard the moment you click into a PC input.
 #[tauri::command]
 pub fn remote_textfield_active() -> bool {
     crate::remote::focus::foreground_text_field_active()
+}
+
+/// Latest host capture-pipeline telemetry (capture/scale/encode ms, produced fps,
+/// frame size, resolution), so the phone's debug HUD can pinpoint the bottleneck.
+#[tauri::command]
+pub fn remote_capture_stats() -> crate::remote::capture::CaptureStats {
+    crate::remote::capture::capture_stats()
 }
 
 /// List the PC's monitors so the phone can offer a display switcher.

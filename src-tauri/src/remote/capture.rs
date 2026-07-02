@@ -13,12 +13,155 @@
 //! both the capture loop and the input mapper.
 
 use base64::Engine as _;
+use fast_image_resize::images::{Image as FirImage, ImageRef};
+use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer};
+use jpeg_encoder::{ColorType as JpegColor, Encoder as JpegEnc, SamplingFactor};
+use parking_lot::{Condvar, Mutex as PlMutex};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xcap::image::codecs::jpeg::JpegEncoder;
-use xcap::image::{imageops, imageops::FilterType, DynamicImage, RgbImage};
+use xcap::image::{imageops, imageops::FilterType, RgbImage};
 use xcap::Monitor;
+
+// ---------------------------------------------------------------------------
+// Fast pixel helpers shared by every stream path.
+//
+// The old path used the `image` crate's `resize(Triangle)` + `JpegEncoder`, both
+// compiled for size — together ~150 ms/frame on a high-res monitor, which is why
+// the remote stream topped out at ~6 fps. These replace them with SIMD downscale
+// (`fast_image_resize`) and SIMD (AVX2) JPEG (`jpeg-encoder`), an order-of-magnitude
+// faster, so the WebRTC video track is fed at its real target rate.
+// ---------------------------------------------------------------------------
+
+/// Drop the alpha from a tightly-packed 4-byte-per-pixel buffer, yielding RGB.
+/// `swap_rb` converts BGRA (Desktop Duplication) → RGB; RGBA (xcap) passes false.
+fn u8x4_to_rgb(px4: &[u8], w: u32, h: u32, swap_rb: bool) -> Vec<u8> {
+    let n = (w as usize) * (h as usize);
+    let mut out = Vec::with_capacity(n * 3);
+    if swap_rb {
+        for px in px4.chunks_exact(4) {
+            out.push(px[2]);
+            out.push(px[1]);
+            out.push(px[0]);
+        }
+    } else {
+        for px in px4.chunks_exact(4) {
+            out.extend_from_slice(&px[0..3]);
+        }
+    }
+    out
+}
+
+/// Downscale a captured RGBA/BGRA frame to `max_w` (keeping aspect) and return
+/// packed RGB bytes + the output dimensions. `fast` picks nearest-neighbour (the
+/// big fps lever on a 4K downscale) over bilinear; H.264 + the phone screen hide
+/// the aliasing at the lower-quality presets. `swap_rb` handles BGRA sources.
+fn scale_u8x4_to_rgb(px4: &[u8], sw: u32, sh: u32, max_w: u32, fast: bool, swap_rb: bool) -> Option<(Vec<u8>, u32, u32)> {
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    if sw <= max_w {
+        return Some((u8x4_to_rgb(px4, sw, sh, swap_rb), sw, sh));
+    }
+    let dw = max_w;
+    let dh = (((sh as u64) * (dw as u64)) / (sw as u64)).max(1) as u32;
+    // Borrow the source (so the caller's buffer — e.g. the duplicator's reusable
+    // readback — isn't consumed); the resize is spread across cores via rayon.
+    let src = ImageRef::new(sw, sh, px4, PixelType::U8x4).ok()?;
+    let mut dst = FirImage::new(dw, dh, PixelType::U8x4);
+    let alg = if fast {
+        ResizeAlg::Nearest
+    } else {
+        ResizeAlg::Convolution(FirFilter::Bilinear)
+    };
+    let opts = ResizeOptions::new().resize_alg(alg);
+    Resizer::new().resize(&src, &mut dst, &opts).ok()?;
+    Some((u8x4_to_rgb(dst.buffer(), dw, dh, swap_rb), dw, dh))
+}
+
+/// Encode packed RGB to a JPEG via the SIMD encoder. `subsample_420` trades a
+/// little chroma sharpness for speed + size (fine for the video-track path, whose
+/// H.264 stage is 4:2:0 anyway); tile/LAN paths pass `false` for crisp text.
+fn encode_jpeg_rgb(rgb: &[u8], w: u32, h: u32, quality: u8, subsample_420: bool) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut enc = JpegEnc::new(&mut buf, quality);
+    enc.set_sampling_factor(if subsample_420 {
+        SamplingFactor::R_4_2_0
+    } else {
+        SamplingFactor::R_4_4_4
+    });
+    enc.encode(rgb, w as u16, h as u16, JpegColor::Rgb).ok()?;
+    Some(buf)
+}
+
+/// Encode a full RGB frame for the WebRTC video-track feed. At high resolutions a
+/// single-threaded JPEG encode becomes the bottleneck (and leaves cores idle), so
+/// large frames are split into horizontal **strips encoded in parallel** (rayon)
+/// and packed into a "GS" container the host webview composites onto its canvas.
+/// Strip heights are 16-aligned (the 4:2:0 MCU height) so seams fall on block
+/// boundaries. Small frames just return a plain single JPEG (magic `FF D8`).
+fn encode_frame(rgb: &[u8], w: u32, h: u32, quality: u8) -> Option<Vec<u8>> {
+    // Text mode keeps full 4:4:4 chroma so glyph edges survive the JPEG → H.264
+    // hand-off; auto/video use 4:2:0 (smaller + faster, and H.264 is 4:2:0 anyway).
+    let sub420 = CAP_CONTENT.load(Ordering::Relaxed) != CONTENT_TEXT;
+    let area = w as u64 * h as u64;
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // Only parallelize when it pays off: enough pixels and >1 core.
+    let strips = if area >= 1_300_000 && cores > 1 {
+        (cores.min(6) as u32).min(h / 16).max(1)
+    } else {
+        1
+    };
+    if strips <= 1 {
+        return encode_jpeg_rgb(rgb, w, h, quality, sub420);
+    }
+
+    // Split H into `strips` bands, each a multiple of 16 rows (last takes the rest).
+    let stride = (w * 3) as usize;
+    let band = ((h / strips) / 16).max(1) * 16;
+    let mut bands: Vec<(u32, u32)> = Vec::new();
+    let mut y = 0u32;
+    for _ in 0..strips {
+        if y >= h {
+            break;
+        }
+        let bh = band.min(h - y);
+        bands.push((y, bh));
+        y += bh;
+    }
+    if y < h {
+        // Give the remainder to the last band.
+        let last = bands.last_mut().unwrap();
+        last.1 = h - last.0;
+    }
+
+    let parts: Vec<Option<(u32, u32, Vec<u8>)>> = bands
+        .par_iter()
+        .map(|&(y0, bh)| {
+            let start = y0 as usize * stride;
+            let end = start + bh as usize * stride;
+            encode_jpeg_rgb(&rgb[start..end], w, bh, quality, sub420).map(|j| (y0, bh, j))
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(64 * 1024);
+    out.extend_from_slice(b"GS");
+    out.push(1);
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
+    out.push(bands.len() as u8);
+    for p in parts {
+        let (y0, bh, jpg) = p?;
+        out.extend_from_slice(&(y0 as u16).to_le_bytes());
+        out.extend_from_slice(&(bh as u16).to_le_bytes());
+        out.extend_from_slice(&(jpg.len() as u32).to_le_bytes());
+        out.extend_from_slice(&jpg);
+    }
+    Some(out)
+}
 
 /// Decode an image file, downscale to `max_w`, and return a small JPEG data URL.
 /// Used to ship cover art over the cloud data channel cheaply (tiny + fast).
@@ -103,16 +246,10 @@ pub fn monitor_bounds(index: usize) -> Option<(i32, i32, u32, u32)> {
 pub fn grab_primary_jpeg(max_w: u32, quality: u8) -> Option<Vec<u8>> {
     let mon = primary_monitor()?;
     let rgba = mon.capture_image().ok()?;
-    let mut dynimg = DynamicImage::ImageRgba8(rgba);
-    if dynimg.width() > max_w {
-        dynimg = dynimg.resize(max_w, u32::MAX, FilterType::Triangle);
-    }
-    let rgb = dynimg.to_rgb8();
-    let mut buf = Vec::new();
-    JpegEncoder::new_with_quality(&mut buf, quality)
-        .encode_image(&rgb)
-        .ok()?;
-    Some(buf)
+    let (sw, sh) = (rgba.width(), rgba.height());
+    let raw = rgba.into_raw();
+    let (rgb, w, h) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, false, false)?;
+    encode_jpeg_rgb(&rgb, w, h, quality, false)
 }
 
 /// Pixel size of the primary monitor.
@@ -161,12 +298,12 @@ impl TileEncoder {
     pub fn encode(&mut self, monitor: usize, max_w: u32, quality: u8, force_key: bool) -> Option<Vec<u8>> {
         let mon = monitor_at(monitor)?;
         let rgba = mon.capture_image().ok()?;
-        let mut dynimg = DynamicImage::ImageRgba8(rgba);
-        if dynimg.width() > max_w {
-            dynimg = dynimg.resize(max_w, u32::MAX, FilterType::Triangle);
-        }
-        let cur = dynimg.to_rgb8();
-        let (w, h) = (cur.width(), cur.height());
+        let (sw, sh) = (rgba.width(), rgba.height());
+        // SIMD downscale to packed RGB (bilinear keeps tiles crisp for the sharp
+        // LAN path), then wrap as an RgbImage for the tile diff/crop below.
+        let raw = rgba.into_raw();
+        let (rgb, w, h) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, false, false)?;
+        let cur = RgbImage::from_raw(w, h, rgb)?;
 
         let prev_ok = matches!(&self.prev, Some(p) if p.width() == w && p.height() == h);
         let keyframe = force_key || !prev_ok || monitor != self.last_monitor || self.frames_since_key >= KEY_INTERVAL;
@@ -205,10 +342,9 @@ impl TileEncoder {
         out.extend_from_slice(&(changed.len() as u16).to_le_bytes());
         for (x0, y0, tw, th) in &changed {
             let sub = imageops::crop_imm(&cur, *x0, *y0, *tw, *th).to_image();
-            let mut jpg = Vec::new();
-            if JpegEncoder::new_with_quality(&mut jpg, quality).encode_image(&sub).is_err() {
+            let Some(jpg) = encode_jpeg_rgb(sub.as_raw(), *tw, *th, quality, false) else {
                 continue;
-            }
+            };
             out.extend_from_slice(&(*x0 as u16).to_le_bytes());
             out.extend_from_slice(&(*y0 as u16).to_le_bytes());
             out.extend_from_slice(&(*tw as u16).to_le_bytes());
@@ -242,48 +378,115 @@ impl TileEncoder {
 static CAP_MAXW: AtomicU32 = AtomicU32::new(1600);
 static CAP_FPS: AtomicU32 = AtomicU32::new(30);
 static CAP_QUALITY: AtomicU32 = AtomicU32::new(70);
+/// Content-optimization mode driving downscale filter + JPEG chroma subsampling.
+/// 0 = auto (quality-driven), 1 = text (sharp + 4:4:4), 2 = video (fast + 4:2:0).
+static CAP_CONTENT: AtomicU32 = AtomicU32::new(0);
+pub const CONTENT_AUTO: u32 = 0;
+pub const CONTENT_TEXT: u32 = 1;
+pub const CONTENT_VIDEO: u32 = 2;
 static CAP_RUNNING: AtomicBool = AtomicBool::new(false);
 /// Bumped on every (re)start so a stale thread from a prior session exits.
 static CAP_GEN: AtomicU32 = AtomicU32::new(0);
 
+// Live per-frame telemetry (micros / bytes / dims), so the phone can show exactly
+// where the pipeline is spending time and whether the host or the network is the
+// bottleneck. Written by the capture/encode threads, read by `capture_stats`.
+static ST_CAP_US: AtomicU32 = AtomicU32::new(0);
+static ST_SCALE_US: AtomicU32 = AtomicU32::new(0);
+static ST_ENC_US: AtomicU32 = AtomicU32::new(0);
+static ST_BYTES: AtomicU32 = AtomicU32::new(0);
+static ST_NAT_W: AtomicU32 = AtomicU32::new(0);
+static ST_NAT_H: AtomicU32 = AtomicU32::new(0);
+static ST_OUT_W: AtomicU32 = AtomicU32::new(0);
+static ST_OUT_H: AtomicU32 = AtomicU32::new(0);
+/// Monotonic count of frames actually encoded+emitted; the phone diffs it over
+/// time to derive the true produced fps (independent of the target fps).
+static ST_PRODUCED: AtomicU32 = AtomicU32::new(0);
+
+/// A snapshot of the host capture pipeline, surfaced to the companion's debug HUD.
+#[derive(Serialize, Clone, Copy, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureStats {
+    pub capture_ms: f32,
+    pub scale_ms: f32,
+    pub encode_ms: f32,
+    pub frame_bytes: u32,
+    pub native_w: u32,
+    pub native_h: u32,
+    pub out_w: u32,
+    pub out_h: u32,
+    pub produced_frames: u32,
+    pub max_w: u32,
+    pub fps: u32,
+    pub quality: u32,
+    pub content: u32,
+    pub running: bool,
+}
+
+/// Read the latest host-side capture telemetry.
+pub fn capture_stats() -> CaptureStats {
+    CaptureStats {
+        capture_ms: ST_CAP_US.load(Ordering::Relaxed) as f32 / 1000.0,
+        scale_ms: ST_SCALE_US.load(Ordering::Relaxed) as f32 / 1000.0,
+        encode_ms: ST_ENC_US.load(Ordering::Relaxed) as f32 / 1000.0,
+        frame_bytes: ST_BYTES.load(Ordering::Relaxed),
+        native_w: ST_NAT_W.load(Ordering::Relaxed),
+        native_h: ST_NAT_H.load(Ordering::Relaxed),
+        out_w: ST_OUT_W.load(Ordering::Relaxed),
+        out_h: ST_OUT_H.load(Ordering::Relaxed),
+        produced_frames: ST_PRODUCED.load(Ordering::Relaxed),
+        max_w: CAP_MAXW.load(Ordering::Relaxed),
+        fps: CAP_FPS.load(Ordering::Relaxed),
+        quality: CAP_QUALITY.load(Ordering::Relaxed),
+        content: CAP_CONTENT.load(Ordering::Relaxed),
+        running: CAP_RUNNING.load(Ordering::Relaxed),
+    }
+}
+
 /// Live-tune the running capture stream (resolution / fps / JPEG quality).
 pub fn set_capture_quality(max_w: u32, fps: u32, quality: u32) {
     CAP_MAXW.store(max_w.clamp(320, 3840), Ordering::Relaxed);
-    CAP_FPS.store(fps.clamp(1, 60), Ordering::Relaxed);
+    CAP_FPS.store(fps.clamp(1, 120), Ordering::Relaxed);
     CAP_QUALITY.store(quality.clamp(20, 95), Ordering::Relaxed);
 }
 
-/// Stop the capture thread (if any).
+/// Set the content-optimization mode (0 auto / 1 text / 2 video). Affects the
+/// downscale filter (sharp vs fast) and JPEG chroma subsampling live.
+pub fn set_capture_content(mode: u32) {
+    CAP_CONTENT.store(mode.clamp(CONTENT_AUTO, CONTENT_VIDEO), Ordering::Relaxed);
+}
+
+/// Stop the capture threads (if any).
 pub fn stop_capture() {
     CAP_RUNNING.store(false, Ordering::SeqCst);
     CAP_GEN.fetch_add(1, Ordering::SeqCst);
 }
 
-/// Capture the selected monitor and downscale to `max_w`, returning an RGB image.
-/// `filter` trades speed for smoothness — `Nearest` is dramatically faster on a
-/// big downscale (only samples output pixels), which is the main fps lever on
-/// high-res / 4K monitors, so lower-quality presets use it.
-fn capture_rgb(monitor: usize, max_w: u32, filter: FilterType) -> Option<RgbImage> {
-    let mon = monitor_at(monitor)?;
-    let rgba = mon.capture_image().ok()?;
-    let mut dynimg = DynamicImage::ImageRgba8(rgba);
-    if dynimg.width() > max_w {
-        dynimg = dynimg.resize(max_w, u32::MAX, filter);
-    }
-    Some(dynimg.to_rgb8())
+/// One captured + downscaled frame handed from the capture thread to the encoder
+/// thread through a single-slot mailbox (latest-wins, so a slow encoder never
+/// backs up latency — it just skips stale frames).
+struct RawFrame {
+    /// Shared so the capture thread can also retain it for keep-alive without a
+    /// full-frame copy (a 4K frame is ~25 MB — cloning it every frame was pure
+    /// memory-bandwidth waste). The encoder only reads it.
+    rgb: Arc<Vec<u8>>,
+    w: u32,
+    h: u32,
+    nat_w: u32,
+    nat_h: u32,
+    cap_us: u32,
+    scale_us: u32,
+    /// True when this frame carries genuinely new pixels (a fresh capture), false
+    /// for a keep-alive re-send. Lets the encoder skip the whole-frame diff.
+    changed: bool,
 }
 
-fn encode_rgb(img: &RgbImage, quality: u8) -> Option<Vec<u8>> {
-    let mut buf = Vec::with_capacity(128 * 1024);
-    JpegEncoder::new_with_quality(&mut buf, quality)
-        .encode_image(img)
-        .ok()?;
-    Some(buf)
-}
-
-/// Start the streaming capture loop. `emit` is called with a full-frame JPEG for
-/// every changed frame plus a periodic keep-alive; it runs until `stop_capture`.
-/// Any existing loop is superseded (generation bump), so it's safe to call again.
+/// Start the streaming capture **pipeline**. Two threads run so capture(frame N+1)
+/// overlaps encode+emit(frame N) — roughly doubling throughput vs the old
+/// single-threaded loop. The capture thread grabs + SIMD-downscales; the encoder
+/// thread change-detects + SIMD-JPEG-encodes and calls `emit` with a full-frame
+/// JPEG for every changed frame plus a ~1s keep-alive. Runs until `stop_capture`;
+/// any existing pipeline is superseded (generation bump), so it's safe to re-call.
 pub fn start_capture<F>(max_w: u32, fps: u32, quality: u32, emit: F)
 where
     F: Fn(Vec<u8>) + Send + 'static,
@@ -291,51 +494,214 @@ where
     set_capture_quality(max_w, fps, quality);
     let my_gen = CAP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     CAP_RUNNING.store(true, Ordering::SeqCst);
+    ST_PRODUCED.store(0, Ordering::Relaxed);
 
+    // Single-slot mailbox: (latest frame, condvar to wake the encoder).
+    let mailbox: Arc<(PlMutex<Option<RawFrame>>, Condvar)> =
+        Arc::new((PlMutex::new(None), Condvar::new()));
+
+    // ---- capture thread: grab (persistent DXGI Desktop Duplication on Windows,
+    // xcap/GDI fallback) + SIMD downscale, as fast as the target fps allows ----
+    let cap_mail = mailbox.clone();
     std::thread::spawn(move || {
-        let mut prev: Option<Vec<u8>> = None; // previous raw RGB bytes, for change-detect
-        let mut last_emit = Instant::now() - Duration::from_secs(2);
-        while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
-            let frame_start = Instant::now();
-            let max_w = CAP_MAXW.load(Ordering::Relaxed);
-            let quality = CAP_QUALITY.load(Ordering::Relaxed) as u8;
-            let fps = CAP_FPS.load(Ordering::Relaxed).max(1);
-            // Fast nearest-neighbour downscale below the "sharp" threshold — the big
-            // fps win on high-res monitors; H.264 + the phone screen hide the aliasing.
-            let filter = if quality >= 65 { FilterType::Triangle } else { FilterType::Nearest };
+        #[cfg(windows)]
+        let mut dup: Option<super::dxdupe::Duplicator> = None;
+        let mut cur_mon = usize::MAX;
+        // Last successfully scaled frame (shared), re-sent on idle so the encoder's
+        // ~1s keep-alive still fires for a freshly attached decoder.
+        let mut last: Option<(Arc<Vec<u8>>, u32, u32, u32, u32)> = None;
+        let mut last_push = Instant::now() - Duration::from_secs(2);
 
-            match capture_rgb(selected_monitor(), max_w, filter) {
-                Some(cur) => {
-                    let raw = cur.as_raw();
-                    let changed = prev.as_deref().map_or(true, |p| p != raw.as_slice());
-                    // Keep-alive re-emit so a late/reconnecting decoder always paints.
-                    let stale = last_emit.elapsed() >= Duration::from_millis(1000);
-                    if changed || stale {
-                        if let Some(jpg) = encode_rgb(&cur, quality) {
-                            emit(jpg);
-                            last_emit = Instant::now();
+        while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
+            let max_w = CAP_MAXW.load(Ordering::Relaxed);
+            let quality = CAP_QUALITY.load(Ordering::Relaxed);
+            let fps = CAP_FPS.load(Ordering::Relaxed).max(1);
+            // Downscale filter: text always sharp, video always fast (fps lever on a
+            // 4K downscale), auto keys off quality.
+            let fast = match CAP_CONTENT.load(Ordering::Relaxed) {
+                CONTENT_TEXT => false,
+                CONTENT_VIDEO => true,
+                _ => quality < 65,
+            };
+            let budget_ms = (1000 / fps).clamp(1, 1000);
+            let sel = selected_monitor();
+
+            let cap0 = Instant::now();
+            // Capture + downscale one frame → packed RGB. Tuple layout:
+            // (rgb, out_w, out_h, native_w, native_h, scale_us, from_dd). `from_dd` =
+            // came from Desktop Duplication (always a genuine change) vs the xcap
+            // fallback (which still needs a diff for the static-screen skip).
+            let mut scaled: Option<(Vec<u8>, u32, u32, u32, u32, u32, bool)> = None;
+            let mut timed_out = false;
+            let mut cap_us = 0u32;
+
+            #[cfg(windows)]
+            {
+                if dup.is_none() || cur_mon != sel {
+                    let (tx, ty) = monitor_bounds(sel).map(|(x, y, _, _)| (x, y)).unwrap_or((0, 0));
+                    dup = super::dxdupe::Duplicator::new_for(tx, ty);
+                    cur_mon = sel;
+                }
+                if let Some(d) = dup.as_mut() {
+                    // Grab downscales on the GPU toward max_w; time it on its own so
+                    // capture vs scale telemetry stays honest.
+                    let g0 = Instant::now();
+                    let grab = d.grab(budget_ms, max_w);
+                    cap_us = g0.elapsed().as_micros() as u32;
+                    match grab {
+                        super::dxdupe::Grab::Frame { w: gw, h: gh, native_w, native_h } => {
+                            let s0 = Instant::now();
+                            // BGRA source (already GPU-downscaled to ~max_w); the CPU
+                            // resize just trims to the exact target across all cores.
+                            if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(d.buffer(), gw, gh, max_w, fast, true) {
+                                scaled = Some((rgb, ow, oh, native_w, native_h, s0.elapsed().as_micros() as u32, true));
+                            }
                         }
-                        if changed {
-                            prev = Some(raw.clone());
-                        }
+                        super::dxdupe::Grab::Timeout => timed_out = true,
+                        super::dxdupe::Grab::Lost => dup = None,
+                    }
+                } else if let Some(rgba) = monitor_at(sel).and_then(|m| m.capture_image().ok()) {
+                    cap_us = cap0.elapsed().as_micros() as u32;
+                    let (sw, sh) = (rgba.width(), rgba.height());
+                    let raw = rgba.into_raw();
+                    let s0 = Instant::now();
+                    if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, fast, false) {
+                        scaled = Some((rgb, ow, oh, sw, sh, s0.elapsed().as_micros() as u32, false));
                     }
                 }
-                None => {
-                    // Capture transiently unavailable (mode change / secure desktop).
-                    // Don't die — back off briefly and retry; force a fresh frame next.
-                    prev = None;
-                    std::thread::sleep(Duration::from_millis(120));
-                    continue;
+            }
+            #[cfg(not(windows))]
+            {
+                cur_mon = sel;
+                if let Some(rgba) = monitor_at(sel).and_then(|m| m.capture_image().ok()) {
+                    cap_us = cap0.elapsed().as_micros() as u32;
+                    let (sw, sh) = (rgba.width(), rgba.height());
+                    let raw = rgba.into_raw();
+                    let s0 = Instant::now();
+                    if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, fast, false) {
+                        scaled = Some((rgb, ow, oh, sw, sh, s0.elapsed().as_micros() as u32, false));
+                    }
                 }
             }
 
-            let target = Duration::from_millis(1000 / fps as u64);
-            let elapsed = frame_start.elapsed();
-            if elapsed < target {
-                std::thread::sleep(target - elapsed);
+            if let Some((rgb, w, h, nat_w, nat_h, scale_us, from_dd)) = scaled {
+                // DD only ever yields changed frames; the xcap fallback diffs the
+                // scaled result against the previous to preserve the static skip.
+                let changed = from_dd
+                    || last.as_ref().map_or(true, |(prev, pw, ph, _, _)| {
+                        *pw != w || *ph != h || prev.as_slice() != rgb.as_slice()
+                    });
+                let rgb = Arc::new(rgb);
+                {
+                    let (lock, cv) = &*cap_mail;
+                    let mut slot = lock.lock();
+                    // If an as-yet-unconsumed frame was already "changed", carry that
+                    // forward so coalescing can never swallow a real update.
+                    let carried = slot.as_ref().map_or(false, |f| f.changed);
+                    *slot = Some(RawFrame {
+                        rgb: rgb.clone(),
+                        w,
+                        h,
+                        nat_w,
+                        nat_h,
+                        cap_us,
+                        scale_us,
+                        changed: changed || carried,
+                    });
+                    cv.notify_one();
+                }
+                last = Some((rgb, w, h, nat_w, nat_h));
+                last_push = Instant::now();
+
+                // Pace to target fps. Desktop Duplication already blocked up to the
+                // budget waiting for a change, so only the xcap path really sleeps.
+                let elapsed = cap0.elapsed();
+                let target = Duration::from_millis(budget_ms as u64);
+                if elapsed < target {
+                    std::thread::sleep(target - elapsed);
+                }
+            } else {
+                // No new frame. Re-send the last one occasionally for keep-alive.
+                if let Some((rgb, w, h, sw, sh)) = &last {
+                    if last_push.elapsed() >= Duration::from_millis(700) {
+                        let (lock, cv) = &*cap_mail;
+                        let mut slot = lock.lock();
+                        let carried = slot.as_ref().map_or(false, |f| f.changed);
+                        *slot = Some(RawFrame {
+                            rgb: rgb.clone(),
+                            w: *w,
+                            h: *h,
+                            nat_w: *sw,
+                            nat_h: *sh,
+                            cap_us,
+                            scale_us: 0,
+                            changed: carried,
+                        });
+                        cv.notify_one();
+                        last_push = Instant::now();
+                    }
+                }
+                // DD already waited `budget_ms`; only back off when it didn't block.
+                if !timed_out {
+                    std::thread::sleep(Duration::from_millis(budget_ms.min(60) as u64));
+                }
+            }
+        }
+        // Wake the encoder so it re-checks the run flag and exits.
+        mailbox_wake(&cap_mail);
+    });
+
+    // ---- encoder thread: change-detect + SIMD JPEG + emit ----
+    let enc_mail = mailbox;
+    std::thread::spawn(move || {
+        let mut last_emit = Instant::now() - Duration::from_secs(2);
+        while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
+            let frame = {
+                let (lock, cv) = &*enc_mail;
+                let mut slot = lock.lock();
+                loop {
+                    if !CAP_RUNNING.load(Ordering::SeqCst) || CAP_GEN.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
+                    if let Some(f) = slot.take() {
+                        break f;
+                    }
+                    cv.wait_for(&mut slot, Duration::from_millis(200));
+                }
+            };
+
+            let quality = CAP_QUALITY.load(Ordering::Relaxed) as u8;
+            let stale = last_emit.elapsed() >= Duration::from_millis(1000);
+
+            // Record capture/scale/dims every frame so the HUD stays live even on a
+            // static screen (where we skip the encode).
+            ST_CAP_US.store(frame.cap_us, Ordering::Relaxed);
+            ST_SCALE_US.store(frame.scale_us, Ordering::Relaxed);
+            ST_NAT_W.store(frame.nat_w, Ordering::Relaxed);
+            ST_NAT_H.store(frame.nat_h, Ordering::Relaxed);
+            ST_OUT_W.store(frame.w, Ordering::Relaxed);
+            ST_OUT_H.store(frame.h, Ordering::Relaxed);
+
+            // The capture side already told us whether the pixels changed, so there's
+            // no whole-frame diff here (a 4K memcmp per frame was pure overhead).
+            if frame.changed || stale {
+                let enc0 = Instant::now();
+                if let Some(jpg) = encode_frame(&frame.rgb, frame.w, frame.h, quality) {
+                    ST_ENC_US.store(enc0.elapsed().as_micros() as u32, Ordering::Relaxed);
+                    ST_BYTES.store(jpg.len() as u32, Ordering::Relaxed);
+                    ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
+                    emit(jpg);
+                    last_emit = Instant::now();
+                }
             }
         }
     });
+}
+
+/// Nudge the encoder thread's condvar (used on capture-thread exit).
+fn mailbox_wake(mail: &Arc<(PlMutex<Option<RawFrame>>, Condvar)>) {
+    let (_lock, cv) = &**mail;
+    cv.notify_all();
 }
 
 /// True if any pixel in the tile region changed between `prev` and `cur`

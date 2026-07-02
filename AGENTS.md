@@ -426,10 +426,68 @@ transports share one UI; the whole feature is gated behind the **`remote_enabled
 embedded **axum** HTTP+WS server on **port 47800** (`remote_port`), bound `0.0.0.0`, permissive
 CORS. Pairing: a 6-digit **PIN** (shown on `/remote`) → `POST /pair` returns a bearer token; every
 `/api/*` needs it. WS channels carry the token as a `?token=` query (browsers can't set WS headers).
-Endpoints reuse the exact `db::*` functions via `spawn_blocking`. `/screen` streams JPEG frames
-(**xcap** capture, ≤1280px, ~12fps); `/control` injects mouse/keyboard (**enigo**, on its own OS
-thread since `Enigo` isn't `Send`); `/media?path=<abs>` serves artwork (path-checked under
-`media_dir`). `best_host_ip()` prefers a Tailscale 100.64/10 address, else LAN.
+Endpoints reuse the exact `db::*` functions via `spawn_blocking`. `/screen` streams delta JPEG tiles
+(**xcap** capture); `/control` injects mouse/keyboard (**enigo**, on its own OS thread since `Enigo`
+isn't `Send`); `/media?path=<abs>` serves artwork (path-checked under `media_dir`). `best_host_ip()`
+prefers a Tailscale 100.64/10 address, else LAN.
+
+**Screen-capture pipeline (`capture.rs` + `dxdupe.rs`) — the fps-critical path.** The companion always
+uses the WebRTC video-track path (below), so the host frame rate is capped by how fast Rust can
+produce JPEGs to feed `canvas.captureStream()`. `start_capture` runs a **two-thread pipeline**: a
+capture thread hands frames to an encoder thread through a single-slot latest-wins mailbox, so
+capture(N+1) overlaps encode(N).
+- **Capture = persistent DXGI Desktop Duplication (`dxdupe.rs`, Windows).** The old `xcap` path used
+  GDI `BitBlt`+`GetDIBits`, which copies the **whole native framebuffer every frame** (fixed,
+  single-threaded, memory-bandwidth-bound → capture was the flat bottleneck at every resolution with
+  no core saturated). Desktop Duplication keeps a GPU capture session that only yields **changed**
+  frames (cursor-only updates skipped) via a fast staging-texture DMA. Falls back to xcap/GDI if
+  duplication init fails (exclusive-fullscreen game, driver quirk). Output is BGRA (`swap_rb`).
+- **Downscale = SIMD** (`fast_image_resize`); **encode = SIMD/AVX2 JPEG** (`jpeg-encoder`). Large
+  frames are split into **16-aligned horizontal strips encoded in parallel** (`rayon`, `encode_frame`)
+  and packed into a "GS" container the host webview composites (see `rtcHost.ts buildVideoTrack`), so
+  high-res encode uses all cores instead of one. Hot image crates build at `opt-level=3` (per-package
+  profiles in `Cargo.toml`), not the app-wide `opt-level="s"`.
+- `remote_capture_stats` exposes per-frame telemetry (capture/scale/encode ms, produced fps, frame
+  bytes, native/out res) for the phone's debug HUD. **Do not revert to xcap/GDI full-frame capture or
+  a single-threaded resize** — that reintroduces the low frame rate.
+- **Zero-copy hot path (v3.2.7):** the capture→encoder mailbox carries `Arc<Vec<u8>>`, not a fresh
+  `Vec` per frame — the old `rgb.clone()` (a ~25 MB memcpy per 4K frame) is gone. Change detection
+  also moved off the encoder: DXGI only ever yields changed frames, so the capture thread sets a
+  `changed` flag (Desktop Duplication → always true; xcap fallback → cheap slice compare) and the
+  encoder trusts it instead of running a whole-frame memcmp. The mailbox **carries `changed` forward
+  on coalescing** so a real update is never swallowed by a later keep-alive. **Don't re-add the
+  per-frame clone or the encoder-side full-frame diff.**
+- **GPU downscale + parallel resize (v3.2.7, capture/scale pass):** once encode got fast, capture then
+  scale were the tall poles. `dxdupe::grab(timeout, max_w)` now downscales **on the GPU** via
+  `GenerateMips`: it copies the frame into a full mip-chain texture (`BIND_RENDER_TARGET |
+  BIND_SHADER_RESOURCE | MISC_GENERATE_MIPS`), generates mips, and reads back only the smallest mip
+  level still ≥ `max_w` — so the CPU readback and the SIMD resize work on a ~2×-target image instead
+  of full 4K, and the scaling load moves to the GPU. Guarded by a one-time `CheckFormatSupport`
+  (`MIP_AUTOGEN`); if unsupported it falls back to a full-res readback (never a black frame). The
+  staging readback **reuses one buffer** (`self.readback`) with a single bulk memcpy when the row
+  pitch is tight (no 33 MB alloc+zero per frame), and `grab` returns the readback via `buffer()`
+  (borrowed — `scale_u8x4_to_rgb` takes `&[u8]`, doesn't consume it). The remaining CPU resize is
+  **multi-threaded** via `fast_image_resize`'s `rayon` feature (was single-threaded, left cores idle).
+  **Don't remove the mip downscale, the buffer reuse, or the rayon feature.**
+- **Cursor injection uses `SendInput`, not `SetCursorPos` (`input.rs::move_abs`).** `SetCursorPos` only
+  teleports the pointer, so the shell never starts its hover timer → taskbar thumbnail previews (Aero
+  Peek) never appear under the remote cursor. `SendInput` with `MOUSEEVENTF_MOVE|ABSOLUTE|VIRTUALDESK`
+  injects a real move into the input queue (like AnyDesk), so hover/preview works; multi-monitor is
+  preserved by normalizing to the virtual-desktop 0..65535 range. **Don't revert to `SetCursorPos`.**
+- **Content-optimization mode** (`CAP_CONTENT`, `remote_set_capture_quality(..., content)`; 0 auto /
+  1 text / 2 video): text keeps 4:4:4 chroma + a sharp bilinear downscale for crisp glyphs; video
+  uses 4:2:0 + a fast nearest downscale (the 4K-downscale fps lever); auto keys the filter off
+  quality. The phone's Quality dock picks it; the host also maps it to the video track's
+  `contentHint` (detail/motion) and `degradationPreference` (maintain-resolution/-framerate). The
+  guest shrinks its receiver `jitterBufferTarget`/`playoutDelayHint` (~40 ms) to cut decode latency
+  — **not 0** (stutters at high res). The desktop Remote page's **Live session** panel shows the host
+  capture + link telemetry (send bitrate/fps, RTT, per-stage ms) via `startHost({onStats})`.
+
+**Desktop audio (`audio.rs`).** WASAPI **loopback** capture of the default render endpoint → float32
+PCM over a Tauri channel → host webview WebAudio (`buildAudioTrack` in `rtcHost.ts`: jitter buffer →
+`ScriptProcessor` → `MediaStreamAudioDestinationNode`) → a WebRTC **audio track** added to the same
+stream as the video. `remote_start_audio`/`remote_stop_audio`. The phone starts **muted** (mobile
+browsers only start audio from a user gesture) — a speaker toggle in Control unmutes the video track.
 
 **Two ways the phone connects:**
 1. **Same network** — phone enters the LAN/Tailscale address + PIN; talks straight to the server
@@ -438,10 +496,16 @@ thread since `Enigo` isn't `Send`); `/media?path=<abs>` serves artwork (path-che
    axum crate, port 8080) brokers only the SDP/ICE handshake; screen + control then flow **directly
    peer-to-peer** (never through signaling). Desktop is the **host** (`src/lib/rtcHost.ts`), phone is
    the **guest** (`src/companion/cloud.ts`), shared helpers in `src/lib/rtc.ts`. Both peers use the
-   browser-native `RTCPeerConnection` — **no native webrtc crate**. Data channels: `screen`
-   (host→guest base64 JPEG), `control` (guest→host input), `data` (id-correlated stats req/resp).
-   Backend state adds `cloud_enabled`/`code` (8-char room id, `remote_regen_code`); the host grabs
-   frames via `remote_grab_frame` and injects via `remote_inject` (see `commands.rs`).
+   browser-native `RTCPeerConnection` — **no native webrtc crate**. The screen rides a real **WebRTC
+   video track** (hardware H.264/VP9): the host feeds Rust JPEGs (`remote_start_capture`) into a canvas
+   → `captureStream()`; the `screen` data channel base64 JPEG is a legacy fallback. `control`
+   (guest→host input), `data` (id-correlated stats req/resp **plus** unsolicited host events —
+   `focus` for auto-keyboard, `capstats` for the debug HUD). Backend state adds `cloud_enabled`/`code`
+   (8-char room id, `remote_regen_code`); the host injects via `remote_inject` (see `commands.rs`).
+   **Auto-keyboard:** the host polls `remote_textfield_active` (Win32 caret heuristic, `focus.rs`) and
+   pushes `focus` events (with an extra rapid re-check right after each click, `pokeFocus` in
+   `rtcHost.ts`); the phone focuses its hidden input. Mobile browsers only raise the soft keyboard
+   from a user gesture, so a "Tap to type on PC" prompt is the guaranteed fallback.
 
 **Self-hosting the signaling server (the current setup): Cloudflare Tunnel.** The signaling server
 runs on this PC (`npm run signal:serve` → `signaling/serve.ps1`, builds+runs on `localhost:8080`)

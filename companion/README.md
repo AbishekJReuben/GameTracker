@@ -23,6 +23,13 @@ The **Control** tab is a full remote-desktop surface (see `src/companion/screens
   feeds `canvas.captureStream()` into the peer connection, so the browser hardware-encodes
   H.264/VP9 with inter-frame compression + adaptive bitrate; the phone renders a plain,
   hardware-decoded `<video>`. Pinch-to-zoom and pan (edge-clamped so no empty space shows).
+  The desktop side captures via **persistent DXGI Desktop Duplication** (GPU, only delivers changed
+  frames) and runs a **two-thread SIMD pipeline** (fast downscale + AVX2 JPEG, high-res frames split
+  into strips encoded across all cores, capture overlapping encode) so it feeds the video track at a
+  high frame rate instead of the old ~6 fps GDI-grab-every-frame loop.
+- **Desktop audio**: the PC's sound is captured (WASAPI loopback) and sent as a WebRTC audio track in
+  sync with the screen. It starts **muted** (phones only start audio on a tap) — hit the speaker
+  button in the top bar to hear your PC.
 - **Fullscreen app**: the Android shell hides the system bars (immersive; swipe to reveal) and
   the in-app toolbars are collapsible, so the stream uses the whole screen.
 - **Two pointer modes**: **Trackpad** (relative on-screen cursor; tap = click, double-tap-drag =
@@ -35,8 +42,10 @@ The **Control** tab is a full remote-desktop surface (see `src/companion/screens
     use the dock's Enter key for a deliberate PC Enter.
   - **Buffered** — type on the phone, then Android Enter sends the whole line at once (again, no
     PC Enter). Good on flaky links / to avoid accidental submits.
-  - The keyboard **auto-opens once** when a text field gains focus on the PC (a "Typing on PC"
-    chip shows), and there's an always-visible floating keyboard button.
+  - The keyboard **auto-opens** when a text field gains focus on the PC (best-effort — mobile
+    browsers only raise the soft keyboard from a user gesture, so a prominent **"Tap to type on
+    PC"** prompt + a tappable "Typing on PC" chip guarantee one-tap access), plus an always-visible
+    floating keyboard button.
 - **Buttons & keys**: left/right/middle click, drag-lock, pointer speed, scroll; Esc/Tab/Enter/
   Backspace/Del, arrow cluster, **sticky modifiers** (Ctrl/Alt/Shift/Win), F1–F12, media/volume.
 - **Shortcut macros**: Alt+Tab, Win, Show desktop, Task Manager, Alt+F4, Explorer, Copy/Paste/
@@ -44,9 +53,12 @@ The **Control** tab is a full remote-desktop surface (see `src/companion/screens
 - **Navigation**: a quick tab switcher (Stats / Library / Music) is reachable right from Control.
 - **Adjustable quality** — live presets *Fluid* (720p/60fps) · *Smooth* (900p/40fps) · *Balanced*
   · *HD* · *Ultra* · *Max 4K*, or custom resolution / sharpness / frame-rate; the desktop capture
-  retunes and the encoder bitrate/framerate ceiling is set on the fly. Optional fps/res overlay
-  and a one-tap frame screenshot. (Lower-sharpness presets use a fast nearest-neighbour downscale
-  — the main fps lever on high-res/4K monitors.)
+  retunes and the encoder bitrate/framerate ceiling is set on the fly. A one-tap frame screenshot,
+  and a **debug stats HUD** (enable in the Quality tab) that shows phone display fps, decode fps +
+  bitrate + jitter + loss + dropped/frozen frames (WebRTC `getStats`), and host produce fps +
+  capture/scale/encode ms + frame size + resolution — with a plain-language bottleneck guess
+  (host CPU vs network/decoder). (Lower-sharpness presets use a fast nearest-neighbour downscale —
+  the main fps lever on high-res/4K monitors.)
 
 ## Prerequisites (one-time, on your PC)
 

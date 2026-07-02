@@ -19,8 +19,23 @@ type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 type Status = RTCPeerConnectionState | "error";
 type HostEvent = { event: string; [k: string]: unknown };
 
+/** Decode-side WebRTC video telemetry, sampled from `RTCPeerConnection.getStats`. */
+export type RtcInboundVideoStats = {
+  framesPerSecond: number;
+  framesDecoded: number;
+  framesDropped: number;
+  bytesReceived: number;
+  frameWidth: number;
+  frameHeight: number;
+  jitter: number;
+  packetsLost: number;
+  freezeCount: number;
+  at: number;
+};
+
 const HEARTBEAT_MS = 5000; // ping cadence
 const HEARTBEAT_DEAD_MS = 13000; // no pong within this → treat link as dead
+const OFFER_TIMEOUT_MS = 8000; // joined the room but no offer arrived → rejoin
 const BACKOFF_MIN = 1500;
 const BACKOFF_MAX = 30000;
 
@@ -45,8 +60,27 @@ export class CloudConn {
   private backoff = BACKOFF_MIN;
   private hbTimer: number | null = null;
   private lastPong = 0;
+  private offerTimer: number | null = null;
 
-  constructor(private signalUrl: string, private code: string, private iceServers?: IceServer[]) {}
+  constructor(private signalUrl: string, private code: string, private iceServers?: IceServer[]) {
+    // Android throttles/suspends timers while the app is backgrounded, so on
+    // resume `lastPong` looks ancient and the heartbeat would declare a healthy
+    // link dead and force a visible reconnect. Give the link a fresh window and
+    // probe it immediately instead.
+    document.addEventListener("visibilitychange", this.onVisibility);
+  }
+
+  private onVisibility = () => {
+    if (document.visibilityState !== "visible" || this.closed) return;
+    this.lastPong = Date.now();
+    if (this.chData?.readyState === "open") {
+      try {
+        this.chData.send(JSON.stringify({ ping: Date.now() }));
+      } catch {
+        /* ignore */
+      }
+    }
+  };
 
   /** True once the peer link has been established at least one time. */
   get established(): boolean {
@@ -78,6 +112,7 @@ export class CloudConn {
   private async openSignaling(throwOnFail: boolean): Promise<void> {
     if (this.closed) return;
     this.stopHeartbeat();
+    this.clearOfferTimeout();
     this.pc?.close();
     this.pc = null;
     this.sig?.close();
@@ -94,8 +129,14 @@ export class CloudConn {
           /* ignore */
         }
       } else if (m.type === "peer-left") {
-        this.emit("disconnected");
-        this.scheduleReconnect();
+        // The host's *signaling* socket closed — not the P2P session. While the
+        // peer link is healthy, keep streaming; tearing down here caused visible
+        // "reconnecting" flaps every time the idle socket died on the way to the
+        // signaling server. A truly dead session is caught by the heartbeat.
+        if (!this.connectedViaPeer()) {
+          this.emit("disconnected");
+          this.scheduleReconnect();
+        }
       } else if (m.type === "room-full") this.emit("error");
     });
     sig.onClose(() => {
@@ -104,10 +145,28 @@ export class CloudConn {
 
     try {
       await sig.connect();
-      // Our join makes the host emit its offer; we answer in onOffer().
+      // Our join makes the host emit its offer; we answer in onOffer(). If the
+      // host never sends one (e.g. it thinks a previous session is still live),
+      // don't hang forever — rejoin, which makes the host re-announce us.
+      this.armOfferTimeout();
     } catch (e) {
       if (throwOnFail && !this.connectedOnce) throw e;
       this.scheduleReconnect();
+    }
+  }
+
+  private armOfferTimeout() {
+    this.clearOfferTimeout();
+    this.offerTimer = window.setTimeout(() => {
+      this.offerTimer = null;
+      if (!this.closed && !this.connectedViaPeer()) this.scheduleReconnect();
+    }, OFFER_TIMEOUT_MS);
+  }
+
+  private clearOfferTimeout() {
+    if (this.offerTimer !== null) {
+      window.clearTimeout(this.offerTimer);
+      this.offerTimer = null;
     }
   }
 
@@ -133,20 +192,46 @@ export class CloudConn {
   }
 
   private async onOffer(sdp: string) {
-    this.pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers) });
-    pipeIce(this.pc, this.sig!);
-    this.pc.onconnectionstatechange = () => this.pc && this.emit(this.pc.connectionState);
+    this.clearOfferTimeout();
+    this.pc?.close(); // a fresh offer supersedes any prior/wedged session
+    this.stream = null; // new session → new tracks; don't accumulate dead ones
+    const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers) });
+    this.pc = pc;
+    pipeIce(pc, this.sig!);
+    // Guard every handler against firing for a superseded connection.
+    pc.onconnectionstatechange = () => this.pc === pc && this.emit(pc.connectionState);
     // ICE can wedge without a connectionState change; nudge a reconnect on failure.
-    this.pc.oniceconnectionstatechange = () => {
-      const st = this.pc?.iceConnectionState;
-      if (st === "failed" && !this.closed) this.scheduleReconnect();
+    pc.oniceconnectionstatechange = () => {
+      if (this.pc === pc && pc.iceConnectionState === "failed" && !this.closed) this.scheduleReconnect();
     };
-    // The screen now arrives as a real media track (hardware-decoded video).
+    // The screen now arrives as a real media track (hardware-decoded video). The
+    // host sends video and audio in separate streams (so the receiver never
+    // delays video to lip-sync with the audio jitter buffer); merge the tracks
+    // into one local stream for the single <video> element.
     this.pc.ontrack = (e) => {
-      this.stream = e.streams[0] ?? new MediaStream([e.track]);
+      if (this.pc !== pc) return;
+      if (!this.stream) this.stream = new MediaStream();
+      this.stream.addTrack(e.track);
+      // Shrink the receiver jitter buffer: screen control wants minimal latency, so
+      // trade a little jitter resilience for responsiveness. Not 0 (that stutters at
+      // high resolution) — a small target keeps the decoder from buffering ahead.
+      if (e.track.kind === "video") {
+        const rx = e.receiver as unknown as { jitterBufferTarget?: number; playoutDelayHint?: number };
+        try {
+          rx.jitterBufferTarget = 20; // ms (modern Chromium)
+        } catch {
+          /* unsupported */
+        }
+        try {
+          rx.playoutDelayHint = 0.02; // seconds (legacy fallback name)
+        } catch {
+          /* unsupported */
+        }
+      }
       this.streamCb?.(this.stream);
     };
     this.pc.ondatachannel = (e) => {
+      if (this.pc !== pc) return; // superseded before channels arrived
       const ch = e.channel;
       if (ch.label === "screen") {
         this.chScreen = ch;
@@ -171,7 +256,15 @@ export class CloudConn {
     this.lastPong = Date.now();
     this.hbTimer = window.setInterval(() => {
       if (this.closed) return;
+      // Backgrounded: timers are throttled and pongs may sit unprocessed, so a
+      // stale lastPong proves nothing. Skip the dead-check (and keep the window
+      // fresh); onVisibility probes the link the moment we're visible again.
+      if (document.hidden) {
+        this.lastPong = Date.now();
+        return;
+      }
       if (Date.now() - this.lastPong > HEARTBEAT_DEAD_MS) {
+        this.stopHeartbeat();
         this.emit("disconnected");
         this.scheduleReconnect();
         return;
@@ -286,6 +379,37 @@ export class CloudConn {
   sendControl(msg: unknown) {
     if (this.chControl?.readyState === "open") this.chControl.send(JSON.stringify(msg));
   }
+  /**
+   * Snapshot the inbound video RTP stats (decode-side fps, bytes, resolution,
+   * jitter, packet loss, dropped/frozen frames) so the phone's debug HUD can tell
+   * whether the bottleneck is the host, the network, or the decoder.
+   */
+  async videoStats(): Promise<RtcInboundVideoStats | null> {
+    if (!this.pc) return null;
+    let report: RTCStatsReport;
+    try {
+      report = await this.pc.getStats();
+    } catch {
+      return null;
+    }
+    let inbound: any = null;
+    report.forEach((s: any) => {
+      if (s.type === "inbound-rtp" && s.kind === "video") inbound = s;
+    });
+    if (!inbound) return null;
+    return {
+      framesPerSecond: inbound.framesPerSecond ?? 0,
+      framesDecoded: inbound.framesDecoded ?? 0,
+      framesDropped: inbound.framesDropped ?? 0,
+      bytesReceived: inbound.bytesReceived ?? 0,
+      frameWidth: inbound.frameWidth ?? 0,
+      frameHeight: inbound.frameHeight ?? 0,
+      jitter: inbound.jitter ?? 0,
+      packetsLost: inbound.packetsLost ?? 0,
+      freezeCount: inbound.freezeCount ?? 0,
+      at: Date.now(),
+    };
+  }
   onStatus(cb: (s: Status) => void) {
     this.statusCb = cb;
     // Fire immediately with the last known state: by the time the Control screen
@@ -295,7 +419,16 @@ export class CloudConn {
   }
   close() {
     this.closed = true;
+    document.removeEventListener("visibilitychange", this.onVisibility);
+    // Tell the host we're leaving on purpose so it stops capturing immediately
+    // (it no longer tears down on signaling-level "peer-left" alone).
+    try {
+      if (this.chControl?.readyState === "open") this.chControl.send(JSON.stringify({ type: "bye" }));
+    } catch {
+      /* ignore */
+    }
     this.clearReconnect();
+    this.clearOfferTimeout();
     this.stopHeartbeat();
     this.pc?.close();
     this.pc = null;

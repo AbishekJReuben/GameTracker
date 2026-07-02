@@ -33,7 +33,8 @@ type SignalMsg =
   | { type: "room-full" }
   | { type: "offer"; sdp: string }
   | { type: "answer"; sdp: string }
-  | { type: "candidate"; candidate: RTCIceCandidateInit };
+  | { type: "candidate"; candidate: RTCIceCandidateInit }
+  | { type: "ping" };
 
 /** Thin wrapper over the signaling WebSocket for one room. */
 export class Signaling {
@@ -41,6 +42,7 @@ export class Signaling {
   private handlers: ((m: SignalMsg) => void)[] = [];
   private openResolvers: (() => void)[] = [];
   private closeHandlers: (() => void)[] = [];
+  private pingTimer: number | null = null;
 
   constructor(private url: string, private room: string, private role: Role) {}
 
@@ -56,10 +58,18 @@ export class Signaling {
         /* ignore non-JSON */
       }
     };
-    this.ws.onclose = () => this.closeHandlers.forEach((h) => h());
+    this.ws.onclose = () => {
+      this.stopPing();
+      this.closeHandlers.forEach((h) => h());
+    };
     return new Promise((resolve, reject) => {
       if (!this.ws) return reject(new Error("no socket"));
       this.ws.onopen = () => {
+        // Keep the socket (and any proxy in between) from idling out: once the
+        // WebRTC link is up nothing else flows here, and cloud proxies commonly
+        // kill WebSockets after ~60s of silence — which used to cascade into a
+        // full session rebuild. The relayed ping is ignored by the other peer.
+        this.startPing();
         this.openResolvers.forEach((r) => r());
         resolve();
       };
@@ -80,7 +90,20 @@ export class Signaling {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(m));
   }
 
+  private startPing() {
+    this.stopPing();
+    this.pingTimer = window.setInterval(() => this.send({ type: "ping" }), 20000);
+  }
+
+  private stopPing() {
+    if (this.pingTimer !== null) {
+      window.clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
   close() {
+    this.stopPing();
     this.ws?.close();
     this.ws = null;
   }

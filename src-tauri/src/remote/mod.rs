@@ -13,7 +13,10 @@
 //! - DB reads reuse the exact same `db::*` functions the Tauri commands use, wrapped in
 //!   `spawn_blocking` so rusqlite never blocks the async runtime.
 
+pub(crate) mod audio;
 pub(crate) mod capture;
+#[cfg(windows)]
+pub(crate) mod dxdupe;
 pub(crate) mod focus;
 pub(crate) mod input;
 

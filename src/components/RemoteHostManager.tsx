@@ -15,6 +15,7 @@ import { useRemoteHost } from "@/store/remote";
  */
 export function RemoteHostManager() {
   const setCloudClients = useRemoteHost((s) => s.setCloudClients);
+  const setHostStats = useRemoteHost((s) => s.setHostStats);
   const cfg = useRef({ on: false, url: "", code: "" });
   const stopRef = useRef<null | (() => void)>(null);
 
@@ -25,8 +26,14 @@ export function RemoteHostManager() {
       stopRef.current?.();
       stopRef.current = null;
       setCloudClients(0);
+      setHostStats(null);
       if (on && url && code) {
-        stopRef.current = startHost({ signalUrl: url, code, onClients: (n) => alive && setCloudClients(n) });
+        stopRef.current = startHost({
+          signalUrl: url,
+          code,
+          onClients: (n) => alive && setCloudClients(n),
+          onStats: (s) => alive && setHostStats(s),
+        });
       }
     };
 
@@ -53,8 +60,9 @@ export function RemoteHostManager() {
       window.clearInterval(id);
       stopRef.current?.();
       stopRef.current = null;
+      setHostStats(null);
     };
-  }, [setCloudClients]);
+  }, [setCloudClients, setHostStats]);
 
   return null;
 }

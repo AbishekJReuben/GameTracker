@@ -1,7 +1,7 @@
 {
   "name": "gametracker-companion",
   "private": true,
-  "version": "3.2.5",
+  "version": "3.2.7",
   "type": "module",
   "scripts": {
     "tauri": "node ../node_modules/@tauri-apps/cli/tauri.js"

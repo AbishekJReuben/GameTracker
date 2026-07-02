@@ -5,7 +5,7 @@
  */
 
 import { remoteWsUrl } from "@/lib/remoteClient";
-import type { CloudConn } from "./cloud";
+import type { CloudConn, RtcInboundVideoStats } from "./cloud";
 
 export type ControlMsg =
   | { type: "move"; x: number; y: number }
@@ -20,8 +20,12 @@ export type ControlMsg =
   | { type: "keyup"; name: string }
   | { type: "monitor"; index: number };
 
-/** Live stream-quality knobs the phone pushes to the desktop. */
-export type QualitySettings = { maxW: number; quality: number; fps: number };
+/** Content-optimization mode: tune the pipeline for crisp text or smooth video. */
+export type ContentMode = "auto" | "text" | "video";
+
+/** Live stream-quality knobs the phone pushes to the desktop. `bitrate` (kbps) caps
+ * the WebRTC encoder directly; 0/undefined means auto (derived from resolution/fps). */
+export type QualitySettings = { maxW: number; quality: number; fps: number; mode?: ContentMode; bitrate?: number };
 
 export interface RemoteLink {
   /** Deliver a raw tile wire-frame (LAN fallback; see capture.rs `TileEncoder`). */
@@ -34,6 +38,8 @@ export interface RemoteLink {
   send(msg: ControlMsg): void;
   /** Re-tune the live screen stream (resolution / JPEG quality / frame rate). */
   setQuality(q: QualitySettings): void;
+  /** Decode-side WebRTC video telemetry for the debug HUD (cloud only). */
+  netStats(): Promise<RtcInboundVideoStats | null>;
   close(): void;
 }
 
@@ -106,6 +112,9 @@ export function makeWsLink(): RemoteLink {
       quality = q;
       if (screenWs?.readyState === WebSocket.OPEN) screenWs.send(JSON.stringify({ type: "quality", ...q }));
     },
+    async netStats() {
+      return null; // LAN path has no WebRTC media stats.
+    },
     close() {
       alive = false;
       if (retry) window.clearTimeout(retry);
@@ -149,6 +158,9 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
       // The host intercepts `quality` messages on the control channel and re-tunes
       // its capture loop; they never reach the input injector.
       conn.sendControl({ type: "quality", ...q });
+    },
+    netStats() {
+      return conn.videoStats();
     },
     close() {
       // The CloudConn is owned by CompanionApp; closing it happens on disconnect.

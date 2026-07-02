@@ -36,10 +36,16 @@ import {
   Library as LibraryIcon,
   Headphones,
   Send,
+  Type as TypeIcon,
+  Film,
+  Sparkles,
 } from "lucide-react";
-import type { QualitySettings, RemoteLink } from "../links";
+import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { apiGet } from "../link";
-import type { RemoteMonitor } from "@/lib/api";
+import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
+
+type HostStats = RemoteCaptureStats & { producedFps?: number };
+type NetStats = { fps: number; kbps: number; w: number; h: number; jitterMs: number; lostPkts: number; dropped: number; freezes: number };
 
 // ---------- tuning constants ----------
 const TAP_MS = 260; // max press time still counted as a tap
@@ -49,21 +55,22 @@ const LONGPRESS_MS = 550; // hold to fire a right-click
 const SCROLL_STEP = 20; // finger px per wheel notch
 const MAX_ZOOM = 6;
 const FOLLOW_MARGIN = 72; // keep the cursor this far from the viewport edge when zoomed
+const EDGE_MARGIN = 56; // trackpad edge zone (px): a held finger here auto-pans the cursor
+const EDGE_SPEED = 0.016; // max cursor movement (fraction of the screen) per frame at the very edge
 
 type Mode = "trackpad" | "touch";
 type Mod = "ctrl" | "alt" | "shift" | "win";
 type KbMode = "direct" | "buffered";
 type NavTab = "stats" | "library" | "music" | "control";
+/** Which bottom control panel is expanded (null = collapsed to just the tab strip). */
+type Panel = "mouse" | "keys" | "shortcuts" | "quality" | "keyboard";
 
-type QualityPreset = { id: string; label: string; hint: string; q: QualitySettings };
-
-const PRESETS: QualityPreset[] = [
-  { id: "fluid", label: "Fluid", hint: "720p / 60fps", q: { maxW: 1280, quality: 45, fps: 60 } },
-  { id: "smooth", label: "Smooth", hint: "900p / 40fps", q: { maxW: 1600, quality: 50, fps: 40 } },
-  { id: "balanced", label: "Balanced", hint: "1080p / 30fps", q: { maxW: 1600, quality: 60, fps: 30 } },
-  { id: "hd", label: "HD", hint: "1080p / crisp", q: { maxW: 1920, quality: 72, fps: 30 } },
-  { id: "ultra", label: "Ultra", hint: "1440p / sharp", q: { maxW: 2560, quality: 82, fps: 30 } },
-  { id: "max", label: "Max 4K", hint: "2160p / heaviest", q: { maxW: 3840, quality: 90, fps: 30 } },
+// Content optimization: tunes the whole pipeline (downscale filter, JPEG chroma,
+// encoder content-hint + bitrate-degradation) for the kind of thing on screen.
+const CONTENT_MODES: { id: ContentMode; label: string; hint: string; icon: typeof TypeIcon }[] = [
+  { id: "auto", label: "Auto", hint: "Balanced", icon: Sparkles },
+  { id: "text", label: "Text", hint: "Crisp UI / code", icon: TypeIcon },
+  { id: "video", label: "Video", hint: "Smooth motion", icon: Film },
 ];
 
 // ---------- geometry helpers ----------
@@ -125,12 +132,17 @@ export function ControlScreen({
   const kbdRef = useRef<HTMLInputElement | null>(null);
 
   const [connected, setConnected] = useState(false);
+  // Debounced "Reconnecting…" overlay: WebRTC dips into "disconnected" briefly on
+  // packet-loss blips and usually self-heals within a second — flashing the
+  // overlay for those made the link feel flakier than it is.
+  const [showReconnect, setShowReconnect] = useState(false);
   const [hasStream, setHasStream] = useState(false);
+  const [hasAudio, setHasAudio] = useState(false);
+  const [soundOn, setSoundOn] = useState(false);
   const [mode, setMode] = useState<Mode>("trackpad");
-  const [dockOpen, setDockOpen] = useState(true);
-  const [dockTab, setDockTab] = useState<"mouse" | "keys" | "shortcuts" | "quality">("mouse");
+  // Expanded bottom panel (null = collapsed). It pushes the viewport up, never overlaps.
+  const [panel, setPanel] = useState<Panel | null>(null);
   const [immersive, setImmersive] = useState(false);
-  const [kbdOpen, setKbdOpen] = useState(false);
   const [kbMode, setKbMode] = useState<KbMode>("direct");
   const [pcTextField, setPcTextField] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
@@ -149,21 +161,27 @@ export function ControlScreen({
   const layoutRef = useRef<Layout | null>(null);
   const natRef = useRef({ w: 0, h: 0 });
 
-  // Quality + live stats.
-  const [presetId, setPresetId] = useState("balanced");
-  const [custom, setCustom] = useState<QualitySettings>(PRESETS[2].q);
+  // Live stream quality (sliders only). `bitrate` is kbps.
+  const [streamQ, setStreamQ] = useState({ maxW: 1600, quality: 55, fps: 40, bitrate: 12000 });
+  // Content optimization: sharpen for text/UI, smooth for video, or auto.
+  const [contentMode, setContentMode] = useState<ContentMode>("auto");
   const [showStats, setShowStats] = useState(false);
   const [fps, setFps] = useState(0);
   const [res, setRes] = useState("");
   const frameTimes = useRef<number[]>([]);
+  // Debug telemetry: host capture pipeline + decode-side WebRTC stats.
+  const [hostStats, setHostStats] = useState<HostStats | null>(null);
+  const [net, setNet] = useState<NetStats | null>(null);
+  const prodRef = useRef<{ frames: number; at: number } | null>(null);
+  const netRef = useRef<{ bytes: number; at: number } | null>(null);
 
   // Multi-monitor.
   const [monitors, setMonitors] = useState<RemoteMonitor[]>([]);
   const [monitorIdx, setMonitorIdx] = useState(0);
 
   const activeQuality = useMemo<QualitySettings>(
-    () => (presetId === "custom" ? custom : PRESETS.find((p) => p.id === presetId)?.q ?? PRESETS[2].q),
-    [presetId, custom],
+    () => ({ ...streamQ, mode: contentMode }),
+    [streamQ, contentMode],
   );
 
   // Composite one delta wire-frame (see capture.rs `TileEncoder::encode`) onto the
@@ -215,11 +233,28 @@ export function ControlScreen({
       if (!v) return;
       v.srcObject = stream;
       setHasStream(true);
+      setHasAudio(stream.getAudioTracks().length > 0);
+      stream.addEventListener?.("addtrack", (e) => {
+        if ((e as MediaStreamTrackEvent).track?.kind === "audio") setHasAudio(true);
+      });
       v.play?.().catch(() => {});
     });
-    // Host events: auto-pop the keyboard once when a PC text field gains focus.
+    // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     link.onEvent((e) => {
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
+      else if (e.event === "capstats") {
+        const cs = (e as { stats?: RemoteCaptureStats }).stats;
+        if (!cs) return;
+        const now = performance.now();
+        const prev = prodRef.current;
+        let producedFps: number | undefined;
+        if (prev && now > prev.at) {
+          const df = cs.producedFrames - prev.frames;
+          if (df >= 0) producedFps = Math.round((df * 1000) / (now - prev.at));
+        }
+        prodRef.current = { frames: cs.producedFrames, at: now };
+        setHostStats({ ...cs, producedFps });
+      }
     });
     // LAN fallback: JPEG tile frames drawn to the canvas.
     link.onFrame((buf) => {
@@ -274,13 +309,60 @@ export function ControlScreen({
     return () => v.cancelVideoFrameCallback?.(handle);
   }, [hasStream]);
 
-  // Load the monitor list once connected (for the display switcher).
+  // Load the monitor list once connected (for the display switcher). The data
+  // channel can lag the "connected" signal, so retry until it answers — otherwise
+  // the quick display-switch button would silently never appear.
   useEffect(() => {
     if (!connected) return;
-    apiGet<RemoteMonitor[]>("/api/monitors")
-      .then((m) => setMonitors(m || []))
-      .catch(() => {});
+    let alive = true;
+    let tries = 0;
+    const load = async () => {
+      if (!alive) return;
+      try {
+        const m = await apiGet<RemoteMonitor[]>("/api/monitors");
+        if (alive && m && m.length) {
+          setMonitors(m);
+          return;
+        }
+      } catch {
+        /* channel not ready yet */
+      }
+      if (alive && tries++ < 10) window.setTimeout(load, 800);
+    };
+    load();
+    return () => {
+      alive = false;
+    };
   }, [connected]);
+
+  // Poll decode-side WebRTC video stats (bitrate/fps/jitter/loss) while the HUD
+  // is open, so the phone can show where the frame-rate bottleneck actually is.
+  useEffect(() => {
+    if (!showStats) return;
+    let alive = true;
+    const id = window.setInterval(async () => {
+      const s = await link.netStats().catch(() => null);
+      if (!alive || !s) return;
+      const prev = netRef.current;
+      let kbps = 0;
+      if (prev && s.at > prev.at) kbps = Math.round(((s.bytesReceived - prev.bytes) * 8) / (s.at - prev.at));
+      netRef.current = { bytes: s.bytesReceived, at: s.at };
+      setNet({
+        fps: Math.round(s.framesPerSecond || 0),
+        kbps,
+        w: s.frameWidth,
+        h: s.frameHeight,
+        jitterMs: Math.round((s.jitter || 0) * 1000),
+        lostPkts: s.packetsLost,
+        dropped: s.framesDropped,
+        freezes: s.freezeCount,
+      });
+    }, 1000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [link, showStats]);
 
   const selectMonitor = (i: number) => {
     setMonitorIdx(i);
@@ -288,10 +370,29 @@ export function ControlScreen({
     resetView();
   };
 
-  // Push quality to the desktop whenever it changes.
+  // Push quality to the desktop whenever it changes AND on every (re)connect.
+  // Sends before the control channel opens are dropped silently, so retry a
+  // couple of times shortly after — the message is idempotent on the host.
   useEffect(() => {
+    if (!connected) return;
     link.setQuality(activeQuality);
-  }, [link, activeQuality]);
+    const t1 = window.setTimeout(() => link.setQuality(activeQuality), 1200);
+    const t2 = window.setTimeout(() => link.setQuality(activeQuality), 4000);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, [link, activeQuality, connected]);
+
+  // Only surface "Reconnecting…" after the link has been down for a moment.
+  useEffect(() => {
+    if (connected) {
+      setShowReconnect(false);
+      return;
+    }
+    const t = window.setTimeout(() => setShowReconnect(true), 1200);
+    return () => window.clearTimeout(t);
+  }, [connected]);
 
   // Sample fps once a second for the stats overlay.
   useEffect(() => {
@@ -299,7 +400,10 @@ export function ControlScreen({
     return () => window.clearInterval(id);
   }, []);
 
-  // Keep layout measurement fresh on resize / orientation change.
+  // Keep layout measurement fresh on resize / orientation change. A ResizeObserver
+  // also catches the viewport shrinking/growing when a bottom panel opens/closes
+  // (it now occupies real space instead of overlaying) — without it the cursor and
+  // touch-to-screen mapping would drift by the panel's height.
   useEffect(() => {
     const remeasure = () => {
       const l = measure(viewportRef.current, natRef.current.w, natRef.current.h);
@@ -308,10 +412,21 @@ export function ControlScreen({
     remeasure();
     window.addEventListener("resize", remeasure);
     window.addEventListener("orientationchange", remeasure);
+    let ro: ResizeObserver | undefined;
+    if (viewportRef.current && typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(remeasure);
+      ro.observe(viewportRef.current);
+    }
     return () => {
       window.removeEventListener("resize", remeasure);
       window.removeEventListener("orientationchange", remeasure);
+      ro?.disconnect();
     };
+  }, []);
+
+  // Cancel any in-flight edge-pan frame if the screen unmounts mid-drag.
+  useEffect(() => () => {
+    if (edgeRaf.current != null) cancelAnimationFrame(edgeRaf.current);
   }, []);
 
   // ----- coalesced pointer-move sending (one per animation frame) -----
@@ -392,6 +507,49 @@ export function ControlScreen({
   const touchPressed = useRef(false);
   const longTimer = useRef<number | null>(null);
 
+  // ----- edge auto-pan (trackpad): holding a finger at a screen edge keeps nudging
+  // the remote cursor in that direction, so you can reach anywhere on a big PC
+  // display from a small phone without lifting/repositioning. Runs while a single
+  // finger drives the cursor (moving or dragging); speed scales with edge depth.
+  const edgeRaf = useRef<number | null>(null);
+  const fingerPos = useRef({ x: 0, y: 0 });
+  const edgeTick = () => {
+    const r = viewportRef.current?.getBoundingClientRect();
+    // Keep looping for the whole single-finger trackpad gesture...
+    const gestureAlive = pts.current.size === 1 && (gesture.current === "cursor" || gesture.current === "dragging");
+    if (!r || mode !== "trackpad" || !gestureAlive) {
+      edgeRaf.current = null;
+      return;
+    }
+    // ...but only pan once it's clearly a drag (or drag-lock) — never during a
+    // stationary tap or long-press that merely happens to land near an edge.
+    const panning = gesture.current === "dragging" || maxMove.current > TAP_SLOP;
+    if (panning) {
+      const fx = fingerPos.current.x - r.left;
+      const fy = fingerPos.current.y - r.top;
+      let vx = 0;
+      let vy = 0;
+      if (fx < EDGE_MARGIN) vx = -(EDGE_MARGIN - fx) / EDGE_MARGIN;
+      else if (fx > r.width - EDGE_MARGIN) vx = (fx - (r.width - EDGE_MARGIN)) / EDGE_MARGIN;
+      if (fy < EDGE_MARGIN) vy = -(EDGE_MARGIN - fy) / EDGE_MARGIN;
+      else if (fy > r.height - EDGE_MARGIN) vy = (fy - (r.height - EDGE_MARGIN)) / EDGE_MARGIN;
+      if (vx !== 0 || vy !== 0) {
+        // Ease-in on depth so the edge feels gentle near the boundary, fast at the rim.
+        setCursorPos(cursorRef.current.x + vx * Math.abs(vx) * EDGE_SPEED, cursorRef.current.y + vy * Math.abs(vy) * EDGE_SPEED);
+      }
+    }
+    edgeRaf.current = requestAnimationFrame(edgeTick);
+  };
+  const startEdgePan = () => {
+    if (edgeRaf.current == null && mode === "trackpad") edgeRaf.current = requestAnimationFrame(edgeTick);
+  };
+  const stopEdgePan = () => {
+    if (edgeRaf.current != null) {
+      cancelAnimationFrame(edgeRaf.current);
+      edgeRaf.current = null;
+    }
+  };
+
   const clearLong = () => {
     if (longTimer.current != null) {
       window.clearTimeout(longTimer.current);
@@ -404,6 +562,7 @@ export function ControlScreen({
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
     const now = performance.now();
     pts.current.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY });
+    fingerPos.current = { x: e.clientX, y: e.clientY };
 
     if (pts.current.size === 1) {
       downT.current = now;
@@ -412,6 +571,7 @@ export function ControlScreen({
       touchPressed.current = false;
       armedDrag.current = false;
       gesture.current = mode === "touch" ? "touchdrag" : "cursor";
+      if (mode === "trackpad") startEdgePan();
 
       if (mode === "touch") {
         const l = layoutRef.current;
@@ -440,6 +600,7 @@ export function ControlScreen({
       }
     } else if (pts.current.size === 2) {
       clearLong();
+      stopEdgePan(); // two-finger gesture (pinch/scroll) — no cursor edge-pan
       downCount.current = 2;
       gesture.current = "two";
       twoMode.current = "undecided";
@@ -457,6 +618,7 @@ export function ControlScreen({
     const prevY = p.y;
     p.x = e.clientX;
     p.y = e.clientY;
+    fingerPos.current = { x: e.clientX, y: e.clientY }; // feed the edge-pan loop
     const travel = Math.hypot(e.clientX - p.sx, e.clientY - p.sy);
     if (travel > maxMove.current) maxMove.current = travel;
 
@@ -553,14 +715,17 @@ export function ControlScreen({
       armedDrag.current = false;
       touchPressed.current = false;
       downCount.current = 0;
+      stopEdgePan(); // finger lifted — stop nudging the cursor
     } else if (pts.current.size === 1) {
       // Dropped to one finger — reset its origin so the pointer doesn't jump.
       const [rem] = [...pts.current.values()];
       rem.sx = rem.x;
       rem.sy = rem.y;
+      fingerPos.current = { x: rem.x, y: rem.y };
       gesture.current = mode === "touch" ? "touchdrag" : "cursor";
       twoMode.current = "undecided";
       prevMid.current = null;
+      if (mode === "trackpad") startEdgePan(); // back to single-finger cursor control
     }
   };
 
@@ -707,9 +872,25 @@ export function ControlScreen({
     a.download = `remote-${Date.now()}.jpg`;
     a.click();
   };
-  const toggleKeyboard = () => {
-    if (kbdOpen) kbdRef.current?.blur();
-    else kbdRef.current?.focus();
+  // Open/close a bottom panel; the keyboard panel also focuses/blurs the input so
+  // the soft keyboard follows. Tapping an already-open panel collapses it.
+  const openPanel = (id: Panel) => {
+    const next = panel === id ? null : id;
+    setPanel(next);
+    if (id === "keyboard") {
+      if (next) window.setTimeout(() => kbdRef.current?.focus(), 30);
+      else kbdRef.current?.blur();
+    }
+  };
+  // Mobile browsers only allow audio to start from a user gesture, so PC sound is
+  // muted until the user taps this — then we unmute the video element's audio track.
+  const toggleSound = () => {
+    const v = videoRef.current;
+    if (!v) return;
+    const next = !soundOn;
+    v.muted = !next;
+    if (next) v.play?.().catch(() => {});
+    setSoundOn(next);
   };
 
   const zoomed = zoom > 1.01 || pan.x !== 0 || pan.y !== 0;
@@ -720,7 +901,9 @@ export function ControlScreen({
   }, [cursor, zoom, pan]);
 
   return (
-    <div className="relative h-full w-full overflow-hidden bg-black select-none">
+    <div className="flex h-full w-full flex-col overflow-hidden bg-black select-none">
+      {/* ==== viewport area — takes the remaining height; shrinks when a panel opens ==== */}
+      <div className="relative min-h-0 flex-1">
       {/* ---- screen viewport ---- */}
       <div
         ref={viewportRef}
@@ -752,7 +935,7 @@ export function ControlScreen({
             <MousePointer2 className="h-6 w-6 text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.9)]" fill="rgba(0,0,0,0.35)" />
           </div>
         )}
-        {!connected && (
+        {showReconnect && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
             <div className="flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm text-white backdrop-blur">
               <Loader2 className="h-4 w-4 animate-spin" /> Reconnecting…
@@ -823,9 +1006,13 @@ export function ControlScreen({
               </span>
             )}
             {pcTextField && (
-              <span className="flex items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-accent-3">
+              <button
+                onClick={() => kbdRef.current?.focus()}
+                className="flex items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-accent-3 active:scale-95"
+                title="A PC text field is focused — tap to type"
+              >
                 <Keyboard className="h-3 w-3" /> Typing on PC
-              </span>
+              </button>
             )}
           </div>
 
@@ -844,6 +1031,17 @@ export function ControlScreen({
                 <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
               </button>
             )}
+            {hasAudio && (
+              <button
+                onClick={toggleSound}
+                className={`grid h-9 w-9 place-items-center rounded-xl glass border shadow-float active:scale-95 ${
+                  soundOn ? "border-accent-3/40 text-accent-3" : "border-white/[0.08] text-ink-soft"
+                }`}
+                title={soundOn ? "Mute PC sound" : "Play PC sound"}
+              >
+                {soundOn ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
+              </button>
+            )}
             <button onClick={screenshot} className="grid h-9 w-9 place-items-center rounded-xl glass border border-white/[0.08] text-ink-soft shadow-float active:scale-95" title="Save frame">
               <Camera className="h-4 w-4" />
             </button>
@@ -854,269 +1052,204 @@ export function ControlScreen({
         </div>
       )}
 
-      {/* ---- floating keyboard button (always reachable) ---- */}
-      {!immersive && !kbdOpen && (
-        <button
-          onClick={toggleKeyboard}
-          className="absolute left-5 z-50 grid h-12 w-12 place-items-center rounded-full glass border border-white/[0.08] text-white shadow-float active:scale-95"
-          style={{ bottom: "max(1.25rem, calc(env(safe-area-inset-bottom) + 0.75rem))" }}
-          title="Keyboard"
-        >
-          <Keyboard className="h-5 w-5" />
-        </button>
-      )}
-
-      {/* ---- FAB: toggle dock ---- */}
-      {!immersive && (
-        <button
-          onClick={() => setDockOpen((v) => !v)}
-          className="absolute right-5 z-50 grid h-14 w-14 place-items-center rounded-full bg-accent-3 text-white shadow-glow active:scale-95"
-          style={{
-            bottom: "max(1.25rem, calc(env(safe-area-inset-bottom) + 0.75rem))",
-            transform: kbdOpen ? "translateY(-320px)" : "none",
-          }}
-        >
-          {dockOpen ? <X className="h-6 w-6" /> : <Grip className="h-6 w-6" />}
-        </button>
-      )}
-
-      {/* ---- keyboard compose bar (always mounted so focus() works from anywhere) ---- */}
-      <div
-        className={`absolute inset-x-0 z-[60] px-3 transition-all duration-200 ${
-          kbdOpen ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-4 opacity-0"
-        }`}
-        style={{ bottom: "max(0.75rem, calc(env(safe-area-inset-bottom) + 0.5rem))" }}
-      >
-        <div className="flex items-center gap-2 rounded-2xl glass border border-white/[0.08] p-2 shadow-float">
-          <button
-            onClick={() => setKbMode((m) => (m === "direct" ? "buffered" : "direct"))}
-            className="shrink-0 rounded-xl border border-white/[0.08] px-2.5 py-2 text-[11px] font-700 text-ink-soft active:bg-white/[0.08]"
-            title="Direct sends each keystroke live; Buffered sends the line on Enter"
-          >
-            {kbMode === "direct" ? "Direct" : "Buffered"}
-          </button>
-          <input
-            ref={kbdRef}
-            onInput={onKbdInput}
-            onKeyDown={onKbdKeyDown}
-            onCompositionStart={() => (composing.current = true)}
-            onCompositionEnd={() => {
-              composing.current = false;
-              onKbdInput();
-            }}
-            onFocus={() => {
-              setKbdOpen(true);
-              resetField();
-            }}
-            onBlur={() => setKbdOpen(false)}
-            className="min-w-0 flex-1 rounded-xl border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-sm text-white outline-none focus:border-accent-3"
-            placeholder={kbMode === "buffered" ? "Type, then Enter to send" : "Type - keys go to your PC"}
-            inputMode="text"
-            enterKeyHint={kbMode === "buffered" ? "send" : "done"}
-            autoCapitalize="none"
-            autoCorrect="off"
-            autoComplete="off"
-            spellCheck={false}
-          />
-          {kbMode === "buffered" && (
-            <button onClick={sendBuffer} className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-3 text-white active:scale-95" title="Send to PC">
-              <Send className="h-4 w-4" />
-            </button>
-          )}
-          <button onClick={() => kbdRef.current?.blur()} className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-ink-dim active:bg-white/[0.08]" title="Close keyboard">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      </div>
-
-      {/* ---- bottom command dock ---- */}
-      {!immersive && (
+      {/* ---- performance / debug HUD ---- */}
+      {showStats && !immersive && (
         <div
-          className={`absolute inset-x-3 z-40 max-h-[46vh] overflow-y-auto rounded-2xl glass border border-white/[0.08] p-2 shadow-float transition-all duration-300 ${
-            dockOpen ? "translate-y-0 opacity-100" : "translate-y-[130%] opacity-0 pointer-events-none"
-          }`}
-          style={{ marginRight: "4.75rem", bottom: "max(0.6rem, calc(env(safe-area-inset-bottom) + 0.4rem))" }}
+          className="absolute right-3 z-30 w-[16.5rem] max-w-[80vw] rounded-2xl glass border border-white/[0.08] p-2.5 text-[10px] leading-relaxed text-ink-soft shadow-float"
+          style={{ top: "max(3.6rem, calc(env(safe-area-inset-top) + 3rem))" }}
         >
-          <div className="mb-1.5 flex gap-1 rounded-xl bg-white/[0.03] p-0.5 text-xs">
-            <DockTab active={dockTab === "mouse"} onClick={() => setDockTab("mouse")} icon={<MousePointer2 className="h-3.5 w-3.5" />} label="Mouse" />
-            <DockTab active={dockTab === "keys"} onClick={() => setDockTab("keys")} icon={<Keyboard className="h-3.5 w-3.5" />} label="Keys" />
-            <DockTab active={dockTab === "shortcuts"} onClick={() => setDockTab("shortcuts")} icon={<Command className="h-3.5 w-3.5" />} label="Shortcuts" />
-            <DockTab active={dockTab === "quality"} onClick={() => setDockTab("quality")} icon={<Gauge className="h-3.5 w-3.5" />} label="Quality" />
+          <div className="mb-1 flex items-center gap-1.5 text-[11px] font-800 text-white">
+            <Gauge className="h-3.5 w-3.5 text-accent-3" /> Stream stats
+          </div>
+          <StatRow k="Display (phone)" v={`${fps} fps${res ? ` · ${res}` : ""}`} />
+          {net && (
+            <>
+              <StatRow k="Decode" v={`${net.fps} fps · ${net.w}×${net.h}`} />
+              <StatRow k="Bitrate" v={net.kbps >= 1000 ? `${(net.kbps / 1000).toFixed(1)} Mbps` : `${net.kbps} kbps`} />
+              <StatRow k="Jitter / loss" v={`${net.jitterMs} ms · ${net.lostPkts} pkt`} />
+              <StatRow k="Dropped / freezes" v={`${net.dropped} · ${net.freezes}`} />
+            </>
+          )}
+          {hostStats && (
+            <>
+              <div className="my-1 border-t border-white/[0.06]" />
+              <StatRow k="Host produce" v={`${hostStats.producedFps ?? "–"} fps (target ${hostStats.fps})`} />
+              <StatRow k="Capture / scale" v={`${hostStats.captureMs.toFixed(1)} · ${hostStats.scaleMs.toFixed(1)} ms`} />
+              <StatRow k="Encode" v={`${hostStats.encodeMs.toFixed(1)} ms`} />
+              <StatRow k="Frame size" v={`${(hostStats.frameBytes / 1024).toFixed(0)} KB`} />
+              <StatRow k="Resolution" v={`${hostStats.nativeW}×${hostStats.nativeH} → ${hostStats.outW}×${hostStats.outH}`} />
+            </>
+          )}
+          <div className="mt-1.5 rounded-lg bg-white/[0.04] px-2 py-1 text-[10px] font-700 text-accent-3">
+            {bottleneckHint(hostStats, net)}
+          </div>
+        </div>
+      )}
+
+      {/* ---- "tap to type" prompt when a PC text field is focused ---- */}
+      {!immersive && panel !== "keyboard" && pcTextField && (
+        <button
+          onClick={() => openPanel("keyboard")}
+          className="absolute bottom-3 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-full bg-accent-3 px-4 py-2 text-xs font-800 text-white shadow-glow active:scale-95"
+        >
+          <Keyboard className="h-4 w-4" /> Tap to type on PC
+        </button>
+      )}
+      </div>{/* ==== end viewport area ==== */}
+
+      {/* ==== bottom control bar — collapsed = just the icon tab strip; expanding a
+             panel grows this section and shrinks the viewport above (never overlaps) ==== */}
+      {!immersive && (
+        <div className="shrink-0 border-t border-white/10 bg-base/95 backdrop-blur" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
+          {/* keyboard compose row — always mounted so focus() works; height collapses to 0 when inactive */}
+          <div className={`overflow-hidden transition-[max-height] duration-200 ${panel === "keyboard" ? "max-h-20" : "max-h-0"}`}>
+            <div className="flex items-center gap-1.5 border-b border-white/5 px-2 py-2">
+              {/* Direct / Buffered — an obvious two-state toggle, right in the field row */}
+              <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
+                <button onClick={() => setKbMode("direct")} title="Direct: each keystroke is sent live" className={`grid h-8 w-8 place-items-center rounded-md ${kbMode === "direct" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Keyboard className="h-4 w-4" /></button>
+                <button onClick={() => setKbMode("buffered")} title="Buffered: type, then send the whole line" className={`grid h-8 w-8 place-items-center rounded-md ${kbMode === "buffered" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Send className="h-4 w-4" /></button>
+              </div>
+              <input
+                ref={kbdRef}
+                onInput={onKbdInput}
+                onKeyDown={onKbdKeyDown}
+                onCompositionStart={() => (composing.current = true)}
+                onCompositionEnd={() => {
+                  composing.current = false;
+                  onKbdInput();
+                }}
+                onFocus={() => {
+                  setPanel("keyboard");
+                  resetField();
+                }}
+                onBlur={() => setPanel((p) => (p === "keyboard" ? null : p))}
+                className="min-w-0 flex-1 rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-sm text-white outline-none focus:border-accent-3"
+                placeholder={kbMode === "buffered" ? "Type, then Enter to send" : "Type — keys go to your PC"}
+                inputMode="text"
+                enterKeyHint={kbMode === "buffered" ? "send" : "done"}
+                autoCapitalize="none"
+                autoCorrect="off"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              {kbMode === "buffered" && (
+                <button onClick={sendBuffer} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent-3 text-white active:scale-95" title="Send to PC">
+                  <Send className="h-4 w-4" />
+                </button>
+              )}
+              <button onClick={() => { kbdRef.current?.blur(); setPanel(null); }} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-ink-dim active:bg-white/[0.08]" title="Close">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
 
-          {dockTab === "mouse" && (
-            <div className="flex flex-col gap-2.5">
-              <div className="flex gap-1 rounded-2xl bg-white/[0.03] p-1 text-xs">
-                <Seg active={mode === "trackpad"} onClick={() => setMode("trackpad")} icon={<Pointer className="h-3.5 w-3.5" />} label="Trackpad" />
-                <Seg active={mode === "touch"} onClick={() => setMode("touch")} icon={<Hand className="h-3.5 w-3.5" />} label="Direct touch" />
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                <Chip onClick={() => link.send({ type: "click", button: "left" })} icon={<MousePointer2 className="h-3.5 w-3.5" />}>Left</Chip>
-                <Chip onClick={() => link.send({ type: "click", button: "right" })} icon={<MousePointerClick className="h-3.5 w-3.5" />}>Right</Chip>
-                <Chip onClick={() => link.send({ type: "click", button: "middle" })} icon={<Pointer className="h-3.5 w-3.5" />}>Middle</Chip>
-                {mode === "trackpad" && (
-                  <Chip
-                    active={dragLock}
-                    onClick={() => {
-                      if (dragLock) {
-                        link.send({ type: "up", button: "left" });
-                        setDragLock(false);
-                      } else setDragLock(true);
-                    }}
-                    icon={<Hand className="h-3.5 w-3.5" />}
-                  >
-                    {dragLock ? "Drag: ON" : "Drag lock"}
-                  </Chip>
-                )}
-                <Chip onClick={() => link.send({ type: "scroll", dy: -3 })} icon={<ChevronUp className="h-3.5 w-3.5" />}>Scroll ↑</Chip>
-                <Chip onClick={() => link.send({ type: "scroll", dy: 3 })} icon={<ChevronDown className="h-3.5 w-3.5" />}>Scroll ↓</Chip>
-              </div>
-              <div className="flex items-center gap-3 px-1 text-[11px] text-ink-dim">
-                <span className="whitespace-nowrap">Pointer speed</span>
-                <input type="range" min="0.6" max="3.5" step="0.1" value={sensitivity} onChange={(e) => setSensitivity(parseFloat(e.target.value))} className="flex-1 accent-accent-3" />
-                <span className="w-8 text-right font-700 text-white">{sensitivity.toFixed(1)}×</span>
-              </div>
-              <p className="px-1 text-[10px] leading-relaxed text-ink-faint">
-                {mode === "trackpad"
-                  ? "Drag to move · tap = click · two-finger tap = right-click · two-finger drag = scroll · pinch to zoom · double-tap-drag = drag · long-press = right-click"
-                  : "Tap where you want to click · drag to move directly · two-finger tap = right-click · two-finger drag = scroll · pinch to zoom"}
-              </p>
-            </div>
-          )}
-
-          {dockTab === "keys" && (
-            <div className="flex flex-col gap-2">
-              <div className="flex flex-wrap gap-1.5">
-                <Chip
-                  active={kbdOpen}
-                  onClick={() => (kbdOpen ? kbdRef.current?.blur() : kbdRef.current?.focus())}
-                  icon={<Keyboard className="h-3.5 w-3.5" />}
-                >
-                  Keyboard
-                </Chip>
-                <Chip onClick={() => tapKey("escape")}>Esc</Chip>
-                <Chip onClick={() => tapKey("tab")}>Tab</Chip>
-                <IconChip onClick={() => tapKey("enter")}><CornerDownLeft className="h-4 w-4" /></IconChip>
-                <IconChip onClick={() => tapKey("backspace")}><Delete className="h-4 w-4" /></IconChip>
-                <Chip onClick={() => tapKey("delete")}>Del</Chip>
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <ModChip active={mods.has("ctrl")} onClick={() => toggleMod("ctrl")}>Ctrl</ModChip>
-                <ModChip active={mods.has("alt")} onClick={() => toggleMod("alt")}>Alt</ModChip>
-                <ModChip active={mods.has("shift")} onClick={() => toggleMod("shift")}>Shift</ModChip>
-                <ModChip active={mods.has("win")} onClick={() => toggleMod("win")}>Win</ModChip>
-                <div className="ml-auto flex items-center gap-1 rounded-xl bg-white/[0.03] p-0.5">
-                  <IconChip onClick={() => tapKey("left")}><ArrowLeft className="h-4 w-4" /></IconChip>
-                  <div className="flex flex-col gap-0.5">
-                    <IconChip onClick={() => tapKey("up")}><ArrowUp className="h-3.5 w-3.5" /></IconChip>
-                    <IconChip onClick={() => tapKey("down")}><ArrowDown className="h-3.5 w-3.5" /></IconChip>
-                  </div>
-                  <IconChip onClick={() => tapKey("right")}><ArrowRight className="h-4 w-4" /></IconChip>
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-1">
-                {Array.from({ length: 12 }, (_, i) => i + 1).map((n) => (
-                  <button key={n} onClick={() => tapKey(`f${n}`)} className="h-7 min-w-[2rem] rounded-lg border border-white/[0.05] bg-white/[0.02] px-1.5 text-[11px] font-700 text-ink-soft active:bg-white/[0.08]">
-                    F{n}
-                  </button>
-                ))}
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                <IconChip onClick={() => tapKey("volumedown")}><Volume1 className="h-4 w-4" /></IconChip>
-                <IconChip onClick={() => tapKey("volumeup")}><Volume2 className="h-4 w-4" /></IconChip>
-                <IconChip onClick={() => tapKey("volumemute")}><VolumeX className="h-4 w-4" /></IconChip>
-                <IconChip onClick={() => tapKey("prevtrack")}><SkipBack className="h-4 w-4" /></IconChip>
-                <IconChip onClick={() => tapKey("playpause")}><PlayCircle className="h-4 w-4" /></IconChip>
-                <IconChip onClick={() => tapKey("nexttrack")}><SkipForward className="h-4 w-4" /></IconChip>
-              </div>
-              <div className="flex items-center gap-1.5 rounded-2xl bg-white/[0.03] p-1 text-xs">
-                <Seg active={kbMode === "direct"} onClick={() => setKbMode("direct")} icon={<Keyboard className="h-3.5 w-3.5" />} label="Direct" />
-                <Seg active={kbMode === "buffered"} onClick={() => setKbMode("buffered")} icon={<Send className="h-3.5 w-3.5" />} label="Buffered" />
-              </div>
-              <p className="px-1 text-[10px] leading-relaxed text-ink-faint">
-                {kbMode === "direct"
-                  ? "Each keystroke goes to your PC live; Enter presses Enter."
-                  : "Type on your phone, then Enter sends the whole line — Enter is not pressed on the PC."}
-              </p>
-            </div>
-          )}
-
-          {dockTab === "shortcuts" && (
-            <div className="grid grid-cols-3 gap-1.5 text-xs">
-              <Macro onClick={() => chord(["alt"], "tab")}>Alt + Tab</Macro>
-              <Macro onClick={() => chord(["win"])}>⊞ Win</Macro>
-              <Macro onClick={() => chord(["win"], "d")}>Show desktop</Macro>
-              <Macro onClick={() => chord(["ctrl", "shift"], "escape")}>Task Manager</Macro>
-              <Macro onClick={() => chord(["alt"], "f4")}>Close (Alt+F4)</Macro>
-              <Macro onClick={() => chord(["win"], "e")}>File Explorer</Macro>
-              <Macro onClick={() => chord(["ctrl"], "c")}>Copy</Macro>
-              <Macro onClick={() => chord(["ctrl"], "v")}>Paste</Macro>
-              <Macro onClick={() => chord(["ctrl"], "x")}>Cut</Macro>
-              <Macro onClick={() => chord(["ctrl"], "z")}>Undo</Macro>
-              <Macro onClick={() => chord(["ctrl"], "a")}>Select all</Macro>
-              <Macro onClick={() => chord(["ctrl", "alt"], "delete")}>Ctrl+Alt+Del</Macro>
-            </div>
-          )}
-
-          {dockTab === "quality" && (
-            <div className="flex flex-col gap-2.5">
-              <div className="flex flex-wrap gap-1.5">
-                {PRESETS.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => setPresetId(p.id)}
-                    className={`flex flex-col items-start rounded-xl border px-2.5 py-1.5 text-left transition ${
-                      presetId === p.id ? "border-accent-3 bg-accent-3/15 text-white" : "border-white/[0.06] bg-white/[0.02] text-ink-soft"
-                    }`}
-                  >
-                    <span className="text-xs font-700">{p.label}</span>
-                    <span className="text-[9px] text-ink-faint">{p.hint}</span>
-                  </button>
-                ))}
-              </div>
-              <div className="rounded-2xl border border-white/[0.05] bg-white/[0.02] p-2.5">
-                <div className="mb-1.5 flex items-center justify-between text-[11px] font-700 text-ink-dim">
-                  <span>Custom</span>
-                  {presetId === "custom" && <span className="text-accent-3">active</span>}
-                </div>
-                <Slider label="Resolution" min={480} max={3840} step={80} value={custom.maxW} unit="px" onChange={(v) => { setCustom((c) => ({ ...c, maxW: v })); setPresetId("custom"); }} />
-                <Slider label="Sharpness" min={20} max={95} step={1} value={custom.quality} unit="%" onChange={(v) => { setCustom((c) => ({ ...c, quality: v })); setPresetId("custom"); }} />
-                <Slider label="Frame rate" min={10} max={60} step={2} value={custom.fps} unit="fps" onChange={(v) => { setCustom((c) => ({ ...c, fps: v })); setPresetId("custom"); }} />
-              </div>
-              <label className="flex items-center justify-between px-1 text-[11px] text-ink-dim">
-                <span>Show performance stats</span>
-                <input type="checkbox" checked={showStats} onChange={(e) => setShowStats(e.target.checked)} className="h-4 w-4 accent-accent-3" />
-              </label>
-              {monitors.length > 1 && (
-                <div className="rounded-2xl border border-white/[0.05] bg-white/[0.02] p-2.5">
-                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 text-ink-dim">
-                    <Monitor className="h-3.5 w-3.5" /> Display
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {monitors.map((m) => (
-                      <button
-                        key={m.index}
-                        onClick={() => selectMonitor(m.index)}
-                        className={`flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-700 transition ${
-                          monitorIdx === m.index ? "border-accent-3 bg-accent-3/15 text-white" : "border-white/[0.06] bg-white/[0.02] text-ink-soft"
-                        }`}
-                      >
-                        {m.name || `Display ${m.index + 1}`}
-                        {m.isPrimary && <span className="text-[9px] text-ink-faint">primary</span>}
-                        <span className="text-[9px] text-ink-faint">{m.width}×{m.height}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
+          {/* expanded control panels — each a single horizontally-scrollable row of icons */}
+          {panel === "mouse" && (
+            <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2">
+              <IcoBtn active title={mode === "trackpad" ? "Trackpad mode" : "Direct-touch mode"} onClick={() => setMode((m) => (m === "trackpad" ? "touch" : "trackpad"))}>
+                {mode === "trackpad" ? <Pointer className="h-4 w-4" /> : <Hand className="h-4 w-4" />}
+              </IcoBtn>
+              <Sep />
+              <IcoBtn title="Left click" onClick={() => link.send({ type: "click", button: "left" })}><MousePointer2 className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Right click" onClick={() => link.send({ type: "click", button: "right" })}><MousePointerClick className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Middle click" onClick={() => link.send({ type: "click", button: "middle" })}><Command className="h-4 w-4" /></IcoBtn>
+              {mode === "trackpad" && (
+                <IcoBtn active={dragLock} title={dragLock ? "Drag lock: ON" : "Drag lock"} onClick={() => { if (dragLock) { link.send({ type: "up", button: "left" }); setDragLock(false); } else setDragLock(true); }}>
+                  <Hand className="h-4 w-4" />
+                </IcoBtn>
               )}
+              <IcoBtn title="Scroll up" onClick={() => link.send({ type: "scroll", dy: -3 })}><ChevronUp className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Scroll down" onClick={() => link.send({ type: "scroll", dy: 3 })}><ChevronDown className="h-4 w-4" /></IcoBtn>
+              <Sep />
+              <div className="flex shrink-0 items-center gap-1.5 pr-1" title="Pointer speed">
+                <Gauge className="h-3.5 w-3.5 text-ink-dim" />
+                <input type="range" min="0.6" max="3.5" step="0.1" value={sensitivity} onChange={(e) => setSensitivity(parseFloat(e.target.value))} className="w-24 accent-accent-3" />
+                <span className="w-7 text-[10px] font-700 text-white">{sensitivity.toFixed(1)}×</span>
+              </div>
             </div>
           )}
 
-          {onDisconnect && (
-            <button onClick={onDisconnect} className="mt-2.5 flex h-8 w-full items-center justify-center gap-1.5 rounded-xl border border-red/15 bg-red/5 text-[11px] font-700 text-red active:bg-red/10">
-              <LogOut className="h-3.5 w-3.5" /> Disconnect
-            </button>
+          {panel === "keys" && (
+            <div className="flex items-center gap-1 overflow-x-auto border-b border-white/5 px-2 py-2">
+              <KeyBtn onClick={() => tapKey("escape")}>Esc</KeyBtn>
+              <KeyBtn onClick={() => tapKey("tab")}>Tab</KeyBtn>
+              <IcoBtn title="Enter" onClick={() => tapKey("enter")}><CornerDownLeft className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Backspace" onClick={() => tapKey("backspace")}><Delete className="h-4 w-4" /></IcoBtn>
+              <KeyBtn onClick={() => tapKey("delete")}>Del</KeyBtn>
+              <Sep />
+              <KeyBtn active={mods.has("ctrl")} onClick={() => toggleMod("ctrl")}>Ctrl</KeyBtn>
+              <KeyBtn active={mods.has("alt")} onClick={() => toggleMod("alt")}>Alt</KeyBtn>
+              <KeyBtn active={mods.has("shift")} onClick={() => toggleMod("shift")}>Shift</KeyBtn>
+              <KeyBtn active={mods.has("win")} onClick={() => toggleMod("win")}>Win</KeyBtn>
+              <Sep />
+              <IcoBtn title="Left" onClick={() => tapKey("left")}><ArrowLeft className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Up" onClick={() => tapKey("up")}><ArrowUp className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Down" onClick={() => tapKey("down")}><ArrowDown className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Right" onClick={() => tapKey("right")}><ArrowRight className="h-4 w-4" /></IcoBtn>
+              <Sep />
+              {Array.from({ length: 12 }, (_, i) => i + 1).map((n) => (
+                <KeyBtn key={n} onClick={() => tapKey(`f${n}`)}>F{n}</KeyBtn>
+              ))}
+              <Sep />
+              <IcoBtn title="Volume down" onClick={() => tapKey("volumedown")}><Volume1 className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Volume up" onClick={() => tapKey("volumeup")}><Volume2 className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Mute" onClick={() => tapKey("volumemute")}><VolumeX className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Previous track" onClick={() => tapKey("prevtrack")}><SkipBack className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Play / pause" onClick={() => tapKey("playpause")}><PlayCircle className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Next track" onClick={() => tapKey("nexttrack")}><SkipForward className="h-4 w-4" /></IcoBtn>
+            </div>
           )}
+
+          {panel === "shortcuts" && (
+            <div className="flex items-center gap-1 overflow-x-auto border-b border-white/5 px-2 py-2">
+              <KeyBtn onClick={() => chord(["alt"], "tab")}>Alt+Tab</KeyBtn>
+              <KeyBtn onClick={() => chord(["win"])}>Win</KeyBtn>
+              <KeyBtn onClick={() => chord(["win"], "d")}>Desktop</KeyBtn>
+              <KeyBtn onClick={() => chord(["ctrl", "shift"], "escape")}>Task&nbsp;Mgr</KeyBtn>
+              <KeyBtn onClick={() => chord(["alt"], "f4")}>Alt+F4</KeyBtn>
+              <KeyBtn onClick={() => chord(["win"], "e")}>Explorer</KeyBtn>
+              <Sep />
+              <KeyBtn onClick={() => chord(["ctrl"], "c")}>Copy</KeyBtn>
+              <KeyBtn onClick={() => chord(["ctrl"], "v")}>Paste</KeyBtn>
+              <KeyBtn onClick={() => chord(["ctrl"], "x")}>Cut</KeyBtn>
+              <KeyBtn onClick={() => chord(["ctrl"], "z")}>Undo</KeyBtn>
+              <KeyBtn onClick={() => chord(["ctrl"], "a")}>All</KeyBtn>
+              <KeyBtn onClick={() => chord(["ctrl", "alt"], "delete")}>Ctrl+Alt+Del</KeyBtn>
+            </div>
+          )}
+
+          {panel === "quality" && (
+            <div className="flex items-center gap-2 overflow-x-auto border-b border-white/5 px-2 py-2">
+              <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
+                {CONTENT_MODES.map((m) => (
+                  <button key={m.id} onClick={() => setContentMode(m.id)} title={`${m.label} — ${m.hint}`} className={`grid h-8 w-8 place-items-center rounded-md ${contentMode === m.id ? "bg-accent-3 text-white" : "text-ink-dim"}`}>
+                    <m.icon className="h-4 w-4" />
+                  </button>
+                ))}
+              </div>
+              <Sep />
+              <QSlider icon={<Monitor className="h-3.5 w-3.5" />} label="Res" min={480} max={3840} step={80} value={streamQ.maxW} fmt={(v) => `${v}`} onChange={(v) => setStreamQ((p) => ({ ...p, maxW: v }))} />
+              <QSlider icon={<Sparkles className="h-3.5 w-3.5" />} label="Sharp" min={20} max={95} step={1} value={streamQ.quality} fmt={(v) => `${v}`} onChange={(v) => setStreamQ((p) => ({ ...p, quality: v }))} />
+              <QSlider icon={<Film className="h-3.5 w-3.5" />} label="FPS" min={10} max={60} step={2} value={streamQ.fps} fmt={(v) => `${v}`} onChange={(v) => setStreamQ((p) => ({ ...p, fps: v }))} />
+              <QSlider icon={<Wifi className="h-3.5 w-3.5" />} label="Mbps" min={1000} max={40000} step={500} value={streamQ.bitrate} fmt={(v) => (v / 1000).toFixed(1)} onChange={(v) => setStreamQ((p) => ({ ...p, bitrate: v }))} />
+              <Sep />
+              <IcoBtn active={showStats} title="Performance stats" onClick={() => setShowStats((s) => !s)}><Gauge className="h-4 w-4" /></IcoBtn>
+            </div>
+          )}
+
+          {/* always-visible icon tab strip */}
+          <div className="flex items-center gap-1 px-1.5 py-1.5">
+            <Tab active={panel === "mouse"} onClick={() => openPanel("mouse")} title="Mouse"><MousePointer2 className="h-5 w-5" /></Tab>
+            <Tab active={panel === "keys"} onClick={() => openPanel("keys")} title="Special keys"><Command className="h-5 w-5" /></Tab>
+            <Tab active={panel === "shortcuts"} onClick={() => openPanel("shortcuts")} title="Shortcuts"><Grip className="h-5 w-5" /></Tab>
+            <Tab active={panel === "keyboard"} onClick={() => openPanel("keyboard")} title="Keyboard"><Keyboard className="h-5 w-5" /></Tab>
+            <Tab active={panel === "quality"} onClick={() => openPanel("quality")} title="Quality"><Gauge className="h-5 w-5" /></Tab>
+            {onDisconnect && (
+              <button onClick={onDisconnect} title="Disconnect" className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-red/20 bg-red/5 text-red active:scale-95">
+                <LogOut className="h-4 w-4" />
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -1124,54 +1257,85 @@ export function ControlScreen({
 }
 
 // ---------- small UI pieces ----------
-function DockTab({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
+function StatRow({ k, v }: { k: string; v: string }) {
   return (
-    <button onClick={onClick} className={`flex flex-1 items-center justify-center gap-1 rounded-lg py-1 text-[11px] font-700 transition ${active ? "bg-white/[0.08] text-white shadow-sm" : "text-ink-dim"}`}>
-      {icon} {label}
-    </button>
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-ink-faint">{k}</span>
+      <span className="font-700 text-white">{v}</span>
+    </div>
   );
 }
-function Seg({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
-  return (
-    <button onClick={onClick} className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl py-1.5 font-700 transition ${active ? "bg-white/[0.08] text-white shadow-sm" : "text-ink-dim"}`}>
-      {icon} {label}
-    </button>
-  );
+
+/** A plain-language guess at where the frame-rate is being lost. */
+function bottleneckHint(host: HostStats | null, net: NetStats | null): string {
+  if (!host && !net) return "Gathering stats…";
+  const target = host?.fps ?? 30;
+  const produced = host?.producedFps;
+  const hostCpuMs = host ? host.captureMs + host.scaleMs + host.encodeMs : 0;
+  // Host can't produce near the target and is spending real time doing it → CPU-bound.
+  if (host && produced != null && produced < target * 0.75 && hostCpuMs > 12) {
+    const worst = host.encodeMs >= host.scaleMs && host.encodeMs >= host.captureMs ? "encode" : host.scaleMs >= host.captureMs ? "downscale" : "capture";
+    return `Bottleneck: host CPU (${worst}). Lower resolution or sharpness.`;
+  }
+  // Host produces fine but the phone decodes far fewer → network or decoder limited.
+  if (host && net && produced != null && produced > 0 && net.fps < produced * 0.7) {
+    return "Bottleneck: network / decoder. Lower bitrate (resolution/fps).";
+  }
+  if (net && net.freezes > 0 && net.fps < target * 0.6) return "Bottleneck: unstable link (freezes).";
+  return "Pipeline healthy.";
 }
-function Chip({ onClick, children, icon, active }: { onClick: () => void; children: React.ReactNode; icon?: React.ReactNode; active?: boolean }) {
-  return (
-    <button onClick={onClick} className={`flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-700 transition active:scale-95 ${active ? "border-accent-3 bg-accent-3/15 text-white" : "border-white/[0.06] bg-white/[0.03] text-ink-soft"}`}>
-      {icon} {children}
-    </button>
-  );
+
+/** A thin vertical divider between icon groups in a panel row. */
+function Sep() {
+  return <span className="mx-0.5 h-6 w-px shrink-0 bg-white/10" />;
 }
-function IconChip({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
+/** Square icon button used across the panels. */
+function IcoBtn({ onClick, active, title, children }: { onClick: () => void; active?: boolean; title?: string; children: React.ReactNode }) {
   return (
-    <button onClick={onClick} className="grid h-8 w-8 place-items-center rounded-xl border border-white/[0.06] bg-white/[0.03] text-ink-soft transition active:scale-95 active:bg-white/[0.08] active:text-white">
+    <button
+      onClick={onClick}
+      title={title}
+      className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg border transition active:scale-95 ${active ? "border-accent-3 bg-accent-3/15 text-white" : "border-white/[0.06] bg-white/[0.03] text-ink-soft active:bg-white/[0.08]"}`}
+    >
       {children}
     </button>
   );
 }
-function ModChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+/** Compact labelled key (for Esc / modifiers / F-keys / shortcut chords). */
+function KeyBtn({ onClick, active, children }: { onClick: () => void; active?: boolean; children: React.ReactNode }) {
   return (
-    <button onClick={onClick} className={`rounded-xl border px-3 py-1.5 text-xs font-700 transition active:scale-95 ${active ? "border-accent-1 bg-accent-1 text-white shadow-glow" : "border-white/[0.06] bg-white/[0.03] text-ink-soft"}`}>
+    <button
+      onClick={onClick}
+      className={`grid h-9 shrink-0 place-items-center whitespace-nowrap rounded-lg border px-2 text-[11px] font-700 transition active:scale-95 ${active ? "border-accent-1 bg-accent-1 text-white shadow-glow" : "border-white/[0.06] bg-white/[0.03] text-ink-soft active:bg-white/[0.08]"}`}
+    >
       {children}
     </button>
   );
 }
-function Macro({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
+/** A tab in the always-visible bottom strip (icon only). */
+function Tab({ onClick, active, title, children }: { onClick: () => void; active: boolean; title: string; children: React.ReactNode }) {
   return (
-    <button onClick={onClick} className="rounded-xl border border-white/[0.06] bg-white/[0.03] px-2 py-2.5 text-[11px] font-700 text-ink-soft transition active:scale-95 active:bg-white/[0.08] active:text-white">
+    <button
+      onClick={onClick}
+      title={title}
+      className={`grid h-9 flex-1 place-items-center rounded-lg transition active:scale-95 ${active ? "bg-accent-3 text-white shadow-glow" : "text-ink-dim active:bg-white/[0.06]"}`}
+    >
       {children}
     </button>
   );
 }
-function Slider({ label, min, max, step, value, unit, onChange }: { label: string; min: number; max: number; step: number; value: number; unit: string; onChange: (v: number) => void }) {
+/** Compact labelled slider for the single-row quality panel. */
+function QSlider({ icon, label, min, max, step, value, fmt, onChange }: { icon: React.ReactNode; label: string; min: number; max: number; step: number; value: number; fmt: (v: number) => string; onChange: (v: number) => void }) {
   return (
-    <div className="mb-1.5 flex items-center gap-3 text-[11px] text-ink-dim last:mb-0">
-      <span className="w-20 whitespace-nowrap">{label}</span>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(parseInt(e.target.value, 10))} className="flex-1 accent-accent-3" />
-      <span className="w-14 text-right font-700 text-white">{value}{unit}</span>
+    <div className="flex w-[4.75rem] shrink-0 flex-col gap-0.5">
+      <div className="flex items-center justify-between text-[9px] font-700 leading-none text-ink-dim">
+        <span className="flex items-center gap-0.5">
+          {icon}
+          {label}
+        </span>
+        <span className="text-white">{fmt(value)}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(parseInt(e.target.value, 10))} className="w-full accent-accent-3" />
     </div>
   );
 }
