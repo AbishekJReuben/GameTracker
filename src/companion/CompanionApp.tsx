@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { listen } from "@tauri-apps/api/event";
 import {
-  BarChart3,
+  LayoutDashboard,
   Library,
   Headphones,
   MonitorSmartphone,
@@ -23,11 +23,13 @@ import { setCloudMode } from "./link";
 import { makeRtcLink, type RemoteLink } from "./links";
 import { CloudConn } from "./cloud";
 import { deviceId, deviceName } from "./device";
-import { StatsScreen } from "./screens/Stats";
+import { DashboardScreen } from "./screens/Dashboard";
 import { LibraryScreen } from "./screens/Library";
 import { MusicScreen } from "./screens/MusicView";
 import { ControlScreen } from "./screens/Control";
 import { SettingsScreen } from "./screens/Settings";
+import { GameDetailScreen } from "./screens/GameDetail";
+import { useOpenGame, closeGame } from "./ui";
 import { checkForUpdate, installUpdate, type UpdateInfo } from "./update";
 
 type Tab = "stats" | "library" | "music" | "control" | "settings";
@@ -37,8 +39,8 @@ const LS_CODE = "gt.remote.code"; // remembered code → auto-connect on launch
 const LS_SIGNAL = "gt.remote.signal";
 const LS_SECRET = "gt.remote.secret"; // remembered permanent key (optional)
 
-const TABS: { id: Tab; label: string; icon: typeof BarChart3 }[] = [
-  { id: "stats", label: "Stats", icon: BarChart3 },
+const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
+  { id: "stats", label: "Home", icon: LayoutDashboard },
   { id: "library", label: "Library", icon: Library },
   { id: "music", label: "Music", icon: Headphones },
   { id: "control", label: "Control", icon: MonitorSmartphone },
@@ -51,6 +53,8 @@ export function CompanionApp() {
   const [tab, setTab] = useState<Tab>("control");
   const [activeCode, setActiveCode] = useState(() => localStorage.getItem(LS_CODE) || "");
   const autoConnRef = useRef<CloudConn | null>(null);
+  // Full-screen game-detail overlay, opened from any screen via `openGame(id)`.
+  const detailId = useOpenGame();
 
   const adopt = useCallback((c: CloudConn, code?: string, signalUrl?: string, secret?: string) => {
     autoConnRef.current = null; // hand ownership to app state; skip cleanup close
@@ -187,6 +191,7 @@ export function CompanionApp() {
   return (
     <>
     {updateBanner}
+    {detailId && <GameDetailScreen id={detailId} onClose={closeGame} />}
     <div className="flex h-[100dvh] flex-col bg-bg-base text-ink">
       {!isControlTab && (
         <header
@@ -207,7 +212,7 @@ export function CompanionApp() {
       )}
 
       <main className={`min-h-0 flex-1 ${isControlTab || tab === "library" ? "" : "overflow-y-auto"}`}>
-        {tab === "stats" && <StatsScreen />}
+        {tab === "stats" && <DashboardScreen />}
         {tab === "library" && <LibraryScreen />}
         {tab === "music" && <MusicScreen />}
         {tab === "settings" && (

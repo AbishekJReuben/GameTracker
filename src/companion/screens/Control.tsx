@@ -1014,7 +1014,7 @@ export function ControlScreen({
                 <div className="fixed inset-0 z-40" onClick={() => setNavOpen(false)} />
                 <div className="absolute left-0 top-[calc(100%+6px)] z-50 flex flex-col gap-0.5 rounded-2xl glass border border-white/[0.08] p-1.5 shadow-float">
                   {([
-                    { id: "stats", label: "Stats", icon: BarChart3 },
+                    { id: "stats", label: "Home", icon: BarChart3 },
                     { id: "library", label: "Library", icon: LibraryIcon },
                     { id: "music", label: "Music", icon: Headphones },
                     { id: "settings", label: "Settings", icon: SettingsIcon },

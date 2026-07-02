@@ -107,6 +107,8 @@ async function handleData(path: string, body?: any): Promise<unknown> {
   if (urlPath === "/api/sessions") {
     return api.listSessions({
       kind: (params.get("kind") as any) || null,
+      gameId: params.get("gameId") || undefined,
+      fromUtc: params.get("fromUtc") || undefined,
       limit: num("limit") ?? 500,
     });
   }
