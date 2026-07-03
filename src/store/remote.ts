@@ -33,9 +33,12 @@ export const useRemoteHost = create<RemoteHostState>((set, get) => ({
   setHostStats: (s) => set({ hostStats: s }),
   pendingApproval: null,
   setPendingApproval: (p) => {
-    // A superseding request auto-denies any previous, unanswered one.
+    // A superseding request auto-dismisses any previous, unanswered one. Resolve it
+    // as "superseded" (NOT "deny") so the host stays silent toward that old session
+    // instead of pushing a terminal "denied" to a phone that's still waiting — which
+    // is what made a reconnecting phone see "access declined" before the PC user chose.
     const prev = get().pendingApproval;
-    if (prev && prev !== p) prev.resolve({ kind: "deny" });
+    if (prev && prev !== p) prev.resolve({ kind: "superseded" });
     set({ pendingApproval: p });
   },
   resolveApproval: (decision) => {

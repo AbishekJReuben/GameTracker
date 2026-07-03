@@ -36,7 +36,13 @@ export interface HostLiveStats {
 export type ApprovalDecision =
   | { kind: "temporary"; durationSecs: number }
   | { kind: "permanent" }
-  | { kind: "deny" };
+  | { kind: "deny" }
+  // A pending prompt that was auto-dismissed because a *newer* request replaced it
+  // (e.g. the phone's link flapped and reconnected). This is NOT a user refusal —
+  // the host must stay silent (no "denied" to the phone), otherwise the phone,
+  // which treats "denied" as terminal, drops to pairing showing "access declined"
+  // even though nobody on the PC ever chose. The live session drives its own prompt.
+  | { kind: "superseded" };
 
 /** A device asking to connect that isn't trusted yet (needs the prompt). */
 export interface ApprovalRequest {
@@ -806,9 +812,14 @@ export function startHost(opts: HostOptions): () => void {
           const decision: ApprovalDecision = opts.onApprovalRequest
             ? await opts.onApprovalRequest({ deviceId, name })
             : { kind: "deny" };
-          // Bail if this session was replaced while the prompt was open. The store
-          // auto-denies a superseded request, but that verdict belongs to the OLD
-          // session — forwarding it here would kill the new, healthy one.
+          // A superseded prompt (the store auto-dismissed it because a newer request
+          // arrived) is never a refusal — stay completely silent so we don't send a
+          // terminal "denied" to a phone that's still waiting. The newer session runs
+          // its own prompt and decides. This is the primary guard against "access
+          // denied before the PC user chose".
+          if (decision.kind === "superseded") return;
+          // Bail if this session was replaced while the prompt was open — any verdict
+          // now belongs to the OLD session; forwarding it would disturb the new one.
           if (pc !== myPc) return;
           if (decision.kind === "deny") {
             if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "denied" }));

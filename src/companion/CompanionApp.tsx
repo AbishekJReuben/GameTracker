@@ -8,6 +8,7 @@ import {
   Trophy,
   Headphones,
   MonitorSmartphone,
+  Cpu,
   Settings as SettingsIcon,
   LogOut,
   Globe,
@@ -31,12 +32,14 @@ import { TimelineScreen } from "./screens/Timeline";
 import { CollectionsScreen } from "./screens/Collections";
 import { MusicScreen } from "./screens/MusicView";
 import { ControlScreen } from "./screens/Control";
+import { SystemScreen } from "./screens/System";
 import { SettingsScreen } from "./screens/Settings";
 import { GameDetailScreen } from "./screens/GameDetail";
 import { useOpenGame, closeGame } from "./ui";
+import { PageTransitionFX } from "./PageTransitionFX";
 import { checkForUpdate, installUpdate, type UpdateInfo } from "./update";
 
-type Tab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "settings";
+type Tab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
 type Phase = "boot" | "pairing" | "autoconnecting" | "connected" | "paused";
 
 const LS_CODE = "gt.remote.code"; // remembered code → auto-connect on launch
@@ -50,6 +53,7 @@ const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "collection", label: "Wins", icon: Trophy },
   { id: "music", label: "Music", icon: Headphones },
   { id: "control", label: "Remote", icon: MonitorSmartphone },
+  { id: "system", label: "System", icon: Cpu },
   { id: "settings", label: "More", icon: SettingsIcon },
 ];
 
@@ -197,6 +201,9 @@ export function CompanionApp() {
   return (
     <>
     {updateBanner}
+    {/* Glitch "energy tear" sweep on every tab change — matches the desktop route
+        transition. Keyed on the active tab so it fires exactly on a screen swap. */}
+    <PageTransitionFX triggerKey={tab} />
     {detailId && <GameDetailScreen id={detailId} onClose={closeGame} />}
     <div className="flex h-[100dvh] flex-col bg-bg-base text-ink">
       {!isControlTab && (
@@ -223,6 +230,7 @@ export function CompanionApp() {
         {tab === "timeline" && <TimelineScreen />}
         {tab === "collection" && <CollectionsScreen />}
         {tab === "music" && <MusicScreen />}
+        {tab === "system" && <SystemScreen />}
         {tab === "settings" && (
           <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} />
         )}
@@ -233,7 +241,7 @@ export function CompanionApp() {
 
       {!isControlTab && (
         <nav
-          className="grid grid-cols-7 border-t border-line bg-bg-900/70 backdrop-blur"
+          className="grid grid-cols-8 border-t border-line bg-bg-900/70 backdrop-blur"
           style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
         >
           {TABS.map((t) => {

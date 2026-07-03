@@ -22,7 +22,7 @@ import {
   Gamepad2,
   Target,
 } from "lucide-react";
-import type { Dashboard, TrackingState, Session } from "@/lib/api";
+import type { Dashboard, TrackingState, Session, Game } from "@/lib/api";
 import { StatTile } from "@/components/StatTile";
 import { Sparkline } from "@/components/Sparkline";
 import { Heatmap } from "@/components/Heatmap";
@@ -30,12 +30,14 @@ import { PolarHours, WeekdayBars } from "@/components/Charts";
 import { dur, hours, relativeTime, timeLabel, accentFor } from "@/lib/format";
 import { useRemote } from "../useRemote";
 import { Art, openGame } from "../ui";
+import { CoverMarquee, MarqueePoolProvider, SectionBackdrop } from "../Marquee";
 
 type HeatDay = { date: string; seconds: number };
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export function DashboardScreen() {
   const { data, loading } = useRemote<Dashboard>("/api/dashboard", 30000);
+  const { data: games } = useRemote<Game[]>("/api/games", 60000);
   const { data: now } = useRemote<TrackingState>("/api/tracking", 3000);
   const { data: heat } = useRemote<HeatDay[]>("/api/heatmap?days=182&kind=game", 60000);
   const { data: hourOfDay } = useRemote<number[]>("/api/hourofday?kind=game", 60000);
@@ -117,6 +119,7 @@ export function DashboardScreen() {
   const nowName = now?.isPlaying ? now.gameName : now?.appName;
 
   return (
+    <MarqueePoolProvider games={games ?? []}>
     <div className="space-y-5 p-4">
       {/* header */}
       <div>
@@ -125,6 +128,9 @@ export function DashboardScreen() {
           {new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
         </div>
       </div>
+
+      {/* scrolling cover-wall hero — mirrors the desktop dashboard header marquee */}
+      {games && games.length > 0 && <CoverMarquee games={games} className="h-24" durationSec={60} />}
 
       {/* now playing */}
       {playing && (
@@ -313,6 +319,7 @@ export function DashboardScreen() {
         </div>
       )}
     </div>
+    </MarqueePoolProvider>
   );
 }
 
@@ -370,15 +377,18 @@ function TodayGantt({ sessions }: { sessions: Session[] }) {
 
 function Section({ title, subtitle, right, children }: { title: string; subtitle?: string; right?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <section className="rounded-2xl border border-line bg-bg-900/40 p-3.5">
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <div className="font-display text-base font-800">{title}</div>
-          {subtitle && <div className="text-[11px] text-ink-dim">{subtitle}</div>}
+    <section className="relative overflow-hidden rounded-2xl border border-line bg-bg-900/40 p-3.5">
+      <SectionBackdrop prefix="dashboard" title={title} />
+      <div className="relative z-10">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <div className="font-display text-base font-800">{title}</div>
+            {subtitle && <div className="text-[11px] text-ink-dim">{subtitle}</div>}
+          </div>
+          {right}
         </div>
-        {right}
+        {children}
       </div>
-      {children}
     </section>
   );
 }

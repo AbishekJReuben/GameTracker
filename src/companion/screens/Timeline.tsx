@@ -7,10 +7,11 @@
 
 import { useMemo, useState } from "react";
 import { Loader2, Clock, Zap } from "lucide-react";
-import type { Session } from "@/lib/api";
+import type { Session, Game } from "@/lib/api";
 import { accentFor, dur, timeLabel } from "@/lib/format";
 import { useRemote } from "../useRemote";
 import { openGame } from "../ui";
+import { MarqueeFX } from "../Marquee";
 
 type Range = "24h" | "7d" | "30d";
 type Kind = "all" | "game" | "app";
@@ -30,6 +31,7 @@ export function TimelineScreen() {
   // Over-fetch a bit past the window so a session that started before it still shows.
   const fromUtc = useMemo(() => new Date(Date.now() - RANGE_MS[range] - 6 * 3600_000).toISOString(), [range]);
   const { data: raw, loading } = useRemote<Session[]>(`/api/sessions?fromUtc=${encodeURIComponent(fromUtc)}&limit=500`, 15000);
+  const { data: games } = useRemote<Game[]>("/api/games", 60000);
 
   const now = Date.now();
   const windowStart = now - RANGE_MS[range];
@@ -120,8 +122,9 @@ export function TimelineScreen() {
         ) : (
           <>
             {/* gantt */}
-            <div className="rounded-2xl border border-line bg-bg-900/40 p-3">
-              <div className="relative w-full overflow-hidden" style={{ height: lanes.count * laneH + 22 }}>
+            <div className="relative overflow-hidden rounded-2xl border border-line bg-bg-900/40 p-3">
+              <MarqueeFX variant="drift" games={games ?? []} opacity={0.1} tier="base" />
+              <div className="relative z-10 w-full overflow-hidden" style={{ height: lanes.count * laneH + 22 }}>
                 {/* tick gridlines + labels */}
                 {ticks.map((t, i) => (
                   <div key={i} className="absolute top-0 bottom-5 w-px bg-white/[0.05]" style={{ left: `${t.left}%` }} />
@@ -141,7 +144,7 @@ export function TimelineScreen() {
                   <span key={i} className="absolute bottom-0 -translate-x-1/2 text-[9px] tabular-nums text-ink-faint" style={{ left: `${Math.min(97, Math.max(3, t.left))}%` }}>{t.label}</span>
                 ))}
               </div>
-              <div className="mt-2 flex gap-3 text-[10px] text-ink-dim">
+              <div className="relative z-10 mt-2 flex gap-3 text-[10px] text-ink-dim">
                 <span className="inline-flex items-center gap-1.5"><span className="h-2 w-3 rounded bg-green" /> Games</span>
                 <span className="inline-flex items-center gap-1.5"><span className="h-2 w-3 rounded bg-accent-3" /> Apps</span>
                 <span className="ml-auto">{sessions.length} sessions</span>

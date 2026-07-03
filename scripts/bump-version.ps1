@@ -6,14 +6,24 @@
     Updates the version string in every source-of-truth file so the installer,
     the auto-updater, and the version shown inside the app all agree:
 
-        package.json                 "version"
-        src-tauri/tauri.conf.json    "version"   (embedded at compile time -> package_info)
-        src-tauri/Cargo.toml         [package] version
-        src-tauri/Cargo.lock         gametracker package entry
+        package.json                          "version"
+        src-tauri/tauri.conf.json             "version"   (embedded at compile time -> package_info)
+        src-tauri/Cargo.toml                  [package] version
+        src-tauri/Cargo.lock                  gametracker package entry
+        companion/src-tauri/tauri.conf.json   "version"   (the Android APK version + apk-latest.json)
+        companion/src-tauri/Cargo.toml        [package] version
+        companion/src-tauri/Cargo.lock        gametracker-companion package entry
 
     The NSIS installer template uses {{version}} placeholders that Tauri fills
     from tauri.conf.json, and the version label in the app reads package_info()
     (driven by Cargo.toml / tauri.conf.json), so those need no manual edit.
+
+    The Android companion is a SEPARATE Tauri app: its version comes from
+    companion/src-tauri/tauri.conf.json, which is ALSO what the release workflow
+    reads to write apk-latest.json (the manifest the phone's in-app updater polls).
+    If the companion isn't bumped, both the installed APK and the manifest keep the
+    old version, so the phone always reports "you're on the latest version" and
+    auto-update never fires. Hence these must move together with the desktop.
 
     The frontend version strings (title bar "vX.Y.Z", Settings "Tracker X.Y.Z")
     read package.json at build time via Vite's `__APP_VERSION__` define
@@ -53,6 +63,13 @@ $pkgJson  = P "package.json"
 $confJson = P "src-tauri/tauri.conf.json"
 $cargo    = P "src-tauri/Cargo.toml"
 $cargoLk  = P "src-tauri/Cargo.lock"
+# Android companion (separate Tauri app). Historically these drifted behind the
+# desktop because the bump only touched the files above, which silently broke the
+# phone's in-app updater — so they're bumped here too, matched independently of the
+# desktop's current version (they may not agree with it).
+$cCompConf  = P "companion/src-tauri/tauri.conf.json"
+$cCompCargo = P "companion/src-tauri/Cargo.toml"
+$cCompLock  = P "companion/src-tauri/Cargo.lock"
 
 # Read/write files as UTF-8 (no BOM) explicitly. Windows PowerShell 5.1's
 # Get-Content -Raw mis-decodes non-ASCII bytes (e.g. the em-dash in Cargo.toml's
@@ -100,6 +117,31 @@ function Edit-File([string]$path, [string]$pattern, [string]$replacement, [strin
     Write-Host "  updated $(Resolve-Path $path -Relative)" -ForegroundColor DarkGray
 }
 
+# Like Edit-File, but the version being replaced is captured from the file itself
+# (any semver) rather than assumed to equal the desktop's $current. This is what
+# lets the companion re-sync even after it has drifted behind (e.g. companion 3.2.7
+# while the desktop is 3.6.0). $pattern must capture the leading text in group 1,
+# the version in group 2, and the trailing text in group 3. A file already at $new
+# is left untouched (not an error) so re-runs are safe.
+function Set-Version([string]$path, [string]$pattern, [string]$label) {
+    if (-not (Test-Path $path)) {
+        throw "Expected file not found: $path ($label)."
+    }
+    $raw = Read-Text $path
+    $m = [regex]::Match($raw, $pattern)
+    if (-not $m.Success) {
+        throw "Did not find a version to replace in $path ($label). File left unchanged."
+    }
+    $old = $m.Groups[2].Value
+    if ($old -eq $new) {
+        Write-Host "  already $new in $(Resolve-Path $path -Relative) ($label)" -ForegroundColor DarkGray
+        return
+    }
+    $updated = $raw.Remove($m.Groups[2].Index, $m.Groups[2].Length).Insert($m.Groups[2].Index, $new)
+    Write-Text $path $updated
+    Write-Host "  updated $(Resolve-Path $path -Relative)  ($old -> $new)" -ForegroundColor DarkGray
+}
+
 # package.json:        "version": "x.y.z"
 Edit-File $pkgJson  "(`"version`"\s*:\s*`")$esc(`")" "`${1}$new`${2}" "package.json version"
 
@@ -113,13 +155,21 @@ Edit-File $cargo    "(?m)^(version\s*=\s*`")$esc(`")" "`${1}$new`${2}" "Cargo.to
 # Cargo.lock:          the version line directly under  name = "gametracker"
 Edit-File $cargoLk  "(name = `"gametracker`"\r?\nversion = `")$esc(`")" "`${1}$new`${2}" "Cargo.lock gametracker entry"
 
-Write-Host "Version bumped to $new in 4 files." -ForegroundColor Green
+# --- Android companion (matched independently of the desktop's $current) --------
+# companion tauri.conf.json:  "version": "x.y.z"  (drives the APK version + apk-latest.json)
+Set-Version $cCompConf  "(`"version`"\s*:\s*`")([0-9]+\.[0-9]+\.[0-9]+[^`"]*)(`")" "companion tauri.conf.json version"
+# companion Cargo.toml:       version = "x.y.z"   (first line-anchored = the [package] version)
+Set-Version $cCompCargo "(?m)^(version\s*=\s*`")([0-9]+\.[0-9]+\.[0-9]+[^`"]*)(`")" "companion Cargo.toml [package] version"
+# companion Cargo.lock:       the version line directly under  name = "gametracker-companion"
+Set-Version $cCompLock  "(name = `"gametracker-companion`"\r?\nversion = `")([0-9]+\.[0-9]+\.[0-9]+[^`"]*)(`")" "companion Cargo.lock entry"
+
+Write-Host "Version bumped to $new in 7 files (desktop + Android companion)." -ForegroundColor Green
 
 # --- Optional git tag / push --------------------------------------------------
 if ($Tag -or $Push) {
     Push-Location $root
     try {
-        git add $pkgJson $confJson $cargo $cargoLk | Out-Null
+        git add $pkgJson $confJson $cargo $cargoLk $cCompConf $cCompCargo $cCompLock | Out-Null
         git commit -m "Bump version to $new" | Out-Null
         git tag -a "v$new" -m "Tracker v$new" | Out-Null
         Write-Host "Committed and tagged v$new." -ForegroundColor Green

@@ -34,6 +34,7 @@ import { clipFocusSpans } from "@/lib/focusSpans";
 import { apiGet, apiPost, loadMedia } from "../link";
 import { useRemote } from "../useRemote";
 import { Art, RemoteImg, STATUS_STYLE, STATUS_ORDER } from "../ui";
+import { MarqueePoolProvider, SectionBackdrop } from "../Marquee";
 import { LiveStatsPanel, SteamReviewsPanel, MetacriticReviewsPanel, TrailerPanel, SoundtrackPanel, TwitchPanel } from "./OnlinePanels";
 import { Sparkles } from "lucide-react";
 
@@ -161,6 +162,7 @@ function Detail({ game, sessions, shots, onClose }: { game: Game; sessions: Sess
   const maxRuntime = useMemo(() => sessions.reduce((m, s) => Math.max(m, s.runtimeSeconds), 1), [sessions]);
 
   return (
+    <MarqueePoolProvider games={[g]} game={g}>
     <div className="pb-10">
       {/* hero */}
       <div className="relative">
@@ -360,6 +362,7 @@ function Detail({ game, sessions, shots, onClose }: { game: Game; sessions: Sess
         )}
       </div>
     </div>
+    </MarqueePoolProvider>
   );
 }
 
@@ -483,15 +486,18 @@ function Stat({ icon, label, value, color }: { icon: React.ReactNode; label: str
 
 function Card({ title, subtitle, icon, children }: { title: string; subtitle?: string; icon?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <section className="rounded-2xl border border-line bg-bg-900/40 p-3.5">
-      <div className="mb-3 flex items-center gap-2">
-        {icon && <span className="text-ink-dim">{icon}</span>}
-        <div>
-          <div className="font-display text-sm font-800">{title}</div>
-          {subtitle && <div className="text-[11px] text-ink-dim">{subtitle}</div>}
+    <section className="relative overflow-hidden rounded-2xl border border-line bg-bg-900/40 p-3.5">
+      <SectionBackdrop prefix="game-detail" title={title} />
+      <div className="relative z-10">
+        <div className="mb-3 flex items-center gap-2">
+          {icon && <span className="text-ink-dim">{icon}</span>}
+          <div>
+            <div className="font-display text-sm font-800">{title}</div>
+            {subtitle && <div className="text-[11px] text-ink-dim">{subtitle}</div>}
+          </div>
         </div>
+        {children}
       </div>
-      {children}
     </section>
   );
 }

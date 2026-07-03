@@ -10,6 +10,7 @@ import type { Game, GameStatus } from "@/lib/api";
 import { dur } from "@/lib/format";
 import { useRemote } from "../useRemote";
 import { Art, STATUS_STYLE, STATUS_ORDER, openGame } from "../ui";
+import { MarqueeFX } from "../Marquee";
 
 type StatusFilter = "all" | GameStatus;
 type Sort = "recent" | "name" | "playtime" | "score";
@@ -61,10 +62,14 @@ export function LibraryScreen() {
   if (loading && !games) return <div className="grid h-full place-items-center text-sm text-ink-dim"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading library…</div>;
   if (error && !games) return <div className="m-4 rounded-xl border border-amber/40 bg-amber/10 p-3 text-sm text-amber">{error}</div>;
 
+  const onlyGames = useMemo(() => (games ?? []).filter((g) => g.kind !== "app"), [games]);
+
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col overflow-hidden">
+      {/* full-page drifting cover backdrop — mirrors the desktop Library marquee */}
+      <MarqueeFX variant="driftReverse" games={onlyGames} opacity={0.12} />
       {/* filters */}
-      <div className="shrink-0 space-y-2.5 border-b border-line p-3">
+      <div className="relative z-10 shrink-0 space-y-2.5 border-b border-line bg-bg-base/70 p-3 backdrop-blur">
         <div className="flex items-center gap-2">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-dim" />
@@ -110,7 +115,7 @@ export function LibraryScreen() {
       </div>
 
       {/* grid */}
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+      <div className="relative z-10 min-h-0 flex-1 overflow-y-auto p-3">
         {filtered.length === 0 ? (
           <div className="grid h-full place-items-center text-sm text-ink-dim">No {kind} match your filters</div>
         ) : (
