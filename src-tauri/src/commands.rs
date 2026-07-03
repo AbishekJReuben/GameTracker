@@ -2226,6 +2226,13 @@ pub fn remote_textfield_active() -> bool {
     crate::remote::focus::foreground_text_field_active()
 }
 
+/// The current desktop cursor shape (arrow/hand/text/resize/busy…), so the phone
+/// can mirror it on its on-screen remote cursor.
+#[tauri::command]
+pub fn remote_cursor_kind() -> String {
+    crate::remote::focus::foreground_cursor_kind().to_string()
+}
+
 /// Latest host capture-pipeline telemetry (capture/scale/encode ms, produced fps,
 /// frame size, resolution), so the phone's debug HUD can pinpoint the bottleneck.
 #[tauri::command]

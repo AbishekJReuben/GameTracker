@@ -277,6 +277,7 @@ export function startHost(opts: HostOptions): () => void {
   let audioNode: ScriptProcessorNode | null = null;
   let focusTimer: number | null = null;
   let lastTextField = false;
+  let lastCursorKind = "";
   let sigBackoff = 1000;
   let sigRetry: number | null = null;
   // Timestamp of the last message from the phone (input, quality, or heartbeat
@@ -364,6 +365,11 @@ export function startHost(opts: HostOptions): () => void {
           lastTextField = active;
           dataCh.send(JSON.stringify({ event: "focus", textField: active }));
         }
+        const kind = await api.remoteCursorKind();
+        if (kind !== lastCursorKind) {
+          lastCursorKind = kind;
+          dataCh.send(JSON.stringify({ event: "cursor", kind }));
+        }
       } catch {
         /* ignore */
       }
@@ -407,6 +413,7 @@ export function startHost(opts: HostOptions): () => void {
     pc?.close();
     pc = null;
     lastTextField = false;
+    lastCursorKind = "";
     opts.onClients?.(0);
     opts.onStats?.(null);
   };
@@ -997,6 +1004,17 @@ export function startHost(opts: HostOptions): () => void {
           if (active !== lastTextField) {
             lastTextField = active;
             if (data.readyState === "open") data.send(JSON.stringify({ event: "focus", textField: active }));
+          }
+        } catch {
+          /* ignore */
+        }
+        // Mirror the live desktop cursor shape so the phone's on-screen cursor
+        // follows the PC (hand over links, I-beam over text, resize arrows…).
+        try {
+          const kind = await api.remoteCursorKind();
+          if (kind !== lastCursorKind) {
+            lastCursorKind = kind;
+            if (data.readyState === "open") data.send(JSON.stringify({ event: "cursor", kind }));
           }
         } catch {
           /* ignore */

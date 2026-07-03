@@ -8,21 +8,26 @@
 //! the prompt render on the normal interactive desktop, which we DO capture — so
 //! the phone can see it and click Yes/No.
 //!
-//! This lowers local security (remote input can then answer UAC), so it is
-//! strictly **opt-in** (`remote_show_uac`, default off) and we restore the secure
-//! desktop (`1`) whenever remote is disabled or the app exits. The app runs
-//! elevated (`requireAdministrator`), so the HKLM write succeeds without a prompt.
+//! Because injected input can't click the elevation dialog anyway (`consent.exe`
+//! runs at a higher integrity level than our High-IL elevated app, and UIPI drops
+//! upward input) without a uiAccess-signed build, "on" ALSO sets
+//! **`ConsentPromptBehaviorAdmin = 0`** ("Elevate without prompting"), so an admin
+//! user's UAC operations proceed **automatically** while remote is on — the remote
+//! side just works instead of hanging on an unclickable prompt.
+//!
+//! This lowers local security, so it is strictly **opt-in** (`remote_show_uac`,
+//! default off) and we restore the secure Windows defaults (secure desktop on,
+//! prompt-for-consent) whenever remote is disabled or the app exits. The app runs
+//! elevated (`requireAdministrator`), so the HKLM writes succeed without a prompt.
 
-/// Registry key + value that controls the UAC secure desktop.
+/// UAC policy registry key (both values live here).
 #[cfg(windows)]
 const SUBKEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
-#[cfg(windows)]
-const VALUE: &str = "PromptOnSecureDesktop";
 
-/// Make the UAC prompt visible to remote capture (`visible = true` → disable the
-/// secure desktop) or restore the secure Windows default (`visible = false`).
-/// Best-effort: returns a message on failure so the caller can surface it; never
-/// panics. No-op on non-Windows.
+/// Enable (`visible = true`) AnyDesk-style remote UAC handling — disable the secure
+/// desktop AND auto-approve admin elevations — or restore the secure Windows
+/// defaults (`visible = false`). Best-effort: returns a message on failure so the
+/// caller can surface it; never panics. No-op on non-Windows.
 #[cfg(windows)]
 pub fn set_visible(visible: bool) -> Result<(), String> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE};
@@ -32,10 +37,18 @@ pub fn set_visible(visible: bool) -> Result<(), String> {
     let key = hklm
         .open_subkey_with_flags(SUBKEY, KEY_READ | KEY_SET_VALUE)
         .map_err(|e| format!("open UAC policy key: {e}"))?;
-    // 0 = prompt on the normal desktop (capturable); 1 = secure desktop (default).
-    let want: u32 = if visible { 0 } else { 1 };
-    key.set_value(VALUE, &want)
-        .map_err(|e| format!("set {VALUE}: {e}"))
+
+    // PromptOnSecureDesktop: 0 = prompt on the normal (capturable) desktop, 1 = secure default.
+    let secure: u32 = if visible { 0 } else { 1 };
+    // ConsentPromptBehaviorAdmin: 0 = elevate without prompting (auto-approve),
+    // 5 = the Windows default (prompt for consent for non-Windows binaries).
+    let consent: u32 = if visible { 0 } else { 5 };
+
+    key.set_value("PromptOnSecureDesktop", &secure)
+        .map_err(|e| format!("set PromptOnSecureDesktop: {e}"))?;
+    key.set_value("ConsentPromptBehaviorAdmin", &consent)
+        .map_err(|e| format!("set ConsentPromptBehaviorAdmin: {e}"))?;
+    Ok(())
 }
 
 #[cfg(not(windows))]

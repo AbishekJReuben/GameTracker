@@ -46,6 +46,15 @@ import {
   Sparkles,
   Pin,
   PinOff,
+  TextCursor,
+  Move,
+  MoveHorizontal,
+  MoveVertical,
+  MoveDiagonal,
+  MoveDiagonal2,
+  Crosshair,
+  Ban,
+  Grab,
 } from "lucide-react";
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { apiGet } from "../link";
@@ -209,6 +218,40 @@ export function ControlScreen({
   const [mods, setMods] = useState<Set<Mod>>(new Set());
   const autoKbdRef = useRef(false); // guards the once-per-focus auto keyboard pop
 
+  // Remote-cursor polish: the live desktop cursor shape (mirrored from the host),
+  // a transient action "flash" (click/right-click/scroll ripple), and a drag flag.
+  const [cursorKind, setCursorKind] = useState("arrow");
+  const [dragging, setDragging] = useState(false);
+  const [cursorFx, setCursorFx] = useState<{ id: number; kind: "left" | "right" | "scroll"; dir?: number } | null>(null);
+  const fxId = useRef(0);
+  const fxClear = useRef<number | null>(null);
+  const lastScrollFx = useRef(0);
+  const flashCursor = (kind: "left" | "right" | "scroll", dir?: number) => {
+    if (kind === "scroll") {
+      const now = performance.now();
+      if (now - lastScrollFx.current < 120) return; // don't spam ripples mid-scroll
+      lastScrollFx.current = now;
+    }
+    fxId.current += 1;
+    setCursorFx({ id: fxId.current, kind, dir });
+    if (fxClear.current) clearTimeout(fxClear.current);
+    fxClear.current = window.setTimeout(() => setCursorFx(null), 500);
+  };
+  // All input goes through this wrapper so the on-screen cursor can react to the
+  // action (click ripple, right-click ripple, scroll pulse, grabbing while dragging).
+  // Non-mouse messages (keys/quality/text) pass straight through untouched.
+  const send: RemoteLink["send"] = (msg) => {
+    const m = msg as { type?: string; button?: string; dy?: number };
+    if (m.type === "click") flashCursor(m.button === "right" ? "right" : m.button === "left" ? "left" : "left");
+    else if (m.type === "scroll") flashCursor("scroll", m.dy ?? 0);
+    else if (m.type === "down" && m.button) setDragging(true);
+    else if (m.type === "up" && m.button) setDragging(false);
+    link.send(msg);
+  };
+  // First frame received (video decoded or a canvas frame drawn) → hide the
+  // app-icon "connecting" placeholder that fills the ~1s gap before pixels arrive.
+  const [hasFrame, setHasFrame] = useState(false);
+
   // Floating compose bar: the hidden text field is ALWAYS mounted (so both the
   // auto-keyboard on PC focus and the collapsed floating keyboard button work,
   // regardless of dock state); `typing` reveals the compose chrome.
@@ -303,6 +346,7 @@ export function ControlScreen({
         .then((bmp) => {
           ctx.drawImage(bmp, tx, ty);
           bmp.close?.();
+          setHasFrame(true);
         })
         .catch(() => {});
     }
@@ -310,7 +354,10 @@ export function ControlScreen({
 
   // ----- frame + status lifecycle -----
   useEffect(() => {
-    link.onStatus(setConnected);
+    link.onStatus((c) => {
+      setConnected(c);
+      if (!c) setHasFrame(false); // show the app-icon placeholder again on reconnect
+    });
     const unsubProgress = link.onProgress?.(setProgress);
     // Cloud: the screen arrives as a hardware-decoded WebRTC video track.
     link.onStream((stream) => {
@@ -327,6 +374,7 @@ export function ControlScreen({
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     link.onEvent((e) => {
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
+      else if (e.event === "cursor") setCursorKind(String((e as { kind?: string }).kind || "arrow"));
       else if (e.event === "capstats") {
         const cs = (e as { stats?: RemoteCaptureStats }).stats;
         if (!cs) return;
@@ -389,6 +437,7 @@ export function ControlScreen({
       const t = frameTimes.current;
       t.push(now);
       while (t.length && now - t[0] > 1000) t.shift();
+      setHasFrame(true);
       handle = v.requestVideoFrameCallback!(onVF);
     };
     handle = v.requestVideoFrameCallback(onVF);
@@ -452,7 +501,7 @@ export function ControlScreen({
 
   const selectMonitor = (i: number) => {
     setMonitorIdx(i);
-    link.send({ type: "monitor", index: i });
+    send({ type: "monitor", index: i });
     resetView();
   };
 
@@ -523,7 +572,7 @@ export function ControlScreen({
     const m = pendingMove.current;
     if (m) {
       pendingMove.current = null;
-      link.send({ type: "move", x: m.x, y: m.y });
+      send({ type: "move", x: m.x, y: m.y });
     }
   };
   const queueMove = (x: number, y: number) => {
@@ -667,7 +716,7 @@ export function ControlScreen({
           queueMove(n.x, n.y);
         }
       } else if (dragLock) {
-        link.send({ type: "down", button: "left" });
+        send({ type: "down", button: "left" });
         gesture.current = "dragging";
       } else {
         armedDrag.current = now - lastTapUp.current < DOUBLE_MS; // double-tap-drag
@@ -679,7 +728,7 @@ export function ControlScreen({
         longTimer.current = window.setTimeout(() => {
           if (pts.current.size === 1 && maxMove.current < TAP_SLOP) {
             gesture.current = "none"; // consume the gesture; no click on release
-            link.send({ type: "click", button: "right" });
+            send({ type: "click", button: "right" });
             navigator.vibrate?.(15);
           }
         }, LONGPRESS_MS);
@@ -727,12 +776,12 @@ export function ControlScreen({
         scrollAcc.current.x += midX - (prevMid.current?.x ?? midX);
         while (Math.abs(scrollAcc.current.y) >= SCROLL_STEP) {
           const dir = scrollAcc.current.y > 0 ? 1 : -1;
-          link.send({ type: "scroll", dy: -dir }); // natural: content follows fingers
+          send({ type: "scroll", dy: -dir }); // natural: content follows fingers
           scrollAcc.current.y -= dir * SCROLL_STEP;
         }
         while (Math.abs(scrollAcc.current.x) >= SCROLL_STEP) {
           const dir = scrollAcc.current.x > 0 ? 1 : -1;
-          link.send({ type: "scroll", dx: -dir, dy: 0 });
+          send({ type: "scroll", dx: -dir, dy: 0 });
           scrollAcc.current.x -= dir * SCROLL_STEP;
         }
       }
@@ -750,7 +799,7 @@ export function ControlScreen({
         const n = screenToNorm(l, r.left, r.top, zoomRef.current, panRef.current.x, panRef.current.y, e.clientX, e.clientY);
         queueMove(n.x, n.y);
         if (travel > TAP_SLOP && !touchPressed.current) {
-          link.send({ type: "down", button: "left" });
+          send({ type: "down", button: "left" });
           touchPressed.current = true;
         }
       }
@@ -760,7 +809,7 @@ export function ControlScreen({
     // Trackpad: relative cursor movement.
     if (armedDrag.current && gesture.current !== "dragging" && travel > TAP_SLOP) {
       gesture.current = "dragging";
-      link.send({ type: "down", button: "left" });
+      send({ type: "down", button: "left" });
     }
     const l = layoutRef.current;
     if (!l) return;
@@ -783,15 +832,15 @@ export function ControlScreen({
       const wasTap = maxMove.current < TAP_SLOP && now - downT.current < TAP_MS;
 
       if (mode === "touch") {
-        if (touchPressed.current) link.send({ type: "up", button: "left" });
-        else if (wasTap && downCount.current === 1) link.send({ type: "click", button: "left" });
-        if (downCount.current === 2 && wasTap && twoMode.current === "undecided") link.send({ type: "click", button: "right" });
+        if (touchPressed.current) send({ type: "up", button: "left" });
+        else if (wasTap && downCount.current === 1) send({ type: "click", button: "left" });
+        if (downCount.current === 2 && wasTap && twoMode.current === "undecided") send({ type: "click", button: "right" });
       } else if (g === "dragging") {
-        link.send({ type: "up", button: "left" });
+        send({ type: "up", button: "left" });
       } else if (g === "two") {
-        if (twoMode.current === "undecided" && wasTap && downCount.current === 2) link.send({ type: "click", button: "right" });
+        if (twoMode.current === "undecided" && wasTap && downCount.current === 2) send({ type: "click", button: "right" });
       } else if (g === "cursor" && wasTap && downCount.current === 1) {
-        link.send({ type: "click", button: "left" });
+        send({ type: "click", button: "left" });
         lastTapUp.current = now; // enables double-tap-drag & native double-click
       }
 
@@ -818,7 +867,7 @@ export function ControlScreen({
   // ----- keyboard -----
   const releaseMods = () => {
     if (mods.size === 0) return;
-    mods.forEach((m) => link.send({ type: "keyup", name: m }));
+    mods.forEach((m) => send({ type: "keyup", name: m }));
     setMods(new Set());
   };
   const toggleMod = (m: Mod) => {
@@ -826,17 +875,17 @@ export function ControlScreen({
       const next = new Set(prev);
       if (next.has(m)) {
         next.delete(m);
-        link.send({ type: "keyup", name: m });
+        send({ type: "keyup", name: m });
       } else {
         next.add(m);
-        link.send({ type: "keydown", name: m });
+        send({ type: "keydown", name: m });
       }
       return next;
     });
   };
   /** Fire a named key wrapped in any sticky modifiers, then release them. */
   const tapKey = (name: string) => {
-    link.send({ type: "key", name });
+    send({ type: "key", name });
     releaseMods();
   };
 
@@ -867,11 +916,11 @@ export function ControlScreen({
     while (i < min && val[i] === prev[i]) i++;
     const removed = prev.length - i;
     const added = val.slice(i);
-    for (let k = 0; k < removed; k++) link.send({ type: "key", name: "backspace" });
+    for (let k = 0; k < removed; k++) send({ type: "key", name: "backspace" });
     if (added) {
       if (mods.size > 0 && added.length === 1) tapKey(added.toLowerCase());
       else {
-        link.send({ type: "text", value: added });
+        send({ type: "text", value: added });
         releaseMods();
       }
     }
@@ -891,7 +940,7 @@ export function ControlScreen({
     const el = kbdRef.current;
     const val = el?.value ?? "";
     if (val) {
-      link.send({ type: "text", value: val });
+      send({ type: "text", value: val });
       releaseMods();
     }
     resetField();
@@ -932,9 +981,9 @@ export function ControlScreen({
 
   /** Run a chord as an explicit hold→press→release sequence (independent of sticky). */
   const chord = (modKeys: Mod[], key?: string) => {
-    modKeys.forEach((m) => link.send({ type: "keydown", name: m }));
-    if (key) link.send({ type: "key", name: key });
-    [...modKeys].reverse().forEach((m) => link.send({ type: "keyup", name: m }));
+    modKeys.forEach((m) => send({ type: "keydown", name: m }));
+    if (key) send({ type: "key", name: key });
+    [...modKeys].reverse().forEach((m) => send({ type: "keyup", name: m }));
     navigator.vibrate?.(8);
   };
 
@@ -1084,10 +1133,30 @@ export function ControlScreen({
           style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "center center" }}
         />
         {mode === "trackpad" && connected && cursorScreen && (
-          <div className="pointer-events-none absolute z-10" style={{ left: cursorScreen.x, top: cursorScreen.y, transform: "translate(-2px,-2px)" }}>
-            <MousePointer2 className="h-6 w-6 text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.9)]" fill="rgba(0,0,0,0.35)" />
-          </div>
+          <RemoteCursor x={cursorScreen.x} y={cursorScreen.y} kind={cursorKind} dragging={dragging} fx={cursorFx} />
         )}
+        {/* App-icon placeholder for the ~1s gap before the first frame arrives. */}
+        <AnimatePresence>
+          {connected && !hasFrame && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="pointer-events-none absolute inset-0 grid place-items-center bg-black"
+            >
+              <motion.div
+                className="flex flex-col items-center gap-4"
+                animate={{ scale: [1, 1.05, 1], opacity: [0.75, 1, 0.75] }}
+                transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
+              >
+                <img src="/app-icon.png" alt="" className="h-24 w-24 rounded-3xl shadow-glow" />
+                <span className="flex items-center gap-2 text-xs font-700 text-ink-dim">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waking your screen…
+                </span>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
         {showReconnect && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
             {progress ? (
@@ -1383,16 +1452,16 @@ export function ControlScreen({
                 {mode === "trackpad" ? <Pointer className="h-4 w-4" /> : <Hand className="h-4 w-4" />}
               </IcoBtn>
               <Sep />
-              <IcoBtn title="Left click" onClick={() => link.send({ type: "click", button: "left" })}><MousePointer2 className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Right click" onClick={() => link.send({ type: "click", button: "right" })}><MousePointerClick className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Middle click" onClick={() => link.send({ type: "click", button: "middle" })}><Command className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Left click" onClick={() => send({ type: "click", button: "left" })}><MousePointer2 className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Right click" onClick={() => send({ type: "click", button: "right" })}><MousePointerClick className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Middle click" onClick={() => send({ type: "click", button: "middle" })}><Command className="h-4 w-4" /></IcoBtn>
               {mode === "trackpad" && (
-                <IcoBtn active={dragLock} title={dragLock ? "Drag lock: ON" : "Drag lock"} onClick={() => { if (dragLock) { link.send({ type: "up", button: "left" }); setDragLock(false); } else setDragLock(true); }}>
+                <IcoBtn active={dragLock} title={dragLock ? "Drag lock: ON" : "Drag lock"} onClick={() => { if (dragLock) { send({ type: "up", button: "left" }); setDragLock(false); } else setDragLock(true); }}>
                   <Hand className="h-4 w-4" />
                 </IcoBtn>
               )}
-              <IcoBtn title="Scroll up" onClick={() => link.send({ type: "scroll", dy: -3 })}><ChevronUp className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Scroll down" onClick={() => link.send({ type: "scroll", dy: 3 })}><ChevronDown className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Scroll up" onClick={() => send({ type: "scroll", dy: -3 })}><ChevronUp className="h-4 w-4" /></IcoBtn>
+              <IcoBtn title="Scroll down" onClick={() => send({ type: "scroll", dy: 3 })}><ChevronDown className="h-4 w-4" /></IcoBtn>
               <Sep />
               <div className="flex shrink-0 items-center gap-1.5 pr-1" title="Pointer speed">
                 <Gauge className="h-3.5 w-3.5 text-ink-dim" />
@@ -1482,6 +1551,108 @@ export function ControlScreen({
         </motion.div>
       )}
     </div>
+  );
+}
+
+// ---------- remote cursor ----------
+/** Icons for each mirrored desktop cursor shape. `center` = the icon's hotspot is
+ *  its centre (I-beam, resize, move) vs. the top-left tip (arrow/hand). */
+const CURSOR_ICONS: Record<string, { Icon: typeof MousePointer2; center?: boolean }> = {
+  arrow: { Icon: MousePointer2 },
+  hand: { Icon: Pointer },
+  grab: { Icon: Grab, center: true },
+  text: { Icon: TextCursor, center: true },
+  busy: { Icon: Loader2, center: true },
+  move: { Icon: Move, center: true },
+  "resize-ns": { Icon: MoveVertical, center: true },
+  "resize-we": { Icon: MoveHorizontal, center: true },
+  "resize-nwse": { Icon: MoveDiagonal, center: true },
+  "resize-nesw": { Icon: MoveDiagonal2, center: true },
+  cross: { Icon: Crosshair, center: true },
+  no: { Icon: Ban, center: true },
+};
+
+/** The on-screen remote cursor: mirrors the live desktop cursor shape, springs on
+ *  every state change, shrinks while dragging, and ripples on click/scroll. */
+function RemoteCursor({
+  x,
+  y,
+  kind,
+  dragging,
+  fx,
+}: {
+  x: number;
+  y: number;
+  kind: string;
+  dragging: boolean;
+  fx: { id: number; kind: "left" | "right" | "scroll"; dir?: number } | null;
+}) {
+  const effective = dragging ? "grab" : kind;
+  const hidden = kind === "hidden" && !dragging;
+  const entry = CURSOR_ICONS[effective] ?? CURSOR_ICONS.arrow;
+  const Icon = entry.Icon;
+  const offset = entry.center ? "translate(-50%,-50%)" : "translate(-2px,-2px)";
+  return (
+    <div className="pointer-events-none absolute z-10" style={{ left: x, top: y }}>
+      {!hidden && (
+        <motion.div
+          key={effective}
+          initial={{ scale: 0.5, opacity: 0 }}
+          animate={{ scale: dragging ? 0.85 : 1, opacity: 1 }}
+          transition={{ type: "spring", stiffness: 650, damping: 22 }}
+          style={{ transform: offset }}
+        >
+          <Icon
+            className={`h-6 w-6 text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.9)] ${effective === "busy" ? "animate-spin" : ""}`}
+            fill={effective === "arrow" || effective === "hand" ? "rgba(0,0,0,0.35)" : "none"}
+            strokeWidth={2.25}
+          />
+        </motion.div>
+      )}
+      <AnimatePresence>{fx && <CursorFx key={fx.id} kind={fx.kind} dir={fx.dir} />}</AnimatePresence>
+    </div>
+  );
+}
+
+/** A one-shot ripple/pulse at the cursor for a click / right-click / scroll. */
+function CursorFx({ kind, dir }: { kind: "left" | "right" | "scroll"; dir?: number }) {
+  if (kind === "scroll") {
+    const up = (dir ?? 0) < 0;
+    const Chevron = up ? ChevronUp : ChevronDown;
+    return (
+      <motion.div
+        className="absolute left-0 top-0"
+        style={{ transform: "translate(-50%,-50%)" }}
+        initial={{ opacity: 0.95, y: 0, scale: 0.8 }}
+        animate={{ opacity: 0, y: up ? -18 : 18, scale: 1.15 }}
+        exit={{ opacity: 0 }}
+        transition={{ duration: 0.45, ease: "easeOut" }}
+      >
+        <Chevron className="h-5 w-5 text-accent-3 drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]" strokeWidth={3} />
+      </motion.div>
+    );
+  }
+  const color = kind === "right" ? "#f472b6" : "#ffffff";
+  return (
+    <>
+      <motion.span
+        className="absolute left-0 top-0 rounded-full border-2"
+        style={{ width: 12, height: 12, transform: "translate(-50%,-50%)", borderColor: color }}
+        initial={{ opacity: 0.85, scale: 0.35 }}
+        animate={{ opacity: 0, scale: 3.4 }}
+        exit={{ opacity: 0 }}
+        transition={{ duration: 0.44, ease: "easeOut" }}
+      />
+      {kind === "right" && (
+        <motion.span
+          className="absolute left-0 top-0 rounded-full"
+          style={{ width: 6, height: 6, transform: "translate(-50%,-50%)", background: color }}
+          initial={{ opacity: 0.9, scale: 1 }}
+          animate={{ opacity: 0, scale: 0.4 }}
+          transition={{ duration: 0.3 }}
+        />
+      )}
+    </>
   );
 }
 

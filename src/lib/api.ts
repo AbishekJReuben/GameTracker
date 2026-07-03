@@ -1219,6 +1219,7 @@ export const api = {
     call<RemoteAudioFormat | null>("remote_start_audio", { onPcm }),
   remoteStopAudio: () => call<void>("remote_stop_audio"),
   remoteTextfieldActive: () => call<boolean>("remote_textfield_active"),
+  remoteCursorKind: () => call<string>("remote_cursor_kind"),
   remoteCaptureStats: () => call<RemoteCaptureStats>("remote_capture_stats"),
   remoteListMonitors: () => call<RemoteMonitor[]>("remote_list_monitors"),
   remoteReadMedia: (path: string) => call<string | null>("remote_read_media", { path }),
