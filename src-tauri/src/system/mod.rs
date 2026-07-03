@@ -59,10 +59,21 @@ impl SensorReading {
     }
 }
 
+/// One tick's per-app resource samples (all sharing a timestamp). Kept in a live
+/// ring so the per-app history chart's tail advances every ~2s like the main
+/// system-usage chart, even though we only persist to SQLite every ~16s.
+#[derive(Clone)]
+pub struct AppTickSample {
+    pub ts: String,
+    /// (game_id, cpu%, ram_mb, gpu%)
+    pub rows: Vec<(String, f64, f64, Option<f64>)>,
+}
+
 pub struct SystemShared {
     pub specs: Mutex<Option<SystemSpecs>>,
     pub sensor: Mutex<SensorReading>,
     pub live: Mutex<VecDeque<SystemSample>>,
+    pub live_apps: Mutex<VecDeque<AppTickSample>>,
 }
 
 impl SystemShared {
@@ -71,7 +82,17 @@ impl SystemShared {
             specs: Mutex::new(None),
             sensor: Mutex::new(SensorReading::default()),
             live: Mutex::new(VecDeque::with_capacity(LIVE_CAP)),
+            live_apps: Mutex::new(VecDeque::with_capacity(LIVE_CAP)),
         }
+    }
+
+    /// Push a per-app tick sample into the live ring (bounded).
+    pub fn push_app_live(&self, sample: AppTickSample) {
+        let mut live = self.live_apps.lock();
+        if live.len() >= LIVE_CAP {
+            live.pop_front();
+        }
+        live.push_back(sample);
     }
 }
 
@@ -596,60 +617,97 @@ pub fn prune_app(pool: &DbPool) -> AppResult<()> {
     Ok(())
 }
 
-pub fn app_history(pool: &DbPool, minutes: i64) -> AppResult<AppUsageHistory> {
+pub fn app_history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppResult<AppUsageHistory> {
+    use std::collections::{HashMap, HashSet};
+
     let minutes = minutes.clamp(5, 60 * 24 * PRUNE_DAYS);
     let from = (Utc::now() - ChronoDuration::minutes(minutes)).to_rfc3339();
 
     let conn = pool.get()?;
     ensure_app_table(pool)?;
 
+    // Persisted history (downsampled, ~16s resolution).
     let mut stmt = conn.prepare(
-        "SELECT a.ts, a.game_id, a.cpu, a.ram_mb, a.gpu,
-                g.display_name, g.kind, g.icon_path, g.cover_path, g.accent_color
-         FROM app_samples a JOIN games g ON g.id = a.game_id
-         WHERE a.ts >= ?1 ORDER BY a.ts ASC",
+        "SELECT ts, game_id, cpu, ram_mb, gpu FROM app_samples
+         WHERE ts >= ?1 ORDER BY ts ASC",
     )?;
+    let mut points: Vec<AppUsagePoint> = stmt
+        .query_map([&from], |r| {
+            Ok(AppUsagePoint {
+                ts: r.get(0)?,
+                game_id: r.get(1)?,
+                cpu: r.get(2)?,
+                ram_mb: r.get(3)?,
+                gpu: r.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let mut points: Vec<AppUsagePoint> = Vec::new();
-    let mut meta: std::collections::HashMap<String, AppUsageMeta> = std::collections::HashMap::new();
-    // Rank apps by cumulative load (CPU + a scaled RAM term) so the busiest ones
-    // sit at the base of the stack and stay visible.
-    let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    let mut has_gpu = false;
-
-    let rows = stmt.query_map([&from], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, f64>(2)?,
-            r.get::<_, f64>(3)?,
-            r.get::<_, Option<f64>>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
-            r.get::<_, Option<String>>(7)?,
-            r.get::<_, Option<String>>(8)?,
-            r.get::<_, Option<String>>(9)?,
-        ))
-    })?;
-
-    for row in rows {
-        let (ts, gid, cpu, ram_mb, gpu, name, kind, icon, cover, accent) = row?;
-        if gpu.is_some() {
-            has_gpu = true;
+    // Fold in the live tail so the chart tip stays current (2s) between persists,
+    // exactly like `history()` does for the system-usage chart.
+    let last_ts = points.last().map(|p| p.ts.clone());
+    for s in shared.live_apps.lock().iter() {
+        if s.ts.as_str() >= from.as_str()
+            && last_ts.as_deref().map(|t| s.ts.as_str() > t).unwrap_or(true)
+        {
+            for (gid, cpu, ram_mb, gpu) in &s.rows {
+                points.push(AppUsagePoint {
+                    ts: s.ts.clone(),
+                    game_id: gid.clone(),
+                    cpu: *cpu,
+                    ram_mb: *ram_mb,
+                    gpu: *gpu,
+                });
+            }
         }
-        *totals.entry(gid.clone()).or_insert(0.0) += cpu + ram_mb / 256.0 + gpu.unwrap_or(0.0);
-        meta.entry(gid.clone()).or_insert_with(|| AppUsageMeta {
-            game_id: gid.clone(),
-            name,
-            kind,
-            icon_path: icon,
-            cover_path: cover,
-            accent_color: accent,
-        });
-        points.push(AppUsagePoint { ts, game_id: gid, cpu, ram_mb, gpu });
     }
 
-    let mut apps: Vec<AppUsageMeta> = meta.into_values().collect();
+    // Rank apps by cumulative load (CPU + a scaled RAM term + GPU) so the busiest
+    // ones sit at the base of the stack; collect ids in first-seen order.
+    let mut has_gpu = false;
+    let mut totals: HashMap<String, f64> = HashMap::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for p in &points {
+        if p.gpu.is_some() {
+            has_gpu = true;
+        }
+        *totals.entry(p.game_id.clone()).or_insert(0.0) +=
+            p.cpu + p.ram_mb / 256.0 + p.gpu.unwrap_or(0.0);
+        if seen.insert(p.game_id.clone()) {
+            ids.push(p.game_id.clone());
+        }
+    }
+
+    // Fetch identity for every app in one query.
+    let mut meta_map: HashMap<String, AppUsageMeta> = HashMap::new();
+    if !ids.is_empty() {
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, display_name, kind, icon_path, cover_path, accent_color
+             FROM games WHERE id IN ({placeholders})"
+        );
+        let mut mstmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = mstmt.query_map(params.as_slice(), |r| {
+            Ok(AppUsageMeta {
+                game_id: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                icon_path: r.get(3)?,
+                cover_path: r.get(4)?,
+                accent_color: r.get(5)?,
+            })
+        })?;
+        for m in rows {
+            let m = m?;
+            meta_map.insert(m.game_id.clone(), m);
+        }
+    }
+
+    let mut apps: Vec<AppUsageMeta> =
+        ids.into_iter().filter_map(|id| meta_map.remove(&id)).collect();
     apps.sort_by(|a, b| {
         let ta = totals.get(&a.game_id).copied().unwrap_or(0.0);
         let tb = totals.get(&b.game_id).copied().unwrap_or(0.0);

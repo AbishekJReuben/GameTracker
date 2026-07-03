@@ -194,13 +194,22 @@ export default function SystemsPage() {
             groupByKind
             showActiveApp
             emptyLabel="No games or apps in this window — start tracking to see them here."
-            footer={<HistoryUsageChart history={history} metric={histMetric} lookbackMs={lookbackMs} />}
+            footer={
+              <div className="space-y-5">
+                <div>
+                  <div className="mb-2 flex items-center gap-2 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+                    <Activity className="h-3.5 w-3.5" /> System usage
+                  </div>
+                  <HistoryUsageChart history={history} metric={histMetric} lookbackMs={lookbackMs} />
+                </div>
+                <div className="border-t border-line pt-4">
+                  <HistoryAppChart minutes={historyMinutes} lookbackMs={lookbackMs} monitorOn={monitorOn} />
+                </div>
+              </div>
+            }
           />
           <SessionLegend sessions={sessions ?? []} />
         </Panel>
-
-        {/* Per-app resource history — combined stacked chart across all apps */}
-        <AppUsagePanel games={games ?? []} minutes={historyMinutes} range={range} monitorOn={monitorOn} />
       </div>
     </Page>
   );
@@ -584,14 +593,34 @@ function buildAppSeries(data: import("@/lib/api").AppUsageHistory | undefined, m
   return { rows, apps };
 }
 
-function AppUsagePanel({ games, minutes, range, monitorOn }: { games: Game[]; minutes: number; range: TimelineRange; monitorOn: boolean }) {
+/**
+ * Per-app stacked resource chart, rendered as the third graph inside the History
+ * panel. It shares the usage chart's fixed `[from, now]` domain and identical
+ * left margin / YAxis width so its x-axis lines up pixel-for-pixel with the
+ * system-usage graph above it and the session timeline at the top.
+ */
+function HistoryAppChart({ minutes, lookbackMs, monitorOn }: { minutes: number; lookbackMs: number; monitorOn: boolean }) {
   const { data } = useSystemAppHistory(minutes, monitorOn);
   const [metric, setMetric] = useState<AppMetric>("cpu");
   const hasGpu = data?.hasGpu ?? false;
   const effMetric: AppMetric = metric === "gpu" && !hasGpu ? "cpu" : metric;
   const { rows, apps } = useMemo(() => buildAppSeries(data, effMetric), [data, effMetric]);
   const isRam = effMetric === "ram";
-  const longRange = rangeToLookbackMs(range) > 86_400_000;
+  const tracking = useApp((s) => s.tracking);
+  // Match HistoryUsageChart's window so the two graphs align on the same axis.
+  const now = useMemo(
+    () => Date.now(),
+    [
+      tracking?.sessionActiveSeconds,
+      tracking?.sessionRuntimeSeconds,
+      tracking?.appSessionActiveSeconds,
+      tracking?.isPlaying,
+      tracking?.appIsActive,
+      data?.points.length,
+    ]
+  );
+  const from = now - lookbackMs;
+  const longRange = lookbackMs > 86_400_000;
   const axisTick = (t: number) => (longRange ? new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : timeTick(t));
   const fmtVal = (v: number) => (isRam ? `${v.toFixed(1)} GB` : `${Math.round(v)}%`);
 
@@ -602,28 +631,23 @@ function AppUsagePanel({ games, minutes, range, monitorOn }: { games: Game[]; mi
   ];
 
   return (
-    <Panel panelKey="systems.apps" games={games} art="icon">
-      <SectionTitle
-        sheen
-        title="Per-app resource usage"
-        subtitle="Combined history — each app is stacked, so the band heights show who's using what and the total"
-        right={
-          <div className="flex items-center gap-2">
-            <Segmented value={metric} onChange={setMetric} size="sm" options={options} />
-            <Layers className="h-4 w-4 text-ink-dim" />
-          </div>
-        }
-      />
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+          <Layers className="h-3.5 w-3.5" /> Per-app usage
+        </div>
+        <Segmented value={metric} onChange={setMetric} size="sm" options={options} />
+      </div>
       {apps.length === 0 || rows.length < 2 ? (
         <EmptyState
           icon={<Layers className="h-6 w-6" />}
           title="Building per-app history"
-          message="Play a game or use a tracked app while Performance tracking is on — per-app CPU, GPU and memory fill in every ~16s and line up here."
+          message="Play a game or use a tracked app while Performance tracking is on — per-app CPU, GPU and memory fill in live and line up above."
         />
       ) : (
         <>
-          <ResponsiveContainer width="100%" height={280}>
-            <AreaChart data={rows} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
+          <ResponsiveContainer width="100%" height={260}>
+            <AreaChart data={rows} margin={{ top: 8, right: 8, left: -22, bottom: 0 }}>
               <defs>
                 {apps.map((a) => (
                   <linearGradient key={a.key} id={`ag-${a.key}`} x1="0" y1="0" x2="0" y2="1">
@@ -633,15 +657,15 @@ function AppUsagePanel({ games, minutes, range, monitorOn }: { games: Game[]; mi
                 ))}
               </defs>
               <CartesianGrid stroke="rgba(255,255,255,0.04)" vertical={false} />
-              <XAxis dataKey="t" type="number" scale="time" domain={["dataMin", "dataMax"]} tickFormatter={axisTick} stroke="#454c66" fontSize={10} tickLine={false} axisLine={false} minTickGap={56} />
-              <YAxis stroke="#454c66" fontSize={10} tickLine={false} axisLine={false} width={44} unit={isRam ? "" : "%"} />
+              <XAxis dataKey="t" type="number" scale="time" domain={[from, now]} tickFormatter={axisTick} stroke="#454c66" fontSize={10} tickLine={false} axisLine={false} minTickGap={56} />
+              <YAxis stroke="#454c66" fontSize={10} tickLine={false} axisLine={false} width={42} unit={isRam ? "" : "%"} />
               <Tooltip content={<AppUsageTooltip apps={apps} fmtVal={fmtVal} />} />
               {apps.map((a) => (
                 <Area key={a.key} type="monotone" dataKey={a.key} name={a.name} stackId="apps" stroke={a.color} strokeWidth={1.25} fill={`url(#ag-${a.key})`} isAnimationActive={false} dot={false} />
               ))}
             </AreaChart>
           </ResponsiveContainer>
-          <div className="mt-3 flex flex-wrap gap-2 border-t border-line pt-3">
+          <div className="mt-3 flex flex-wrap gap-2">
             {apps.map((a) => (
               <span key={a.key} className="flex items-center gap-1.5 rounded-lg border border-line bg-white/[0.02] py-1 pl-1 pr-2.5 text-xs">
                 {a.meta ? (
@@ -655,7 +679,7 @@ function AppUsagePanel({ games, minutes, range, monitorOn }: { games: Game[]; mi
           </div>
         </>
       )}
-    </Panel>
+    </div>
   );
 }
 

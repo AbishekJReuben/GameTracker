@@ -223,6 +223,7 @@ fn build_router(state: ApiState) -> Router {
         .route("/api/system/specs", get(system_specs))
         .route("/api/system/live", get(system_live))
         .route("/api/system/history", get(system_history))
+        .route("/api/system/app-history", get(system_app_history))
         .route("/api/settings", get(get_settings))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
@@ -629,6 +630,16 @@ async fn system_history(
     let sys = s.sys.clone();
     let min = q.minutes.unwrap_or(60).clamp(5, 1440);
     blocking(move || crate::system::history(&pool, &sys, min)).await
+}
+
+async fn system_app_history(
+    State(s): State<ApiState>,
+    Query(q): Query<MinutesQuery>,
+) -> ApiResult<crate::system::AppUsageHistory> {
+    let pool = s.pool.clone();
+    let sys = s.sys.clone();
+    let min = q.minutes.unwrap_or(60).clamp(5, 1440);
+    blocking(move || crate::system::app_history(&pool, &sys, min)).await
 }
 
 async fn get_settings(State(s): State<ApiState>) -> ApiResult<std::collections::HashMap<String, String>> {

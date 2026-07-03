@@ -173,7 +173,7 @@ pub fn run() {
                 }
             });
 
-            tracking::spawn(handle.clone(), pool.clone(), shared, media_dir);
+            tracking::spawn(handle.clone(), pool.clone(), shared, sys_shared.clone(), media_dir);
 
             // Keep the elevated logon task pointed at this install folder (survives
             // reinstalls / custom install paths without requiring a Settings toggle).

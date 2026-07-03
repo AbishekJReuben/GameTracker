@@ -24,8 +24,9 @@ import {
   Boxes,
   ShieldAlert,
   Loader2,
+  Layers,
 } from "lucide-react";
-import type { SystemLive, SystemHistory, SystemSample, SystemSpecs, DiskSpec, Session, Game } from "@/lib/api";
+import type { SystemLive, SystemHistory, SystemSample, SystemSpecs, DiskSpec, Session, Game, AppUsageHistory, AppUsageMeta } from "@/lib/api";
 import { RadialGauge, LevelBar } from "@/components/RadialGauge";
 import { dur } from "@/lib/format";
 import { useRemote } from "../useRemote";
@@ -77,6 +78,9 @@ export function SystemScreen() {
   const [range, setRange] = useState<Range>("1h");
   const [histMetric, setHistMetric] = useState<"usage" | "temp">("usage");
   const { data: history } = useRemote<SystemHistory>(`/api/system/history?minutes=${RANGE_MIN[range]}`, 15000);
+  // Per-app history polls at ~2s so the stacked chart's tail advances live, matching
+  // the host's per-app tick ring (same data the desktop System route shows).
+  const { data: appHistory } = useRemote<AppUsageHistory>(`/api/system/app-history?minutes=${RANGE_MIN[range]}`, 2000);
 
   const specs = live?.specs;
   const samples = live?.samples ?? [];
@@ -174,7 +178,13 @@ export function SystemScreen() {
               <button key={o.id} onClick={() => setRange(o.id)} className={`flex-1 rounded-lg py-1.5 text-xs font-700 transition ${range === o.id ? "bg-accent-3 text-white" : "bg-white/[0.04] text-ink-dim"}`}>{o.label}</button>
             ))}
           </div>
+          <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-700 uppercase tracking-wider text-ink-dim">
+            <Activity className="h-3 w-3" /> System usage
+          </div>
           <HistoryChart history={history} metric={histMetric} minutes={RANGE_MIN[range]} />
+          <div className="mt-4 border-t border-line pt-4">
+            <AppHistoryChart data={appHistory} minutes={RANGE_MIN[range]} />
+          </div>
           <SessionLegend sessions={history?.sessions ?? []} />
         </Section>
       </div>
@@ -507,6 +517,140 @@ function HistoryChart({ history, metric, minutes }: { history?: SystemHistory | 
         ))}
       </AreaChart>
     </ResponsiveContainer>
+  );
+}
+
+type AppMetric = "cpu" | "gpu" | "ram";
+type AppSeries = { key: string; name: string; color: string; meta?: AppUsageMeta };
+const APP_PALETTE = ["#22d3ee", "#a78bfa", "#34d399", "#fbbf24", "#f472b6", "#60a5fa", "#fb923c", "#2dd4bf"];
+const MAX_APPS = 6;
+
+function isHex(c?: string | null): c is string {
+  return !!c && /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c);
+}
+
+function buildAppSeries(data: AppUsageHistory | undefined | null, metric: AppMetric) {
+  if (!data || data.points.length === 0) return { rows: [] as Record<string, number>[], apps: [] as AppSeries[] };
+  const top = data.apps.slice(0, MAX_APPS);
+  const topIds = new Set(top.map((a) => a.gameId));
+  const apps: AppSeries[] = top.map((a, i) => ({
+    key: a.gameId,
+    name: a.name,
+    color: isHex(a.accentColor) ? a.accentColor : APP_PALETTE[i % APP_PALETTE.length],
+    meta: a,
+  }));
+  if (data.apps.length > MAX_APPS) apps.push({ key: "__other", name: "Other apps", color: "#64748b" });
+  const keys = apps.map((a) => a.key);
+  const byT = new Map<number, Record<string, number>>();
+  for (const p of data.points) {
+    const t = new Date(p.ts).getTime();
+    let row = byT.get(t);
+    if (!row) {
+      row = { t };
+      for (const k of keys) row[k] = 0;
+      byT.set(t, row);
+    }
+    const v = metric === "cpu" ? p.cpu : metric === "gpu" ? p.gpu ?? 0 : p.ramMb / 1024;
+    const key = topIds.has(p.gameId) ? p.gameId : "__other";
+    row[key] = (row[key] ?? 0) + v;
+  }
+  const rows = [...byT.values()].sort((a, b) => a.t - b.t);
+  return { rows, apps };
+}
+
+/**
+ * Per-app stacked resource chart — the third graph in the History card. Uses the
+ * same `[from, now]` domain and left margin / YAxis width as HistoryChart so its
+ * x-axis lines up with the system-usage graph above it.
+ */
+function AppHistoryChart({ data, minutes }: { data?: AppUsageHistory | null; minutes: number }) {
+  const [metric, setMetric] = useState<AppMetric>("cpu");
+  const hasGpu = data?.hasGpu ?? false;
+  const effMetric: AppMetric = metric === "gpu" && !hasGpu ? "cpu" : metric;
+  const { rows, apps } = useMemo(() => buildAppSeries(data, effMetric), [data, effMetric]);
+  const isRam = effMetric === "ram";
+  const now = Date.now();
+  const from = now - minutes * 60_000;
+  const longRange = minutes > 1440;
+  const axisTick = (t: number) => (longRange ? new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : timeTick(t));
+  const fmtVal = (v: number) => (isRam ? `${v.toFixed(1)} GB` : `${Math.round(v)}%`);
+  const opts: { id: AppMetric; label: string }[] = [
+    { id: "cpu", label: "CPU" },
+    ...(hasGpu ? [{ id: "gpu" as const, label: "GPU" }] : []),
+    { id: "ram", label: "RAM" },
+  ];
+
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-[10px] font-700 uppercase tracking-wider text-ink-dim">
+          <Layers className="h-3 w-3" /> Per-app usage
+        </div>
+        <Toggle value={effMetric} onChange={setMetric} opts={opts} />
+      </div>
+      {apps.length === 0 || rows.length < 2 ? (
+        <Empty text="Building per-app history — play a game or use a tracked app with Performance tracking on." />
+      ) : (
+        <>
+          <ResponsiveContainer width="100%" height={200}>
+            <AreaChart data={rows} margin={{ top: 8, right: 8, left: -26, bottom: 0 }}>
+              <defs>
+                {apps.map((a) => (
+                  <linearGradient key={a.key} id={`asg-${a.key}`} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={a.color} stopOpacity={0.55} />
+                    <stop offset="100%" stopColor={a.color} stopOpacity={0.12} />
+                  </linearGradient>
+                ))}
+              </defs>
+              <CartesianGrid stroke="rgba(255,255,255,0.04)" vertical={false} />
+              <XAxis dataKey="t" type="number" scale="time" domain={[from, now]} tickFormatter={axisTick} stroke="#454c66" fontSize={9} tickLine={false} axisLine={false} minTickGap={48} />
+              <YAxis stroke="#454c66" fontSize={9} tickLine={false} axisLine={false} width={40} unit={isRam ? "" : "%"} />
+              <Tooltip content={<AppTooltip apps={apps} fmtVal={fmtVal} />} />
+              {apps.map((a) => (
+                <Area key={a.key} type="monotone" dataKey={a.key} name={a.name} stackId="apps" stroke={a.color} strokeWidth={1.25} fill={`url(#asg-${a.key})`} isAnimationActive={false} dot={false} />
+              ))}
+            </AreaChart>
+          </ResponsiveContainer>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {apps.map((a) => (
+              <span key={a.key} className="flex items-center gap-1.5 rounded-lg border border-line bg-white/[0.02] py-1 pl-1 pr-2.5 text-xs">
+                {a.meta ? (
+                  <Art id={a.meta.gameId} name={a.meta.name} cover={a.meta.coverPath} icon={a.meta.iconPath} accent={a.meta.accentColor} className="h-5 w-5" rounded="rounded" />
+                ) : (
+                  <span className="h-3 w-3 rounded-sm" style={{ background: a.color }} />
+                )}
+                <span className="max-w-[120px] truncate font-700 text-ink-soft">{a.name}</span>
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function AppTooltip({ active, payload, label, apps, fmtVal }: any) {
+  if (!active || !payload?.length) return null;
+  const nameFor = (key: string) => apps.find((a: AppSeries) => a.key === key)?.name ?? key;
+  const rows = (payload as any[]).filter((p) => (p.value ?? 0) > 0.05).sort((a, b) => (b.value ?? 0) - (a.value ?? 0));
+  const total = (payload as any[]).reduce((a, p) => a + (p.value || 0), 0);
+  if (rows.length === 0) return null;
+  return (
+    <div className="rounded-xl border border-line bg-bg-900/95 px-3 py-2 text-xs shadow-float backdrop-blur">
+      <div className="mb-1 flex items-center justify-between gap-4 font-800 text-ink">
+        <span>{timeTick(label)}</span>
+        <span className="text-ink-dim">Σ {fmtVal(total)}</span>
+      </div>
+      {rows.map((p) => (
+        <div key={p.dataKey} className="flex items-center justify-between gap-3 text-ink-soft">
+          <span className="flex items-center gap-2">
+            <span className="h-2 w-2 rounded-full" style={{ background: p.stroke }} />
+            <span className="max-w-[140px] truncate">{nameFor(p.dataKey)}</span>
+          </span>
+          <span className="font-800 text-ink">{fmtVal(p.value)}</span>
+        </div>
+      ))}
+    </div>
   );
 }
 

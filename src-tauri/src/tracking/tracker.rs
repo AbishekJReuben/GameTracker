@@ -1,5 +1,6 @@
 use crate::db::{foreground as fg_db, games, media as media_db, screenshots, sessions, settings, DbPool};
 use crate::db::games::MatchGame;
+use crate::system::SystemShared;
 use crate::tracking::{activity, foreground, gpu, idle, matcher, media, screenshot};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -151,14 +152,26 @@ pub fn runtime_delta(g: &MatchGame, is_running: bool, is_focused: bool, tick: i6
     }
 }
 
-pub fn spawn(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir: PathBuf) {
+pub fn spawn(
+    app: AppHandle,
+    pool: DbPool,
+    shared: Arc<TrackingShared>,
+    sys_shared: Arc<SystemShared>,
+    media_dir: PathBuf,
+) {
     std::thread::Builder::new()
         .name("gametracker-tracker".into())
-        .spawn(move || run_loop(app, pool, shared, media_dir))
+        .spawn(move || run_loop(app, pool, shared, sys_shared, media_dir))
         .ok();
 }
 
-fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir: PathBuf) {
+fn run_loop(
+    app: AppHandle,
+    pool: DbPool,
+    shared: Arc<TrackingShared>,
+    sys_shared: Arc<SystemShared>,
+    media_dir: PathBuf,
+) {
     let _ = sessions::close_orphans(&pool);
     let _ = media_db::close_orphans(&pool);
     let _ = fg_db::close_orphans(&pool);
@@ -715,9 +728,11 @@ fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir
         }
         publish(&app, &shared, state);
 
-        // Persist per-app resource samples roughly every 16s (all rows share one
-        // timestamp so the chart can pivot them into stacked columns).
-        if sample_usage && tick % APP_SAMPLE_EVERY == 0 && !usage.is_empty() {
+        // Per-app resource samples: push into the live ring EVERY tick (so the
+        // chart tail advances every ~2s like the system-usage chart) and persist
+        // to SQLite every ~16s (all rows share one timestamp so the chart pivots
+        // them into stacked columns). Storage matches system_samples: 30 days.
+        if sample_usage && !usage.is_empty() {
             let ts = chrono::Utc::now().to_rfc3339();
             let rows: Vec<(String, f64, f64, Option<f64>)> = usage
                 .into_iter()
@@ -735,9 +750,12 @@ fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir
                     )
                 })
                 .collect();
-            crate::system::persist_app_samples(&pool, &ts, &rows);
-            if tick % (APP_SAMPLE_EVERY * 200) == 0 {
-                let _ = crate::system::prune_app(&pool);
+            sys_shared.push_app_live(crate::system::AppTickSample { ts: ts.clone(), rows: rows.clone() });
+            if tick % APP_SAMPLE_EVERY == 0 {
+                crate::system::persist_app_samples(&pool, &ts, &rows);
+                if tick % (APP_SAMPLE_EVERY * 200) == 0 {
+                    let _ = crate::system::prune_app(&pool);
+                }
             }
         }
 
