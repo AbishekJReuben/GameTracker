@@ -36,6 +36,7 @@ import { SystemScreen } from "./screens/System";
 import { SettingsScreen } from "./screens/Settings";
 import { GameDetailScreen } from "./screens/GameDetail";
 import { useOpenGame, closeGame } from "./ui";
+import { ScreenErrorBoundary } from "./ErrorBoundary";
 import { PageTransitionFX } from "./PageTransitionFX";
 import { checkForUpdate, installUpdate, type UpdateInfo } from "./update";
 
@@ -204,7 +205,11 @@ export function CompanionApp() {
     {/* Glitch "energy tear" sweep on every tab change — matches the desktop route
         transition. Keyed on the active tab so it fires exactly on a screen swap. */}
     <PageTransitionFX triggerKey={tab} />
-    {detailId && <GameDetailScreen id={detailId} onClose={closeGame} />}
+    {detailId && (
+      <ScreenErrorBoundary key={detailId} label="game-detail">
+        <GameDetailScreen id={detailId} onClose={closeGame} />
+      </ScreenErrorBoundary>
+    )}
     <div className="flex h-[100dvh] flex-col bg-bg-base text-ink">
       {!isControlTab && (
         <header
@@ -225,18 +230,22 @@ export function CompanionApp() {
       )}
 
       <main className={`min-h-0 flex-1 ${isControlTab || tab === "library" || tab === "timeline" ? "" : "overflow-y-auto"}`}>
-        {tab === "stats" && <DashboardScreen />}
-        {tab === "library" && <LibraryScreen />}
-        {tab === "timeline" && <TimelineScreen />}
-        {tab === "collection" && <CollectionsScreen />}
-        {tab === "music" && <MusicScreen />}
-        {tab === "system" && <SystemScreen />}
-        {tab === "settings" && (
-          <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} />
-        )}
-        {tab === "control" && (
-          <ControlTab conn={conn} onNavigate={(t) => setTab(t)} onDisconnect={disconnect} />
-        )}
+        {/* Keyed by tab so a crash in one screen is isolated and cleared when you
+            switch tabs — a screen error shows a retry card instead of a blank app. */}
+        <ScreenErrorBoundary key={tab} label={tab}>
+          {tab === "stats" && <DashboardScreen />}
+          {tab === "library" && <LibraryScreen />}
+          {tab === "timeline" && <TimelineScreen />}
+          {tab === "collection" && <CollectionsScreen />}
+          {tab === "music" && <MusicScreen />}
+          {tab === "system" && <SystemScreen />}
+          {tab === "settings" && (
+            <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} />
+          )}
+          {tab === "control" && (
+            <ControlTab conn={conn} onNavigate={(t) => setTab(t)} onDisconnect={disconnect} />
+          )}
+        </ScreenErrorBoundary>
       </main>
 
       {!isControlTab && (

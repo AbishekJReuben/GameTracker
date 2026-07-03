@@ -1,15 +1,17 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMotionEnabled, useReduceEffects } from "@/store/app";
 
 /**
- * Companion port of the desktop `components/animations/PageTransitionFX` — the
- * WebGL "energy tear" glitch sweep that masks a screen swap. The desktop version
- * fires on react-router `useLocation()` changes; the phone app has no router, so
- * this variant fires whenever the `triggerKey` prop changes (i.e. the active tab).
+ * Companion port of the desktop `PageTransitionFX` — the WebGL "energy tear"
+ * glitch sweep that masks a screen swap. Fires whenever `triggerKey` changes
+ * (the active tab), since the phone app has no router.
  *
- * Same safety contract: a purely additive, `pointer-events:none` overlay that
- * self-clears to fully transparent at the end of every ~0.7s sweep, so it can
- * never obscure content and costs nothing while idle. Disabled under reduced motion.
+ * MOBILE SAFETY: unlike the desktop version (which keeps one persistent WebGL
+ * context alive the whole session), the phone WebView has a tiny live-context
+ * budget and blanks the entire webview when it's exhausted. So the canvas — and
+ * its GL context — is mounted ONLY for the ~0.72s of an active sweep and torn
+ * down immediately after, leaving zero persistent contexts between transitions.
+ * The overlay is `pointer-events:none`, self-clears, and bails on context loss.
  */
 
 const VERT = `
@@ -75,74 +77,148 @@ void main() {
   gl_FragColor = vec4(col, alpha);
 }`;
 
-interface GLState {
-  gl: WebGLRenderingContext;
-  prog: WebGLProgram;
-  uProgress: WebGLUniformLocation | null;
-  uTime: WebGLUniformLocation | null;
-  uDir: WebGLUniformLocation | null;
-  uSeed: WebGLUniformLocation | null;
-}
-
 const DURATION = 720;
+
+/** One transition: mounts a canvas, runs the GL sweep once, then the parent
+ *  unmounts it (freeing the context). Never throws — WebGL failures just no-op. */
+function Sweep({ onDone }: { onDone: () => void }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      onDone();
+      return;
+    }
+
+    let lost = false;
+    const onLost = (e: Event) => {
+      e.preventDefault();
+      lost = true;
+    };
+    canvas.addEventListener("webglcontextlost", onLost as EventListener, false);
+
+    let gl: WebGLRenderingContext | null = null;
+    try {
+      gl = canvas.getContext("webgl", { alpha: true, premultipliedAlpha: false, antialias: false, failIfMajorPerformanceCaveat: false });
+    } catch {
+      gl = null;
+    }
+    if (!gl) {
+      canvas.removeEventListener("webglcontextlost", onLost as EventListener);
+      onDone();
+      return;
+    }
+
+    let raf = 0;
+    let prog: WebGLProgram | null = null;
+    let buf: WebGLBuffer | null = null;
+    let doneCalled = false;
+    const finish = () => {
+      if (doneCalled) return;
+      doneCalled = true;
+      onDone();
+    };
+
+    try {
+      // Cap at DPR 1 on the phone — the sweep is brief and full-screen, so extra
+      // pixels buy nothing and cost GPU memory (part of what tipped the webview over).
+      const dpr = 1;
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      if (w < 1 || h < 1) {
+        finish();
+        return;
+      }
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+
+      const compile = (type: number, src: string) => {
+        const s = gl!.createShader(type)!;
+        gl!.shaderSource(s, src);
+        gl!.compileShader(s);
+        return s;
+      };
+      prog = gl.createProgram();
+      gl.attachShader(prog!, compile(gl.VERTEX_SHADER, VERT));
+      gl.attachShader(prog!, compile(gl.FRAGMENT_SHADER, FRAG));
+      gl.linkProgram(prog!);
+      gl.useProgram(prog!);
+
+      buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const loc = gl.getAttribLocation(prog!, "aPos");
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+      const uProgress = gl.getUniformLocation(prog!, "uProgress");
+      const uTime = gl.getUniformLocation(prog!, "uTime");
+      const uDir = gl.getUniformLocation(prog!, "uDir");
+      const uSeed = gl.getUniformLocation(prog!, "uSeed");
+
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+      const dir = Math.random() > 0.5 ? 1 : -1;
+      const seed = Math.random() * 100;
+      const start = performance.now();
+
+      const tick = (now: number) => {
+        if (lost || !gl) {
+          finish();
+          return;
+        }
+        const p = Math.min(1, (now - start) / DURATION);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.uniform1f(uProgress, p);
+        gl.uniform1f(uTime, (now - start) / 1000);
+        gl.uniform1f(uDir, dir);
+        gl.uniform1f(uSeed, seed);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        if (p < 1) {
+          raf = requestAnimationFrame(tick);
+        } else {
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          finish();
+        }
+      };
+      raf = requestAnimationFrame(tick);
+    } catch {
+      finish();
+    }
+
+    return () => {
+      cancelAnimationFrame(raf);
+      canvas.removeEventListener("webglcontextlost", onLost as EventListener);
+      try {
+        if (gl) {
+          if (prog) gl.deleteProgram(prog);
+          if (buf) gl.deleteBuffer(buf);
+          // Proactively drop the GPU context so it isn't held until GC.
+          gl.getExtension("WEBGL_lose_context")?.loseContext();
+        }
+      } catch {
+        /* ignore teardown races */
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return <canvas ref={canvasRef} aria-hidden className="pointer-events-none fixed inset-0 z-40 h-full w-full mix-blend-screen" />;
+}
 
 export function PageTransitionFX({ triggerKey }: { triggerKey: string }) {
   const reduce = useReduceEffects();
   const enabled = useMotionEnabled() && !reduce;
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const stateRef = useRef<GLState | null>(null);
-  const rafRef = useRef(0);
   const firstRef = useRef(true);
+  // A monotonically-increasing id identifies the current sweep; null = idle (no
+  // canvas / no GL context mounted). Bumped on each tab change after the first.
+  const [sweepId, setSweepId] = useState<number | null>(null);
 
-  // One-time WebGL setup. Re-runs only when motion is toggled.
-  useEffect(() => {
-    if (!enabled) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const gl = canvas.getContext("webgl", { alpha: true, premultipliedAlpha: false, antialias: false });
-    if (!gl) return;
-
-    const compile = (type: number, src: string) => {
-      const s = gl.createShader(type)!;
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      return s;
-    };
-    const vs = compile(gl.VERTEX_SHADER, VERT);
-    const fs = compile(gl.FRAGMENT_SHADER, FRAG);
-    const prog = gl.createProgram()!;
-    gl.attachShader(prog, vs);
-    gl.attachShader(prog, fs);
-    gl.linkProgram(prog);
-    gl.useProgram(prog);
-
-    const buf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(prog, "aPos");
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-
-    stateRef.current = {
-      gl,
-      prog,
-      uProgress: gl.getUniformLocation(prog, "uProgress"),
-      uTime: gl.getUniformLocation(prog, "uTime"),
-      uDir: gl.getUniformLocation(prog, "uDir"),
-      uSeed: gl.getUniformLocation(prog, "uSeed"),
-    };
-
-    return () => {
-      cancelAnimationFrame(rafRef.current);
-      gl.deleteProgram(prog);
-      gl.deleteShader(vs);
-      gl.deleteShader(fs);
-      gl.deleteBuffer(buf);
-      stateRef.current = null;
-    };
-  }, [enabled]);
-
-  // Fire a sweep on every trigger change (but never on the first render).
   useEffect(() => {
     if (!enabled) {
       firstRef.current = true;
@@ -152,56 +228,9 @@ export function PageTransitionFX({ triggerKey }: { triggerKey: string }) {
       firstRef.current = false;
       return;
     }
-    const st = stateRef.current;
-    const canvas = canvasRef.current;
-    if (!st || !canvas) return;
-
-    cancelAnimationFrame(rafRef.current);
-
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    if (w < 1 || h < 1) return;
-    canvas.width = Math.floor(w * dpr);
-    canvas.height = Math.floor(h * dpr);
-
-    const { gl, prog } = st;
-    const dir = Math.random() > 0.5 ? 1 : -1;
-    const seed = Math.random() * 100;
-    const start = performance.now();
-
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-    const tick = (now: number) => {
-      const p = Math.min(1, (now - start) / DURATION);
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      gl.useProgram(prog);
-      gl.uniform1f(st.uProgress, p);
-      gl.uniform1f(st.uTime, (now - start) / 1000);
-      gl.uniform1f(st.uDir, dir);
-      gl.uniform1f(st.uSeed, seed);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      if (p < 1) {
-        rafRef.current = requestAnimationFrame(tick);
-      } else {
-        gl.clearColor(0, 0, 0, 0);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-      }
-    };
-    rafRef.current = requestAnimationFrame(tick);
-
-    return () => cancelAnimationFrame(rafRef.current);
+    setSweepId((n) => (n ?? 0) + 1);
   }, [triggerKey, enabled]);
 
-  if (!enabled) return null;
-  return (
-    <canvas
-      ref={canvasRef}
-      aria-hidden
-      className="pointer-events-none fixed inset-0 z-40 h-full w-full mix-blend-screen"
-    />
-  );
+  if (!enabled || sweepId == null) return null;
+  return <Sweep key={sweepId} onDone={() => setSweepId(null)} />;
 }

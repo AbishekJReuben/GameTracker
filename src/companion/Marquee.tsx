@@ -6,8 +6,9 @@
  * Tauri asset protocol — unavailable in the phone app. This module reproduces the
  * same ~30 backdrop techniques and the same per-panel deterministic variant/art
  * selection, but draws through the companion `Art` / `LoadedImg` loaders (which
- * fetch bytes over the remote link). The procedural `MarqueeShader` and the WebGL
- * `ShaderImageTransition` are pure/URL-based, so they're reused as-is elsewhere.
+ * fetch bytes over the remote link). Unlike desktop it uses NO WebGL: the phone
+ * WebView's live-context budget is tiny, so the desktop `MarqueeShader` overlay is
+ * replaced by a CSS `CssSheen` for the "shader"/"lightfield" variants.
  *
  * Keyframes (`gt-marquee`, `gt-marquee-y`, `gt-orbit`, …) live in the shared
  * `index.css` the companion already imports, so the animations match desktop.
@@ -15,7 +16,6 @@
 
 import { createContext, useContext, useMemo, type CSSProperties, type ReactNode } from "react";
 import type { Game, Session } from "@/lib/api";
-import { MarqueeShader } from "@/components/animations/MarqueeShader";
 import {
   MOVING_VARIANTS,
   FX_VARIANTS,
@@ -30,6 +30,23 @@ export type { MarqueeFXVariant };
 export { MOVING_VARIANTS, FX_VARIANTS };
 
 type ArtKind = "cover" | "icon";
+
+/**
+ * A cheap, CSS-only decorative sheen used where the desktop overlays the WebGL
+ * `MarqueeShader`. The phone's WebView has a very small live-WebGL-context budget
+ * (each shader panel = one GL context), and stacking several across the section
+ * backdrops + the page-transition canvas blanked the whole webview — so the
+ * companion deliberately uses NO WebGL for backdrops. This gradient wash keeps the
+ * "shader"/"lightfield" variants visually distinct without a GL context.
+ */
+function CssSheen() {
+  return (
+    <>
+      <div className="absolute inset-0 bg-[radial-gradient(120%_120%_at_20%_0%,color-mix(in_srgb,var(--accent-3)_45%,transparent),transparent_60%)] mix-blend-soft-light" />
+      <div className="absolute inset-0 bg-[radial-gradient(120%_120%_at_100%_100%,color-mix(in_srgb,var(--accent-1)_40%,transparent),transparent_55%)] mix-blend-screen opacity-70" />
+    </>
+  );
+}
 
 const DEFAULT_OPACITY: Partial<Record<MarqueeFXVariant, number>> = {
   kenburns: 0.26,
@@ -502,7 +519,7 @@ export function MarqueeFX({
       content = hasCovers && (
         <>
           <CoverTrack games={sorted} durationSec={90} motionOn={motionOn} art={art} />
-          <MarqueeShader />
+          <CssSheen />
         </>
       );
       break;
@@ -599,7 +616,7 @@ export function MarqueeFX({
       content = hasCovers && (
         <>
           <StaticGrid games={sorted} motionOn={false} art={art} />
-          <MarqueeShader />
+          <CssSheen />
         </>
       );
       break;

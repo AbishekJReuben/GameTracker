@@ -121,12 +121,58 @@ fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result
 /// content:// URI + `ACTION_VIEW` install intent (JNI, no Kotlin plugin needed).
 #[cfg(target_os = "android")]
 fn launch_installer(apk_path: &str) -> Result<(), String> {
-    use jni::objects::{JObject, JValue};
+    use jni::objects::JObject;
 
     let ctx = ndk_context::android_context();
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    // Run the JNI sequence, then ALWAYS clear any pending Java exception before
+    // returning. A JNI call that fails because Java threw (e.g. FileProvider misconfig,
+    // or startActivity for the installer while "install unknown apps" is off) leaves
+    // the exception pending; returning to the JVM / detaching the thread with a pending
+    // exception makes ART abort the whole process — which is exactly the "crashes when
+    // trying to install" the user saw. Clearing it turns that into a clean error string
+    // the UI can show ("Update failed — tap to retry") instead of a native crash.
+    let result = do_install(&mut env, &context, apk_path);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe(); // dump to logcat for diagnosis
+        let _ = env.exception_clear();
+    }
+    result
+}
+
+#[cfg(target_os = "android")]
+fn do_install(
+    env: &mut jni::AttachGuard,
+    context: &jni::objects::JObject,
+    apk_path: &str,
+) -> Result<(), String> {
+    use jni::objects::{JObject, JValue};
+
+    // On Android 8+ an app can't launch the package installer unless the user has
+    // granted it "install unknown apps". If we don't have it, bounce the user to the
+    // exact settings screen for THIS app and return a clear message instead of firing
+    // an install intent that the system silently refuses (which looked like a failure).
+    // On API < 26 `canRequestPackageInstalls` doesn't exist (throws NoSuchMethodError) —
+    // treat any check failure as "allowed" and CLEAR the pending exception so it can't
+    // poison the install JNI calls that follow (a pending exception aborts the process).
+    let allowed = can_request_installs(env, context).unwrap_or(true);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    if !allowed {
+        let _ = open_unknown_sources_settings(env, context);
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        return Err(
+            "Android needs permission to install updates. We opened the setting — enable \
+             \"Allow from this source\", then tap Update again."
+                .into(),
+        );
+    }
 
     // File file = new File(apk_path);
     let jpath: JObject = env.new_string(apk_path).map_err(|e| e.to_string())?.into();
@@ -145,7 +191,7 @@ fn launch_installer(apk_path: &str) -> Result<(), String> {
             "getUriForFile",
             "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
             &[
-                JValue::Object(&context),
+                JValue::Object(context),
                 JValue::Object(&authority),
                 JValue::Object(&file),
             ],
@@ -193,13 +239,88 @@ fn launch_installer(apk_path: &str) -> Result<(), String> {
 
     // context.startActivity(intent);
     env.call_method(
-        &context,
+        context,
         "startActivity",
         "(Landroid/content/Intent;)V",
         &[JValue::Object(&intent)],
     )
     .map_err(|e| format!("startActivity: {e}"))?;
 
+    Ok(())
+}
+
+/// context.getPackageManager().canRequestPackageInstalls() — whether this app may
+/// install packages (Android 8+; older versions always may, so treat errors as `true`).
+#[cfg(target_os = "android")]
+fn can_request_installs(
+    env: &mut jni::AttachGuard,
+    context: &jni::objects::JObject,
+) -> Result<bool, String> {
+    let pm = env
+        .call_method(context, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])
+        .map_err(|e| e.to_string())?
+        .l()
+        .map_err(|e| e.to_string())?;
+    let allowed = env
+        .call_method(&pm, "canRequestPackageInstalls", "()Z", &[])
+        .map_err(|e| e.to_string())?
+        .z()
+        .map_err(|e| e.to_string())?;
+    Ok(allowed)
+}
+
+/// Open Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES for this package so the user can
+/// grant install permission in one tap. Best-effort (errors are ignored by the caller).
+#[cfg(target_os = "android")]
+fn open_unknown_sources_settings(
+    env: &mut jni::AttachGuard,
+    context: &jni::objects::JObject,
+) -> Result<(), String> {
+    use jni::objects::{JObject, JValue};
+
+    // String pkg = context.getPackageName();  (kept as a Java String — no Rust round-trip)
+    let pkg = env
+        .call_method(context, "getPackageName", "()Ljava/lang/String;", &[])
+        .map_err(|e| e.to_string())?
+        .l()
+        .map_err(|e| e.to_string())?;
+
+    // Uri uri = Uri.fromParts("package", pkg, null);  (builds package:<pkg> in Java)
+    let scheme: JObject = env.new_string("package").map_err(|e| e.to_string())?.into();
+    let null_obj = JObject::null();
+    let uri = env
+        .call_static_method(
+            "android/net/Uri",
+            "fromParts",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Landroid/net/Uri;",
+            &[
+                JValue::Object(&scheme),
+                JValue::Object(&pkg),
+                JValue::Object(&null_obj),
+            ],
+        )
+        .map_err(|e| e.to_string())?
+        .l()
+        .map_err(|e| e.to_string())?;
+
+    // Intent intent = new Intent(ACTION_MANAGE_UNKNOWN_APP_SOURCES, uri);
+    let action: JObject = env
+        .new_string("android.settings.MANAGE_UNKNOWN_APP_SOURCES")
+        .map_err(|e| e.to_string())?
+        .into();
+    let intent = env
+        .new_object(
+            "android/content/Intent",
+            "(Ljava/lang/String;Landroid/net/Uri;)V",
+            &[JValue::Object(&action), JValue::Object(&uri)],
+        )
+        .map_err(|e| e.to_string())?;
+
+    const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+    env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)])
+        .map_err(|e| e.to_string())?;
+    env.call_method(context, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
