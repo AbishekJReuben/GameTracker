@@ -277,6 +277,7 @@ pub fn run() {
             commands::system_specs,
             commands::system_live,
             commands::system_history,
+            commands::system_app_history,
             commands::autostart_enabled,
             commands::set_autostart,
             commands::export_sessions_csv,

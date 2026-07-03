@@ -92,15 +92,28 @@ const save = (path, before, after, msg) => {
 }
 
 // --- 2b: res/xml/file_paths.xml ---------------------------------------------
+// The updater downloads the APK into the app cache dir and shares it with the
+// system package installer via a FileProvider content:// URI. Tauri's
+// `app_cache_dir()` can resolve to the INTERNAL cache (`<cache-path>`) or the
+// EXTERNAL cache (`<external-cache-path>`) depending on device/OS; if the file's
+// dir isn't covered by a declared root, `FileProvider.getUriForFile` throws
+// IllegalArgumentException — which historically crashed the app right before the
+// install prompt. Declare every standard root so the URI always resolves.
 {
+  const roots = [
+    ['files-path', 'my_files'],
+    ['cache-path', 'my_cache_images'],
+    ['external-path', 'my_images'],
+    ['external-files-path', 'my_ext_files'],
+    ['external-cache-path', 'my_ext_cache'],
+  ];
   if (!existsSync(filePathsPath)) {
     mkdirSync(dirname(filePathsPath), { recursive: true });
     writeFileSync(
       filePathsPath,
       `<?xml version="1.0" encoding="utf-8"?>\r\n` +
         `<paths xmlns:android="http://schemas.android.com/apk/res/android">\r\n` +
-        `  <external-path name="my_images" path="." />\r\n` +
-        `  <cache-path name="my_cache_images" path="." />\r\n` +
+        roots.map(([tag, name]) => `  <${tag} name="${name}" path="." />\r\n`).join('') +
         `</paths>\r\n`,
     );
     note("created res/xml/file_paths.xml");
@@ -108,13 +121,12 @@ const save = (path, before, after, msg) => {
     const before = readFileSync(filePathsPath, "utf8");
     const eol = before.includes("\r\n") ? "\r\n" : "\n";
     let f = before;
-    if (!/<cache-path\b/.test(f)) {
-      f = f.replace(
-        /([ \t]*<\/paths>)/,
-        `  <cache-path name="my_cache_images" path="." />${eol}$1`,
-      );
+    for (const [tag, name] of roots) {
+      if (!new RegExp(`<${tag}\\b`).test(f)) {
+        f = f.replace(/([ \t]*<\/paths>)/, `  <${tag} name="${name}" path="." />${eol}$1`);
+      }
     }
-    save(filePathsPath, before, f, "added cache-path to file_paths.xml");
+    save(filePathsPath, before, f, "ensured all FileProvider roots in file_paths.xml");
   }
 }
 

@@ -166,6 +166,42 @@ pub struct SystemHistory {
     pub sessions: Vec<SessionDto>,
 }
 
+/// One persisted resource sample for a single tracked app/game.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUsagePoint {
+    pub ts: String,
+    pub game_id: String,
+    /// CPU as a share of total system capacity (0–100).
+    pub cpu: f64,
+    pub ram_mb: f64,
+    /// GPU % (best-effort; None when the GPU-engine counters are unavailable).
+    pub gpu: Option<f64>,
+}
+
+/// Identity for one app that appears in the per-app history window.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUsageMeta {
+    pub game_id: String,
+    pub name: String,
+    pub kind: String,
+    pub icon_path: Option<String>,
+    pub cover_path: Option<String>,
+    pub accent_color: Option<String>,
+}
+
+/// Per-app resource history for the combined stacked chart.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUsageHistory {
+    /// Apps present in the window, ordered by total load (busiest first).
+    pub apps: Vec<AppUsageMeta>,
+    pub points: Vec<AppUsagePoint>,
+    /// True when any point carries a GPU reading (drives the GPU toggle).
+    pub has_gpu: bool,
+}
+
 fn bytes_to_gb(b: u64) -> f64 {
     b as f64 / 1_073_741_824.0
 }
@@ -509,4 +545,116 @@ pub fn history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppResult<
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(SystemHistory { points, sessions })
+}
+
+// ---------- per-app resource sampling ----------
+
+/// Create the per-app samples table (idempotent; called by the tracker + sysmon).
+pub fn ensure_app_table(pool: &DbPool) -> AppResult<()> {
+    let conn = pool.get()?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS app_samples (
+            ts       TEXT NOT NULL,
+            game_id  TEXT NOT NULL,
+            cpu      REAL NOT NULL DEFAULT 0,
+            ram_mb   REAL NOT NULL DEFAULT 0,
+            gpu      REAL,
+            PRIMARY KEY (ts, game_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_app_samples_ts ON app_samples(ts);",
+    )?;
+    Ok(())
+}
+
+/// Persist a tick's worth of per-app samples (all sharing one timestamp so the
+/// UI can pivot them into stacked rows). Cheap single transaction.
+pub fn persist_app_samples(pool: &DbPool, ts: &str, rows: &[(String, f64, f64, Option<f64>)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let Ok(mut conn) = pool.get() else { return };
+    let Ok(tx) = conn.transaction() else { return };
+    {
+        let Ok(mut stmt) = tx.prepare(
+            "INSERT OR REPLACE INTO app_samples(ts, game_id, cpu, ram_mb, gpu)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+        ) else {
+            return;
+        };
+        for (gid, cpu, ram_mb, gpu) in rows {
+            let _ = stmt.execute(rusqlite::params![ts, gid, cpu, ram_mb, gpu]);
+        }
+    }
+    let _ = tx.commit();
+}
+
+/// Drop per-app samples older than the retention window.
+pub fn prune_app(pool: &DbPool) -> AppResult<()> {
+    let conn = pool.get()?;
+    let cutoff = (Utc::now() - ChronoDuration::days(PRUNE_DAYS)).to_rfc3339();
+    conn.execute("DELETE FROM app_samples WHERE ts < ?1", [cutoff])?;
+    Ok(())
+}
+
+pub fn app_history(pool: &DbPool, minutes: i64) -> AppResult<AppUsageHistory> {
+    let minutes = minutes.clamp(5, 60 * 24 * PRUNE_DAYS);
+    let from = (Utc::now() - ChronoDuration::minutes(minutes)).to_rfc3339();
+
+    let conn = pool.get()?;
+    ensure_app_table(pool)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT a.ts, a.game_id, a.cpu, a.ram_mb, a.gpu,
+                g.display_name, g.kind, g.icon_path, g.cover_path, g.accent_color
+         FROM app_samples a JOIN games g ON g.id = a.game_id
+         WHERE a.ts >= ?1 ORDER BY a.ts ASC",
+    )?;
+
+    let mut points: Vec<AppUsagePoint> = Vec::new();
+    let mut meta: std::collections::HashMap<String, AppUsageMeta> = std::collections::HashMap::new();
+    // Rank apps by cumulative load (CPU + a scaled RAM term) so the busiest ones
+    // sit at the base of the stack and stay visible.
+    let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut has_gpu = false;
+
+    let rows = stmt.query_map([&from], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, f64>(2)?,
+            r.get::<_, f64>(3)?,
+            r.get::<_, Option<f64>>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<String>>(8)?,
+            r.get::<_, Option<String>>(9)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (ts, gid, cpu, ram_mb, gpu, name, kind, icon, cover, accent) = row?;
+        if gpu.is_some() {
+            has_gpu = true;
+        }
+        *totals.entry(gid.clone()).or_insert(0.0) += cpu + ram_mb / 256.0 + gpu.unwrap_or(0.0);
+        meta.entry(gid.clone()).or_insert_with(|| AppUsageMeta {
+            game_id: gid.clone(),
+            name,
+            kind,
+            icon_path: icon,
+            cover_path: cover,
+            accent_color: accent,
+        });
+        points.push(AppUsagePoint { ts, game_id: gid, cpu, ram_mb, gpu });
+    }
+
+    let mut apps: Vec<AppUsageMeta> = meta.into_values().collect();
+    apps.sort_by(|a, b| {
+        let ta = totals.get(&a.game_id).copied().unwrap_or(0.0);
+        let tb = totals.get(&b.game_id).copied().unwrap_or(0.0);
+        tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(AppUsageHistory { apps, points, has_gpu })
 }

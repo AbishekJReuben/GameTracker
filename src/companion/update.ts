@@ -118,6 +118,26 @@ export async function checkForUpdateVerbose(): Promise<UpdateCheck> {
 }
 
 /**
+ * Whether Android currently allows this app to install packages ("install
+ * unknown apps"). We check this BEFORE downloading so we can send the user to
+ * grant it, rather than downloading and then failing at the install step (which
+ * is where the app historically appeared to "close" before any prompt). Defaults
+ * to `true` on any error / non-Android so the flow never gets stuck.
+ */
+export async function installPermissionGranted(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("install_permission_status");
+  } catch {
+    return true;
+  }
+}
+
+/** Open the system "install unknown apps" settings screen for this app. */
+export async function openInstallSettings(): Promise<void> {
+  await invoke("open_install_settings");
+}
+
+/**
  * Download the APK and launch the system installer. Resolves once the installer
  * has been handed the file (the OS then shows its one-tap install prompt).
  */

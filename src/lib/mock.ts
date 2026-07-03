@@ -627,6 +627,34 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       const sessions = SESSIONS.filter((s) => new Date(s.startUtc).getTime() >= from);
       return { points, sessions } as T;
     }
+    case "system_app_history": {
+      const minutes = (args?.minutes as number) ?? 60;
+      const stepSec = minutes <= 60 ? 30 : minutes <= 360 ? 120 : 600;
+      const count = Math.min(600, Math.floor((minutes * 60) / stepSec));
+      const now = Date.now();
+      const picks = MOCK_GAMES.slice(0, 5);
+      const apps = picks.map((g) => ({
+        gameId: g.id,
+        name: g.displayName,
+        kind: g.kind,
+        iconPath: g.iconPath ?? null,
+        coverPath: g.coverPath ?? null,
+        accentColor: g.accentColor ?? null,
+      }));
+      const st = picks.map(() => ({ cpu: 4 + rnd() * 18, gpu: 4 + rnd() * 24, ram: 400 + rnd() * 2200 }));
+      const points: { ts: string; gameId: string; cpu: number; ramMb: number; gpu: number }[] = [];
+      for (let i = count - 1; i >= 0; i--) {
+        const ts = new Date(now - i * stepSec * 1000).toISOString();
+        picks.forEach((g, idx) => {
+          const s = st[idx];
+          s.cpu = Math.max(0, Math.min(60, s.cpu + (rnd() - 0.5) * 10));
+          s.gpu = Math.max(0, Math.min(70, s.gpu + (rnd() - 0.5) * 14));
+          s.ram = Math.max(200, Math.min(6000, s.ram + (rnd() - 0.5) * 600));
+          points.push({ ts, gameId: g.id, cpu: Math.round(s.cpu * 10) / 10, ramMb: Math.round(s.ram), gpu: Math.round(s.gpu * 10) / 10 });
+        });
+      }
+      return { apps, points, hasGpu: true } as T;
+    }
     case "fetch_steam_reviews":
       return [
         { author: "PreviewUser", text: "Mock review — great game in browser preview mode.", votedUp: true, votesUp: 42, votesFunny: 3, playtimeForever: 7200 },

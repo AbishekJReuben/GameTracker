@@ -25,6 +25,7 @@ import {
   ShieldAlert,
   Gamepad2,
   AppWindow,
+  Layers,
 } from "lucide-react";
 import { Page } from "@/components/Page";
 import { SectionTitle, EmptyState, Skeleton, Segmented, Badge } from "@/components/ui";
@@ -32,7 +33,7 @@ import { Panel } from "@/components/Panel";
 import { SYSTEM_HISTORY_RANGES, rangeToHistoryMinutes, rangeToLookbackMs, type TimelineRange } from "@/lib/timelineZoom";
 import { RadialGauge, LevelBar } from "@/components/RadialGauge";
 import { GameArt } from "@/components/GameArt";
-import { useSystemLive, useSystemHistory, useSessions, useSettings, useGames } from "@/lib/queries";
+import { useSystemLive, useSystemHistory, useSystemAppHistory, useSessions, useSettings, useGames } from "@/lib/queries";
 import { Timeline } from "@/components/Timeline";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { dur } from "@/lib/format";
@@ -197,6 +198,9 @@ export default function SystemsPage() {
           />
           <SessionLegend sessions={sessions ?? []} />
         </Panel>
+
+        {/* Per-app resource history — combined stacked chart across all apps */}
+        <AppUsagePanel games={games ?? []} minutes={historyMinutes} range={range} monitorOn={monitorOn} />
       </div>
     </Page>
   );
@@ -538,6 +542,145 @@ function HistoryUsageChart({
         ))}
       </AreaChart>
     </ResponsiveContainer>
+  );
+}
+
+type AppMetric = "cpu" | "gpu" | "ram";
+type AppSeries = { key: string; name: string; color: string; meta?: import("@/lib/api").AppUsageMeta };
+
+const APP_PALETTE = ["#22d3ee", "#a78bfa", "#34d399", "#fbbf24", "#f472b6", "#60a5fa", "#fb923c", "#2dd4bf", "#c084fc", "#f87171"];
+const MAX_APPS = 8;
+
+function isHex(c?: string | null): c is string {
+  return !!c && /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c);
+}
+
+function buildAppSeries(data: import("@/lib/api").AppUsageHistory | undefined, metric: AppMetric) {
+  if (!data || data.points.length === 0) return { rows: [] as Record<string, number>[], apps: [] as AppSeries[] };
+  const top = data.apps.slice(0, MAX_APPS);
+  const topIds = new Set(top.map((a) => a.gameId));
+  const apps: AppSeries[] = top.map((a, i) => ({
+    key: a.gameId,
+    name: a.name,
+    color: isHex(a.accentColor) ? a.accentColor : APP_PALETTE[i % APP_PALETTE.length],
+    meta: a,
+  }));
+  if (data.apps.length > MAX_APPS) apps.push({ key: "__other", name: "Other apps", color: "#64748b" });
+  const keys = apps.map((a) => a.key);
+  const byT = new Map<number, Record<string, number>>();
+  for (const p of data.points) {
+    const t = new Date(p.ts).getTime();
+    let row = byT.get(t);
+    if (!row) {
+      row = { t };
+      for (const k of keys) row[k] = 0;
+      byT.set(t, row);
+    }
+    const v = metric === "cpu" ? p.cpu : metric === "gpu" ? p.gpu ?? 0 : p.ramMb / 1024;
+    const key = topIds.has(p.gameId) ? p.gameId : "__other";
+    row[key] = (row[key] ?? 0) + v;
+  }
+  const rows = [...byT.values()].sort((a, b) => a.t - b.t);
+  return { rows, apps };
+}
+
+function AppUsagePanel({ games, minutes, range, monitorOn }: { games: Game[]; minutes: number; range: TimelineRange; monitorOn: boolean }) {
+  const { data } = useSystemAppHistory(minutes, monitorOn);
+  const [metric, setMetric] = useState<AppMetric>("cpu");
+  const hasGpu = data?.hasGpu ?? false;
+  const effMetric: AppMetric = metric === "gpu" && !hasGpu ? "cpu" : metric;
+  const { rows, apps } = useMemo(() => buildAppSeries(data, effMetric), [data, effMetric]);
+  const isRam = effMetric === "ram";
+  const longRange = rangeToLookbackMs(range) > 86_400_000;
+  const axisTick = (t: number) => (longRange ? new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : timeTick(t));
+  const fmtVal = (v: number) => (isRam ? `${v.toFixed(1)} GB` : `${Math.round(v)}%`);
+
+  const options = [
+    { value: "cpu" as const, label: "CPU" },
+    ...(hasGpu ? [{ value: "gpu" as const, label: "GPU" }] : []),
+    { value: "ram" as const, label: "RAM" },
+  ];
+
+  return (
+    <Panel panelKey="systems.apps" games={games} art="icon">
+      <SectionTitle
+        sheen
+        title="Per-app resource usage"
+        subtitle="Combined history — each app is stacked, so the band heights show who's using what and the total"
+        right={
+          <div className="flex items-center gap-2">
+            <Segmented value={metric} onChange={setMetric} size="sm" options={options} />
+            <Layers className="h-4 w-4 text-ink-dim" />
+          </div>
+        }
+      />
+      {apps.length === 0 || rows.length < 2 ? (
+        <EmptyState
+          icon={<Layers className="h-6 w-6" />}
+          title="Building per-app history"
+          message="Play a game or use a tracked app while Performance tracking is on — per-app CPU, GPU and memory fill in every ~16s and line up here."
+        />
+      ) : (
+        <>
+          <ResponsiveContainer width="100%" height={280}>
+            <AreaChart data={rows} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
+              <defs>
+                {apps.map((a) => (
+                  <linearGradient key={a.key} id={`ag-${a.key}`} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={a.color} stopOpacity={0.55} />
+                    <stop offset="100%" stopColor={a.color} stopOpacity={0.12} />
+                  </linearGradient>
+                ))}
+              </defs>
+              <CartesianGrid stroke="rgba(255,255,255,0.04)" vertical={false} />
+              <XAxis dataKey="t" type="number" scale="time" domain={["dataMin", "dataMax"]} tickFormatter={axisTick} stroke="#454c66" fontSize={10} tickLine={false} axisLine={false} minTickGap={56} />
+              <YAxis stroke="#454c66" fontSize={10} tickLine={false} axisLine={false} width={44} unit={isRam ? "" : "%"} />
+              <Tooltip content={<AppUsageTooltip apps={apps} fmtVal={fmtVal} />} />
+              {apps.map((a) => (
+                <Area key={a.key} type="monotone" dataKey={a.key} name={a.name} stackId="apps" stroke={a.color} strokeWidth={1.25} fill={`url(#ag-${a.key})`} isAnimationActive={false} dot={false} />
+              ))}
+            </AreaChart>
+          </ResponsiveContainer>
+          <div className="mt-3 flex flex-wrap gap-2 border-t border-line pt-3">
+            {apps.map((a) => (
+              <span key={a.key} className="flex items-center gap-1.5 rounded-lg border border-line bg-white/[0.02] py-1 pl-1 pr-2.5 text-xs">
+                {a.meta ? (
+                  <GameArt id={a.meta.gameId} name={a.meta.name} cover={a.meta.coverPath} icon={a.meta.iconPath} accent={a.meta.accentColor} className="h-5 w-5" rounded="rounded" />
+                ) : (
+                  <span className="h-3 w-3 rounded-sm" style={{ background: a.color }} />
+                )}
+                <span className="max-w-[140px] truncate font-700 text-ink-soft">{a.name}</span>
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function AppUsageTooltip({ active, payload, label, apps, fmtVal }: any) {
+  if (!active || !payload?.length) return null;
+  const nameFor = (key: string) => apps.find((a: AppSeries) => a.key === key)?.name ?? key;
+  const rows = (payload as any[]).filter((p) => (p.value ?? 0) > 0.05).sort((a, b) => (b.value ?? 0) - (a.value ?? 0));
+  const total = (payload as any[]).reduce((a, p) => a + (p.value || 0), 0);
+  if (rows.length === 0) return null;
+  return (
+    <div className="rounded-xl border border-line bg-bg-800/95 px-3 py-2 text-xs shadow-float backdrop-blur">
+      <div className="mb-1 flex items-center justify-between gap-4 font-800 text-ink">
+        <span>{timeTick(label)}</span>
+        <span className="text-ink-dim">Σ {fmtVal(total)}</span>
+      </div>
+      {rows.map((p) => (
+        <div key={p.dataKey} className="flex items-center justify-between gap-3 text-ink-soft">
+          <span className="flex items-center gap-2">
+            <span className="h-2 w-2 rounded-full" style={{ background: p.stroke }} />
+            <span className="max-w-[150px] truncate">{nameFor(p.dataKey)}</span>
+          </span>
+          <span className="font-800 text-ink">{fmtVal(p.value)}</span>
+        </div>
+      ))}
+    </div>
   );
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.6.3"
+version = "3.7.0"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -65,6 +65,7 @@ windows = { version = "0.58", features = [
   "Storage_Streams",
   "Win32_Foundation",
   "Win32_System_SystemInformation",
+  "Win32_System_Performance",
   "Win32_System_Registry",
   "Win32_System_Com",
   "Win32_System_Variant",

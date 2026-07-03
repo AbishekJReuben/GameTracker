@@ -14,7 +14,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             update::download_and_install_apk,
-            update::fetch_update_manifest
+            update::fetch_update_manifest,
+            update::install_permission_status,
+            update::open_install_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running GameTracker Remote");

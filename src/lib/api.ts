@@ -833,6 +833,29 @@ export interface SystemHistory {
   sessions: Session[];
 }
 
+export interface AppUsagePoint {
+  ts: string;
+  gameId: string;
+  cpu: number;
+  ramMb: number;
+  gpu: number | null;
+}
+
+export interface AppUsageMeta {
+  gameId: string;
+  name: string;
+  kind: string;
+  iconPath: string | null;
+  coverPath: string | null;
+  accentColor: string | null;
+}
+
+export interface AppUsageHistory {
+  apps: AppUsageMeta[];
+  points: AppUsagePoint[];
+  hasGpu: boolean;
+}
+
 export type Settings = Record<string, string>;
 
 export interface SteamSession {
@@ -1075,6 +1098,7 @@ export const api = {
   systemSpecs: () => call<SystemSpecs>("system_specs"),
   systemLive: () => call<SystemLive>("system_live"),
   systemHistory: (minutes: number) => call<SystemHistory>("system_history", { minutes }),
+  systemAppHistory: (minutes: number) => call<AppUsageHistory>("system_app_history", { minutes }),
 
   autostartEnabled: () => call<boolean>("autostart_enabled"),
   setAutostart: (enabled: boolean) => call<void>("set_autostart", { enabled }),

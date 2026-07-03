@@ -1,6 +1,6 @@
 use crate::db::{foreground as fg_db, games, media as media_db, screenshots, sessions, settings, DbPool};
 use crate::db::games::MatchGame;
-use crate::tracking::{activity, foreground, idle, matcher, media, screenshot};
+use crate::tracking::{activity, foreground, gpu, idle, matcher, media, screenshot};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -13,6 +13,7 @@ use tauri::{AppHandle, Emitter};
 const TICK_SECS: u64 = 2;
 const MERGE_WINDOW_SECS: i64 = 120;
 const RELOAD_EVERY: u32 = 8; // reload registered games roughly every 16s
+const APP_SAMPLE_EVERY: u32 = 8; // persist per-app resource samples roughly every 16s
 const DEFAULT_SHOT_INTERVAL_MIN: i64 = 30;
 /// Resume a media play after a brief pause/skip; close it after this much silence.
 const MEDIA_MERGE_SECS: u64 = 45;
@@ -177,6 +178,15 @@ fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir
     let mut tick: u32 = 0;
     let notify = settings::get_bool(&pool, "notify_sessions").unwrap_or(true);
 
+    // Per-app resource sampling (CPU/RAM from sysinfo, GPU best-effort via PDH)
+    // feeds the System screen's combined per-app history. Persist every ~16s.
+    let _ = crate::system::ensure_app_table(&pool);
+    let gpu_meter = gpu::GpuMeter::new();
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1) as f64;
+
     // UI Automation client for reading browser URLs (COM-init on this thread).
     let automation = activity::Automation::new();
     // Per-game wall-clock timer for the periodic in-game screenshot.
@@ -233,7 +243,17 @@ fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir
             .map(|g| (g.id.clone(), g.clone()))
             .collect();
 
+        // Per-process GPU utilization for this tick (empty when unavailable).
+        let sample_usage = crate::db::settings::get_bool(&pool, "system_monitor_enabled")
+            .unwrap_or(true);
+        let gpu_map = if sample_usage {
+            gpu_meter.as_ref().map(|m| m.poll()).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
         let mut running: HashMap<String, RunGame> = HashMap::new();
+        let mut usage: HashMap<String, AppAccum> = HashMap::new();
         for proc_ in sys.processes().values() {
             if let Some(exe) = proc_.exe() {
                 let path = exe.to_string_lossy();
@@ -245,6 +265,15 @@ fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir
                         accent: g.accent_color.clone(),
                         kind: g.kind.clone(),
                     });
+                    if sample_usage {
+                        let acc = usage.entry(g.id.clone()).or_default();
+                        // cpu_usage() is per single core; normalize to total-system %.
+                        acc.cpu += proc_.cpu_usage() as f64 / ncpu;
+                        acc.ram_mb += proc_.memory() as f64 / 1_048_576.0;
+                        if gpu_meter.is_some() {
+                            acc.gpu += gpu_map.get(&proc_.pid().as_u32()).copied().unwrap_or(0.0);
+                        }
+                    }
                 }
             }
         }
@@ -686,8 +715,42 @@ fn run_loop(app: AppHandle, pool: DbPool, shared: Arc<TrackingShared>, media_dir
         }
         publish(&app, &shared, state);
 
+        // Persist per-app resource samples roughly every 16s (all rows share one
+        // timestamp so the chart can pivot them into stacked columns).
+        if sample_usage && tick % APP_SAMPLE_EVERY == 0 && !usage.is_empty() {
+            let ts = chrono::Utc::now().to_rfc3339();
+            let rows: Vec<(String, f64, f64, Option<f64>)> = usage
+                .into_iter()
+                .map(|(gid, a)| {
+                    let gpu = if gpu_meter.is_some() {
+                        Some((a.gpu.min(100.0) * 10.0).round() / 10.0)
+                    } else {
+                        None
+                    };
+                    (
+                        gid,
+                        (a.cpu.min(100.0) * 10.0).round() / 10.0,
+                        (a.ram_mb * 10.0).round() / 10.0,
+                        gpu,
+                    )
+                })
+                .collect();
+            crate::system::persist_app_samples(&pool, &ts, &rows);
+            if tick % (APP_SAMPLE_EVERY * 200) == 0 {
+                let _ = crate::system::prune_app(&pool);
+            }
+        }
+
         std::thread::sleep(Duration::from_secs(TICK_SECS));
     }
+}
+
+/// Accumulates a tick's resource usage across all processes of one tracked app.
+#[derive(Default)]
+struct AppAccum {
+    cpu: f64,
+    ram_mb: f64,
+    gpu: f64,
 }
 
 #[derive(Clone)]

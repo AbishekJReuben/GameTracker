@@ -58,6 +58,65 @@ pub async fn fetch_update_manifest(url: String) -> Result<String, String> {
     .map_err(|e| format!("manifest fetch task panicked: {e}"))?
 }
 
+/// Whether Android currently permits this app to install packages ("install
+/// unknown apps"). Checked up front so the UI can prompt the user to grant it
+/// BEFORE downloading, instead of failing at the install step. Always `true` on
+/// non-Android / pre-API-26 where the concept doesn't exist.
+#[tauri::command]
+pub async fn install_permission_status() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(check_install_permission)
+        .await
+        .map_err(|e| format!("permission check panicked: {e}"))?
+}
+
+/// Open the system "install unknown apps" settings screen for this app so the
+/// user can grant permission in one tap.
+#[tauri::command]
+pub async fn open_install_settings() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(open_install_settings_impl)
+        .await
+        .map_err(|e| format!("open settings panicked: {e}"))?
+}
+
+#[cfg(target_os = "android")]
+fn check_install_permission() -> Result<bool, String> {
+    use jni::objects::JObject;
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let allowed = can_request_installs(&mut env, &context).unwrap_or(true);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    Ok(allowed)
+}
+
+#[cfg(target_os = "android")]
+fn open_install_settings_impl() -> Result<(), String> {
+    use jni::objects::JObject;
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let r = open_unknown_sources_settings(&mut env, &context);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    r
+}
+
+#[cfg(not(target_os = "android"))]
+fn check_install_permission() -> Result<bool, String> {
+    Ok(true)
+}
+
+#[cfg(not(target_os = "android"))]
+fn open_install_settings_impl() -> Result<(), String> {
+    Err("Install settings are only available on Android".into())
+}
+
 fn emit(app: &AppHandle, phase: &str, received: u64, total: u64) {
     let _ = app.emit(
         "apk-update://progress",

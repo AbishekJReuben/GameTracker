@@ -994,6 +994,11 @@ pub fn system_history(state: State<AppState>, minutes: i64) -> AppResult<system:
     system::history(&state.pool, &state.sys, minutes)
 }
 
+#[tauri::command]
+pub fn system_app_history(state: State<AppState>, minutes: i64) -> AppResult<system::AppUsageHistory> {
+    system::app_history(&state.pool, minutes)
+}
+
 // ---------- autostart (elevated, via scheduled task) ----------
 
 #[tauri::command]

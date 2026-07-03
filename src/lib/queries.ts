@@ -18,6 +18,7 @@ export const keys = {
   systemSpecs: ["systemSpecs"] as const,
   systemLive: ["systemLive"] as const,
   systemHistory: (m: number) => ["systemHistory", m] as const,
+  systemAppHistory: (m: number) => ["systemAppHistory", m] as const,
   steamAchievements: (id: string) => ["steamAchievements", id] as const,
   steamAchievementsOverview: ["steamAchievementsOverview"] as const,
   musicOverview: ["music", "overview"] as const,
@@ -134,6 +135,15 @@ export function useSystemHistory(minutes: number, enabled = true) {
     queryKey: keys.systemHistory(minutes),
     queryFn: () => api.systemHistory(minutes),
     refetchInterval: enabled ? 4_000 : false,
+    enabled,
+  });
+}
+
+export function useSystemAppHistory(minutes: number, enabled = true) {
+  return useQuery({
+    queryKey: keys.systemAppHistory(minutes),
+    queryFn: () => api.systemAppHistory(minutes),
+    refetchInterval: enabled ? 8_000 : false,
     enabled,
   });
 }

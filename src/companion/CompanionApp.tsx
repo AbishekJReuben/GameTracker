@@ -39,7 +39,7 @@ import { GameDetailScreen } from "./screens/GameDetail";
 import { useOpenGame, closeGame } from "./ui";
 import { ScreenErrorBoundary } from "./ErrorBoundary";
 import { PageTransitionFX } from "./PageTransitionFX";
-import { checkForUpdate, installUpdate, type UpdateInfo } from "./update";
+import { checkForUpdate, installUpdate, installPermissionGranted, openInstallSettings, type UpdateInfo } from "./update";
 
 type Tab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
 type Phase = "boot" | "pairing" | "autoconnecting" | "connected" | "paused";
@@ -285,7 +285,7 @@ export function CompanionApp() {
  * package installer; a small progress line reflects the download.
  */
 function UpdateBanner({ info, onDismiss }: { info: UpdateInfo; onDismiss: () => void }) {
-  const [state, setState] = useState<"idle" | "working" | "error">("idle");
+  const [state, setState] = useState<"idle" | "needs-permission" | "working" | "error">("idle");
   const [pct, setPct] = useState<number | null>(null);
 
   useEffect(() => {
@@ -303,6 +303,19 @@ function UpdateBanner({ info, onDismiss }: { info: UpdateInfo; onDismiss: () => 
   }, [state]);
 
   const start = async () => {
+    // Ask for the "install unknown apps" permission up front. Without it, Android
+    // silently refuses the install intent — and older builds crashed at that
+    // point, closing the app before any prompt appeared. Bounce the user to the
+    // setting first; they grant it and tap Update again.
+    if (!(await installPermissionGranted())) {
+      setState("needs-permission");
+      try {
+        await openInstallSettings();
+      } catch {
+        /* best-effort — the message tells the user what to do */
+      }
+      return;
+    }
     setState("working");
     setPct(null);
     try {
@@ -332,9 +345,11 @@ function UpdateBanner({ info, onDismiss }: { info: UpdateInfo; onDismiss: () => 
                 : pct >= 100
                   ? "Opening installer…"
                   : `Downloading… ${pct}%`
-              : state === "error"
-                ? "Update failed — tap to retry"
-                : "A newer version of the companion is ready."}
+              : state === "needs-permission"
+                ? "Allow installing apps from this source, then tap Update again."
+                : state === "error"
+                  ? "Update failed — tap to retry"
+                  : "A newer version of the companion is ready."}
           </div>
         </div>
         {state === "working" && pct != null && pct < 100 ? (
