@@ -75,6 +75,22 @@ export function RemoteImg({ url, className, alt = "" }: { url: string; className
   return <img src={url} alt={alt} loading="lazy" className={className} />;
 }
 
+/** An image resolved from a local media path over the link (`loadMedia`), with a
+ *  fallback slot shown until/unless the art loads (e.g. media thumbnails). */
+export function LoadedImg({ path, className, fallback }: { path?: string | null; className?: string; fallback?: React.ReactNode }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setSrc(null);
+    loadMedia(path).then((u) => alive && setSrc(u));
+    return () => {
+      alive = false;
+    };
+  }, [path]);
+  if (src) return <img src={src} alt="" loading="lazy" className={className} />;
+  return <>{fallback ?? null}</>;
+}
+
 // ---- game-detail navigation (a tiny global so any screen can open the sheet) ----
 
 let currentGame: string | null = null;

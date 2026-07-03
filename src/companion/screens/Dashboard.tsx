@@ -20,13 +20,14 @@ import {
   TrendingUp,
   TrendingDown,
   Gamepad2,
+  Target,
 } from "lucide-react";
-import type { Dashboard, TrackingState } from "@/lib/api";
+import type { Dashboard, TrackingState, Session } from "@/lib/api";
 import { StatTile } from "@/components/StatTile";
 import { Sparkline } from "@/components/Sparkline";
 import { Heatmap } from "@/components/Heatmap";
 import { PolarHours, WeekdayBars } from "@/components/Charts";
-import { dur, hours, relativeTime, timeLabel } from "@/lib/format";
+import { dur, hours, relativeTime, timeLabel, accentFor } from "@/lib/format";
 import { useRemote } from "../useRemote";
 import { Art, openGame } from "../ui";
 
@@ -38,6 +39,16 @@ export function DashboardScreen() {
   const { data: now } = useRemote<TrackingState>("/api/tracking", 3000);
   const { data: heat } = useRemote<HeatDay[]>("/api/heatmap?days=182&kind=game", 60000);
   const { data: hourOfDay } = useRemote<number[]>("/api/hourofday?kind=game", 60000);
+  const { data: settings } = useRemote<Record<string, string>>("/api/settings", 60000);
+  const todayFrom = useMemo(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.toISOString();
+  }, []);
+  const { data: todaySessions } = useRemote<Session[]>(`/api/sessions?fromUtc=${encodeURIComponent(todayFrom)}&limit=300`, 15000);
+
+  const dailyGoalMin = parseInt(settings?.daily_goal_minutes ?? "0", 10) || 0;
+  const goalProgress = dailyGoalMin > 0 && data ? Math.min(100, (data.todayActive / (dailyGoalMin * 60)) * 100) : 0;
 
   const greeting = useMemo(() => {
     const h = new Date().getHours();
@@ -176,6 +187,30 @@ export function DashboardScreen() {
         </div>
       )}
 
+      {/* daily goal */}
+      {dailyGoalMin > 0 && data && (
+        <Section title="Daily goal">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="grid h-10 w-10 place-items-center rounded-xl bg-green/15 text-green"><Target className="h-5 w-5" /></div>
+              <div>
+                <div className="text-sm font-700">{dur(data.todayActive)} of {dailyGoalMin >= 60 ? `${Math.floor(dailyGoalMin / 60)}h ${dailyGoalMin % 60}m` : `${dailyGoalMin}m`}</div>
+                <div className="text-xs text-ink-dim">active today</div>
+              </div>
+            </div>
+            <span className="font-display text-2xl font-800 tabular-nums">{Math.round(goalProgress)}%</span>
+          </div>
+          <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/[0.06]"><div className="h-full rounded-full bg-accent-sheen" style={{ width: `${goalProgress}%` }} /></div>
+        </Section>
+      )}
+
+      {/* today's timeline */}
+      {todaySessions && todaySessions.length > 0 && (
+        <Section title="Today's timeline" subtitle="Your sessions across the day">
+          <TodayGantt sessions={todaySessions} />
+        </Section>
+      )}
+
       {/* top games */}
       <Section title="Top games" subtitle="By active playtime">
         {data && data.topGames.length > 0 ? (
@@ -286,6 +321,51 @@ function NowArt({ now }: { now: TrackingState }) {
   const name = (now.isPlaying ? now.gameName : now.appName) ?? "?";
   const id = (now.isPlaying ? now.gameId : now.appName) ?? name;
   return <Art id={String(id)} name={name} cover={cover} rounded="rounded-xl" className="h-12 w-12 shrink-0" />;
+}
+
+/** A compact lane-packed gantt of today's sessions (midnight → now). */
+function TodayGantt({ sessions }: { sessions: Session[] }) {
+  const start = useMemo(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }, []);
+  const now = Date.now();
+  const span = now - start || 1;
+  const { placed, count } = useMemo(() => {
+    const sorted = [...sessions].sort((a, b) => new Date(a.startUtc).getTime() - new Date(b.startUtc).getTime());
+    const laneEnds: number[] = [];
+    const placed: { s: Session; lane: number; left: number; width: number }[] = [];
+    for (const s of sorted) {
+      const ss = Math.max(new Date(s.startUtc).getTime(), start);
+      const ee = Math.min(new Date(s.endUtc ?? s.lastSeenUtc).getTime(), now);
+      if (ee <= start) continue;
+      let lane = laneEnds.findIndex((e) => e <= ss);
+      if (lane === -1) {
+        lane = laneEnds.length;
+        laneEnds.push(ee);
+      } else laneEnds[lane] = ee;
+      placed.push({ s, lane, left: ((ss - start) / span) * 100, width: Math.max(((ee - ss) / span) * 100, 0.8) });
+    }
+    return { placed, count: Math.max(1, laneEnds.length) };
+  }, [sessions, start, now, span]);
+  const laneH = 13;
+  const color = (s: Session) => (s.kind === "app" ? "#22d3ee" : s.accentColor || accentFor(s.gameId)[0]);
+  return (
+    <div>
+      <div className="relative w-full" style={{ height: count * laneH + 16 }}>
+        {[0, 6, 12, 18, 24].map((h) => (
+          <div key={h} className="absolute top-0 bottom-4 w-px bg-white/[0.05]" style={{ left: `${(h / 24) * 100}%` }} />
+        ))}
+        {placed.map(({ s, lane, left, width }) => (
+          <button key={s.id} onClick={() => openGame(s.gameId)} title={`${s.gameName} · ${dur(s.activeSeconds)}`} className="absolute rounded-full active:opacity-80" style={{ left: `${left}%`, width: `${width}%`, top: lane * laneH + 2, height: laneH - 4, background: color(s) }} />
+        ))}
+        {[0, 6, 12, 18].map((h) => (
+          <span key={h} className="absolute bottom-0 text-[9px] tabular-nums text-ink-faint" style={{ left: `${(h / 24) * 100}%` }}>{h}:00</span>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function Section({ title, subtitle, right, children }: { title: string; subtitle?: string; right?: React.ReactNode; children: React.ReactNode }) {

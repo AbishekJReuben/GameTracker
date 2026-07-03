@@ -21,9 +21,25 @@ export interface IceServer {
   credential?: string;
 }
 
-/** Default ICE servers: a free public STUN. TURN can be appended by the caller. */
+/**
+ * Default ICE servers: several public STUN endpoints for reliable candidate
+ * gathering, plus a public **TURN relay** so the link still forms when a direct
+ * P2P path can't (symmetric NAT / CGNAT / restrictive firewalls) — the same
+ * relay-fallback strategy AnyDesk/Chrome-Remote-Desktop use to "never drop".
+ * Without TURN, hard NATs simply fail to connect or flap. Extra servers (e.g. a
+ * private TURN) can be appended by the caller.
+ */
 export function defaultIceServers(extra?: IceServer[]): RTCIceServer[] {
-  const base: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  const base: RTCIceServer[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    // Open Relay Project — free public TURN (UDP/TCP/TLS) with static creds. Used
+    // only as a last resort when a direct candidate pair can't be established.
+    { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+  ];
   return extra && extra.length ? [...base, ...(extra as RTCIceServer[])] : base;
 }
 

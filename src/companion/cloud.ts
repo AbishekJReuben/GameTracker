@@ -47,8 +47,7 @@ const OFFER_TIMEOUT_MS = 8000; // joined the room but no offer arrived → rejoi
 const BACKOFF_MIN = 1500;
 const BACKOFF_MAX = 30000;
 const WATCHDOG_MS = 3000; // health-check cadence
-const HARD_RESET_MS = 60000; // unhealthy this long → full teardown + rebuild
-const STALL_MS = 10000; // authorized+connected but no decoded frames → rebuild
+const HARD_RESET_MS = 60000; // transport down this long → full teardown + rebuild
 // Receiver jitter buffer (ms): the old 20ms was so tight that late frames were
 // dropped (≈30% on Android). A larger buffer trades a little latency for far
 // fewer drops; it adapts up when the decoder falls behind and eases back.
@@ -78,6 +77,11 @@ export class CloudConn {
   private lastStatus: Status | null = null;
   private closed = false;
   private connectedOnce = false;
+  // True only during the fragile signaling handshake (socket open → offer received).
+  // Serializes reconnects so overlapping attempts can't spawn duplicate sockets/PCs
+  // that make the host churn. Cleared once we have a live PC (onOffer) or the attempt
+  // fails, so it can never wedge reconnection shut.
+  private connecting = false;
   private reconnectTimer: number | null = null;
   private backoff = BACKOFF_MIN;
   private hbTimer: number | null = null;
@@ -91,7 +95,6 @@ export class CloudConn {
   private watchdogTimer: number | null = null;
   private lastHealthyAt = Date.now();
   private lastDecoded = -1;
-  private lastDecodeAdvanceAt = Date.now();
 
   constructor(
     private signalUrl: string,
@@ -150,6 +153,7 @@ export class CloudConn {
    */
   private async openSignaling(throwOnFail: boolean): Promise<void> {
     if (this.closed) return;
+    this.connecting = true;
     this.stopHeartbeat();
     this.clearOfferTimeout();
     this.pc?.close();
@@ -194,6 +198,7 @@ export class CloudConn {
       // don't hang forever — rejoin, which makes the host re-announce us.
       this.armOfferTimeout();
     } catch (e) {
+      this.connecting = false;
       if (throwOnFail && !this.connectedOnce) throw e;
       this.scheduleReconnect();
     }
@@ -203,7 +208,10 @@ export class CloudConn {
     this.clearOfferTimeout();
     this.offerTimer = window.setTimeout(() => {
       this.offerTimer = null;
-      if (!this.closed && !this.connectedViaPeer()) this.scheduleReconnect();
+      if (!this.closed && !this.connectedViaPeer()) {
+        this.connecting = false; // handshake stalled — allow a fresh attempt
+        this.scheduleReconnect();
+      }
     }, OFFER_TIMEOUT_MS);
   }
 
@@ -219,7 +227,7 @@ export class CloudConn {
   }
 
   private scheduleReconnect() {
-    if (this.closed || this.denied || this.reconnectTimer !== null) return;
+    if (this.closed || this.denied || this.reconnectTimer !== null || this.connecting) return;
     const wait = this.backoff;
     this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX);
     this.reconnectTimer = window.setTimeout(() => {
@@ -241,6 +249,9 @@ export class CloudConn {
     this.stream = null; // new session → new tracks; don't accumulate dead ones
     this.authed = false; // every fresh peer requires re-authorization by the host
     this.videoReceiver = null;
+    // A new PC restarts inbound-RTP counters from 0, so the old frame count is
+    // meaningless — reset it so the jitter-adaptation baseline is correct.
+    this.lastDecoded = -1;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers) });
     this.pc = pc;
     pipeIce(pc, this.sig!);
@@ -296,6 +307,11 @@ export class CloudConn {
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
     this.sig!.send({ type: "answer", sdp: answer.sdp ?? "" });
+    // We have a live PC now; the signaling handshake is done. Further recovery is
+    // driven by the PC's own state + the data-channel heartbeat, so drop the
+    // serialization guard (leaving it set here would wedge reconnection if the PC
+    // later got stuck in "disconnected" without ever reaching "connected").
+    this.connecting = false;
   }
 
   /** Ping the host regularly; if pongs stop, tear the link down and rebuild. */
@@ -388,33 +404,28 @@ export class CloudConn {
       // still requires full authorization.
       if (transportUp) this.lastHealthyAt = Date.now();
       // Backgrounded: timers throttle and getStats is meaningless — skip checks.
-      if (document.hidden) {
-        this.lastDecodeAdvanceAt = Date.now();
-        return;
-      }
-      // Hard reset: unhealthy for too long → tear down and rebuild from scratch.
+      if (document.hidden) return;
+      // Hard reset — the ultimate backstop: if the transport hasn't been "connected"
+      // for HARD_RESET_MS, force a clean rebuild. Bypasses the `connecting` guard so
+      // a PC wedged in "disconnected"/"connecting" (never firing "failed") recovers.
       if (Date.now() - this.lastHealthyAt > HARD_RESET_MS) {
         this.lastHealthyAt = Date.now();
+        this.connecting = false;
         this.backoff = BACKOFF_MIN;
         this.clearReconnect();
-        this.openSignaling(false).catch(() => this.scheduleReconnect());
-        return;
-      }
-      if (!connected) return;
-      // Decode-stall + adaptive jitter: sample inbound video stats.
-      const st = await this.videoStats().catch(() => null);
-      if (!st) return;
-      if (st.framesDecoded > this.lastDecoded) {
-        this.lastDecoded = st.framesDecoded;
-        this.lastDecodeAdvanceAt = Date.now();
-      } else if (Date.now() - this.lastDecodeAdvanceAt > STALL_MS) {
-        // Connected + approved but no new frames for 10s → the stream is wedged.
-        this.lastDecodeAdvanceAt = Date.now();
         this.emit("disconnected");
         this.openSignaling(false).catch(() => this.scheduleReconnect());
         return;
       }
-      // Adapt the jitter buffer to the observed drop rate.
+      if (!connected) return;
+      // Adaptive jitter buffer only. There is deliberately NO decode-stall reconnect:
+      // `framesDecoded` stalls whenever the video isn't being *rendered* (e.g. the
+      // user is on the Home/Library tab, not Control), which used to trigger a
+      // spurious rebuild every ~10s → the connect→reconnect loop. Genuinely dead
+      // links are caught by the data-channel heartbeat and ICE-"failed" instead.
+      const st = await this.videoStats().catch(() => null);
+      if (!st) return;
+      if (st.framesDecoded > this.lastDecoded) this.lastDecoded = st.framesDecoded;
       const total = st.framesDecoded + st.framesDropped;
       const ratio = total > 0 ? st.framesDropped / total : 0;
       const prev = this.jitterTarget;
@@ -507,7 +518,7 @@ export class CloudConn {
     else p.reject(new Error(msg.error ?? "request failed"));
   }
 
-  request<T>(path: string, body?: any): Promise<T> {
+  request<T>(path: string, body?: any, timeoutMs = 8000): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       if (!this.chData || this.chData.readyState !== "open") {
         reject(new Error("Not connected yet."));
@@ -521,7 +532,7 @@ export class CloudConn {
           this.pending.delete(id);
           reject(new Error("Request timed out."));
         }
-      }, 8000);
+      }, timeoutMs);
     });
   }
 

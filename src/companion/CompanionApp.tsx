@@ -4,6 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import {
   LayoutDashboard,
   Library,
+  Clock,
+  Trophy,
   Headphones,
   MonitorSmartphone,
   Settings as SettingsIcon,
@@ -25,6 +27,8 @@ import { CloudConn } from "./cloud";
 import { deviceId, deviceName } from "./device";
 import { DashboardScreen } from "./screens/Dashboard";
 import { LibraryScreen } from "./screens/Library";
+import { TimelineScreen } from "./screens/Timeline";
+import { CollectionsScreen } from "./screens/Collections";
 import { MusicScreen } from "./screens/MusicView";
 import { ControlScreen } from "./screens/Control";
 import { SettingsScreen } from "./screens/Settings";
@@ -32,7 +36,7 @@ import { GameDetailScreen } from "./screens/GameDetail";
 import { useOpenGame, closeGame } from "./ui";
 import { checkForUpdate, installUpdate, type UpdateInfo } from "./update";
 
-type Tab = "stats" | "library" | "music" | "control" | "settings";
+type Tab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "settings";
 type Phase = "boot" | "pairing" | "autoconnecting" | "connected" | "paused";
 
 const LS_CODE = "gt.remote.code"; // remembered code → auto-connect on launch
@@ -42,9 +46,11 @@ const LS_SECRET = "gt.remote.secret"; // remembered permanent key (optional)
 const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "stats", label: "Home", icon: LayoutDashboard },
   { id: "library", label: "Library", icon: Library },
+  { id: "timeline", label: "Time", icon: Clock },
+  { id: "collection", label: "Wins", icon: Trophy },
   { id: "music", label: "Music", icon: Headphones },
-  { id: "control", label: "Control", icon: MonitorSmartphone },
-  { id: "settings", label: "Settings", icon: SettingsIcon },
+  { id: "control", label: "Remote", icon: MonitorSmartphone },
+  { id: "settings", label: "More", icon: SettingsIcon },
 ];
 
 export function CompanionApp() {
@@ -211,9 +217,11 @@ export function CompanionApp() {
         </header>
       )}
 
-      <main className={`min-h-0 flex-1 ${isControlTab || tab === "library" ? "" : "overflow-y-auto"}`}>
+      <main className={`min-h-0 flex-1 ${isControlTab || tab === "library" || tab === "timeline" ? "" : "overflow-y-auto"}`}>
         {tab === "stats" && <DashboardScreen />}
         {tab === "library" && <LibraryScreen />}
+        {tab === "timeline" && <TimelineScreen />}
+        {tab === "collection" && <CollectionsScreen />}
         {tab === "music" && <MusicScreen />}
         {tab === "settings" && (
           <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} />
@@ -225,7 +233,7 @@ export function CompanionApp() {
 
       {!isControlTab && (
         <nav
-          className="grid grid-cols-5 border-t border-line bg-bg-900/70 backdrop-blur"
+          className="grid grid-cols-7 border-t border-line bg-bg-900/70 backdrop-blur"
           style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
         >
           {TABS.map((t) => {
@@ -234,11 +242,11 @@ export function CompanionApp() {
               <button
                 key={t.id}
                 onClick={() => setTab(t.id)}
-                className={`flex flex-col items-center gap-1 py-2.5 text-[11px] font-700 transition ${
+                className={`flex flex-col items-center gap-0.5 py-2 text-[9px] font-700 transition ${
                   active ? "text-accent-3" : "text-ink-dim"
                 }`}
               >
-                <t.icon className="h-5 w-5" />
+                <t.icon className="h-[18px] w-[18px]" />
                 {t.label}
               </button>
             );

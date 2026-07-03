@@ -28,13 +28,13 @@ export function cloudConn(): CloudConn | null {
   return conn;
 }
 
-export async function apiGet<T>(path: string): Promise<T> {
-  if (mode === "cloud" && conn) return conn.request<T>(path);
+export async function apiGet<T>(path: string, timeoutMs?: number): Promise<T> {
+  if (mode === "cloud" && conn) return conn.request<T>(path, undefined, timeoutMs);
   return remoteGet<T>(path);
 }
 
-export async function apiPost<T>(path: string, body?: any): Promise<T> {
-  if (mode === "cloud" && conn) return conn.request<T>(path, body);
+export async function apiPost<T>(path: string, body?: any, timeoutMs?: number): Promise<T> {
+  if (mode === "cloud" && conn) return conn.request<T>(path, body, timeoutMs);
   return remotePost<T>(path, body);
 }
 

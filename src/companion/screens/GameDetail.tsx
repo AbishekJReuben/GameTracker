@@ -26,12 +26,16 @@ import {
   ExternalLink,
   Camera,
   Award,
+  Globe,
 } from "lucide-react";
 import type { Game, GameStatus, Session, Screenshot, SteamAchievement } from "@/lib/api";
 import { dur, relativeTime, timeLabel, dateLabel, partialDate, formatHltbMinutes } from "@/lib/format";
+import { clipFocusSpans } from "@/lib/focusSpans";
 import { apiGet, apiPost, loadMedia } from "../link";
 import { useRemote } from "../useRemote";
 import { Art, RemoteImg, STATUS_STYLE, STATUS_ORDER } from "../ui";
+import { LiveStatsPanel, SteamReviewsPanel, MetacriticReviewsPanel, TrailerPanel, SoundtrackPanel, TwitchPanel } from "./OnlinePanels";
+import { Sparkles } from "lucide-react";
 
 function dayHeading(d: Date): string {
   const today = new Date();
@@ -45,7 +49,7 @@ function dayHeading(d: Date): string {
 }
 
 export function GameDetailScreen({ id, onClose }: { id: string; onClose: () => void }) {
-  const { data: game, loading, error } = useRemote<Game>(`/api/games/${id}`, 20000);
+  const { data: game, loading, error } = useRemote<Game>(`/api/games/${id}`, 10000);
   const { data: sessions } = useRemote<Session[]>(`/api/sessions?gameId=${encodeURIComponent(id)}&limit=500`, 20000);
   const { data: shots } = useRemote<Screenshot[]>(`/api/games/${id}/screenshots`, 60000);
 
@@ -108,6 +112,18 @@ function Detail({ game, sessions, shots, onClose }: { game: Game; sessions: Sess
     } finally {
       setBusy(null);
     }
+  };
+  // "Get data": kick off cover/info/HLTB (or Wikipedia for apps) on the PC. It runs
+  // in the background there; the game's periodic poll fills in the new fields.
+  const [enriching, setEnriching] = useState(false);
+  const enrich = async () => {
+    setEnriching(true);
+    try {
+      await apiPost(`/api/games/${g.id}/enrich`, { name: g.displayName, isApp });
+    } catch {
+      /* ignore */
+    }
+    window.setTimeout(() => setEnriching(false), 20000);
   };
 
   const hltbItems = [
@@ -174,11 +190,16 @@ function Detail({ game, sessions, shots, onClose }: { game: Game; sessions: Sess
       </div>
 
       <div className="space-y-4 px-4">
-        {g.exePaths.length > 0 && (
-          <button onClick={launch} disabled={busy === "launch"} className="btn btn-primary h-11 w-full">
-            {busy === "launch" ? <Loader2 className="h-5 w-5 animate-spin" /> : <Play className="h-5 w-5" />} Launch on PC
+        <div className="flex gap-2">
+          {g.exePaths.length > 0 && (
+            <button onClick={launch} disabled={busy === "launch"} className="btn btn-primary h-11 flex-1">
+              {busy === "launch" ? <Loader2 className="h-5 w-5 animate-spin" /> : <Play className="h-5 w-5" />} Launch on PC
+            </button>
+          )}
+          <button onClick={enrich} disabled={enriching} className="btn btn-subtle h-11 flex-1" title={isApp ? "Fetch details from Wikipedia" : "Fetch cover & info (Steam) + HowLongToBeat"}>
+            {enriching ? <Loader2 className="h-5 w-5 animate-spin" /> : <Sparkles className="h-5 w-5" />} {isApp ? "Get info" : "Get data"}
           </button>
-        )}
+        </div>
 
         {/* stats */}
         <div className="grid grid-cols-2 gap-2.5">
@@ -237,22 +258,40 @@ function Detail({ game, sessions, shots, onClose }: { game: Game; sessions: Sess
                     <span className="text-[10px] tabular-nums text-ink-faint">{grp.sessions.length} · {dur(isApp ? grp.runtime : grp.active)}</span>
                   </div>
                   <div className="divide-y divide-line/40">
-                    {grp.sessions.map((s) => (
-                      <div key={s.id} className="flex items-center gap-3 py-2">
-                        <div className="w-14 shrink-0 text-xs tabular-nums text-ink-dim">{timeLabel(s.startUtc, false)}</div>
-                        <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-white/[0.05]">
-                          <span className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${Math.max((s.runtimeSeconds / maxRuntime) * 100, 3)}%`, background: accent }} />
+                    {grp.sessions.map((s) => {
+                      const startMs = new Date(s.startUtc).getTime();
+                      const endMs = new Date(s.endUtc ?? s.lastSeenUtc).getTime();
+                      const span = endMs - startMs || 1;
+                      const segs = clipFocusSpans(s, startMs, endMs, Date.now());
+                      return (
+                        <div key={s.id} className="flex items-center gap-3 py-2">
+                          <div className="w-14 shrink-0 text-xs tabular-nums text-ink-dim">{timeLabel(s.startUtc, false)}</div>
+                          <div className="min-w-0 flex-1">
+                            {/* Bar width = runtime vs the day's longest; bright = focused, dim = alt-tabbed. */}
+                            <div className="relative h-2 overflow-hidden rounded-full bg-white/[0.05]" style={{ width: `${Math.max((s.runtimeSeconds / maxRuntime) * 100, 3)}%`, minWidth: 24 }}>
+                              {segs.map((seg, si) => (
+                                <span key={si} className="absolute inset-y-0 rounded-full" style={{ left: `${((seg.startMs - startMs) / span) * 100}%`, width: `${Math.max(((seg.endMs - seg.startMs) / span) * 100, 1)}%`, background: accent, opacity: seg.focused ? 1 : 0.35 }} />
+                              ))}
+                            </div>
+                          </div>
+                          <div className="w-20 shrink-0 text-right">
+                            <div className="text-sm font-800 tabular-nums">{dur(isApp ? s.runtimeSeconds : s.activeSeconds)}</div>
+                            {s.runtimeSeconds > s.activeSeconds + 30 && <div className="text-[10px] tabular-nums text-ink-faint">{dur(s.activeSeconds)} focused</div>}
+                          </div>
                         </div>
-                        <div className="w-20 shrink-0 text-right">
-                          <div className="text-sm font-800 tabular-nums">{dur(isApp ? s.runtimeSeconds : s.activeSeconds)}</div>
-                          {s.runtimeSeconds > s.activeSeconds + 30 && <div className="text-[10px] tabular-nums text-ink-faint">{dur(s.activeSeconds)} focused</div>}
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               ))}
             </div>
+          </Card>
+        )}
+
+        {/* window & browser activity log */}
+        {sessions.some((s) => (s.activitySpans?.length ?? 0) > 0) && (
+          <Card title="Window & browser activity" subtitle="What was on screen while you played">
+            <ActivityLog sessions={sessions} />
           </Card>
         )}
 
@@ -299,12 +338,81 @@ function Detail({ game, sessions, shots, onClose }: { game: Game; sessions: Sess
           )}
         </Card>
 
+        {/* online panels — live stats, reviews, trailer, soundtrack, Twitch (games only) */}
+        {isApp && g.notes && (
+          <Card title="About" subtitle="From online sources"><p className="text-sm leading-relaxed text-ink-soft">{g.notes}</p></Card>
+        )}
+        {!isApp && (
+          <>
+            <LiveStatsPanel game={g} />
+            {g.steamAppId != null && <SteamReviewsPanel appId={g.steamAppId} name={g.displayName} />}
+            <MetacriticReviewsPanel gameId={g.id} slug={g.metacriticSlug} name={g.displayName} />
+            {g.trailerUrl && <TrailerPanel game={g} />}
+            <SoundtrackPanel game={g} />
+            <TwitchPanel game={g} />
+          </>
+        )}
+
         {(g.completedYear || g.completedMonth || g.completedDay) && (
           <div className="flex items-center justify-center gap-1.5 text-sm text-ink-soft">
             <Trophy className="h-4 w-4 text-accent" /> Completed {partialDate(g.completedYear, g.completedMonth, g.completedDay)}
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** Chronological browser/window activity from the sessions' `activitySpans`. */
+function ActivityLog({ sessions }: { sessions: Session[] }) {
+  const [showAll, setShowAll] = useState(false);
+  const hostOf = (url?: string | null) => {
+    if (!url) return null;
+    try {
+      return new URL(url.includes("://") ? url : `https://${url}`).hostname.replace(/^www\./, "");
+    } catch {
+      return url;
+    }
+  };
+  const rows = useMemo(() => {
+    const now = Date.now();
+    const out: { key: string; title: string | null; url: string | null; host: string | null; startMs: number; endMs: number; sec: number; live: boolean }[] = [];
+    for (const s of sessions) {
+      for (const a of s.activitySpans ?? []) {
+        if (!a.title && !a.url) continue;
+        const startMs = new Date(a.startUtc).getTime();
+        const live = !a.endUtc;
+        const endMs = a.endUtc ? new Date(a.endUtc).getTime() : now;
+        out.push({ key: `${s.id}-${a.startUtc}-${a.url ?? a.title}`, title: a.title ?? null, url: a.url ?? null, host: hostOf(a.url), startMs, endMs, sec: Math.max(0, Math.round((endMs - startMs) / 1000)), live });
+      }
+    }
+    return out.sort((a, b) => b.startMs - a.startMs);
+  }, [sessions]);
+  const shown = showAll ? rows : rows.slice(0, 40);
+  return (
+    <div>
+      <div className="max-h-[420px] divide-y divide-line/40 overflow-y-auto">
+        {shown.map((r) => {
+          const fmt = (ms: number) => timeLabel(new Date(ms).toISOString(), false);
+          return (
+            <div key={r.key} className="flex items-start gap-2.5 py-2">
+              <div className="w-20 shrink-0 text-[11px] text-ink-dim">
+                {dateLabel(new Date(r.startMs).toISOString())}
+                <div className="text-[10px] tabular-nums text-ink-faint">{fmt(r.startMs)} → {r.live ? "now" : fmt(r.endMs)}</div>
+              </div>
+              <span className="mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-lg border border-line bg-white/[0.03] text-ink-dim">{r.host ? <Globe className="h-3 w-3" /> : <AppWindow className="h-3 w-3" />}</span>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-700 text-ink-soft">{r.title ?? r.host}</div>
+                {r.host && r.url && <a href={r.url} target="_blank" rel="noreferrer" className="inline-flex max-w-full items-center gap-1 truncate text-[11px] text-ink-faint"><ExternalLink className="h-3 w-3 shrink-0" /><span className="truncate">{r.host}</span></a>}
+              </div>
+              <div className="shrink-0 text-right text-xs font-800 tabular-nums text-ink">{r.live ? <span className="text-accent-3">live</span> : dur(r.sec)}</div>
+            </div>
+          );
+        })}
+      </div>
+      {rows.length > 40 && (
+        <button onClick={() => setShowAll((v) => !v)} className="btn btn-ghost mt-2 h-8 w-full text-xs">{showAll ? "Show less" : `Show all ${rows.length} entries`}</button>
+      )}
     </div>
   );
 }

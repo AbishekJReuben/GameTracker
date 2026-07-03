@@ -34,6 +34,8 @@ import {
   Menu,
   BarChart3,
   Library as LibraryIcon,
+  Clock as ClockIcon,
+  Trophy as TrophyIcon,
   Headphones,
   Settings as SettingsIcon,
   Send,
@@ -62,7 +64,7 @@ const EDGE_SPEED = 0.016; // max cursor movement (fraction of the screen) per fr
 type Mode = "trackpad" | "touch";
 type Mod = "ctrl" | "alt" | "shift" | "win";
 type KbMode = "direct" | "buffered";
-type NavTab = "stats" | "library" | "music" | "control" | "settings";
+type NavTab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "settings";
 /** Which bottom control panel is expanded (null = collapsed to just the tab strip). */
 type Panel = "mouse" | "keys" | "shortcuts" | "quality" | "keyboard";
 
@@ -1016,6 +1018,8 @@ export function ControlScreen({
                   {([
                     { id: "stats", label: "Home", icon: BarChart3 },
                     { id: "library", label: "Library", icon: LibraryIcon },
+                    { id: "timeline", label: "Timeline", icon: ClockIcon },
+                    { id: "collection", label: "Collection", icon: TrophyIcon },
                     { id: "music", label: "Music", icon: Headphones },
                     { id: "settings", label: "Settings", icon: SettingsIcon },
                   ] as const).map((t) => (

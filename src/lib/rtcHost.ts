@@ -130,6 +130,15 @@ async function handleData(path: string, body?: any): Promise<unknown> {
   if (urlPath === "/api/system/live") return api.systemLive();
   if (urlPath === "/api/system/history") return api.systemHistory(num("minutes") ?? 60);
   if (urlPath === "/api/settings") return api.getSettings();
+  // Online game panels (mirrors the desktop GameDetail): live stats, reviews, Twitch.
+  if (urlPath === "/api/steam/reviews") {
+    const appId = num("appId");
+    return appId ? api.fetchSteamReviews(appId) : [];
+  }
+  if (urlPath === "/api/twitch") {
+    const name = params.get("name");
+    return name ? api.fetchTwitchLive(name) : null;
+  }
 
   // GET endpoints with IDs
   if (parts.length === 4 && parts[1] === "api" && parts[2] === "games") {
@@ -155,6 +164,10 @@ async function handleData(path: string, body?: any): Promise<unknown> {
   if (parts.length === 4 && parts[1] === "api" && parts[2] === "playlists") {
     const id = parts[3];
     return api.playlistGet(id);
+  }
+  if (parts.length === 5 && parts[1] === "api" && parts[2] === "games" && parts[4] === "metacritic") {
+    const id = parts[3];
+    return api.fetchMetacriticReviews(id, params.get("slug"));
   }
 
   // POST / write actions
@@ -205,6 +218,40 @@ async function handleData(path: string, body?: any): Promise<unknown> {
   if (parts.length === 5 && parts[1] === "api" && parts[2] === "playlists" && parts[4] === "reorder") {
     const id = parts[3];
     return api.playlistReorder(id, body.vids);
+  }
+  // Kick off a background live-stats refresh; the phone re-polls /stats for the
+  // result (the desktop's game://stats event doesn't cross the data channel).
+  if (parts.length === 6 && parts[1] === "api" && parts[2] === "games" && parts[4] === "stats" && parts[5] === "refresh") {
+    return api.refreshGameStats(parts[3]);
+  }
+  // "Get data" enrichment — cover + Steam/Wikipedia info (+ HowLongToBeat for
+  // games). These are slow network calls, so fire-and-forget on the host and let
+  // the phone's periodic /api/games/:id poll pick up the enriched fields; awaiting
+  // here would blow the data-channel request timeout.
+  if (parts.length === 5 && parts[1] === "api" && parts[2] === "games" && parts[4] === "enrich") {
+    const id = parts[3];
+    const name = String(body?.name ?? "Unknown");
+    const isApp = !!body?.isApp;
+    void (async () => {
+      try {
+        if (isApp) {
+          await api.fetchAppInfo(id, name, true);
+        } else {
+          await api.fetchCover(id, name);
+          await api.fetchGameInfo(id, name, false);
+          await api.fetchHltb(id, name, true);
+        }
+      } catch {
+        /* best-effort */
+      }
+    })();
+    return { started: true };
+  }
+  // Resolve this game's full OST now (fire-and-forget; re-poll the game for the
+  // filled-in themeTrackIds/Titles).
+  if (parts.length === 5 && parts[1] === "api" && parts[2] === "games" && parts[4] === "ost") {
+    void api.fetchFullOst(parts[3]).catch(() => {});
+    return { started: true };
   }
 
   throw new Error(`unknown path ${path}`);
