@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { Smartphone, KeyRound, Loader2, Globe, ShieldCheck, Eye, EyeOff } from "lucide-react";
 import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
-import { CloudConn } from "./cloud";
+import { CloudConn, type ConnectSnapshot } from "./cloud";
+import { ConnectionProgress } from "./ConnectionProgress";
 import { deviceId, deviceName } from "./device";
 
 export type Connected = { conn: CloudConn; code: string; signalUrl: string; secret: string };
@@ -28,21 +29,47 @@ export function Pairing({
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(false); // host is showing its approval prompt
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<ConnectSnapshot | null>(null);
+  const activeConnRef = useRef<CloudConn | null>(null);
+  const progressRef = useRef<ConnectSnapshot | null>(null);
+
+  useEffect(() => {
+    if (!busy || !activeConnRef.current) return;
+    return activeConnRef.current.onProgress((snap) => {
+      progressRef.current = snap;
+      setProgress(snap);
+      if (snap.phase === "pending_approval") setWaiting(true);
+    });
+  }, [busy]);
+
+  const timeoutMessage = (snap: ConnectSnapshot | null) => {
+    if (!snap) return "Couldn't reach your PC. Make sure the PC app is on with Remote access enabled, and the code is right.";
+    if (snap.phase === "signaling") return "Couldn't reach the signaling server. Check your internet connection.";
+    if (snap.phase === "waiting_offer") return "Your PC didn't respond. Make sure GameTracker is running with Remote enabled.";
+    if (snap.phase === "negotiating" || snap.phase === "authenticating")
+      return "Connected to your PC but the secure link failed. Try again.";
+    return "Couldn't reach your PC. Make sure the PC app is on with Remote access enabled, and the code is right.";
+  };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setWaiting(false);
     setError(null);
+    setProgress(null);
+    progressRef.current = null;
     const url = signalUrl.trim();
     const c = code.trim().toUpperCase();
     const key = secret.trim().toUpperCase();
     localStorage.setItem(LS_SIGNAL, url);
     localStorage.setItem(LS_SECRET, key);
     const conn = new CloudConn(url, c, { deviceId: deviceId(), name: deviceName(), secret: key || undefined });
+    activeConnRef.current = conn;
     const timeout = window.setTimeout(() => {
-      setError("Couldn't reach your PC. Make sure the PC app is on with Remote access enabled, and the code is right.");
+      setError(timeoutMessage(progressRef.current));
       setBusy(false);
+      setProgress(null);
+      activeConnRef.current = null;
       conn.close();
     }, 15000);
     conn.onStatus((s) => {
@@ -50,7 +77,6 @@ export function Pairing({
         window.clearTimeout(timeout);
         onConnected({ conn, code: c, signalUrl: url, secret: key });
       } else if (s === "pending") {
-        // The PC is asking its user to approve — wait (no timeout) with a hint.
         window.clearTimeout(timeout);
         setWaiting(true);
       } else if (s === "denied") {
@@ -58,11 +84,15 @@ export function Pairing({
         setError("Access was declined on the PC. Ask to be allowed, or enter the permanent key.");
         setBusy(false);
         setWaiting(false);
+        setProgress(null);
+        activeConnRef.current = null;
         conn.close();
       } else if (s === "error") {
         window.clearTimeout(timeout);
         setError("That code was rejected. Check the code on your PC and try again.");
         setBusy(false);
+        setProgress(null);
+        activeConnRef.current = null;
         conn.close();
       }
     });
@@ -72,6 +102,8 @@ export function Pairing({
       window.clearTimeout(timeout);
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
+      setProgress(null);
+      activeConnRef.current = null;
       conn.close();
     }
   };
@@ -125,9 +157,14 @@ export function Pairing({
           <p className="-mt-2 mb-4 text-xs text-ink-faint">
             Enter the key from the PC to be trusted automatically. Leave blank to ask for approval instead.
           </p>
-          {waiting && (
+          {waiting && !progress && (
             <div className="mb-4 flex items-center gap-2 rounded-xl border border-accent-3/40 bg-accent-3/10 px-3 py-2.5 text-sm text-accent-3">
               <Loader2 className="h-4 w-4 animate-spin" /> Waiting for approval on your PC…
+            </div>
+          )}
+          {busy && progress && (
+            <div className="mb-4">
+              <ConnectionProgress snapshot={progress} showSteps={!waiting} />
             </div>
           )}
           {error && <ErrorBox>{error}</ErrorBox>}

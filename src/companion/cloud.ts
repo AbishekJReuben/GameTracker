@@ -17,8 +17,28 @@ import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 /** "pending" = link up, awaiting host approval; "denied" = host rejected us. */
-type Status = RTCPeerConnectionState | "error" | "pending" | "denied";
+export type Status = RTCPeerConnectionState | "error" | "pending" | "denied";
 type HostEvent = { event: string; [k: string]: unknown };
+
+export type ConnectPhase =
+  | "idle"
+  | "signaling"
+  | "waiting_offer"
+  | "negotiating"
+  | "authenticating"
+  | "pending_approval"
+  | "connected"
+  | "reconnecting"
+  | "denied";
+
+export type ConnectSnapshot = {
+  phase: ConnectPhase;
+  status: Status;
+  attempt: number;
+  backoffMs: number;
+  iceState?: RTCIceConnectionState;
+  job: string;
+};
 
 /** Identity + optional secret key the host uses to authorize this device. */
 export interface AuthInfo {
@@ -95,6 +115,13 @@ export class CloudConn {
   private watchdogTimer: number | null = null;
   private lastHealthyAt = Date.now();
   private lastDecoded = -1;
+  private progressListeners = new Set<(s: ConnectSnapshot) => void>();
+  private progressPhase: ConnectPhase = "idle";
+  private progressJob = "Starting…";
+  private reconnectAttempt = 0;
+  private reconnectBackoffMs = 0;
+  private reconnectAt = 0;
+  private iceState?: RTCIceConnectionState;
 
   constructor(
     private signalUrl: string,
@@ -126,14 +153,65 @@ export class CloudConn {
     return this.connectedOnce;
   }
 
+  getSnapshot(): ConnectSnapshot {
+    const backoffMs =
+      this.progressPhase === "reconnecting" && this.reconnectAt > 0
+        ? Math.max(0, this.reconnectAt - Date.now())
+        : this.reconnectBackoffMs;
+    return {
+      phase: this.progressPhase,
+      status: this.lastStatus ?? "new",
+      attempt: this.reconnectAttempt,
+      backoffMs,
+      iceState: this.iceState,
+      job: this.progressJob,
+    };
+  }
+
+  private setProgress(phase: ConnectPhase, job: string) {
+    this.progressPhase = phase;
+    this.progressJob = job;
+    this.emitProgress();
+  }
+
+  private emitProgress() {
+    const snap = this.getSnapshot();
+    for (const cb of this.progressListeners) cb(snap);
+  }
+
+  onProgress(cb: (s: ConnectSnapshot) => void): () => void {
+    this.progressListeners.add(cb);
+    cb(this.getSnapshot());
+    return () => this.progressListeners.delete(cb);
+  }
+
   /** Record and broadcast the latest connection status, healing terminal drops. */
   private emit(s: Status) {
     this.lastStatus = s;
     if (s === "connected") {
       this.connectedOnce = true;
-      this.backoff = BACKOFF_MIN; // reset backoff on success
+      this.backoff = BACKOFF_MIN;
       this.lastHealthyAt = Date.now();
       this.clearReconnect();
+      this.reconnectAttempt = 0;
+      this.reconnectBackoffMs = 0;
+      this.reconnectAt = 0;
+      this.setProgress("connected", "Connected to your PC");
+    } else if (s === "pending") {
+      this.setProgress("pending_approval", "Waiting for approval on your PC…");
+    } else if (s === "denied") {
+      this.setProgress("denied", "Access declined on your PC");
+    } else if (s === "disconnected" || s === "failed" || s === "closed") {
+      if (this.progressPhase !== "reconnecting") {
+        this.setProgress(
+          this.connectedOnce ? "reconnecting" : this.progressPhase,
+          s === "disconnected" ? "Connection lost" : "Connection failed",
+        );
+      }
+    } else if (s === "connecting") {
+      if (this.progressPhase !== "negotiating" && this.progressPhase !== "authenticating") {
+        this.setProgress("negotiating", "Establishing peer connection…");
+      }
     }
     this.statusCb?.(s);
     if (!this.closed && !this.denied && (s === "failed" || s === "closed")) this.scheduleReconnect();
@@ -142,6 +220,8 @@ export class CloudConn {
   async connect(): Promise<void> {
     this.closed = false;
     this.denied = false;
+    this.reconnectAttempt = 0;
+    this.setProgress("idle", "Starting connection…");
     this.startWatchdog();
     await this.openSignaling(true);
   }
@@ -154,6 +234,7 @@ export class CloudConn {
   private async openSignaling(throwOnFail: boolean): Promise<void> {
     if (this.closed) return;
     this.connecting = true;
+    this.setProgress("signaling", "Connecting to signaling server…");
     this.stopHeartbeat();
     this.clearOfferTimeout();
     this.pc?.close();
@@ -178,12 +259,11 @@ export class CloudConn {
         // signaling server. A truly dead session is caught by the heartbeat.
         if (!this.connectedViaPeer()) {
           this.emit("disconnected");
+          this.setProgress("reconnecting", "PC left the room — reconnecting…");
           this.scheduleReconnect();
         }
       } else if (m.type === "room-full") {
-        // The room briefly still holds our stale socket (the signaling server now
-        // evicts same-role zombies, but a race is possible). Retry instead of
-        // dead-ending — this is what made a Wi‑Fi switch require a new code before.
+        this.setProgress("reconnecting", "Room busy — retrying…");
         this.scheduleReconnect();
       }
     });
@@ -193,12 +273,11 @@ export class CloudConn {
 
     try {
       await sig.connect();
-      // Our join makes the host emit its offer; we answer in onOffer(). If the
-      // host never sends one (e.g. it thinks a previous session is still live),
-      // don't hang forever — rejoin, which makes the host re-announce us.
+      this.setProgress("waiting_offer", "Waiting for your PC…");
       this.armOfferTimeout();
     } catch (e) {
       this.connecting = false;
+      this.setProgress("signaling", "Couldn't reach signaling server");
       if (throwOnFail && !this.connectedOnce) throw e;
       this.scheduleReconnect();
     }
@@ -209,7 +288,8 @@ export class CloudConn {
     this.offerTimer = window.setTimeout(() => {
       this.offerTimer = null;
       if (!this.closed && !this.connectedViaPeer()) {
-        this.connecting = false; // handshake stalled — allow a fresh attempt
+        this.connecting = false;
+        this.setProgress("reconnecting", "No response from PC — retrying…");
         this.scheduleReconnect();
       }
     }, OFFER_TIMEOUT_MS);
@@ -230,8 +310,19 @@ export class CloudConn {
     if (this.closed || this.denied || this.reconnectTimer !== null || this.connecting) return;
     const wait = this.backoff;
     this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX);
+    this.reconnectAttempt += 1;
+    this.reconnectBackoffMs = wait;
+    this.reconnectAt = Date.now() + wait;
+    const secs = Math.ceil(wait / 1000);
+    this.setProgress(
+      "reconnecting",
+      this.connectedOnce
+        ? `Reconnecting… attempt ${this.reconnectAttempt} (retry in ${secs}s)`
+        : `Retrying… attempt ${this.reconnectAttempt} (in ${secs}s)`,
+    );
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
+      this.reconnectAt = 0;
       this.openSignaling(false).catch(() => this.scheduleReconnect());
     }, wait);
   }
@@ -245,7 +336,8 @@ export class CloudConn {
 
   private async onOffer(sdp: string) {
     this.clearOfferTimeout();
-    this.pc?.close(); // a fresh offer supersedes any prior/wedged session
+    this.setProgress("negotiating", "Setting up secure peer connection…");
+    this.pc?.close();
     this.stream = null; // new session → new tracks; don't accumulate dead ones
     this.authed = false; // every fresh peer requires re-authorization by the host
     this.videoReceiver = null;
@@ -264,9 +356,18 @@ export class CloudConn {
       if (st === "connected") this.emit(this.authed ? "connected" : "pending");
       else this.emit(st);
     };
-    // ICE can wedge without a connectionState change; nudge a reconnect on failure.
     pc.oniceconnectionstatechange = () => {
-      if (this.pc === pc && pc.iceConnectionState === "failed" && !this.closed) this.scheduleReconnect();
+      if (this.pc !== pc) return;
+      this.iceState = pc.iceConnectionState;
+      if (pc.iceConnectionState === "checking") {
+        this.setProgress("negotiating", "Finding network path (ICE)…");
+      } else if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+        this.emitProgress();
+      }
+      if (pc.iceConnectionState === "failed" && !this.closed) {
+        this.setProgress("reconnecting", "Network path failed — retrying…");
+        this.scheduleReconnect();
+      }
     };
     // The screen now arrives as a real media track (hardware-decoded video). The
     // host sends video and audio in separate streams (so the receiver never
@@ -329,6 +430,7 @@ export class CloudConn {
       }
       if (Date.now() - this.lastPong > HEARTBEAT_DEAD_MS) {
         this.stopHeartbeat();
+        this.setProgress("reconnecting", "Link timed out — reconnecting…");
         this.emit("disconnected");
         this.scheduleReconnect();
         return;
@@ -353,6 +455,7 @@ export class CloudConn {
   /** Send the identity + optional secret so the host can authorize this device. */
   private sendAuth() {
     if (this.chControl?.readyState !== "open") return;
+    this.setProgress("authenticating", "Authorizing this device…");
     const a = this.auth;
     try {
       this.chControl.send(
@@ -413,6 +516,7 @@ export class CloudConn {
         this.connecting = false;
         this.backoff = BACKOFF_MIN;
         this.clearReconnect();
+        this.setProgress("reconnecting", "Connection stalled — rebuilding…");
         this.emit("disconnected");
         this.openSignaling(false).catch(() => this.scheduleReconnect());
         return;

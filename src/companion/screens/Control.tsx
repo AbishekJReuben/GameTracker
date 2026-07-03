@@ -46,6 +46,8 @@ import {
 } from "lucide-react";
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { apiGet } from "../link";
+import type { ConnectSnapshot } from "../cloud";
+import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 
 type HostStats = RemoteCaptureStats & { producedFps?: number };
@@ -136,6 +138,7 @@ export function ControlScreen({
   const kbdRef = useRef<HTMLInputElement | null>(null);
 
   const [connected, setConnected] = useState(false);
+  const [progress, setProgress] = useState<ConnectSnapshot | null>(null);
   // Debounced "Reconnecting…" overlay: WebRTC dips into "disconnected" briefly on
   // packet-loss blips and usually self-heals within a second — flashing the
   // overlay for those made the link feel flakier than it is.
@@ -268,6 +271,7 @@ export function ControlScreen({
   // ----- frame + status lifecycle -----
   useEffect(() => {
     link.onStatus(setConnected);
+    const unsubProgress = link.onProgress?.(setProgress);
     // Cloud: the screen arrives as a hardware-decoded WebRTC video track.
     link.onStream((stream) => {
       const v = videoRef.current;
@@ -305,6 +309,7 @@ export function ControlScreen({
       t.push(now);
       while (t.length && now - t[0] > 1000) t.shift();
     });
+    return () => unsubProgress?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);
 
@@ -982,9 +987,13 @@ export function ControlScreen({
         )}
         {showReconnect && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
-            <div className="flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm text-white backdrop-blur">
-              <Loader2 className="h-4 w-4 animate-spin" /> Reconnecting…
-            </div>
+            {progress ? (
+              <ConnectionProgress snapshot={progress} compact showSteps />
+            ) : (
+              <div className="flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm text-white backdrop-blur">
+                <Loader2 className="h-4 w-4 animate-spin" /> Reconnecting…
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1046,7 +1055,7 @@ export function ControlScreen({
               </span>
             ) : (
               <span className="flex items-center gap-1.5 text-xs font-700 text-ink-dim">
-                <Loader2 className="h-3 w-3 animate-spin" /> Connecting
+                <Loader2 className="h-3 w-3 animate-spin" /> {progress ? statusLabel(progress) : "Connecting"}
               </span>
             )}
             {connected && (

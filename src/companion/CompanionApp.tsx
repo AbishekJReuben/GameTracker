@@ -24,8 +24,9 @@ import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { Pairing, type Connected } from "./Pairing";
 import { setCloudMode } from "./link";
 import { makeRtcLink, type RemoteLink } from "./links";
-import { CloudConn } from "./cloud";
+import { CloudConn, type ConnectSnapshot } from "./cloud";
 import { deviceId, deviceName } from "./device";
+import { ConnectionProgress } from "./ConnectionProgress";
 import { DashboardScreen } from "./screens/Dashboard";
 import { LibraryScreen } from "./screens/Library";
 import { TimelineScreen } from "./screens/Timeline";
@@ -63,12 +64,14 @@ export function CompanionApp() {
   const [conn, setConn] = useState<CloudConn | null>(null);
   const [tab, setTab] = useState<Tab>("control");
   const [activeCode, setActiveCode] = useState(() => localStorage.getItem(LS_CODE) || "");
+  const [pendingConn, setPendingConn] = useState<CloudConn | null>(null);
   const autoConnRef = useRef<CloudConn | null>(null);
   // Full-screen game-detail overlay, opened from any screen via `openGame(id)`.
   const detailId = useOpenGame();
 
   const adopt = useCallback((c: CloudConn, code?: string, signalUrl?: string, secret?: string) => {
-    autoConnRef.current = null; // hand ownership to app state; skip cleanup close
+    autoConnRef.current = null;
+    setPendingConn(null);
     if (code) {
       localStorage.setItem(LS_CODE, code);
       setActiveCode(code);
@@ -104,14 +107,14 @@ export function CompanionApp() {
     const secret = localStorage.getItem(LS_SECRET) || undefined;
     const c = new CloudConn(signalUrl, code, { deviceId: deviceId(), name: deviceName(), secret });
     autoConnRef.current = c;
+    setPendingConn(c);
     setPhase("autoconnecting");
     c.onStatus((s) => {
       if (s === "connected") adopt(c);
-      // Approval declined on the PC — drop back to pairing so the user can enter
-      // the permanent key or ask to be allowed again.
       else if (s === "denied") {
         c.close();
         autoConnRef.current = null;
+        setPendingConn(null);
         setPhase("pairing");
       }
     });
@@ -146,6 +149,7 @@ export function CompanionApp() {
     conn?.close();
     autoConnRef.current?.close();
     autoConnRef.current = null;
+    setPendingConn(null);
     setConn(null);
   };
 
@@ -180,7 +184,7 @@ export function CompanionApp() {
 
   let body: React.ReactNode;
   if (phase === "boot") body = <FullscreenSpinner label="Starting…" />;
-  else if (phase === "autoconnecting") body = <Connecting code={activeCode} onCancel={forget} />;
+  else if (phase === "autoconnecting") body = <Connecting code={activeCode} conn={pendingConn} onCancel={forget} />;
   else if (phase === "paused") body = <Paused onReconnect={beginAutoConnect} onForget={forget} />;
   else if (phase === "pairing" || !conn)
     body = <Pairing onConnected={onPaired} initialCode={activeCode} />;
@@ -382,7 +386,22 @@ function FullscreenSpinner({ label }: { label: string }) {
 }
 
 /** Persistent "reconnecting to your PC" screen shown while the saved code auto-connects. */
-function Connecting({ code, onCancel }: { code: string; onCancel: () => void }) {
+function Connecting({
+  code,
+  conn,
+  onCancel,
+}: {
+  code: string;
+  conn: CloudConn | null;
+  onCancel: () => void;
+}) {
+  const [snap, setSnap] = useState<ConnectSnapshot | null>(conn?.getSnapshot() ?? null);
+
+  useEffect(() => {
+    if (!conn) return;
+    return conn.onProgress(setSnap);
+  }, [conn]);
+
   return (
     <div className="grid min-h-[100dvh] place-items-center bg-bg-base px-6 text-ink">
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="w-full max-w-sm text-center">
@@ -390,9 +409,15 @@ function Connecting({ code, onCancel }: { code: string; onCancel: () => void }) 
           <Smartphone className="h-8 w-8 text-white" />
         </span>
         <h1 className="font-display text-xl font-800">Connecting to your PC</h1>
-        <div className="mt-3 flex items-center justify-center gap-2 text-sm text-ink-dim">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Waiting for your PC to come online…
+        <div className="mt-4 text-left">
+          {snap ? (
+            <ConnectionProgress snapshot={snap} />
+          ) : (
+            <div className="flex items-center justify-center gap-2 text-sm text-ink-dim">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Starting…
+            </div>
+          )}
         </div>
         <div className="mt-4 inline-flex items-center gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 text-sm">
           <KeyRound className="h-3.5 w-3.5 text-ink-faint" />

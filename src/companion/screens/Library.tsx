@@ -59,10 +59,10 @@ export function LibraryScreen() {
     return [...list].sort(by[sort]);
   }, [pool, kind, q, status, sort, tag]);
 
+  const onlyGames = useMemo(() => (games ?? []).filter((g) => g.kind !== "app"), [games]);
+
   if (loading && !games) return <div className="grid h-full place-items-center text-sm text-ink-dim"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading library…</div>;
   if (error && !games) return <div className="m-4 rounded-xl border border-amber/40 bg-amber/10 p-3 text-sm text-amber">{error}</div>;
-
-  const onlyGames = useMemo(() => (games ?? []).filter((g) => g.kind !== "app"), [games]);
 
   return (
     <div className="relative flex h-full flex-col overflow-hidden">

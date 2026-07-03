@@ -5,7 +5,7 @@
  */
 
 import { remoteWsUrl } from "@/lib/remoteClient";
-import type { CloudConn, RtcInboundVideoStats } from "./cloud";
+import type { CloudConn, ConnectSnapshot, RtcInboundVideoStats } from "./cloud";
 
 export type ControlMsg =
   | { type: "move"; x: number; y: number }
@@ -35,6 +35,8 @@ export interface RemoteLink {
   /** Unsolicited host events (e.g. PC text-field focus). */
   onEvent(cb: (e: { event: string; [k: string]: unknown }) => void): void;
   onStatus(cb: (connected: boolean) => void): void;
+  /** Granular connect/reconnect progress (cloud WebRTC only). */
+  onProgress?(cb: (s: ConnectSnapshot) => void): () => void;
   send(msg: ControlMsg): void;
   /** Re-tune the live screen stream (resolution / JPEG quality / frame rate). */
   setQuality(q: QualitySettings): void;
@@ -150,6 +152,9 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
     },
     onStatus(cb) {
       conn.onStatus((s) => cb(s === "connected"));
+    },
+    onProgress(cb) {
+      return conn.onProgress(cb);
     },
     send(msg) {
       conn.sendControl(msg);
