@@ -89,6 +89,24 @@ export default function RemotePage() {
     }
   };
 
+  const setShowUac = async (enabled: boolean) => {
+    setBusy(true);
+    try {
+      setStatus(await api.remoteSetShowUac(enabled));
+      pushToast({
+        kind: enabled ? "success" : "info",
+        title: enabled ? "UAC prompts will show on remote" : "UAC secure desktop restored",
+        message: enabled
+          ? "Admin-permission dialogs are now visible and controllable from your phone."
+          : "Admin prompts go back to the protected secure desktop.",
+      });
+    } catch (e) {
+      pushToast({ kind: "info", title: "Couldn't change UAC handling", message: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const regen = async () => {
     setBusy(true);
     try {
@@ -305,6 +323,33 @@ export default function RemotePage() {
                     Pre-filled with the default. It only brokers the handshake — run it on this PC and expose
                     it with a Cloudflare Tunnel to <span className="font-mono">localhost:{SIGNAL_PORT}</span>.
                   </p>
+                </div>
+
+                <div className="mt-4 border-t border-line pt-4">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+                        <ShieldIcon className="h-3.5 w-3.5" /> Show UAC prompts on remote
+                      </div>
+                      <p className="text-xs text-ink-faint">
+                        Windows normally shows admin-permission (UAC) dialogs on a protected
+                        &ldquo;secure desktop&rdquo; that screen sharing can&rsquo;t see — so the phone
+                        just sees a frozen, dimmed screen. Turning this on (like AnyDesk&rsquo;s Direct UAC
+                        handling) shows those prompts on the normal desktop so you can see and click them
+                        remotely.
+                      </p>
+                      <p className="mt-1.5 text-xs text-amber-400/80">
+                        Trade-off: this lowers local security while remote is on. It&rsquo;s restored
+                        automatically when you turn remote off or close the app.
+                      </p>
+                    </div>
+                    <div className="flex-none pt-0.5">
+                      <Toggle
+                        checked={status.showUac}
+                        onChange={(v) => !busy && setShowUac(v)}
+                      />
+                    </div>
+                  </div>
                 </div>
               </Panel>
             </motion.div>

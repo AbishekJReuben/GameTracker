@@ -617,16 +617,33 @@ export function startHost(opts: HostOptions): () => void {
       }
     };
 
-    // Pull `need` interleaved samples; `lastGot` reports how many were real (the
-    // remainder is left as silence on underrun so the caller can fade it out).
-    let lastGot = 0;
-    const pullInterleaved = (need: number): Float32Array => {
-      const out = new Float32Array(need);
+    // --- Streaming linear resampler (fixes the crackle) --------------------
+    // WASAPI loopback runs at the render endpoint's mix rate (`captureRate`,
+    // often 44.1k or 96/192k, not always 48k), but the AudioContext consumes at
+    // its own `sr`. Consuming at the wrong rate makes the jitter buffer drift —
+    // it periodically starves (underrun → re-prime pop) or overflows (hard trim
+    // pop). Instead we resample: read input frames at a fractional step
+    // `ratio = captureRate / sr`, linearly interpolating between consecutive
+    // frames, and gently nudge that ratio (±0.4%, inaudible) to steer the buffer
+    // toward TARGET — absorbing both a rate mismatch and slow host↔webview clock
+    // skew smoothly, with no trims or re-primes in steady state.
+    let captureRate = sr; // corrected once real format is known (start())
+    // Resampler state: `f0`/`f1` are the two input frames we interpolate between,
+    // `phase` in [0,1) is the position between them.
+    let f0: Float32Array | null = null;
+    let f1: Float32Array | null = null;
+    let phase = 0;
+
+    // Consume exactly one interleaved input frame (`channels` samples) from the
+    // jitter buffer, or null on underrun.
+    const readFrame = (): Float32Array | null => {
+      if (avail < channels) return null;
+      const fr = new Float32Array(channels);
       let got = 0;
-      while (got < need && chunks.length) {
+      while (got < channels && chunks.length) {
         const c = chunks[0];
-        const take = Math.min(need - got, c.length - head);
-        out.set(c.subarray(head, head + take), got);
+        const take = Math.min(channels - got, c.length - head);
+        fr.set(c.subarray(head, head + take), got);
         got += take;
         head += take;
         avail -= take;
@@ -635,16 +652,16 @@ export function startHost(opts: HostOptions): () => void {
           head = 0;
         }
       }
-      lastGot = got;
-      return out;
+      return got === channels ? fr : null;
     };
 
     // Priming + a slew-limited gain ramp make every silence↔audio transition
-    // click-free: hard zero-fills (the source of the "popping") are ramped instead
-    // of stepped, and after an underrun we re-prime before resuming.
+    // click-free: hard zero-fills (the source of the "popping") are ramped
+    // instead of stepped, and after an underrun we re-prime before resuming.
     let priming = true;
     let gain = 0;
     const slew = 1 / Math.max(1, 0.006 * sr); // ~6ms to ramp fully in/out
+    const zero = new Float32Array(2); // reused "silent frame" on underrun
 
     const node = audioCtx.createScriptProcessor(FRAME, 0, channels);
     node.onaudioprocess = (e) => {
@@ -652,29 +669,56 @@ export function startHost(opts: HostOptions): () => void {
       const nch = out.numberOfChannels;
       // Stay silent (and faded down) until enough is buffered to play cleanly.
       if (priming) {
-        if (avail >= primeSamples) priming = false;
-        else {
+        if (avail >= primeSamples) {
+          priming = false;
+          f0 = readFrame() ?? zero;
+          f1 = readFrame() ?? f0;
+          phase = 0;
+        } else {
           for (let c = 0; c < nch; c++) out.getChannelData(c).fill(0);
           gain = 0;
           return;
         }
       }
-      const inter = pullInterleaved(FRAME * channels);
-      const realFrames = Math.min(FRAME, Math.floor(lastGot / channels));
-      for (let c = 0; c < nch; c++) {
-        const od = out.getChannelData(c);
-        const src = Math.min(c, channels - 1);
-        let g = gain;
-        for (let i = 0; i < FRAME; i++) {
-          const tgt = i < realFrames ? 1 : 0;
-          g += Math.max(-slew, Math.min(slew, tgt - g));
-          od[i] = inter[i * channels + src] * g;
+
+      // Drift-adaptive playback ratio: steer buffered frames toward TARGET.
+      const targetFrames = targetSamples / channels;
+      const availFrames = avail / channels;
+      const err = targetFrames > 0 ? (availFrames - targetFrames) / targetFrames : 0;
+      const ratio = (captureRate / sr) * (1 + Math.max(-0.004, Math.min(0.004, err * 0.05)));
+
+      const od: Float32Array[] = [];
+      for (let c = 0; c < nch; c++) od.push(out.getChannelData(c));
+
+      let g = gain;
+      let underran = false;
+      for (let i = 0; i < FRAME; i++) {
+        const a = f0 as Float32Array;
+        const b = f1 as Float32Array;
+        const tgt = underran ? 0 : 1;
+        g += Math.max(-slew, Math.min(slew, tgt - g));
+        for (let c = 0; c < nch; c++) {
+          const src = Math.min(c, channels - 1);
+          od[c][i] = (a[src] * (1 - phase) + b[src] * phase) * g;
         }
-        if (c === nch - 1) gain = g;
+        phase += ratio;
+        while (phase >= 1) {
+          phase -= 1;
+          f0 = f1;
+          const nf = readFrame();
+          if (nf) {
+            f1 = nf;
+          } else {
+            // Buffer emptied mid-frame: hold the last sample and fade out.
+            f1 = f0;
+            underran = true;
+          }
+        }
       }
-      // Underran this buffer → refill to PRIME before resuming (keeps it from
+      gain = g;
+      // Ran dry this buffer → refill to PRIME before resuming (prevents
       // machine-gun clicking when the network briefly starves the stream).
-      if (realFrames < FRAME) priming = true;
+      if (underran && avail < channels) priming = true;
     };
     node.connect(dest);
     audioNode = node;
@@ -682,7 +726,10 @@ export function startHost(opts: HostOptions): () => void {
     if (!track) return null;
     const start = async () => {
       const fmt = await api.remoteStartAudio(ch);
-      if (fmt) channels = Math.max(1, Math.min(2, fmt.channels));
+      if (fmt) {
+        channels = Math.max(1, Math.min(2, fmt.channels));
+        if (fmt.sampleRate > 8000 && fmt.sampleRate <= 384000) captureRate = fmt.sampleRate;
+      }
       recalcEnvelope(); // channel count now known → size the buffer correctly
     };
     return { track, start };

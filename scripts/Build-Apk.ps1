@@ -96,6 +96,16 @@ if (Test-Path (Join-Path $root 'companion\src-tauri\gen\android')) {
 # --- native Android build ---
 Push-Location (Join-Path $root 'companion')
 try {
+    # Regenerate the branded launcher icons into gen/android from the source art.
+    # `tauri android init` (companion:init) scaffolds default Tauri icons, so this
+    # keeps a fresh gen/android in sync with the current app icon. Harmless when
+    # the icons are already current.
+    $iconSrc = Join-Path $root '_iconsrc\source-v2.png'
+    if (Test-Path $iconSrc) {
+        Write-Host "Regenerating Android launcher icons from $iconSrc"
+        npx tauri icon $iconSrc
+        if ($LASTEXITCODE -ne 0) { throw "tauri icon failed (exit $LASTEXITCODE)" }
+    }
     Write-Host "Running: npx tauri android build"
     npx tauri android build
     if ($LASTEXITCODE -ne 0) { throw "tauri android build failed (exit $LASTEXITCODE)" }

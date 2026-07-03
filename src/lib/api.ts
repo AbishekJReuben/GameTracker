@@ -38,6 +38,7 @@ function isPcOnlyCommand(cmd: string): boolean {
     "local_launcher_import",
     "remote_status",
     "remote_set_enabled",
+    "remote_set_show_uac",
     "remote_regen_pin",
     "remote_set_cloud",
     "remote_regen_code"
@@ -1185,6 +1186,7 @@ export const api = {
   // remote access (companion phone app)
   remoteStatus: () => call<RemoteStatus>("remote_status"),
   remoteSetEnabled: (enabled: boolean) => call<RemoteStatus>("remote_set_enabled", { enabled }),
+  remoteSetShowUac: (enabled: boolean) => call<RemoteStatus>("remote_set_show_uac", { enabled }),
   remoteRegenPin: () => call<RemoteStatus>("remote_regen_pin"),
   remoteSetCloud: (enabled: boolean, signalUrl: string) =>
     call<RemoteStatus>("remote_set_cloud", { enabled, signalUrl }),
@@ -1268,6 +1270,9 @@ export interface RemoteStatus {
   code: string;
   /** Secret "permanent key" (code 2), revealed behind the eye toggle. */
   secretCode: string;
+  /** AnyDesk-style UAC handling — UAC secure desktop disabled so admin prompts
+   * are visible/controllable from the phone (opt-in, restored on disable/exit). */
+  showUac: boolean;
 }
 
 export interface TrustedDevice {

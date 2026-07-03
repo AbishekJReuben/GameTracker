@@ -39,6 +39,11 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // Per-device access grants (JSON). Trusted = permanent; temp = time-boxed.
     ("remote_trusted_devices", "[]"),
     ("remote_temp_grants", "[]"),
+    // AnyDesk-style "show UAC prompts to the remote" — disables the UAC secure
+    // desktop while remote is enabled so admin-consent dialogs are captured and
+    // controllable from the phone. Opt-in (lowers local security); restored on
+    // disable/exit. See remote/uac.rs.
+    ("remote_show_uac", "false"),
 ];
 
 fn default_for(key: &str) -> Option<&'static str> {

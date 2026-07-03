@@ -151,24 +151,38 @@ fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result
     let mut file = std::fs::File::create(&apk_path).map_err(|e| format!("create apk: {e}"))?;
     let mut buf = [0u8; 64 * 1024];
     let mut received: u64 = 0;
+    let mut magic = [0u8; 2]; // first two bytes — a real APK (ZIP) starts with "PK"
     loop {
         let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             break;
         }
+        if received == 0 && n >= 2 {
+            magic.copy_from_slice(&buf[..2]);
+        }
         std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("write: {e}"))?;
         received += n as u64;
         emit(app, "downloading", received, total);
     }
+    // Flush to disk before handing the path to another process (the installer).
+    let _ = file.sync_all();
     drop(file);
 
     // Guard against a truncated/HTML error body being handed to the package
-    // installer (which would fail with an opaque "parse error"). A real APK is a
-    // ZIP, comfortably larger than this floor.
+    // installer (which would fail with an opaque "parse error" — looking to the
+    // user like the update just didn't work). A real APK is a ZIP, comfortably
+    // larger than this floor and starting with the ZIP magic "PK".
     if received < 1024 {
         return Err(format!(
             "downloaded file is too small ({received} bytes) — the update may not be published yet"
         ));
+    }
+    if magic != *b"PK" {
+        return Err(
+            "the downloaded file isn't a valid APK (the release asset may be missing or the \
+             link redirected to an error page) — try again shortly"
+                .into(),
+        );
     }
 
     emit(app, "installing", received, total);

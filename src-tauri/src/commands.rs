@@ -1776,6 +1776,9 @@ pub struct RemoteStatus {
     pub code: String,
     /// Secret "permanent key" (code 2), shown behind the eye toggle on the page.
     pub secret_code: String,
+    /// AnyDesk-style UAC handling: when on (and remote enabled), the UAC secure
+    /// desktop is disabled so admin-consent prompts are visible/controllable.
+    pub show_uac: bool,
 }
 
 fn remote_snapshot(state: &State<AppState>) -> RemoteStatus {
@@ -1794,6 +1797,7 @@ fn remote_snapshot(state: &State<AppState>) -> RemoteStatus {
             .unwrap_or_default(),
         code: r.code.lock().clone(),
         secret_code: r.secret.lock().clone(),
+        show_uac: settings::get_bool(&state.pool, "remote_show_uac").unwrap_or(false),
     }
 }
 
@@ -1823,8 +1827,32 @@ pub fn remote_set_enabled(state: State<AppState>, enabled: bool) -> AppResult<Re
             remote: state.remote.clone(),
             sys: state.sys.clone(),
         });
+        // Re-apply the opt-in UAC handling for this session.
+        if settings::get_bool(&state.pool, "remote_show_uac").unwrap_or(false) {
+            let _ = crate::remote::uac::set_visible(true);
+        }
     } else {
         crate::remote::stop(&state.remote);
+        // Always restore the UAC secure desktop when remote is turned off.
+        let _ = crate::remote::uac::set_visible(false);
+    }
+    Ok(remote_snapshot(&state))
+}
+
+/// Toggle AnyDesk-style UAC handling. When enabled (and remote is on), the UAC
+/// secure desktop is disabled so admin-consent prompts render on the capturable
+/// desktop and can be answered from the phone. Lowers local security, so it's
+/// opt-in; the secure desktop is restored when remote is disabled or on exit.
+#[tauri::command]
+pub fn remote_set_show_uac(state: State<AppState>, enabled: bool) -> AppResult<RemoteStatus> {
+    settings::set(&state.pool, "remote_show_uac", if enabled { "true" } else { "false" })?;
+    // Only actually touch the registry while remote is on; otherwise just persist
+    // the preference (it's applied when remote is enabled / on next launch).
+    let remote_on = state.remote.enabled.load(Ordering::SeqCst);
+    if let Err(e) = crate::remote::uac::set_visible(enabled && remote_on) {
+        return Err(crate::error::AppError::msg(format!(
+            "Couldn't change UAC handling: {e}"
+        )));
     }
     Ok(remote_snapshot(&state))
 }

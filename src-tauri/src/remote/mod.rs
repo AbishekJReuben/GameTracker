@@ -20,6 +20,7 @@ pub(crate) mod capture;
 pub(crate) mod dxdupe;
 pub(crate) mod focus;
 pub(crate) mod input;
+pub(crate) mod uac;
 
 use crate::db::{games, media as mediadb, music, playlists, screenshots, sessions, settings, stats, DbPool};
 use crate::db::models::{GameInput, SessionFilter};

@@ -1,6 +1,6 @@
 [package]
 name = "gametracker-companion"
-version = "3.7.1"
+version = "3.8.0"
 description = "GameTracker Remote — phone companion"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -26,8 +26,15 @@ ureq = "2"
 jni = "0.21"
 ndk-context = "0.1"
 
+# NOTE: keep `panic = "unwind"` (the default) — do NOT set "abort" here.
+# The in-app APK updater runs a lot of fallible JNI (FileProvider, the install
+# intent, permission checks). Under `panic = "abort"` any panic on that path —
+# or a pending Java exception on thread teardown — aborts the whole process, so a
+# recoverable update failure showed up as the app "crashing / closing" instead of
+# the intended "Update failed — tap to retry" banner. With unwind, `spawn_blocking`
+# catches the panic and the command returns a clean error string the UI can show.
 [profile.release]
-panic = "abort"
+panic = "unwind"
 codegen-units = 1
 lto = true
 opt-level = "s"

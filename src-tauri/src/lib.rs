@@ -158,6 +158,10 @@ pub fn run() {
                     remote: remote_shared.clone(),
                     sys: sys_shared.clone(),
                 });
+                // Re-apply opt-in AnyDesk-style UAC handling if it was left on.
+                if db::settings::get_bool(&pool, "remote_show_uac").unwrap_or(false) {
+                    let _ = remote::uac::set_visible(true);
+                }
             }
 
             tray::build(handle)?;
@@ -329,6 +333,7 @@ pub fn run() {
             commands::backfill_metacritic,
             commands::remote_status,
             commands::remote_set_enabled,
+            commands::remote_set_show_uac,
             commands::remote_regen_pin,
             commands::remote_set_cloud,
             commands::remote_regen_code,
@@ -368,6 +373,9 @@ pub fn run() {
                     let _ = db::media::close_orphans(&state.pool);
                     let _ = db::foreground::close_orphans(&state.pool);
                 }
+                // Safety net: never leave the UAC secure desktop disabled once the
+                // app is gone (it's only meant to be off during a remote session).
+                let _ = remote::uac::set_visible(false);
             }
         });
 }

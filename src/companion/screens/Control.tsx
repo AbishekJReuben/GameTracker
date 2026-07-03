@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { motion, AnimatePresence } from "motion/react";
 import {
   MousePointer2,
   Hand,
@@ -43,6 +44,8 @@ import {
   Type as TypeIcon,
   Film,
   Sparkles,
+  Pin,
+  PinOff,
 } from "lucide-react";
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { apiGet } from "../link";
@@ -68,8 +71,20 @@ type Mode = "trackpad" | "touch";
 type Mod = "ctrl" | "alt" | "shift" | "win";
 type KbMode = "direct" | "buffered";
 type NavTab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
-/** Which bottom control panel is expanded (null = collapsed to just the tab strip). */
-type Panel = "mouse" | "keys" | "shortcuts" | "quality" | "keyboard";
+/** Which bottom control panel is expanded (null = collapsed to just the tab strip).
+ * (Keyboard is no longer a panel — it's an always-mounted floating compose bar.) */
+type Panel = "mouse" | "keys" | "shortcuts" | "quality";
+
+/** A pinnable key / shortcut: `keys` are the keycap labels (>1 → combo joined by +). */
+type KeyDef = {
+  id: string;
+  keys: string[];
+  /** Optional friendly caption shown under the keycaps (e.g. "Copy"). */
+  label?: string;
+  run: () => void;
+  /** For sticky modifiers, the modifier this key represents (drives active state). */
+  mod?: Mod;
+};
 
 // Content optimization: tunes the whole pipeline (downscale filter, JPEG chroma,
 // encoder content-hint + bitrate-degradation) for the kind of thing on screen.
@@ -193,6 +208,31 @@ export function ControlScreen({
   const [dragLock, setDragLock] = useState(false);
   const [mods, setMods] = useState<Set<Mod>>(new Set());
   const autoKbdRef = useRef(false); // guards the once-per-focus auto keyboard pop
+
+  // Floating compose bar: the hidden text field is ALWAYS mounted (so both the
+  // auto-keyboard on PC focus and the collapsed floating keyboard button work,
+  // regardless of dock state); `typing` reveals the compose chrome.
+  const [typing, setTyping] = useState(false);
+  // Pinned keys/shortcuts → small, semi-transparent floating quick buttons pinned
+  // to the screen edge so they're always one tap away without opening the dock.
+  const [pinned, setPinned] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("gt.remote.pinned");
+      return raw ? (JSON.parse(raw) as string[]) : [];
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem("gt.remote.pinned", JSON.stringify(pinned));
+  }, [pinned]);
+  // Pin-edit mode: while on, tapping a key in the dock pins/unpins it instead of firing.
+  const [pinMode, setPinMode] = useState(false);
+  const togglePin = (id: string) =>
+    setPinned((prev) => {
+      navigator.vibrate?.(10);
+      return prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id];
+    });
 
   // View transform: refs drive the hot gesture path, state mirrors it for render.
   const [zoom, setZoom] = useState(1);
@@ -918,17 +958,80 @@ export function ControlScreen({
     a.download = `remote-${Date.now()}.jpg`;
     a.click();
   };
-  // Open/close a bottom panel; the keyboard panel also focuses/blurs the input so
-  // the soft keyboard follows. Tapping an already-open panel collapses it.
+  // Open/close a bottom panel. Tapping an already-open panel collapses it.
   const openPanel = (id: Panel) => {
     setDockCollapsed(false); // opening any panel implies the dock is visible
-    const next = panel === id ? null : id;
-    setPanel(next);
-    if (id === "keyboard") {
-      if (next) window.setTimeout(() => kbdRef.current?.focus(), 30);
-      else kbdRef.current?.blur();
-    }
+    setPanel((p) => (p === id ? null : id));
   };
+  // Reveal the floating compose bar + raise the soft keyboard (works whether the
+  // dock is open, collapsed, or immersive — the field is always mounted).
+  const startTyping = () => {
+    setTyping(true);
+    window.setTimeout(() => kbdRef.current?.focus(), 30);
+  };
+  const stopTyping = () => {
+    kbdRef.current?.blur();
+    setTyping(false);
+  };
+
+  // --- pinnable key / shortcut registry --------------------------------------
+  // Data-driven so the dock panels, the pin toggles, and the floating quick-button
+  // rail all share one source of truth (keyed by stable `id` for persistence).
+  const specialKeys: KeyDef[] = [
+    { id: "esc", keys: ["Esc"], run: () => tapKey("escape") },
+    { id: "tab", keys: ["Tab"], run: () => tapKey("tab") },
+    { id: "enter", keys: ["↵"], label: "Enter", run: () => tapKey("enter") },
+    { id: "backspace", keys: ["⌫"], label: "Bksp", run: () => tapKey("backspace") },
+    { id: "delete", keys: ["Del"], run: () => tapKey("delete") },
+    { id: "ctrl", keys: ["Ctrl"], run: () => toggleMod("ctrl"), mod: "ctrl" },
+    { id: "alt", keys: ["Alt"], run: () => toggleMod("alt"), mod: "alt" },
+    { id: "shift", keys: ["Shift"], run: () => toggleMod("shift"), mod: "shift" },
+    { id: "win", keys: ["Win"], run: () => toggleMod("win"), mod: "win" },
+    { id: "arrow-left", keys: ["←"], label: "Left", run: () => tapKey("left") },
+    { id: "arrow-up", keys: ["↑"], label: "Up", run: () => tapKey("up") },
+    { id: "arrow-down", keys: ["↓"], label: "Down", run: () => tapKey("down") },
+    { id: "arrow-right", keys: ["→"], label: "Right", run: () => tapKey("right") },
+    ...Array.from({ length: 12 }, (_, i) => i + 1).map((n) => ({
+      id: `f${n}`,
+      keys: [`F${n}`],
+      run: () => tapKey(`f${n}`),
+    })),
+    { id: "voldown", keys: ["Vol−"], label: "Vol down", run: () => tapKey("volumedown") },
+    { id: "volup", keys: ["Vol+"], label: "Vol up", run: () => tapKey("volumeup") },
+    { id: "mute", keys: ["Mute"], run: () => tapKey("volumemute") },
+    { id: "prevtrack", keys: ["⏮"], label: "Prev", run: () => tapKey("prevtrack") },
+    { id: "playpause", keys: ["⏯"], label: "Play", run: () => tapKey("playpause") },
+    { id: "nexttrack", keys: ["⏭"], label: "Next", run: () => tapKey("nexttrack") },
+  ];
+  const shortcutKeys: KeyDef[] = [
+    { id: "alt-tab", keys: ["Alt", "Tab"], label: "Switch", run: () => chord(["alt"], "tab") },
+    { id: "win", keys: ["Win"], label: "Start", run: () => chord(["win"]) },
+    { id: "show-desktop", keys: ["Win", "D"], label: "Desktop", run: () => chord(["win"], "d") },
+    { id: "task-mgr", keys: ["Ctrl", "Shift", "Esc"], label: "Task Mgr", run: () => chord(["ctrl", "shift"], "escape") },
+    { id: "alt-f4", keys: ["Alt", "F4"], label: "Close", run: () => chord(["alt"], "f4") },
+    { id: "explorer", keys: ["Win", "E"], label: "Files", run: () => chord(["win"], "e") },
+    { id: "copy", keys: ["Ctrl", "C"], label: "Copy", run: () => chord(["ctrl"], "c") },
+    { id: "paste", keys: ["Ctrl", "V"], label: "Paste", run: () => chord(["ctrl"], "v") },
+    { id: "cut", keys: ["Ctrl", "X"], label: "Cut", run: () => chord(["ctrl"], "x") },
+    { id: "undo", keys: ["Ctrl", "Z"], label: "Undo", run: () => chord(["ctrl"], "z") },
+    { id: "select-all", keys: ["Ctrl", "A"], label: "All", run: () => chord(["ctrl"], "a") },
+    { id: "ctrl-alt-del", keys: ["Ctrl", "Alt", "Del"], label: "Secure", run: () => chord(["ctrl", "alt"], "delete") },
+  ];
+  // Pinned ids resolve against a combined registry (shortcut ids are prefixed to
+  // avoid colliding with same-named special keys, e.g. "win").
+  const registry = useMemo(() => {
+    const m = new Map<string, KeyDef & { active?: boolean }>();
+    for (const k of specialKeys) m.set(`k:${k.id}`, k);
+    for (const s of shortcutKeys) m.set(`s:${s.id}`, s);
+    return m;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mods]);
+  const pinnedDefs = pinned
+    .map((id) => {
+      const def = registry.get(id);
+      return def ? { pid: id, def } : null;
+    })
+    .filter((x): x is { pid: string; def: KeyDef } => x !== null);
   // Mobile browsers only allow audio to start from a user gesture, so PC sound is
   // muted until the user taps this — then we unmute the video element's audio track.
   const toggleSound = () => {
@@ -1144,76 +1247,135 @@ export function ControlScreen({
         </div>
       )}
 
-      {/* ---- "tap to type" prompt when a PC text field is focused ---- */}
-      {!immersive && panel !== "keyboard" && pcTextField && (
-        <button
-          onClick={() => openPanel("keyboard")}
-          className="absolute bottom-3 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-full bg-accent-3 px-4 py-2 text-xs font-800 text-white shadow-glow active:scale-95"
+      {/* ---- pinned quick-button rail (small, semi-transparent, screen edge) ---- */}
+      {!immersive && pinnedDefs.length > 0 && (
+        <div
+          className="pointer-events-none absolute right-1.5 top-1/2 z-30 flex max-h-[70%] -translate-y-1/2 flex-col gap-1.5 overflow-y-auto py-1"
+          style={{ scrollbarWidth: "none" }}
         >
-          <Keyboard className="h-4 w-4" /> Tap to type on PC
-        </button>
+          <AnimatePresence initial={false}>
+            {pinnedDefs.map(({ pid, def }) => (
+              <PinnedButton
+                key={pid}
+                def={def}
+                active={def.mod ? mods.has(def.mod) : false}
+                onRun={() => {
+                  navigator.vibrate?.(8);
+                  def.run();
+                }}
+                onUnpin={() => togglePin(pid)}
+              />
+            ))}
+          </AnimatePresence>
+        </div>
       )}
 
-      {/* ---- restore handle when the dock is collapsed (viewport is full-screen) ---- */}
-      {!immersive && dockCollapsed && (
-        <button
-          onClick={() => setDockCollapsed(false)}
-          className="absolute bottom-2 right-2 z-40 flex items-center gap-1.5 rounded-full bg-black/55 px-3 py-1.5 text-xs font-700 text-white backdrop-blur active:scale-95"
-          style={{ marginBottom: "env(safe-area-inset-bottom)" }}
-          title="Show controls"
+      {/* ---- "tap to type" prompt when a PC text field is focused ---- */}
+      {!immersive && !typing && pcTextField && (
+        <motion.button
+          initial={{ y: 20, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          whileTap={{ scale: 0.94 }}
+          onClick={startTyping}
+          className="absolute bottom-3 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-full bg-accent-3 px-4 py-2 text-xs font-800 text-white shadow-glow"
         >
-          <ChevronUp className="h-4 w-4" /> Controls
-        </button>
+          <Keyboard className="h-4 w-4" /> Tap to type on PC
+        </motion.button>
       )}
+
+      {/* ---- collapsed-dock floating helpers: tiny keyboard + restore handle ---- */}
+      {!immersive && dockCollapsed && (
+        <div
+          className="absolute bottom-2 left-2 right-2 z-40 flex items-center justify-between"
+          style={{ marginBottom: "env(safe-area-inset-bottom)" }}
+        >
+          {!typing && (
+            <motion.button
+              initial={{ scale: 0, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              whileTap={{ scale: 0.9 }}
+              onClick={startTyping}
+              className="grid h-11 w-11 place-items-center rounded-full border border-white/15 bg-black/45 text-white/90 shadow-float backdrop-blur"
+              title="Keyboard"
+            >
+              <Keyboard className="h-5 w-5" />
+            </motion.button>
+          )}
+          <motion.button
+            whileTap={{ scale: 0.92 }}
+            onClick={() => setDockCollapsed(false)}
+            className="ml-auto flex items-center gap-1.5 rounded-full bg-black/45 px-3 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
+            title="Show controls"
+          >
+            <ChevronUp className="h-4 w-4" /> Controls
+          </motion.button>
+        </div>
+      )}
+
+      {/* ---- always-mounted floating compose bar (keyboard) ---- */}
+      {/* The hidden field is mounted regardless of dock/immersive state so the
+          auto-keyboard and the floating keyboard button both work; the chrome
+          just slides in when `typing`. It sits above the dock / soft keyboard. */}
+      <motion.div
+        className="absolute inset-x-2 z-50"
+        style={{
+          bottom: dockCollapsed || immersive ? "calc(env(safe-area-inset-bottom) + 0.5rem)" : "0.5rem",
+          pointerEvents: typing ? "auto" : "none",
+        }}
+        animate={{ y: typing ? 0 : 40, opacity: typing ? 1 : 0 }}
+        transition={{ type: "spring", stiffness: 420, damping: 34 }}
+      >
+        <div className="flex items-center gap-1.5 rounded-2xl glass border border-white/[0.1] p-1.5 shadow-float">
+          <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
+            <button onClick={() => setKbMode("direct")} title="Direct: each keystroke is sent live" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "direct" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Keyboard className="h-4 w-4" /></button>
+            <button onClick={() => setKbMode("buffered")} title="Buffered: type, then send the whole line" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "buffered" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Send className="h-4 w-4" /></button>
+          </div>
+          <input
+            ref={kbdRef}
+            onInput={onKbdInput}
+            onKeyDown={onKbdKeyDown}
+            onCompositionStart={() => (composing.current = true)}
+            onCompositionEnd={() => {
+              composing.current = false;
+              onKbdInput();
+            }}
+            onFocus={() => {
+              setTyping(true);
+              resetField();
+            }}
+            onBlur={() => setTyping(false)}
+            className="min-w-0 flex-1 rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-sm text-white outline-none focus:border-accent-3"
+            placeholder={kbMode === "buffered" ? "Type, then Enter to send" : "Type — keys go to your PC"}
+            inputMode="text"
+            enterKeyHint={kbMode === "buffered" ? "send" : "done"}
+            autoCapitalize="none"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          {kbMode === "buffered" && (
+            <button onClick={sendBuffer} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent-3 text-white active:scale-95" title="Send to PC">
+              <Send className="h-4 w-4" />
+            </button>
+          )}
+          <button onClick={stopTyping} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-ink-dim active:bg-white/[0.08]" title="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      </motion.div>
       </div>{/* ==== end viewport area ==== */}
 
       {/* ==== bottom control bar — collapsed = just the icon tab strip; expanding a
              panel grows this section and shrinks the viewport above (never overlaps).
              `dockCollapsed` removes the whole bar so the viewport fills the screen. ==== */}
       {!immersive && !dockCollapsed && (
-        <div className="shrink-0 border-t border-white/10 bg-base/95 backdrop-blur" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
-          {/* keyboard compose row — always mounted so focus() works; height collapses to 0 when inactive */}
-          <div className={`overflow-hidden transition-[max-height] duration-200 ${panel === "keyboard" ? "max-h-20" : "max-h-0"}`}>
-            <div className="flex items-center gap-1.5 border-b border-white/5 px-2 py-2">
-              {/* Direct / Buffered — an obvious two-state toggle, right in the field row */}
-              <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
-                <button onClick={() => setKbMode("direct")} title="Direct: each keystroke is sent live" className={`grid h-8 w-8 place-items-center rounded-md ${kbMode === "direct" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Keyboard className="h-4 w-4" /></button>
-                <button onClick={() => setKbMode("buffered")} title="Buffered: type, then send the whole line" className={`grid h-8 w-8 place-items-center rounded-md ${kbMode === "buffered" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Send className="h-4 w-4" /></button>
-              </div>
-              <input
-                ref={kbdRef}
-                onInput={onKbdInput}
-                onKeyDown={onKbdKeyDown}
-                onCompositionStart={() => (composing.current = true)}
-                onCompositionEnd={() => {
-                  composing.current = false;
-                  onKbdInput();
-                }}
-                onFocus={() => {
-                  setPanel("keyboard");
-                  resetField();
-                }}
-                onBlur={() => setPanel((p) => (p === "keyboard" ? null : p))}
-                className="min-w-0 flex-1 rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-sm text-white outline-none focus:border-accent-3"
-                placeholder={kbMode === "buffered" ? "Type, then Enter to send" : "Type — keys go to your PC"}
-                inputMode="text"
-                enterKeyHint={kbMode === "buffered" ? "send" : "done"}
-                autoCapitalize="none"
-                autoCorrect="off"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              {kbMode === "buffered" && (
-                <button onClick={sendBuffer} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent-3 text-white active:scale-95" title="Send to PC">
-                  <Send className="h-4 w-4" />
-                </button>
-              )}
-              <button onClick={() => { kbdRef.current?.blur(); setPanel(null); }} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-ink-dim active:bg-white/[0.08]" title="Close">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-          </div>
-
+        <motion.div
+          initial={{ y: 32, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          transition={{ type: "spring", stiffness: 380, damping: 32 }}
+          className="shrink-0 border-t border-white/10 bg-base/95 backdrop-blur"
+          style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+        >
           {/* expanded control panels — each a single horizontally-scrollable row of icons */}
           {panel === "mouse" && (
             <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2">
@@ -1241,51 +1403,37 @@ export function ControlScreen({
           )}
 
           {panel === "keys" && (
-            <div className="flex items-center gap-1 overflow-x-auto border-b border-white/5 px-2 py-2">
-              <KeyBtn onClick={() => tapKey("escape")}>Esc</KeyBtn>
-              <KeyBtn onClick={() => tapKey("tab")}>Tab</KeyBtn>
-              <IcoBtn title="Enter" onClick={() => tapKey("enter")}><CornerDownLeft className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Backspace" onClick={() => tapKey("backspace")}><Delete className="h-4 w-4" /></IcoBtn>
-              <KeyBtn onClick={() => tapKey("delete")}>Del</KeyBtn>
+            <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2.5">
+              <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
               <Sep />
-              <KeyBtn active={mods.has("ctrl")} onClick={() => toggleMod("ctrl")}>Ctrl</KeyBtn>
-              <KeyBtn active={mods.has("alt")} onClick={() => toggleMod("alt")}>Alt</KeyBtn>
-              <KeyBtn active={mods.has("shift")} onClick={() => toggleMod("shift")}>Shift</KeyBtn>
-              <KeyBtn active={mods.has("win")} onClick={() => toggleMod("win")}>Win</KeyBtn>
-              <Sep />
-              <IcoBtn title="Left" onClick={() => tapKey("left")}><ArrowLeft className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Up" onClick={() => tapKey("up")}><ArrowUp className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Down" onClick={() => tapKey("down")}><ArrowDown className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Right" onClick={() => tapKey("right")}><ArrowRight className="h-4 w-4" /></IcoBtn>
-              <Sep />
-              {Array.from({ length: 12 }, (_, i) => i + 1).map((n) => (
-                <KeyBtn key={n} onClick={() => tapKey(`f${n}`)}>F{n}</KeyBtn>
+              {specialKeys.map((k) => (
+                <KeyCapButton
+                  key={k.id}
+                  def={k}
+                  pinMode={pinMode}
+                  pinned={pinned.includes(`k:${k.id}`)}
+                  active={k.mod ? mods.has(k.mod) : false}
+                  onFire={k.run}
+                  onTogglePin={() => togglePin(`k:${k.id}`)}
+                />
               ))}
-              <Sep />
-              <IcoBtn title="Volume down" onClick={() => tapKey("volumedown")}><Volume1 className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Volume up" onClick={() => tapKey("volumeup")}><Volume2 className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Mute" onClick={() => tapKey("volumemute")}><VolumeX className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Previous track" onClick={() => tapKey("prevtrack")}><SkipBack className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Play / pause" onClick={() => tapKey("playpause")}><PlayCircle className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Next track" onClick={() => tapKey("nexttrack")}><SkipForward className="h-4 w-4" /></IcoBtn>
             </div>
           )}
 
           {panel === "shortcuts" && (
-            <div className="flex items-center gap-1 overflow-x-auto border-b border-white/5 px-2 py-2">
-              <KeyBtn onClick={() => chord(["alt"], "tab")}>Alt+Tab</KeyBtn>
-              <KeyBtn onClick={() => chord(["win"])}>Win</KeyBtn>
-              <KeyBtn onClick={() => chord(["win"], "d")}>Desktop</KeyBtn>
-              <KeyBtn onClick={() => chord(["ctrl", "shift"], "escape")}>Task&nbsp;Mgr</KeyBtn>
-              <KeyBtn onClick={() => chord(["alt"], "f4")}>Alt+F4</KeyBtn>
-              <KeyBtn onClick={() => chord(["win"], "e")}>Explorer</KeyBtn>
+            <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2.5">
+              <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
               <Sep />
-              <KeyBtn onClick={() => chord(["ctrl"], "c")}>Copy</KeyBtn>
-              <KeyBtn onClick={() => chord(["ctrl"], "v")}>Paste</KeyBtn>
-              <KeyBtn onClick={() => chord(["ctrl"], "x")}>Cut</KeyBtn>
-              <KeyBtn onClick={() => chord(["ctrl"], "z")}>Undo</KeyBtn>
-              <KeyBtn onClick={() => chord(["ctrl"], "a")}>All</KeyBtn>
-              <KeyBtn onClick={() => chord(["ctrl", "alt"], "delete")}>Ctrl+Alt+Del</KeyBtn>
+              {shortcutKeys.map((s) => (
+                <KeyCapButton
+                  key={s.id}
+                  def={s}
+                  pinMode={pinMode}
+                  pinned={pinned.includes(`s:${s.id}`)}
+                  onFire={s.run}
+                  onTogglePin={() => togglePin(`s:${s.id}`)}
+                />
+              ))}
             </div>
           )}
 
@@ -1313,7 +1461,7 @@ export function ControlScreen({
             <Tab active={panel === "mouse"} onClick={() => openPanel("mouse")} title="Mouse"><MousePointer2 className="h-5 w-5" /></Tab>
             <Tab active={panel === "keys"} onClick={() => openPanel("keys")} title="Special keys"><Command className="h-5 w-5" /></Tab>
             <Tab active={panel === "shortcuts"} onClick={() => openPanel("shortcuts")} title="Shortcuts"><Grip className="h-5 w-5" /></Tab>
-            <Tab active={panel === "keyboard"} onClick={() => openPanel("keyboard")} title="Keyboard"><Keyboard className="h-5 w-5" /></Tab>
+            <Tab active={typing} onClick={() => (typing ? stopTyping() : startTyping())} title="Keyboard"><Keyboard className="h-5 w-5" /></Tab>
             <Tab active={panel === "quality"} onClick={() => openPanel("quality")} title="Quality"><Gauge className="h-5 w-5" /></Tab>
             <button
               onClick={() => {
@@ -1331,7 +1479,7 @@ export function ControlScreen({
               </button>
             )}
           </div>
-        </div>
+        </motion.div>
       )}
     </div>
   );
@@ -1373,36 +1521,178 @@ function Sep() {
 /** Square icon button used across the panels. */
 function IcoBtn({ onClick, active, title, children }: { onClick: () => void; active?: boolean; title?: string; children: React.ReactNode }) {
   return (
-    <button
-      onClick={onClick}
+    <motion.button
+      whileTap={{ scale: 0.86 }}
+      transition={{ type: "spring", stiffness: 600, damping: 20 }}
+      onClick={() => {
+        navigator.vibrate?.(5);
+        onClick();
+      }}
       title={title}
-      className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg border transition active:scale-95 ${active ? "border-accent-3 bg-accent-3/15 text-white" : "border-white/[0.06] bg-white/[0.03] text-ink-soft active:bg-white/[0.08]"}`}
+      className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg border ${active ? "border-accent-3 bg-accent-3/15 text-white" : "border-white/[0.06] bg-white/[0.03] text-ink-soft active:bg-white/[0.08]"}`}
     >
       {children}
-    </button>
+    </motion.button>
   );
 }
-/** Compact labelled key (for Esc / modifiers / F-keys / shortcut chords). */
-function KeyBtn({ onClick, active, children }: { onClick: () => void; active?: boolean; children: React.ReactNode }) {
+/** A single physical-looking keycap with the label centred (task: keycap style). */
+function Keycap({ children, active, small }: { children: React.ReactNode; active?: boolean; small?: boolean }) {
+  return (
+    <span
+      className={`inline-grid ${small ? "h-6 min-w-[1.4rem] text-[10px]" : "h-7 min-w-[1.75rem] text-[11px]"} place-items-center rounded-[7px] px-1.5 font-800 leading-none tracking-tight ${
+        active
+          ? "border border-accent-1/70 bg-gradient-to-b from-accent-1/85 to-accent-1/50 text-white shadow-[0_2px_0_rgba(0,0,0,0.45),0_0_10px_var(--accent-1),inset_0_1px_0_rgba(255,255,255,0.35)]"
+          : "border border-white/15 bg-gradient-to-b from-white/[0.17] to-white/[0.04] text-white shadow-[0_2px_0_rgba(0,0,0,0.5),0_3px_5px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.22)]"
+      }`}
+    >
+      {children}
+    </span>
+  );
+}
+/** A key or key-combo: multiple keys are joined by a small "+" (task: combos). */
+function KeyCombo({ keys, active, small }: { keys: string[]; active?: boolean; small?: boolean }) {
+  return (
+    <span className="flex items-center gap-0.5">
+      {keys.map((k, i) => (
+        <span key={i} className="flex items-center gap-0.5">
+          {i > 0 && <span className="px-px text-[10px] font-800 text-ink-dim">+</span>}
+          <Keycap active={active} small={small}>{k}</Keycap>
+        </span>
+      ))}
+    </span>
+  );
+}
+/** A dock button rendering a keycap combo with a caption + pin overlay. In pin
+ *  mode a tap toggles the pin instead of firing the key. */
+function KeyCapButton({
+  def,
+  pinMode,
+  pinned,
+  active,
+  onFire,
+  onTogglePin,
+}: {
+  def: KeyDef;
+  pinMode: boolean;
+  pinned: boolean;
+  active?: boolean;
+  onFire: () => void;
+  onTogglePin: () => void;
+}) {
+  return (
+    <motion.button
+      whileTap={pinMode ? { scale: 0.92 } : { scale: 0.86, y: 2 }}
+      transition={{ type: "spring", stiffness: 600, damping: 20 }}
+      onClick={() => {
+        if (pinMode) {
+          onTogglePin();
+          return;
+        }
+        navigator.vibrate?.(6);
+        onFire();
+      }}
+      className="relative flex shrink-0 flex-col items-center gap-0.5 rounded-xl px-1 py-0.5"
+    >
+      <KeyCombo keys={def.keys} active={active} />
+      {def.label && <span className="text-[8.5px] font-700 leading-none text-ink-dim">{def.label}</span>}
+      {pinMode && (
+        <span
+          className={`absolute -right-1.5 -top-1.5 grid h-4 w-4 place-items-center rounded-full border ${
+            pinned ? "border-accent-3 bg-accent-3 text-white" : "border-white/25 bg-black/70 text-ink-dim"
+          }`}
+        >
+          <Pin className="h-2.5 w-2.5" />
+        </span>
+      )}
+    </motion.button>
+  );
+}
+/** The pin-mode enable toggle shown at the start of the keys/shortcuts panels. */
+function PinModeToggle({ active, onClick }: { active: boolean; onClick: () => void }) {
   return (
     <button
       onClick={onClick}
-      className={`grid h-9 shrink-0 place-items-center whitespace-nowrap rounded-lg border px-2 text-[11px] font-700 transition active:scale-95 ${active ? "border-accent-1 bg-accent-1 text-white shadow-glow" : "border-white/[0.06] bg-white/[0.03] text-ink-soft active:bg-white/[0.08]"}`}
+      title={active ? "Done pinning" : "Pin keys to a floating quick bar"}
+      className={`flex h-9 shrink-0 items-center gap-1 rounded-lg border px-2 text-[10px] font-800 uppercase tracking-wide transition active:scale-95 ${
+        active ? "border-accent-3 bg-accent-3/20 text-accent-3" : "border-white/[0.08] bg-white/[0.03] text-ink-dim"
+      }`}
     >
-      {children}
+      {active ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
+      {active ? "Done" : "Pin"}
     </button>
+  );
+}
+/** A pinned quick button on the floating edge rail — small + semi-transparent,
+ *  tap fires, long-press unpins (task: pinnable floating buttons). */
+function PinnedButton({
+  def,
+  active,
+  onRun,
+  onUnpin,
+}: {
+  def: KeyDef;
+  active?: boolean;
+  onRun: () => void;
+  onUnpin: () => void;
+}) {
+  const timer = useRef<number | null>(null);
+  const longFired = useRef(false);
+  const start = () => {
+    longFired.current = false;
+    timer.current = window.setTimeout(() => {
+      longFired.current = true;
+      navigator.vibrate?.(16);
+      onUnpin();
+    }, 550);
+  };
+  const clear = () => {
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
+  };
+  return (
+    <motion.button
+      layout
+      initial={{ opacity: 0, x: 24, scale: 0.8 }}
+      animate={{ opacity: active ? 1 : 0.55, x: 0, scale: 1 }}
+      exit={{ opacity: 0, x: 24, scale: 0.8 }}
+      whileTap={{ scale: 0.9, opacity: 1 }}
+      transition={{ type: "spring", stiffness: 500, damping: 30 }}
+      onPointerDown={start}
+      onPointerUp={() => {
+        clear();
+        if (!longFired.current) onRun();
+      }}
+      onPointerLeave={clear}
+      onPointerCancel={clear}
+      className={`pointer-events-auto flex items-center rounded-lg border px-1.5 py-1 backdrop-blur ${
+        active ? "border-accent-1/70 bg-black/55" : "border-white/10 bg-black/35"
+      }`}
+      title={`${def.keys.join(" + ")}${def.label ? ` (${def.label})` : ""} — long-press to unpin`}
+    >
+      <KeyCombo keys={def.keys} active={active} small />
+    </motion.button>
   );
 }
 /** A tab in the always-visible bottom strip (icon only). */
 function Tab({ onClick, active, title, children }: { onClick: () => void; active: boolean; title: string; children: React.ReactNode }) {
   return (
-    <button
+    <motion.button
+      whileTap={{ scale: 0.9 }}
       onClick={onClick}
       title={title}
-      className={`grid h-9 flex-1 place-items-center rounded-lg transition active:scale-95 ${active ? "bg-accent-3 text-white shadow-glow" : "text-ink-dim active:bg-white/[0.06]"}`}
+      className={`relative grid h-9 flex-1 place-items-center rounded-lg transition ${active ? "text-white" : "text-ink-dim active:bg-white/[0.06]"}`}
     >
-      {children}
-    </button>
+      {active && (
+        <motion.span
+          layoutId="dockTabActive"
+          className="absolute inset-0 rounded-lg bg-accent-3 shadow-glow"
+          transition={{ type: "spring", stiffness: 500, damping: 34 }}
+        />
+      )}
+      <span className="relative z-10">{children}</span>
+    </motion.button>
   );
 }
 /** Compact labelled slider for the single-row quality panel. */

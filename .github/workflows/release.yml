@@ -90,6 +90,10 @@ jobs:
       - name: Scaffold + patch the Android project
         run: |
           (cd companion && npx tauri android init --ci)
+          # `tauri android init` scaffolds the project with the DEFAULT Tauri launcher
+          # icons; regenerate the branded mipmaps into gen/android from the source art
+          # (gen/android isn't committed, so this must run on every CI build).
+          (cd companion && npx tauri icon ../_iconsrc/source-v2.png)
           node scripts/patch-android.mjs
 
       - name: Build APK

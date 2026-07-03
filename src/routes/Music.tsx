@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
-import { SectionTitle, Segmented, EmptyState, Skeleton } from "@/components/ui";
+import { SectionTitle, Segmented, EmptyState, Skeleton, Toggle } from "@/components/ui";
 import { Heatmap } from "@/components/Heatmap";
 import { buildFixedWindow } from "@/components/Timeline";
 import { ThemePlaylist } from "@/components/ThemePlaylist";
@@ -33,8 +33,11 @@ import {
   useMediaTimeline,
   useMediaRecent,
   useGames,
+  useSettings,
 } from "@/lib/queries";
-import { assetUrl, MediaPlay, MusicEntry } from "@/lib/api";
+import { useQueryClient } from "@tanstack/react-query";
+import { api, assetUrl, MediaPlay, MusicEntry, Settings } from "@/lib/api";
+import { cn } from "@/lib/cn";
 import { dur, hourLabel, relativeTime } from "@/lib/format";
 import { accentFor } from "@/lib/format";
 import { useApp, useMotionEnabled } from "@/store/app";
@@ -73,6 +76,8 @@ export default function MusicPage() {
           : "Your listening, tracked to the minute"
       }
     >
+      <MusicTrackingToggle />
+
       <NowListeningHero />
 
       <Playlists />
@@ -124,6 +129,64 @@ export default function MusicPage() {
         </p>
       )}
     </Page>
+  );
+}
+
+/**
+ * Master switch for automatic media/music tracking. Flips the existing
+ * `media_tracking_enabled` setting (default on) that the Rust tracker reads each
+ * tick — turning it off stops new SMTC plays being recorded (past data is kept).
+ */
+function MusicTrackingToggle() {
+  const { data: settings } = useSettings();
+  const qc = useQueryClient();
+  const pushToast = useApp((s) => s.pushToast);
+  const enabled = settings?.["media_tracking_enabled"] !== "false"; // default on
+
+  const setEnabled = async (v: boolean) => {
+    const prev = qc.getQueryData<Settings>(["settings"]);
+    if (prev) qc.setQueryData(["settings"], { ...prev, media_tracking_enabled: v ? "true" : "false" });
+    try {
+      await api.setSetting("media_tracking_enabled", v ? "true" : "false");
+      await qc.invalidateQueries({ queryKey: ["settings"] });
+      pushToast({
+        kind: v ? "success" : "info",
+        title: v ? "Music tracking on" : "Music tracking paused",
+        message: v
+          ? "New listening from Windows media + the jukebox will be recorded."
+          : "No new plays will be recorded. Your existing history stays.",
+      });
+    } catch {
+      if (prev) qc.setQueryData(["settings"], prev);
+      pushToast({ kind: "info", title: "Couldn't change music tracking" });
+    }
+  };
+
+  return (
+    <Panel panelKey="music.trackingToggle" className="mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <span
+            className={cn(
+              "grid h-9 w-9 place-items-center rounded-xl border transition-colors",
+              enabled ? "border-transparent text-white" : "border-line text-ink-dim"
+            )}
+            style={enabled ? { backgroundImage: "linear-gradient(120deg,var(--accent-1),var(--accent-3))" } : undefined}
+          >
+            <Headphones className="h-4.5 w-4.5" />
+          </span>
+          <div>
+            <div className="text-sm font-600 text-ink">Music &amp; media tracking</div>
+            <div className="text-[12px] text-ink-dim">
+              {enabled
+                ? "Automatically recording what you play across your PC."
+                : "Paused — nothing new is being recorded."}
+            </div>
+          </div>
+        </div>
+        <Toggle checked={enabled} onChange={setEnabled} />
+      </div>
+    </Panel>
   );
 }
 
