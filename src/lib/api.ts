@@ -1224,6 +1224,7 @@ export const api = {
   remoteListMonitors: () => call<RemoteMonitor[]>("remote_list_monitors"),
   remoteReadMedia: (path: string) => call<string | null>("remote_read_media", { path }),
   remoteInject: (event: Record<string, unknown>) => call<void>("remote_inject", { event }),
+  remoteGamepadAvailable: () => call<boolean>("remote_gamepad_available"),
 };
 
 export interface RemoteMonitor {

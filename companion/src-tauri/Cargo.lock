@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "gametracker-companion"
-version = "3.8.1"
+version = "3.8.5"
 dependencies = [
  "jni",
  "ndk-context",

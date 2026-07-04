@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.8.1"
+version = "3.8.5"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -89,6 +89,10 @@ windows = { version = "0.58", features = [
   "Win32_Storage_FileSystem",
 ] }
 winreg = "0.52"
+# Virtual Xbox 360 controller for remote play (a phone with a physical controller
+# streams its state; we replay it as a real XInput device). Needs the ViGEmBus
+# driver installed at runtime; pure-Rust client, Windows-only.
+vigem-client = "0.1"
 
 [profile.release]
 panic = "abort"

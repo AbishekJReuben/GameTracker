@@ -35,6 +35,12 @@ pub enum ControlEvent {
     Keydown { name: String },
     /// Release a previously held key/modifier.
     Keyup { name: String },
+    /// Update the virtual Xbox 360 controller (a physical controller attached to
+    /// the phone, streamed here so PC games see a real XInput device). The pad
+    /// state fields are flattened into this message by serde's internal tagging.
+    Gamepad(crate::remote::gamepad::GamepadState),
+    /// Release the virtual controller to neutral and unplug it.
+    Gamepadstop,
 }
 
 fn button_for(name: &Option<String>) -> Button {
@@ -237,6 +243,16 @@ impl Controller {
             ControlEvent::Key { name } => self.key_dir(&name, Direction::Click),
             ControlEvent::Keydown { name } => self.key_dir(&name, Direction::Press),
             ControlEvent::Keyup { name } => self.key_dir(&name, Direction::Release),
+            // Gamepad events bypass enigo entirely — they drive the virtual XInput
+            // controller, which owns its own dedicated thread (see `gamepad.rs`).
+            ControlEvent::Gamepad(state) => {
+                crate::remote::gamepad::apply(state);
+                Ok(())
+            }
+            ControlEvent::Gamepadstop => {
+                crate::remote::gamepad::stop();
+                Ok(())
+            }
         };
     }
 }

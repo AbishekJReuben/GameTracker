@@ -20,6 +20,7 @@ import {
   Type as TypeIcon,
   Clapperboard,
   Sparkles,
+  Gamepad2,
 } from "lucide-react";
 import { Eye, EyeOff, ExternalLink, DownloadCloud, Usb, Trash2, ShieldCheck as ShieldIcon, Clock, Loader2 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -47,6 +48,9 @@ export default function RemotePage() {
   const [grants, setGrants] = useState<RemoteGrants | null>(null);
   const [usbDevices, setUsbDevices] = useState<string[]>([]);
   const [installing, setInstalling] = useState(false);
+  // Whether a virtual gamepad can be created (ViGEmBus installed) — powers the
+  // controller-play prerequisite note. null = not yet probed.
+  const [gamepadReady, setGamepadReady] = useState<boolean | null>(null);
   // Keep the latest signaling URL from the backend without clobbering the user's
   // in-progress edit (only seed the draft once, when it's still empty).
   const seededSignal = useRef(false);
@@ -62,6 +66,7 @@ export default function RemotePage() {
       // Grants (for the live countdown) + USB devices (for the install button).
       api.remoteListGrants().then(setGrants).catch(() => {});
       api.remoteAdbDevices().then(setUsbDevices).catch(() => setUsbDevices([]));
+      api.remoteGamepadAvailable().then(setGamepadReady).catch(() => setGamepadReady(null));
     } catch {
       /* ignore transient poll errors */
     }
@@ -380,6 +385,43 @@ export default function RemotePage() {
                       ? `${usbDevices.length} phone${usbDevices.length === 1 ? "" : "s"} connected via USB`
                       : "No USB phone (enable USB debugging)"}
                   </span>
+                </div>
+              </Panel>
+            </motion.div>
+          )}
+
+          {on && (
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mb-5">
+              <Panel panelKey="remote.controller" className="p-5">
+                <SectionTitle
+                  title="Play with a controller"
+                  subtitle="Use a gamepad attached to your phone to play PC games remotely"
+                  right={<Gamepad2 className="h-4 w-4" />}
+                />
+                <div className="mt-3 flex items-start gap-3">
+                  <span
+                    className={`mt-0.5 h-2.5 w-2.5 flex-none rounded-full ${gamepadReady ? "bg-green" : "bg-amber-400"}`}
+                    style={gamepadReady ? { boxShadow: "0 0 8px #34d399" } : undefined}
+                  />
+                  <div className="min-w-0 text-xs">
+                    {gamepadReady ? (
+                      <p className="text-ink-soft">
+                        Ready — a controller docked to your phone shows up on this PC as an Xbox pad.
+                        In the phone app&rsquo;s Control screen, open the <b>Controller</b> tab and turn it on.
+                      </p>
+                    ) : (
+                      <p className="text-ink-soft">
+                        Controller play needs the free <b>ViGEmBus</b> driver so your phone&rsquo;s gamepad can
+                        appear to Windows as a real Xbox controller. Install it, then it just works — no
+                        further setup.
+                      </p>
+                    )}
+                    {!gamepadReady && (
+                      <button onClick={() => openUrl("https://vigembus.com")} className="btn btn-subtle mt-3 h-9 gap-2">
+                        <ExternalLink className="h-4 w-4" /> Get ViGEmBus
+                      </button>
+                    )}
+                  </div>
                 </div>
               </Panel>
             </motion.div>

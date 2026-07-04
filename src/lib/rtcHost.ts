@@ -909,6 +909,20 @@ export function startHost(opts: HostOptions): () => void {
           applyBitrate();
           return;
         }
+        // Controller-mode probe: the phone asks whether this PC can create a
+        // virtual gamepad (ViGEmBus installed). Answer over the data channel so the
+        // phone can prompt the user to install the driver if not. Not an input event.
+        if (msg && msg.type === "gamepadprobe") {
+          let ok = false;
+          try {
+            ok = await api.remoteGamepadAvailable();
+          } catch {
+            ok = false;
+          }
+          if (dataCh?.readyState === "open")
+            dataCh.send(JSON.stringify({ event: "gamepad", available: ok }));
+          return;
+        }
         // Everything else is an input event — never inject before authorization.
         if (!authorized) return;
         api.remoteInject(msg);

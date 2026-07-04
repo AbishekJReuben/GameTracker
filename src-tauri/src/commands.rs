@@ -2135,6 +2135,14 @@ pub fn remote_inject(event: crate::remote::input::ControlEvent) {
     crate::remote::input::inject(event);
 }
 
+/// Whether a virtual gamepad can be created on this PC (the ViGEmBus driver is
+/// installed). The phone probes this before offering controller mode so it can
+/// prompt the user to install the driver when it's missing.
+#[tauri::command]
+pub fn remote_gamepad_available() -> bool {
+    crate::remote::gamepad::available()
+}
+
 /// Process-wide delta encoder for the cloud (WebRTC) screen path. There is at most
 /// one cloud viewer, so a single shared encoder is enough.
 static CLOUD_ENC: once_cell::sync::Lazy<parking_lot::Mutex<crate::remote::capture::TileEncoder>> =

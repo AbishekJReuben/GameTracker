@@ -55,8 +55,10 @@ import {
   Crosshair,
   Ban,
   Grab,
+  Gamepad2,
 } from "lucide-react";
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
+import { startGamepadBridge } from "../gamepad";
 import { apiGet } from "../link";
 import type { ConnectSnapshot } from "../cloud";
 import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
@@ -82,7 +84,7 @@ type KbMode = "direct" | "buffered";
 type NavTab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
 /** Which bottom control panel is expanded (null = collapsed to just the tab strip).
  * (Keyboard is no longer a panel — it's an always-mounted floating compose bar.) */
-type Panel = "mouse" | "keys" | "shortcuts" | "quality";
+type Panel = "mouse" | "keys" | "shortcuts" | "quality" | "gamepad";
 
 /** A pinnable key / shortcut: `keys` are the keycap labels (>1 → combo joined by +). */
 type KeyDef = {
@@ -306,6 +308,14 @@ export function ControlScreen({
   const [monitors, setMonitors] = useState<RemoteMonitor[]>([]);
   const [monitorIdx, setMonitorIdx] = useState(0);
 
+  // Controller mode: forward a physical gamepad attached to the phone to a virtual
+  // Xbox pad on the PC so games are playable. `padAvailable` reflects whether the
+  // PC has the ViGEmBus driver (null = not yet probed / answered).
+  const [controllerOn, setControllerOn] = useState(false);
+  const [padConnected, setPadConnected] = useState(false);
+  const [padName, setPadName] = useState("");
+  const [padAvailable, setPadAvailable] = useState<boolean | null>(null);
+
   const activeQuality = useMemo<QualitySettings>(
     () => ({ ...streamQ, mode: contentMode }),
     [streamQ, contentMode],
@@ -375,6 +385,7 @@ export function ControlScreen({
     link.onEvent((e) => {
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
       else if (e.event === "cursor") setCursorKind(String((e as { kind?: string }).kind || "arrow"));
+      else if (e.event === "gamepad") setPadAvailable(!!(e as { available?: boolean }).available);
       else if (e.event === "capstats") {
         const cs = (e as { stats?: RemoteCaptureStats }).stats;
         if (!cs) return;
@@ -400,6 +411,26 @@ export function ControlScreen({
     return () => unsubProgress?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);
+
+  // Controller mode: while on (and connected), probe the PC for the virtual-gamepad
+  // driver and stream the attached physical controller. Re-runs on reconnect so the
+  // pad re-probes; cleanup stops polling and releases the virtual pad to neutral.
+  useEffect(() => {
+    if (!controllerOn || !connected) return;
+    setPadAvailable(null);
+    link.send({ type: "gamepadprobe" }); // host answers via onEvent → setPadAvailable
+    const stop = startGamepadBridge((msg) => link.send(msg), {
+      onStatus: (c, name) => {
+        setPadConnected(c);
+        setPadName(name);
+      },
+    });
+    return () => {
+      stop();
+      setPadConnected(false);
+      link.send({ type: "gamepadstop" });
+    };
+  }, [controllerOn, connected, link]);
 
   // Auto-open the on-screen keyboard exactly once per PC focus gain; show a chip.
   const handleFocusEvent = (textField: boolean) => {
@@ -1525,12 +1556,45 @@ export function ControlScreen({
             </div>
           )}
 
+          {panel === "gamepad" && (
+            <div className="flex flex-col gap-2 border-b border-white/5 px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => setControllerOn((v) => !v)}
+                  className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-[12px] font-700 ${controllerOn ? "bg-accent-3 text-white" : "bg-white/[0.06] text-ink-soft"}`}
+                >
+                  <Gamepad2 className="h-4 w-4" />
+                  {controllerOn ? "Controller ON" : "Turn on controller"}
+                </button>
+                {controllerOn && (
+                  <span className={`flex items-center gap-1.5 text-[11px] font-600 ${padConnected ? "text-green" : "text-ink-dim"}`}>
+                    <span className={`h-1.5 w-1.5 rounded-full ${padConnected ? "bg-green" : "bg-ink-faint"}`} />
+                    {padConnected ? "Pad connected" : "Press a button on your controller"}
+                  </span>
+                )}
+              </div>
+              {controllerOn && padConnected && padName && (
+                <p className="truncate text-[10px] text-ink-faint">{padName}</p>
+              )}
+              {controllerOn && padAvailable === false ? (
+                <p className="text-[11px] leading-snug text-red">
+                  Your PC needs the free <span className="font-700">ViGEmBus</span> driver to accept a controller. Install it from <span className="font-700">vigembus.com</span>, then reconnect.
+                </p>
+              ) : (
+                <p className="text-[10px] leading-snug text-ink-dim">
+                  Plug or pair a controller to your phone, then play the game shown here — your controller drives the PC as an Xbox pad. Keep the game focused on the PC.
+                </p>
+              )}
+            </div>
+          )}
+
           {/* always-visible icon tab strip */}
           <div className="flex items-center gap-1 px-1.5 py-1.5">
             <Tab active={panel === "mouse"} onClick={() => openPanel("mouse")} title="Mouse"><MousePointer2 className="h-5 w-5" /></Tab>
             <Tab active={panel === "keys"} onClick={() => openPanel("keys")} title="Special keys"><Command className="h-5 w-5" /></Tab>
             <Tab active={panel === "shortcuts"} onClick={() => openPanel("shortcuts")} title="Shortcuts"><Grip className="h-5 w-5" /></Tab>
             <Tab active={typing} onClick={() => (typing ? stopTyping() : startTyping())} title="Keyboard"><Keyboard className="h-5 w-5" /></Tab>
+            <Tab active={panel === "gamepad" || controllerOn} onClick={() => openPanel("gamepad")} title="Controller"><Gamepad2 className="h-5 w-5" /></Tab>
             <Tab active={panel === "quality"} onClick={() => openPanel("quality")} title="Quality"><Gauge className="h-5 w-5" /></Tab>
             <button
               onClick={() => {

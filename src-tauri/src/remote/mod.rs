@@ -19,6 +19,7 @@ pub(crate) mod capture;
 #[cfg(windows)]
 pub(crate) mod dxdupe;
 pub(crate) mod focus;
+pub(crate) mod gamepad;
 pub(crate) mod input;
 pub(crate) mod uac;
 

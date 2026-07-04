@@ -18,7 +18,23 @@ export type ControlMsg =
   | { type: "key"; name: string }
   | { type: "keydown"; name: string }
   | { type: "keyup"; name: string }
-  | { type: "monitor"; index: number };
+  | { type: "monitor"; index: number }
+  // Virtual-gamepad stream: a physical controller attached to the phone. `buttons`
+  // is an XInput-style bitmask; sticks are -1..1 (Y flipped to up-positive),
+  // triggers 0..1. `gamepadprobe` asks the host if ViGEmBus is installed;
+  // `gamepadstop` releases + unplugs the virtual controller.
+  | {
+      type: "gamepad";
+      buttons: number;
+      lx: number;
+      ly: number;
+      rx: number;
+      ry: number;
+      lt: number;
+      rt: number;
+    }
+  | { type: "gamepadprobe" }
+  | { type: "gamepadstop" };
 
 /** Content-optimization mode: tune the pipeline for crisp text or smooth video. */
 export type ContentMode = "auto" | "text" | "video";

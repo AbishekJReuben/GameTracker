@@ -357,6 +357,7 @@ pub fn run() {
             commands::remote_list_monitors,
             commands::remote_read_media,
             commands::remote_inject,
+            commands::remote_gamepad_available,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tracker")
