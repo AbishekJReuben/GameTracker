@@ -300,6 +300,9 @@ export function ControlScreen({
   const frameTimes = useRef<number[]>([]);
   // Debug telemetry: host capture pipeline + decode-side WebRTC stats.
   const [hostStats, setHostStats] = useState<HostStats | null>(null);
+  // True when the PC streams via the native GPU getDisplayMedia path (no Rust JPEG
+  // capture, so there are no per-stage host timings to show — the encoder is on-GPU).
+  const [hostNative, setHostNative] = useState(false);
   const [net, setNet] = useState<NetStats | null>(null);
   const prodRef = useRef<{ frames: number; at: number } | null>(null);
   const netRef = useRef<{ bytes: number; at: number } | null>(null);
@@ -387,8 +390,14 @@ export function ControlScreen({
       else if (e.event === "cursor") setCursorKind(String((e as { kind?: string }).kind || "arrow"));
       else if (e.event === "gamepad") setPadAvailable(!!(e as { available?: boolean }).available);
       else if (e.event === "capstats") {
+        const native = !!(e as { native?: boolean }).native;
+        setHostNative(native);
         const cs = (e as { stats?: RemoteCaptureStats }).stats;
-        if (!cs) return;
+        if (!cs) {
+          // Native path: no per-stage host timings; clear the stale Rust-path stats.
+          if (native) setHostStats(null);
+          return;
+        }
         const now = performance.now();
         const prev = prodRef.current;
         let producedFps: number | undefined;
@@ -1341,8 +1350,14 @@ export function ControlScreen({
               <StatRow k="Resolution" v={`${hostStats.nativeW}×${hostStats.nativeH} → ${hostStats.outW}×${hostStats.outH}`} />
             </>
           )}
+          {hostNative && (
+            <>
+              <div className="my-1 border-t border-white/[0.06]" />
+              <StatRow k="Capture" v="Native GPU (getDisplayMedia)" />
+            </>
+          )}
           <div className="mt-1.5 rounded-lg bg-white/[0.04] px-2 py-1 text-[10px] font-700 text-accent-3">
-            {bottleneckHint(hostStats, net)}
+            {bottleneckHint(hostStats, net, hostNative)}
           </div>
         </div>
       )}
@@ -1655,23 +1670,31 @@ function RemoteCursor({
   const hidden = kind === "hidden" && !dragging;
   const entry = CURSOR_ICONS[effective] ?? CURSOR_ICONS.arrow;
   const Icon = entry.Icon;
+  // Hotspot alignment: (x,y) is the true pointer point. `center` cursors (I-beam,
+  // resize, move, crosshair) have their hotspot at the icon's centre, so shift the
+  // icon by -50%,-50% to sit its middle on the point — this is what makes the text
+  // caret land exactly where you tap. Arrow/hand point from a tip near the top-left.
+  // The offset MUST live on a static wrapper, NOT the motion element: Framer Motion
+  // owns `transform` for its scale/opacity animation and would otherwise clobber an
+  // inline transform, leaving every center cursor mis-anchored by half its size.
   const offset = entry.center ? "translate(-50%,-50%)" : "translate(-2px,-2px)";
   return (
     <div className="pointer-events-none absolute z-10" style={{ left: x, top: y }}>
       {!hidden && (
-        <motion.div
-          key={effective}
-          initial={{ scale: 0.5, opacity: 0 }}
-          animate={{ scale: dragging ? 0.85 : 1, opacity: 1 }}
-          transition={{ type: "spring", stiffness: 650, damping: 22 }}
-          style={{ transform: offset }}
-        >
-          <Icon
-            className={`h-6 w-6 text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.9)] ${effective === "busy" ? "animate-spin" : ""}`}
-            fill={effective === "arrow" || effective === "hand" ? "rgba(0,0,0,0.35)" : "none"}
-            strokeWidth={2.25}
-          />
-        </motion.div>
+        <div style={{ transform: offset }}>
+          <motion.div
+            key={effective}
+            initial={{ scale: 0.5, opacity: 0 }}
+            animate={{ scale: dragging ? 0.85 : 1, opacity: 1 }}
+            transition={{ type: "spring", stiffness: 650, damping: 22 }}
+          >
+            <Icon
+              className={`h-6 w-6 text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.9)] ${effective === "busy" ? "animate-spin" : ""}`}
+              fill={effective === "arrow" || effective === "hand" ? "rgba(0,0,0,0.35)" : "none"}
+              strokeWidth={2.25}
+            />
+          </motion.div>
+        </div>
       )}
       <AnimatePresence>{fx && <CursorFx key={fx.id} kind={fx.kind} dir={fx.dir} />}</AnimatePresence>
     </div>
@@ -1731,7 +1754,14 @@ function StatRow({ k, v }: { k: string; v: string }) {
 }
 
 /** A plain-language guess at where the frame-rate is being lost. */
-function bottleneckHint(host: HostStats | null, net: NetStats | null): string {
+function bottleneckHint(host: HostStats | null, net: NetStats | null, native = false): string {
+  // Native GPU capture has no host CPU cost worth reporting; a low frame rate is
+  // then network- or decoder-bound, never host-capture-bound.
+  if (native) {
+    if (net && net.freezes > 0 && net.fps < 24) return "Bottleneck: unstable link (freezes). Lower bitrate.";
+    if (net && net.dropped > 0 && net.fps < 20) return "Bottleneck: network / decoder. Lower bitrate or resolution.";
+    return "Native GPU capture — pipeline healthy.";
+  }
   if (!host && !net) return "Gathering stats…";
   const target = host?.fps ?? 30;
   const produced = host?.producedFps;

@@ -88,7 +88,33 @@ const save = (path, before, after, msg) => {
     m = m.replace(/([ \t]*<\/application>)/, `${provider}$1`);
   }
 
-  save(manifestPath, before, m, "patched AndroidManifest.xml (permission/FileProvider)");
+  // ApkInstallReceiver — the PackageInstaller status callback target. Without this
+  // registered receiver, committing an install session has nowhere to deliver
+  // STATUS_PENDING_USER_ACTION, so the confirmation dialog never launches (this is
+  // the "install prompt never shows up" bug on modern Android). Explicitly targeted
+  // (exported=false is fine — the PendingIntent names the class directly).
+  if (!m.includes(".ApkInstallReceiver")) {
+    const receiver =
+      `        <receiver${eol}` +
+      `          android:name=".ApkInstallReceiver"${eol}` +
+      `          android:exported="false" />${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${receiver}$1`);
+  }
+
+  // <queries> so the legacy ACTION_VIEW fallback can resolve the system package
+  // installer on Android 11+ (package-visibility restrictions otherwise hide it).
+  if (!m.includes("vnd.android.package-archive")) {
+    const queries =
+      `    <queries>${eol}` +
+      `        <intent>${eol}` +
+      `            <action android:name="android.intent.action.VIEW" />${eol}` +
+      `            <data android:mimeType="application/vnd.android.package-archive" />${eol}` +
+      `        </intent>${eol}` +
+      `    </queries>${eol}`;
+    m = m.replace(/([ \t]*<application\b)/, `${queries}$1`);
+  }
+
+  save(manifestPath, before, m, "patched AndroidManifest.xml (permission/FileProvider/receiver/queries)");
 }
 
 // --- 2b: res/xml/file_paths.xml ---------------------------------------------
@@ -207,6 +233,65 @@ const save = (path, before, after, msg) => {
         `}\n`;
       writeFileSync(mainActivityPath, content);
       note("rewrote MainActivity.kt (immersive full-screen)");
+    }
+  }
+}
+
+// --- 5: ApkInstallReceiver.kt — PackageInstaller status callback -------------
+// Handles the install session's status broadcast; on STATUS_PENDING_USER_ACTION it
+// launches the system's install-confirmation dialog. Required for the in-app
+// updater's PackageInstaller path (companion/src-tauri/src/update.rs) to show a
+// prompt on modern Android. Package path derives from the identifier.
+{
+  const conf = JSON.parse(
+    readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"),
+  );
+  const pkg = String(conf.identifier || "");
+  if (!pkg) {
+    console.warn("[patch-android] no identifier in tauri.conf.json — skipping ApkInstallReceiver.");
+  } else {
+    const receiverPath = join(
+      androidDir,
+      "app",
+      "src",
+      "main",
+      "java",
+      ...pkg.split("."),
+      "ApkInstallReceiver.kt",
+    );
+    const content =
+      `package ${pkg}\n\n` +
+      `import android.content.BroadcastReceiver\n` +
+      `import android.content.Context\n` +
+      `import android.content.Intent\n` +
+      `import android.content.pm.PackageInstaller\n\n` +
+      `/**\n` +
+      ` * Receives PackageInstaller session status callbacks from the in-app updater.\n` +
+      ` * When the system asks for user confirmation it hands us a ready-made intent —\n` +
+      ` * launching it is what makes the install prompt reliably appear (the legacy\n` +
+      ` * ACTION_VIEW intent silently no-ops on modern Android).\n` +
+      ` */\n` +
+      `class ApkInstallReceiver : BroadcastReceiver() {\n` +
+      `  override fun onReceive(context: Context, intent: Intent) {\n` +
+      `    val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)\n` +
+      `    if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {\n` +
+      `      @Suppress("DEPRECATION")\n` +
+      `      val confirm = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)\n` +
+      `      if (confirm != null) {\n` +
+      `        confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)\n` +
+      `        context.startActivity(confirm)\n` +
+      `      }\n` +
+      `    }\n` +
+      `  }\n` +
+      `}\n`;
+    const exists = existsSync(receiverPath);
+    const before = exists ? readFileSync(receiverPath, "utf8") : "";
+    if (!exists) {
+      mkdirSync(dirname(receiverPath), { recursive: true });
+      writeFileSync(receiverPath, content);
+      note("created ApkInstallReceiver.kt");
+    } else {
+      save(receiverPath, before, content, "updated ApkInstallReceiver.kt");
     }
   }
 }

@@ -30,6 +30,8 @@ export interface HostLiveStats {
   content: number;
   /** Encoder bitrate ceiling currently applied to the video sender (kbps). */
   encoderMaxKbps: number;
+  /** True when the screen rides the native GPU getDisplayMedia path (no Rust JPEG). */
+  nativeCapture: boolean;
 }
 
 /** What the desktop approval prompt resolves to for an untrusted device. */
@@ -272,6 +274,13 @@ export function startHost(opts: HostOptions): () => void {
   let videoTrack: MediaStreamTrack | null = null;
   let videoWriter: WritableStreamDefaultWriter<VideoFrame> | null = null;
   let videoSender: RTCRtpSender | null = null;
+  // Native OS screen-capture path. When `getDisplayMedia` succeeds (WebView2 with
+  // the auto-select flag), the screen is captured and H.264-encoded entirely by
+  // the browser/GPU — no Rust JPEG encode, no IPC frame copy, no canvas re-encode.
+  // This is the fast path (single encode/decode, browser congestion control). If
+  // it isn't available we fall back to the Rust JPEG pipeline feeding the canvas.
+  let displayStream: MediaStream | null = null;
+  let nativeActive = false;
   let audioTrack: MediaStreamTrack | null = null;
   let audioCtx: AudioContext | null = null;
   let audioNode: ScriptProcessorNode | null = null;
@@ -344,12 +353,33 @@ export function startHost(opts: HostOptions): () => void {
 
   /** Apply the content-mode hint to the live video track (sharp text vs motion). */
   const applyContentHint = () => {
-    if (!videoTrack) return;
+    const t = nativeActive ? displayStream?.getVideoTracks()[0] ?? null : videoTrack;
+    if (!t) return;
     try {
-      (videoTrack as MediaStreamTrack & { contentHint: string }).contentHint = trackTuning(quality.mode).hint;
+      (t as MediaStreamTrack & { contentHint: string }).contentHint = trackTuning(quality.mode).hint;
     } catch {
       /* not supported */
     }
+  };
+
+  /**
+   * Push the phone's resolution/fps knobs onto the native display track. Chromium
+   * downscales a display-capture track and caps its frame rate via constraints, so
+   * this is how the quality dock controls the native path (bitrate is separate, via
+   * `applyBitrate` on the sender). No-op unless the native path is active.
+   */
+  const applyVideoConstraints = () => {
+    if (!nativeActive) return;
+    const t = displayStream?.getVideoTracks()[0];
+    if (!t) return;
+    const h = Math.round((quality.maxW * 9) / 16);
+    t.applyConstraints({
+      width: { max: quality.maxW },
+      height: { max: h },
+      frameRate: { max: quality.fps },
+    }).catch(() => {
+      /* constraint unsupported on this track — bitrate cap still limits it */
+    });
   };
 
   // Rapid focus re-checks right after a click, so the phone hears about a newly
@@ -405,6 +435,9 @@ export function startHost(opts: HostOptions): () => void {
     stopAudio();
     videoWriter?.close().catch(() => {});
     videoWriter = null;
+    displayStream?.getTracks().forEach((t) => t.stop());
+    displayStream = null;
+    nativeActive = false;
     videoTrack?.stop();
     videoTrack = null;
     videoSender = null;
@@ -552,10 +585,74 @@ export function startHost(opts: HostOptions): () => void {
     } catch {
       /* not supported */
     }
-    // Capture is DEFERRED: the track is added to the offer immediately (so no
-    // renegotiation), but the Rust screen capture only starts once the guest is
-    // authorized. Until then the track carries no frames, so the phone sees nothing.
-    const start = () => api.remoteStartCapture(ch, quality.maxW, quality.fps, quality.jpeg);
+    // Try to acquire the OS screen as a native WebRTC track and swap it onto the
+    // sender (no renegotiation — replaceTrack keeps the same m-line/encoder). This
+    // is the frontier path: capture + H.264 encode happen on the GPU, the browser
+    // runs its own congestion control, and there's zero JPEG/IPC/canvas overhead.
+    const startNative = async (): Promise<boolean> => {
+      const md = navigator.mediaDevices as MediaDevices & {
+        getDisplayMedia?: (c: unknown) => Promise<MediaStream>;
+      };
+      if (typeof md.getDisplayMedia !== "function" || !videoSender) return false;
+      const h = Math.round((quality.maxW * 9) / 16);
+      const req = md.getDisplayMedia({
+        video: {
+          frameRate: { ideal: quality.fps, max: Math.max(quality.fps, 60) },
+          width: { max: quality.maxW },
+          height: { max: h },
+          cursor: "always",
+        },
+        audio: false,
+      });
+      // If the WebView2 auto-select flag is missing (or the source label doesn't
+      // match), a picker would appear and never resolve — race a timeout so we fall
+      // back to the Rust pipeline instead of hanging with a black screen.
+      const stream = await Promise.race([
+        req.catch(() => null),
+        new Promise<null>((r) => window.setTimeout(() => r(null), 2500)),
+      ]);
+      if (!stream) {
+        req.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
+        return false;
+      }
+      const dt = stream.getVideoTracks()[0];
+      if (!dt) {
+        stream.getTracks().forEach((t) => t.stop());
+        return false;
+      }
+      // If the display track ends (permission revoked, monitor unplugged), self-heal
+      // by falling back to the Rust capture pipeline on the same sender/canvas.
+      dt.onended = () => {
+        if (!nativeActive) return;
+        nativeActive = false;
+        displayStream = null;
+        api.remoteStartCapture(ch, quality.maxW, quality.fps, quality.jpeg).catch(() => {});
+      };
+      await videoSender.replaceTrack(dt);
+      displayStream = stream;
+      nativeActive = true;
+      try {
+        (dt as MediaStreamTrack & { contentHint: string }).contentHint = trackTuning(quality.mode).hint;
+      } catch {
+        /* unsupported */
+      }
+      applyBitrate();
+      return true;
+    };
+
+    // Capture is DEFERRED: the placeholder track is added to the offer immediately
+    // (so no renegotiation), but real capture only starts once the guest is
+    // authorized. Prefer the native GPU path; fall back to the Rust JPEG pipeline
+    // (which feeds this canvas) if getDisplayMedia isn't usable here.
+    const start = async () => {
+      try {
+        if (await startNative()) return;
+      } catch {
+        /* fall through to the Rust pipeline */
+      }
+      nativeActive = false;
+      await api.remoteStartCapture(ch, quality.maxW, quality.fps, quality.jpeg);
+    };
     return { track, start };
   };
 
@@ -592,13 +689,18 @@ export function startHost(opts: HostOptions): () => void {
     // are absorbed, hold a low TARGET for latency, and only trim when we drift past
     // MAX (host audio clock slightly faster than ours) so lag can't run away.
     const ms = (m: number) => Math.round((sr * m) / 1000) * channels;
-    let primeSamples = ms(90);
-    let targetSamples = ms(120);
-    let maxSamples = ms(240);
+    // Lower envelope for less audible lag. The drift-adaptive resampler below does
+    // the heavy lifting (it steers toward TARGET with no trims/re-primes in steady
+    // state), so these can be tight without machine-gun underruns: prime ~70ms,
+    // hold ~90ms, only trim past ~180ms. Dropping much below this starts to click
+    // on Wi‑Fi jitter — this was tuned against the earlier 120/240 pop complaints.
+    let primeSamples = ms(70);
+    let targetSamples = ms(90);
+    let maxSamples = ms(180);
     const recalcEnvelope = () => {
-      primeSamples = ms(90);
-      targetSamples = ms(120);
-      maxSamples = ms(240);
+      primeSamples = ms(70);
+      targetSamples = ms(90);
+      maxSamples = ms(180);
     };
 
     const ch = new Channel<ArrayBuffer>();
@@ -770,24 +872,92 @@ export function startHost(opts: HostOptions): () => void {
       if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "ok" }));
     };
 
-    pc = new RTCPeerConnection({ iceServers: defaultIceServers(opts.iceServers) });
+    // Pre-gather a small candidate pool so a reconnect/ICE-restart has paths ready
+    // to try immediately instead of waiting on a fresh gathering round.
+    pc = new RTCPeerConnection({ iceServers: defaultIceServers(opts.iceServers), iceCandidatePoolSize: 4 });
     // Capture this session's connection so async handlers (auth/approval) can tell
     // whether they're still the live session after an await. A superseded session's
     // late-resolving approval must NOT send its verdict over the *current* session's
     // channels — that was denying a freshly-connected phone before its own prompt
     // even appeared (and the phone treats "denied" as fatal, giving up entirely).
     const myPc = pc;
+    // Unique id for THIS peer session. Sent with every offer so the guest can tell
+    // an in-place ICE restart (re-route the same live session) from a fresh session.
+    const sessionId = Math.random().toString(36).slice(2);
+    let iceRestartTimer: number | null = null;
+    let deadTimer: number | null = null;
+    let restartAttempts = 0;
+    const clearRecoveryTimers = () => {
+      if (iceRestartTimer) {
+        clearTimeout(iceRestartTimer);
+        iceRestartTimer = null;
+      }
+      if (deadTimer) {
+        clearTimeout(deadTimer);
+        deadTimer = null;
+      }
+    };
+
+    // Re-route a live-but-degraded session without tearing it down: restartIce()
+    // re-gathers candidates and picks a new network path while DTLS, the media
+    // tracks, the encoder, and the app-level auth all stay up. This is the
+    // AnyDesk-style "the link hiccuped but never dropped" recovery — sub-second and
+    // invisible, versus a full rebuild (new offer + re-auth + capture restart).
+    const doIceRestart = async () => {
+      if (pc !== myPc || !sig || myPc.connectionState === "closed") return;
+      try {
+        myPc.restartIce();
+        const offer = await myPc.createOffer({ iceRestart: true });
+        if (pc !== myPc) return; // superseded while awaiting
+        await myPc.setLocalDescription(offer);
+        sig.send({ type: "offer", sdp: offer.sdp ?? "", sid: sessionId });
+      } catch (e) {
+        console.warn("[remote] ICE restart failed:", e);
+      }
+    };
+
     pipeIce(pc, sig);
     pc.onconnectionstatechange = () => {
       const st = pc?.connectionState;
       if (st === "connected") {
         opts.onClients?.(1);
         applyBitrate();
+        restartAttempts = 0;
+        clearRecoveryTimers();
       }
-      // Don't tear down on transient "disconnected" — WebRTC/ICE may recover, and
-      // the guest re-joins (→ peer-joined) to rebuild if it can't. Only a hard
-      // failure/close ends the session.
-      if (st === "failed" || st === "closed") teardownPeer();
+      // Transient "disconnected": give ICE a moment to self-heal, then force an ICE
+      // restart to re-route — without tearing anything down.
+      if (st === "disconnected" && !iceRestartTimer && pc === myPc) {
+        iceRestartTimer = window.setTimeout(() => {
+          iceRestartTimer = null;
+          const s = myPc.connectionState;
+          if (s === "disconnected" || s === "failed") {
+            restartAttempts++;
+            void doIceRestart();
+          }
+        }, 1200);
+      }
+      // Hard ICE failure: try an in-place restart first (cheap, keeps the session);
+      // only if repeated restarts don't recover within a grace window do we tear the
+      // session down — by then the guest's own watchdog is rebuilding anyway.
+      if (st === "failed" && pc === myPc) {
+        if (restartAttempts < 3) {
+          restartAttempts++;
+          void doIceRestart();
+          if (!deadTimer) {
+            deadTimer = window.setTimeout(() => {
+              deadTimer = null;
+              if (pc === myPc && myPc.connectionState !== "connected") teardownPeer();
+            }, 8000);
+          }
+        } else {
+          teardownPeer();
+        }
+      }
+      if (st === "closed") {
+        clearRecoveryTimers();
+        teardownPeer();
+      }
     };
 
     // Screen now rides a real video track (added before the offer so no
@@ -900,10 +1070,15 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.fps === "number") quality.fps = clamp(msg.fps, 1, 120);
           if (typeof msg.bitrate === "number") quality.bitrate = msg.bitrate <= 0 ? 0 : clamp(msg.bitrate, 500, 40000);
           if (msg.mode === "auto" || msg.mode === "text" || msg.mode === "video") quality.mode = msg.mode;
-          try {
-            api.remoteSetCaptureQuality(quality.maxW, quality.fps, quality.jpeg, CONTENT_NUM[quality.mode] ?? 0);
-          } catch {
-            /* ignore */
+          if (nativeActive) {
+            // Native path: resolution/fps ride the display track's constraints.
+            applyVideoConstraints();
+          } else {
+            try {
+              api.remoteSetCaptureQuality(quality.maxW, quality.fps, quality.jpeg, CONTENT_NUM[quality.mode] ?? 0);
+            } catch {
+              /* ignore */
+            }
           }
           applyContentHint();
           applyBitrate();
@@ -1039,15 +1214,20 @@ export function startHost(opts: HostOptions): () => void {
         if (++statsTick % 2 === 0) {
           let cs: RemoteCaptureStats | null = null;
           try {
-            cs = await api.remoteCaptureStats();
-            if (data.readyState === "open") data.send(JSON.stringify({ event: "capstats", stats: cs, at: Date.now() }));
+            // On the native path the Rust capture isn't running (stats would read as
+            // a 0-fps "host stall"); report the native flag so the phone HUD blames
+            // the network/decoder correctly instead of the host CPU.
+            cs = nativeActive ? null : await api.remoteCaptureStats();
+            if (data.readyState === "open")
+              data.send(JSON.stringify({ event: "capstats", stats: cs, native: nativeActive, at: Date.now() }));
           } catch {
             /* ignore */
           }
           // Capture-stall watchdog: if we're authorized and connected but the Rust
           // capture stops producing frames (internal error / device change), restart
-          // it in place so the session self-heals without a full rebuild.
-          if (cs && authorized && pc?.connectionState === "connected") {
+          // it in place so the session self-heals without a full rebuild. Skipped on
+          // the native path — there's no Rust capture producing frames to watch.
+          if (cs && authorized && !nativeActive && pc?.connectionState === "connected") {
             if (cs.producedFrames === lastProduced) {
               if (!zeroSince) zeroSince = Date.now();
               else if (Date.now() - zeroSince > 5000) {
@@ -1075,6 +1255,7 @@ export function startHost(opts: HostOptions): () => void {
               connState: pc?.connectionState ?? "unknown",
               content: CONTENT_NUM[quality.mode] ?? 0,
               encoderMaxKbps: Math.round(appliedCapBps / 1000),
+              nativeCapture: nativeActive,
             });
           }
         }
@@ -1083,7 +1264,7 @@ export function startHost(opts: HostOptions): () => void {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    sig.send({ type: "offer", sdp: offer.sdp ?? "" });
+    sig.send({ type: "offer", sdp: offer.sdp ?? "", sid: sessionId });
   };
 
   // Keep a signaling socket alive for the whole host lifetime, reconnecting with

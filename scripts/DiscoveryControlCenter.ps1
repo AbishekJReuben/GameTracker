@@ -66,8 +66,8 @@ $xamlStr = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
-        Title="GameTracker Discovery" Width="1280" Height="880"
-        MinWidth="1020" MinHeight="720" WindowStartupLocation="CenterScreen"
+        Title="GameTracker Discovery" Width="1340" Height="920"
+        MinWidth="1060" MinHeight="760" WindowStartupLocation="CenterScreen"
         WindowStyle="None" ResizeMode="CanResize"
         Background="$($t.Bg)" FontFamily="Segoe UI" UseLayoutRounding="True">
   <shell:WindowChrome.WindowChrome>
@@ -100,11 +100,24 @@ $(Get-CgResourceXaml)
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <StackPanel Grid.Column="0" VerticalAlignment="Center">
-          <TextBlock Text="Discovery Control Center" Foreground="{StaticResource Text}" FontSize="17" FontWeight="SemiBold"/>
-          <StackPanel Orientation="Horizontal">
-            <TextBlock x:Name="TxtStep" Text="Idle" Foreground="{StaticResource SubText}" FontFamily="Cascadia Mono, Consolas" FontSize="11.5"/>
-            <TextBlock x:Name="TxtCursor" Text="_" Foreground="$($t.Accent2)" FontFamily="Cascadia Mono, Consolas" FontSize="11.5" Margin="1,0,0,0"/>
+        <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+          <Border Width="42" Height="42" CornerRadius="11" Margin="0,0,14,0">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="$($t.Accent2)" Offset="0"/>
+                <GradientStop Color="$($t.Accent)" Offset="0.55"/>
+                <GradientStop Color="$($t.Accent3)" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+            <Border.Effect><DropShadowEffect Color="$($t.Accent)" BlurRadius="16" ShadowDepth="0" Opacity="0.45"/></Border.Effect>
+            <TextBlock Text="D" FontSize="22" FontWeight="Bold" Foreground="#04121A" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Text="Discovery Control Center" Foreground="{StaticResource Text}" FontSize="17.5" FontWeight="SemiBold"/>
+            <StackPanel Orientation="Horizontal">
+              <TextBlock x:Name="TxtStep" Text="Idle" Foreground="{StaticResource SubText}" FontFamily="Cascadia Mono, Consolas" FontSize="11.5"/>
+              <TextBlock x:Name="TxtCursor" Text="_" Foreground="$($t.Accent2)" FontFamily="Cascadia Mono, Consolas" FontSize="11.5" Margin="1,0,0,0"/>
+            </StackPanel>
           </StackPanel>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="14,0">
@@ -136,7 +149,7 @@ $(Get-CgResourceXaml)
               <TextBlock x:Name="TxtHealth" Text="Initializing..." Foreground="{StaticResource Text}" FontSize="12.5" FontWeight="SemiBold"/>
             </StackPanel>
           </Border>
-          <ProgressBar x:Name="ProgOverall" Height="6" Minimum="0" Maximum="100" Value="0" Width="220" Margin="0,8,0,0"/>
+          <ProgressBar x:Name="ProgOverall" Height="6" Minimum="0" Maximum="100" Value="0" Width="230" Margin="0,8,0,0"/>
         </StackPanel>
         <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
           <Button x:Name="BtnStart" Content="Start Stack" Style="{StaticResource Primary}" Margin="0,0,8,0"/>
@@ -147,7 +160,7 @@ $(Get-CgResourceXaml)
     </Border>
     <Grid Grid.Row="2">
       <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="7*" MinWidth="520"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="3*" MinWidth="330"/>
+        <ColumnDefinition Width="7*" MinWidth="540"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="3*" MinWidth="346"/>
       </Grid.ColumnDefinitions>
       <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Padding="18,10,8,16">
         <StackPanel>

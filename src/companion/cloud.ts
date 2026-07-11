@@ -115,6 +115,11 @@ export class CloudConn {
   private watchdogTimer: number | null = null;
   private lastHealthyAt = Date.now();
   private lastDecoded = -1;
+  // Session id of the offer that built the current pc. A later offer with the SAME
+  // id is an ICE-restart renegotiation (apply in place); a different id is a new
+  // session (full rebuild). Lets a transient network drop re-route sub-second
+  // without re-pairing, re-auth, or a decoder reset.
+  private currentSid?: string;
   private progressListeners = new Set<(s: ConnectSnapshot) => void>();
   private progressPhase: ConnectPhase = "idle";
   private progressJob = "Starting…";
@@ -245,7 +250,7 @@ export class CloudConn {
     this.sig = sig;
     sig.onMessage(async (m) => {
       if (this.sig !== sig || this.closed) return; // stale socket from a prior attempt
-      if (m.type === "offer") await this.onOffer(m.sdp);
+      if (m.type === "offer") await this.onOffer(m.sdp, (m as { sid?: string }).sid);
       else if (m.type === "candidate" && this.pc) {
         try {
           await this.pc.addIceCandidate(m.candidate);
@@ -334,8 +339,25 @@ export class CloudConn {
     }
   }
 
-  private async onOffer(sdp: string) {
+  private async onOffer(sdp: string, sid?: string) {
     this.clearOfferTimeout();
+    // ICE-restart renegotiation of the SAME session: apply the new offer to the
+    // existing peer connection instead of rebuilding. Keeps the media track, the
+    // hardware decoder, and the host's authorization — the screen just re-routes
+    // onto a fresh network path with no visible drop. Only when this fails (or the
+    // pc is gone/closed) do we fall through to a clean rebuild below.
+    if (sid && sid === this.currentSid && this.pc && this.pc.connectionState !== "closed" && this.sig) {
+      try {
+        await this.pc.setRemoteDescription({ type: "offer", sdp });
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
+        this.sig.send({ type: "answer", sdp: answer.sdp ?? "" });
+        return;
+      } catch {
+        /* renegotiation failed — fall through and rebuild the session cleanly */
+      }
+    }
+    this.currentSid = sid;
     this.setProgress("negotiating", "Setting up secure peer connection…");
     this.pc?.close();
     this.stream = null; // new session → new tracks; don't accumulate dead ones
@@ -344,7 +366,7 @@ export class CloudConn {
     // A new PC restarts inbound-RTP counters from 0, so the old frame count is
     // meaningless — reset it so the jitter-adaptation baseline is correct.
     this.lastDecoded = -1;
-    const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers) });
+    const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
     pipeIce(pc, this.sig!);
     // Guard every handler against firing for a superseded connection. The peer

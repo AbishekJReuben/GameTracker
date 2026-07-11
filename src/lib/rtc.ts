@@ -31,9 +31,15 @@ export interface IceServer {
  */
 export function defaultIceServers(extra?: IceServer[]): RTCIceServer[] {
   const base: RTCIceServer[] = [
+    // Cloudflare's STUN is fast and highly available; Google's are the usual
+    // fallbacks. More reflexive servers = a better chance of a direct P2P path
+    // (which is lower-latency and drops far less than a relayed one).
+    { urls: "stun:stun.cloudflare.com:3478" },
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
     // Open Relay Project — free public TURN (UDP/TCP/TLS) with static creds. Used
     // only as a last resort when a direct candidate pair can't be established.
     { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
@@ -47,7 +53,10 @@ type SignalMsg =
   | { type: "peer-joined"; role?: string }
   | { type: "peer-left" }
   | { type: "room-full" }
-  | { type: "offer"; sdp: string }
+  // `sid` tags the offer's session so the guest can tell an ICE-restart
+  // renegotiation of the *current* session (apply in place, keep auth+decoder)
+  // apart from a brand-new session (full rebuild). Absent on legacy hosts.
+  | { type: "offer"; sdp: string; sid?: string }
   | { type: "answer"; sdp: string }
   | { type: "candidate"; candidate: RTCIceCandidateInit }
   | { type: "ping" };

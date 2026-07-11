@@ -12,6 +12,11 @@ use std::io::Read;
 
 use tauri::{AppHandle, Emitter, Manager};
 
+/// The companion's applicationId (identifier in `companion/src-tauri/tauri.conf.json`).
+/// Used to build the FileProvider authority and the explicit receiver class name.
+#[cfg(target_os = "android")]
+const PACKAGE_NAME: &str = "com.chilloutgames.gametracker.companion";
+
 /// FileProvider authority — must match `${applicationId}.fileprovider` declared
 /// in the generated AndroidManifest (identifier from tauri.conf.json).
 #[cfg(target_os = "android")]
@@ -190,8 +195,17 @@ fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result
     Ok(())
 }
 
-/// Hand the downloaded APK to the Android package installer via a FileProvider
-/// content:// URI + `ACTION_VIEW` install intent (JNI, no Kotlin plugin needed).
+/// Hand the downloaded APK to the Android package installer.
+///
+/// Primary path is the **`PackageInstaller` Session API** (`do_install_session`):
+/// on modern Android (this app targets SDK 36 / Android 16) the legacy
+/// `ACTION_VIEW` + `application/vnd.android.package-archive` intent is unreliable —
+/// the system install-confirmation dialog frequently just never appears (which is
+/// exactly "the install prompt never shows up"). PackageInstaller is the API Google
+/// documents for this: committing a session makes the *system* drive the
+/// confirmation UI via a status callback, so the prompt reliably shows. We keep the
+/// old `ACTION_VIEW` path (`do_install_legacy`) as a fallback for the rare device
+/// where the session path errors.
 #[cfg(target_os = "android")]
 fn launch_installer(apk_path: &str) -> Result<(), String> {
     use jni::objects::JObject;
@@ -201,23 +215,199 @@ fn launch_installer(apk_path: &str) -> Result<(), String> {
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let context = unsafe { JObject::from_raw(ctx.context().cast()) };
 
-    // Run the JNI sequence, then ALWAYS clear any pending Java exception before
-    // returning. A JNI call that fails because Java threw (e.g. FileProvider misconfig,
-    // or startActivity for the installer while "install unknown apps" is off) leaves
-    // the exception pending; returning to the JVM / detaching the thread with a pending
-    // exception makes ART abort the whole process — which is exactly the "crashes when
-    // trying to install" the user saw. Clearing it turns that into a clean error string
-    // the UI can show ("Update failed — tap to retry") instead of a native crash.
-    let result = do_install(&mut env, &context, apk_path);
+    // Gate up front: without "install unknown apps" the system silently refuses.
+    // Bounce the user to the exact settings screen and return a clear message
+    // instead of firing an install that quietly does nothing. On API < 26 the check
+    // throws NoSuchMethodError → treat as allowed and clear the pending exception.
+    let allowed = can_request_installs(&mut env, &context).unwrap_or(true);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    if !allowed {
+        let _ = open_unknown_sources_settings(&mut env, &context);
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        return Err(
+            "Android needs permission to install updates. We opened the setting — enable \
+             \"Allow from this source\", then tap Update again."
+                .into(),
+        );
+    }
+
+    // Try the modern PackageInstaller session first. Any pending Java exception is
+    // ALWAYS cleared before returning: detaching the thread with an exception pending
+    // makes ART abort the whole process (the old "crashes when installing" bug).
+    let session_result = do_install_session(&mut env, &context, apk_path);
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_describe(); // dump to logcat for diagnosis
         let _ = env.exception_clear();
     }
-    result
+    if session_result.is_ok() {
+        return Ok(());
+    }
+
+    // Fallback: legacy ACTION_VIEW + FileProvider intent.
+    let legacy_result = do_install_legacy(&mut env, &context, apk_path);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    // Surface the session error if the legacy path also failed (it's the more
+    // informative one on a modern device).
+    legacy_result.map_err(|legacy| {
+        let session = session_result.err().unwrap_or_default();
+        if session.is_empty() { legacy } else { format!("{session}; fallback: {legacy}") }
+    })
 }
 
+/// Install the APK via `PackageInstaller` (the reliable modern path). Creates a
+/// session, streams the APK bytes into it, and commits with a `PendingIntent`
+/// targeting our `ApkInstallReceiver` — when the system needs user confirmation it
+/// broadcasts `STATUS_PENDING_USER_ACTION` and the receiver launches the install
+/// dialog. This is JNI-only (no Kotlin plugin); the receiver is a tiny generated
+/// class registered by `scripts/patch-android.mjs`.
 #[cfg(target_os = "android")]
-fn do_install(
+fn do_install_session(
+    env: &mut jni::AttachGuard,
+    context: &jni::objects::JObject,
+    apk_path: &str,
+) -> Result<(), String> {
+    use jni::objects::{JObject, JValue};
+
+    // Load the whole APK into memory once (tens of MB — fine) so we can hand it to
+    // the session's OutputStream in a single JNI write.
+    let bytes = std::fs::read(apk_path).map_err(|e| format!("read apk: {e}"))?;
+    let len = bytes.len() as i64;
+
+    // PackageInstaller installer = context.getPackageManager().getPackageInstaller();
+    let pm = env
+        .call_method(context, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])
+        .map_err(|e| format!("getPackageManager: {e}"))?
+        .l()
+        .map_err(|e| e.to_string())?;
+    let installer = env
+        .call_method(&pm, "getPackageInstaller", "()Landroid/content/pm/PackageInstaller;", &[])
+        .map_err(|e| format!("getPackageInstaller: {e}"))?
+        .l()
+        .map_err(|e| e.to_string())?;
+
+    // SessionParams params = new SessionParams(MODE_FULL_INSTALL); params.setSize(len);
+    const MODE_FULL_INSTALL: i32 = 1;
+    let params = env
+        .new_object(
+            "android/content/pm/PackageInstaller$SessionParams",
+            "(I)V",
+            &[JValue::Int(MODE_FULL_INSTALL)],
+        )
+        .map_err(|e| format!("SessionParams: {e}"))?;
+    let _ = env.call_method(&params, "setSize", "(J)V", &[JValue::Long(len)]);
+
+    // int sessionId = installer.createSession(params);
+    let session_id = env
+        .call_method(
+            &installer,
+            "createSession",
+            "(Landroid/content/pm/PackageInstaller$SessionParams;)I",
+            &[JValue::Object(&params)],
+        )
+        .map_err(|e| format!("createSession: {e}"))?
+        .i()
+        .map_err(|e| e.to_string())?;
+
+    // Session session = installer.openSession(sessionId);
+    let session = env
+        .call_method(
+            &installer,
+            "openSession",
+            "(I)Landroid/content/pm/PackageInstaller$Session;",
+            &[JValue::Int(session_id)],
+        )
+        .map_err(|e| format!("openSession: {e}"))?
+        .l()
+        .map_err(|e| e.to_string())?;
+
+    // OutputStream out = session.openWrite("base.apk", 0, len);
+    let name: JObject = env.new_string("base.apk").map_err(|e| e.to_string())?.into();
+    let out = env
+        .call_method(
+            &session,
+            "openWrite",
+            "(Ljava/lang/String;JJ)Ljava/io/OutputStream;",
+            &[JValue::Object(&name), JValue::Long(0), JValue::Long(len)],
+        )
+        .map_err(|e| format!("openWrite: {e}"))?
+        .l()
+        .map_err(|e| e.to_string())?;
+
+    // out.write(bytes); session.fsync(out); out.flush(); out.close();
+    let jbytes = env.byte_array_from_slice(&bytes).map_err(|e| e.to_string())?;
+    env.call_method(&out, "write", "([B)V", &[JValue::Object(&JObject::from(jbytes))])
+        .map_err(|e| format!("write: {e}"))?;
+    env.call_method(&session, "fsync", "(Ljava/io/OutputStream;)V", &[JValue::Object(&out)])
+        .map_err(|e| format!("fsync: {e}"))?;
+    let _ = env.call_method(&out, "flush", "()V", &[]);
+    env.call_method(&out, "close", "()V", &[]).map_err(|e| format!("close: {e}"))?;
+
+    // Intent statusIntent = new Intent().setClassName(pkg, "<pkg>.ApkInstallReceiver");
+    let pkg_name = env
+        .call_method(context, "getPackageName", "()Ljava/lang/String;", &[])
+        .map_err(|e| e.to_string())?
+        .l()
+        .map_err(|e| e.to_string())?;
+    let receiver: JObject = env
+        .new_string(format!("{PACKAGE_NAME}.ApkInstallReceiver"))
+        .map_err(|e| e.to_string())?
+        .into();
+    let intent = env
+        .new_object("android/content/Intent", "()V", &[])
+        .map_err(|e| e.to_string())?;
+    env.call_method(
+        &intent,
+        "setClassName",
+        "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+        &[JValue::Object(&pkg_name), JValue::Object(&receiver)],
+    )
+    .map_err(|e| format!("setClassName: {e}"))?;
+
+    // PendingIntent pi = PendingIntent.getBroadcast(ctx, sessionId, intent, MUTABLE|UPDATE_CURRENT);
+    // FLAG_MUTABLE (API 31+) is REQUIRED — the system fills the status extras in.
+    const FLAG_UPDATE_CURRENT: i32 = 0x0800_0000;
+    const FLAG_MUTABLE: i32 = 0x0200_0000;
+    let pending = env
+        .call_static_method(
+            "android/app/PendingIntent",
+            "getBroadcast",
+            "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;",
+            &[
+                JValue::Object(context),
+                JValue::Int(session_id),
+                JValue::Object(&intent),
+                JValue::Int(FLAG_UPDATE_CURRENT | FLAG_MUTABLE),
+            ],
+        )
+        .map_err(|e| format!("getBroadcast: {e}"))?
+        .l()
+        .map_err(|e| e.to_string())?;
+    let sender = env
+        .call_method(&pending, "getIntentSender", "()Landroid/content/IntentSender;", &[])
+        .map_err(|e| e.to_string())?
+        .l()
+        .map_err(|e| e.to_string())?;
+
+    // session.commit(sender); session.close();
+    env.call_method(&session, "commit", "(Landroid/content/IntentSender;)V", &[JValue::Object(&sender)])
+        .map_err(|e| format!("commit: {e}"))?;
+    let _ = env.call_method(&session, "close", "()V", &[]);
+    Ok(())
+}
+
+/// Legacy install path: hand the APK to the installer via a FileProvider
+/// content:// URI + `ACTION_VIEW` intent. Kept only as a fallback — on modern
+/// Android the confirmation dialog can silently fail to appear (see
+/// `do_install_session`, the primary path).
+#[cfg(target_os = "android")]
+fn do_install_legacy(
     env: &mut jni::AttachGuard,
     context: &jni::objects::JObject,
     apk_path: &str,
