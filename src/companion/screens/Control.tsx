@@ -300,9 +300,6 @@ export function ControlScreen({
   const frameTimes = useRef<number[]>([]);
   // Debug telemetry: host capture pipeline + decode-side WebRTC stats.
   const [hostStats, setHostStats] = useState<HostStats | null>(null);
-  // True when the PC streams via the native GPU getDisplayMedia path (no Rust JPEG
-  // capture, so there are no per-stage host timings to show — the encoder is on-GPU).
-  const [hostNative, setHostNative] = useState(false);
   const [net, setNet] = useState<NetStats | null>(null);
   const prodRef = useRef<{ frames: number; at: number } | null>(null);
   const netRef = useRef<{ bytes: number; at: number } | null>(null);
@@ -390,14 +387,8 @@ export function ControlScreen({
       else if (e.event === "cursor") setCursorKind(String((e as { kind?: string }).kind || "arrow"));
       else if (e.event === "gamepad") setPadAvailable(!!(e as { available?: boolean }).available);
       else if (e.event === "capstats") {
-        const native = !!(e as { native?: boolean }).native;
-        setHostNative(native);
         const cs = (e as { stats?: RemoteCaptureStats }).stats;
-        if (!cs) {
-          // Native path: no per-stage host timings; clear the stale Rust-path stats.
-          if (native) setHostStats(null);
-          return;
-        }
+        if (!cs) return;
         const now = performance.now();
         const prev = prodRef.current;
         let producedFps: number | undefined;
@@ -497,6 +488,11 @@ export function ControlScreen({
         const m = await apiGet<RemoteMonitor[]>("/api/monitors");
         if (alive && m && m.length) {
           setMonitors(m);
+          // Sync the switcher to the display the host is ACTUALLY capturing — the
+          // selection persists on the host across connections, so assuming index 0
+          // showed the wrong screen number until the user switched once.
+          const sel = m.findIndex((x) => x.selected);
+          setMonitorIdx(sel >= 0 ? sel : 0);
           return;
         }
       } catch {
@@ -1350,14 +1346,8 @@ export function ControlScreen({
               <StatRow k="Resolution" v={`${hostStats.nativeW}×${hostStats.nativeH} → ${hostStats.outW}×${hostStats.outH}`} />
             </>
           )}
-          {hostNative && (
-            <>
-              <div className="my-1 border-t border-white/[0.06]" />
-              <StatRow k="Capture" v="Native GPU (getDisplayMedia)" />
-            </>
-          )}
           <div className="mt-1.5 rounded-lg bg-white/[0.04] px-2 py-1 text-[10px] font-700 text-accent-3">
-            {bottleneckHint(hostStats, net, hostNative)}
+            {bottleneckHint(hostStats, net)}
           </div>
         </div>
       )}
@@ -1754,14 +1744,7 @@ function StatRow({ k, v }: { k: string; v: string }) {
 }
 
 /** A plain-language guess at where the frame-rate is being lost. */
-function bottleneckHint(host: HostStats | null, net: NetStats | null, native = false): string {
-  // Native GPU capture has no host CPU cost worth reporting; a low frame rate is
-  // then network- or decoder-bound, never host-capture-bound.
-  if (native) {
-    if (net && net.freezes > 0 && net.fps < 24) return "Bottleneck: unstable link (freezes). Lower bitrate.";
-    if (net && net.dropped > 0 && net.fps < 20) return "Bottleneck: network / decoder. Lower bitrate or resolution.";
-    return "Native GPU capture — pipeline healthy.";
-  }
+function bottleneckHint(host: HostStats | null, net: NetStats | null): string {
   if (!host && !net) return "Gathering stats…";
   const target = host?.fps ?? 30;
   const produced = host?.producedFps;

@@ -1233,6 +1233,8 @@ export interface RemoteMonitor {
   width: number;
   height: number;
   isPrimary: boolean;
+  /** The display the host is currently capturing (persists across connections). */
+  selected: boolean;
 }
 
 /** Desktop-audio loopback PCM format (see remote_start_audio). */

@@ -197,6 +197,11 @@ pub struct MonitorInfo {
     pub width: u32,
     pub height: u32,
     pub is_primary: bool,
+    /// True for the display the host is CURRENTLY capturing. `SELECTED_MONITOR` is a
+    /// process-global that persists across phone connections, so the phone can't
+    /// assume index 0 — it must read this to show the right screen number on connect
+    /// (otherwise the label is wrong until the user switches displays once).
+    pub selected: bool,
 }
 
 /// All monitors in a **stable order** (left-to-right, then top-to-bottom) so an
@@ -222,6 +227,7 @@ fn monitor_at(index: usize) -> Option<Monitor> {
 
 /// Public list for the phone's monitor picker.
 pub fn list_monitors() -> Vec<MonitorInfo> {
+    let sel = selected_monitor();
     sorted_monitors()
         .into_iter()
         .enumerate()
@@ -231,6 +237,7 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
             width: m.width().unwrap_or(0),
             height: m.height().unwrap_or(0),
             is_primary: m.is_primary().unwrap_or(false),
+            selected: index == sel,
         })
         .collect()
 }

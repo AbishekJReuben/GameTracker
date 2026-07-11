@@ -25,8 +25,7 @@
         "transparent": false,
         "dragDropEnabled": true,
         "backgroundColor": "#08090f",
-        "theme": "Dark",
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --auto-select-desktop-capture-source=\"Entire screen\" --autoplay-policy=no-user-gesture-required"
+        "theme": "Dark"
       }
     ],
     "security": {
