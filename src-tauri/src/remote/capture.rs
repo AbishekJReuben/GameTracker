@@ -469,6 +469,98 @@ pub fn stop_capture() {
     CAP_GEN.fetch_add(1, Ordering::SeqCst);
 }
 
+// ---------------------------------------------------------------------------
+// Aux (pop-out) capture — one lightweight pipeline per monitor index so a second
+// browser tab can stream display 2 while the primary DXGI path keeps display 1.
+// Uses xcap full-frame grabs (no second Desktop Duplication session) so it can't
+// fight the primary pipeline for an output.
+// ---------------------------------------------------------------------------
+
+struct AuxSlot {
+    gen: AtomicU32,
+    running: AtomicBool,
+}
+
+static AUX: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::HashMap<usize, Arc<AuxSlot>>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn aux_slot(monitor: usize) -> Arc<AuxSlot> {
+    let mut map = AUX.lock();
+    map.entry(monitor)
+        .or_insert_with(|| {
+            Arc::new(AuxSlot {
+                gen: AtomicU32::new(0),
+                running: AtomicBool::new(false),
+            })
+        })
+        .clone()
+}
+
+/// Stop one aux monitor pipeline, or every aux pipeline when `monitor` is `None`.
+pub fn stop_aux_capture(monitor: Option<usize>) {
+    let map = AUX.lock();
+    if let Some(m) = monitor {
+        if let Some(s) = map.get(&m) {
+            s.running.store(false, Ordering::SeqCst);
+            s.gen.fetch_add(1, Ordering::SeqCst);
+        }
+    } else {
+        for s in map.values() {
+            s.running.store(false, Ordering::SeqCst);
+            s.gen.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Stream JPEG frames of a **fixed** monitor for a multi-monitor pop-out tab.
+pub fn start_aux_capture<F>(monitor: usize, max_w: u32, fps: u32, quality: u32, emit: F)
+where
+    F: Fn(Vec<u8>) + Send + 'static,
+{
+    let slot = aux_slot(monitor);
+    let my_gen = slot.gen.fetch_add(1, Ordering::SeqCst) + 1;
+    slot.running.store(true, Ordering::SeqCst);
+    let max_w = max_w.clamp(320, 3840);
+    let fps = fps.clamp(1, 60);
+    let quality = quality.clamp(20, 95) as u8;
+
+    std::thread::spawn(move || {
+        let budget = Duration::from_millis((1000 / fps).clamp(16, 1000) as u64);
+        let mut last: Option<Arc<Vec<u8>>> = None;
+        let mut last_wh = (0u32, 0u32);
+        let mut last_emit = Instant::now() - Duration::from_secs(2);
+        while slot.running.load(Ordering::SeqCst) && slot.gen.load(Ordering::SeqCst) == my_gen {
+            let t0 = Instant::now();
+            let mut sent = false;
+            if let Some(rgba) = monitor_at(monitor).and_then(|m| m.capture_image().ok()) {
+                let (sw, sh) = (rgba.width(), rgba.height());
+                let raw = rgba.into_raw();
+                if let Some((rgb, w, h)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, false, false) {
+                    let changed = last.as_ref().map_or(true, |prev| {
+                        last_wh != (w, h) || prev.as_slice() != rgb.as_slice()
+                    });
+                    let stale = last_emit.elapsed() >= Duration::from_millis(900);
+                    if changed || stale {
+                        if let Some(jpg) = encode_frame(&rgb, w, h, quality) {
+                            let arc = Arc::new(rgb);
+                            last = Some(arc);
+                            last_wh = (w, h);
+                            emit(jpg);
+                            last_emit = Instant::now();
+                            sent = true;
+                        }
+                    }
+                }
+            }
+            let _ = sent;
+            let elapsed = t0.elapsed();
+            if elapsed < budget {
+                std::thread::sleep(budget - elapsed);
+            }
+        }
+    });
+}
+
 /// One captured + downscaled frame handed from the capture thread to the encoder
 /// thread through a single-slot mailbox (latest-wins, so a slow encoder never
 /// backs up latency — it just skips stale frames).

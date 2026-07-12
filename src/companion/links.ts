@@ -19,6 +19,9 @@ export type ControlMsg =
   | { type: "keydown"; name: string }
   | { type: "keyup"; name: string }
   | { type: "monitor"; index: number }
+  /** Ask the desktop host to start (or keep) an aux WebRTC room for this monitor. */
+  | { type: "auxHost"; monitor: number }
+  | { type: "auxStop"; monitor: number }
   // Virtual-gamepad stream: a physical controller attached to the phone. `buttons`
   // is an XInput-style bitmask; sticks are -1..1 (Y flipped to up-positive),
   // triggers 0..1. `gamepadprobe` asks the host if ViGEmBus is installed;

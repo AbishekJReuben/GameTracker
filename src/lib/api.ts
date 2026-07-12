@@ -1210,9 +1210,17 @@ export const api = {
   // ArrayBuffer JPEGs over the channel; no per-frame invoke round-trip).
   remoteStartCapture: (onFrame: Channel<ArrayBuffer>, maxW: number, fps: number, quality: number) =>
     call<void>("remote_start_capture", { onFrame, maxW, fps, quality }),
+  remoteStartAuxCapture: (
+    monitor: number,
+    onFrame: Channel<ArrayBuffer>,
+    maxW: number,
+    fps: number,
+    quality: number,
+  ) => call<void>("remote_start_aux_capture", { monitor, onFrame, maxW, fps, quality }),
   remoteSetCaptureQuality: (maxW: number, fps: number, quality: number, content?: number) =>
     call<void>("remote_set_capture_quality", { maxW, fps, quality, content }),
   remoteStopCapture: () => call<void>("remote_stop_capture"),
+  remoteStopAuxCapture: (monitor?: number) => call<void>("remote_stop_aux_capture", { monitor }),
   // Desktop-audio (WASAPI loopback) for the WebRTC audio track. PCM float32 frames
   // arrive as ArrayBuffers; returns the mix format to decode them with.
   remoteStartAudio: (onPcm: Channel<ArrayBuffer>) =>
@@ -1224,6 +1232,8 @@ export const api = {
   remoteListMonitors: () => call<RemoteMonitor[]>("remote_list_monitors"),
   remoteReadMedia: (path: string) => call<string | null>("remote_read_media", { path }),
   remoteInject: (event: Record<string, unknown>) => call<void>("remote_inject", { event }),
+  remoteInjectOn: (monitor: number, event: Record<string, unknown>) =>
+    call<void>("remote_inject_on", { monitor, event }),
   remoteGamepadAvailable: () => call<boolean>("remote_gamepad_available"),
 };
 

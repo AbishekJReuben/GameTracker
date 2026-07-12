@@ -2135,6 +2135,12 @@ pub fn remote_inject(event: crate::remote::input::ControlEvent) {
     crate::remote::input::inject(event);
 }
 
+/// Inject on a specific monitor (multi-monitor pop-out tabs).
+#[tauri::command]
+pub fn remote_inject_on(monitor: usize, event: crate::remote::input::ControlEvent) {
+    crate::remote::input::inject_on_monitor(monitor, event);
+}
+
 /// Whether a virtual gamepad can be created on this PC (the ViGEmBus driver is
 /// installed). The phone probes this before offering controller mode so it can
 /// prompt the user to install the driver when it's missing.
@@ -2206,6 +2212,29 @@ pub fn remote_set_capture_quality(max_w: u32, fps: u32, quality: u32, content: O
 #[tauri::command]
 pub fn remote_stop_capture() {
     crate::remote::capture::stop_capture();
+}
+
+/// Start a lightweight aux capture pipeline for a fixed monitor (pop-out tab).
+#[tauri::command]
+pub fn remote_start_aux_capture(
+    monitor: usize,
+    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+    max_w: Option<u32>,
+    fps: Option<u32>,
+    quality: Option<u32>,
+) {
+    let w = max_w.unwrap_or(1600);
+    let f = fps.unwrap_or(30);
+    let q = quality.unwrap_or(70);
+    crate::remote::capture::start_aux_capture(monitor, w, f, q, move |jpg| {
+        let _ = on_frame.send(tauri::ipc::InvokeResponseBody::Raw(jpg));
+    });
+}
+
+/// Stop one aux capture pipeline, or all of them when `monitor` is omitted.
+#[tauri::command]
+pub fn remote_stop_aux_capture(monitor: Option<usize>) {
+    crate::remote::capture::stop_aux_capture(monitor);
 }
 
 /// Start desktop-audio (WASAPI loopback) capture for the WebRTC audio track. PCM

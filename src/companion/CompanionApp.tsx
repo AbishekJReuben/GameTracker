@@ -19,7 +19,7 @@ import {
   Download,
   X,
 } from "lucide-react";
-import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
+import { DEFAULT_SIGNAL_URL, auxMonitorRoom } from "@/lib/remoteConfig";
 import { Pairing, type Connected } from "./Pairing";
 import { setCloudMode } from "./link";
 import { makeRtcLink, type RemoteLink } from "./links";
@@ -48,6 +48,20 @@ const LS_CODE = "gt.remote.code"; // remembered code → auto-connect on launch
 const LS_SIGNAL = "gt.remote.signal";
 const LS_SECRET = "gt.remote.secret"; // remembered permanent key (optional)
 
+/** Multi-monitor pop-out: `?popout=1&monitor=N` joins the sibling room for that display. */
+function readPopoutMonitor(): number | null {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    if (q.get("popout") !== "1") return null;
+    const n = Number(q.get("monitor"));
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+  } catch {
+    return null;
+  }
+}
+
+const POPOUT_MONITOR = readPopoutMonitor();
+
 const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "stats", label: "Home", icon: LayoutDashboard },
   { id: "library", label: "Library", icon: Library },
@@ -68,6 +82,7 @@ export function CompanionApp() {
   const autoConnRef = useRef<CloudConn | null>(null);
   // Full-screen game-detail overlay, opened from any screen via `openGame(id)`.
   const detailId = useOpenGame();
+  const isPopout = POPOUT_MONITOR != null;
 
   const adopt = useCallback((c: CloudConn, code?: string, signalUrl?: string, secret?: string) => {
     autoConnRef.current = null;
@@ -105,7 +120,8 @@ export function CompanionApp() {
     setActiveCode(code);
     const signalUrl = localStorage.getItem(LS_SIGNAL) || DEFAULT_SIGNAL_URL;
     const secret = localStorage.getItem(LS_SECRET) || undefined;
-    const c = new CloudConn(signalUrl, code, {
+    const room = POPOUT_MONITOR != null ? auxMonitorRoom(code, POPOUT_MONITOR) : code;
+    const c = new CloudConn(signalUrl, room, {
       deviceId: deviceId(),
       name: getCompanionRuntime().deviceName?.() ?? deviceName(),
       secret,
@@ -251,7 +267,12 @@ export function CompanionApp() {
             <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} />
           )}
           {tab === "control" && (
-            <ControlTab conn={conn} onNavigate={(t) => setTab(t)} onDisconnect={disconnect} />
+            <ControlTab
+              conn={conn}
+              onNavigate={isPopout ? undefined : (t) => setTab(t)}
+              onDisconnect={disconnect}
+              popoutMonitor={POPOUT_MONITOR}
+            />
           )}
         </ScreenErrorBoundary>
       </main>
@@ -397,10 +418,12 @@ function ControlTab({
   conn,
   onNavigate,
   onDisconnect,
+  popoutMonitor,
 }: {
   conn: CloudConn;
-  onNavigate: (t: Tab) => void;
+  onNavigate?: (t: Tab) => void;
   onDisconnect: () => void;
+  popoutMonitor?: number | null;
 }) {
   const link: RemoteLink = useMemo(() => makeRtcLink(conn), [conn]);
   const rt = getCompanionRuntime();
@@ -420,6 +443,7 @@ function ControlTab({
       onEnterVr={rt.onEnterVr}
       vrMode={rt.vrMode}
       onVrModeChange={rt.onVrModeChange}
+      popoutMonitor={popoutMonitor}
     />
   );
 }

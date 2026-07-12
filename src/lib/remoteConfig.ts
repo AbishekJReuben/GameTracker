@@ -20,3 +20,13 @@ export const DEFAULT_SIGNAL_URL = "wss://discovery.chilloutgamestudio.com";
 
 /** Local port the signaling server binds; the Cloudflare Tunnel's origin target. */
 export const SIGNAL_PORT = 8080;
+
+/**
+ * Per-monitor pop-out tabs join a sibling signaling room so each display can
+ * stream independently (main room = primary connection, `code~m1` = monitor 1…).
+ */
+export function auxMonitorRoom(code: string, monitor: number): string {
+  const base = code.trim().toUpperCase();
+  if (monitor <= 0) return base;
+  return `${base}~m${monitor}`;
+}

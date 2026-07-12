@@ -297,3 +297,17 @@ pub fn inject(ev: ControlEvent) {
         }
     }
 }
+
+/// Pin absolute input to `monitor`, then apply `ev` — both queued under one lock
+/// so a concurrent primary-tab inject can't land between the switch and the move.
+pub fn inject_on_monitor(monitor: usize, ev: ControlEvent) {
+    let mut guard = CONTROLLER.lock();
+    if guard.is_none() {
+        *guard = spawn_controller();
+    }
+    if let Some(tx) = guard.as_ref() {
+        if tx.send(ControlEvent::Monitor { index: monitor }).is_err() || tx.send(ev).is_err() {
+            *guard = None;
+        }
+    }
+}

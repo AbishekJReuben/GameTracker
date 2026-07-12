@@ -14,6 +14,7 @@
 import { Channel } from "@tauri-apps/api/core";
 import { api, type RemoteCaptureStats } from "./api";
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "./rtc";
+import { auxMonitorRoom } from "./remoteConfig";
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
 export interface HostLiveStats {
@@ -60,6 +61,11 @@ interface HostOptions {
   onStats?: (s: HostLiveStats | null) => void;
   /** Ask the desktop UI to approve an untrusted device; resolves the user's choice. */
   onApprovalRequest?: (req: ApprovalRequest) => Promise<ApprovalDecision>;
+  /**
+   * When set, this host instance serves only that monitor via the lightweight aux
+   * capture path (multi-monitor pop-out tabs). Primary hosts leave this unset.
+   */
+  fixedMonitor?: number;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -284,6 +290,22 @@ export function startHost(opts: HostOptions): () => void {
   // ping — the guest pings every 5s while alive). Used to tell a *live* session
   // apart from a zombie one when signaling-level join/leave notices arrive.
   let lastGuestMsg = 0;
+  /** Pop-out monitor hosts spawned from the primary (monitor index → stop). */
+  const auxStops = new Map<number, () => void>();
+
+  const ensureAuxHost = (monitor: number) => {
+    if (opts.fixedMonitor != null || stopped) return;
+    if (auxStops.has(monitor)) return;
+    const stop = startHost({
+      signalUrl: opts.signalUrl,
+      code: auxMonitorRoom(opts.code, monitor),
+      iceServers: opts.iceServers,
+      fps: opts.fps,
+      fixedMonitor: monitor,
+      onApprovalRequest: opts.onApprovalRequest,
+    });
+    auxStops.set(monitor, stop);
+  };
 
   // Live stream-quality state; the guest re-tunes it over the control channel.
   // `bitrate` is kbps (0 = auto: derive from resolution/fps via bitrateFor).
@@ -291,7 +313,8 @@ export function startHost(opts: HostOptions): () => void {
 
   const stopCapture = () => {
     try {
-      api.remoteStopCapture();
+      if (opts.fixedMonitor != null) api.remoteStopAuxCapture(opts.fixedMonitor);
+      else api.remoteStopCapture();
     } catch {
       /* not on desktop / already stopped */
     }
@@ -565,7 +588,10 @@ export function startHost(opts: HostOptions): () => void {
     // source, so the OS "Choose what to share" picker popped up on the host every
     // connection. The Rust DXGI pipeline (persistent duplication + GPU downscale +
     // parallel encode) needs no picker and is already heavily optimized.
-    const start = () => api.remoteStartCapture(ch, quality.maxW, quality.fps, quality.jpeg);
+    const start = () =>
+      opts.fixedMonitor != null
+        ? api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, quality.jpeg)
+        : api.remoteStartCapture(ch, quality.maxW, quality.fps, quality.jpeg);
     return { track, start };
   };
 
@@ -908,11 +934,14 @@ export function startHost(opts: HostOptions): () => void {
       videoSender = pc.addTrack(videoTrack, new MediaStream([videoTrack]));
       startVideoCapture = v.start;
     }
-    const a = await buildAudioTrack();
-    if (a) {
-      audioTrack = a.track;
-      pc.addTrack(audioTrack, new MediaStream([audioTrack]));
-      startAudioCapture = a.start;
+    // Aux pop-out hosts skip desktop audio — the primary session already carries it.
+    if (opts.fixedMonitor == null) {
+      const a = await buildAudioTrack();
+      if (a) {
+        audioTrack = a.track;
+        pc.addTrack(audioTrack, new MediaStream([audioTrack]));
+        startAudioCapture = a.start;
+      }
     }
 
     // Prefer H.264 for the screen: hardware encode on the PC and hardware decode
@@ -993,8 +1022,19 @@ export function startHost(opts: HostOptions): () => void {
           }
           return;
         }
+        // Multi-monitor pop-out: spin up (or keep) an aux host for that display.
+        if (msg && msg.type === "auxHost" && typeof msg.monitor === "number") {
+          ensureAuxHost(msg.monitor);
+          return;
+        }
+        if (msg && msg.type === "auxStop" && typeof msg.monitor === "number") {
+          auxStops.get(msg.monitor)?.();
+          auxStops.delete(msg.monitor);
+          return;
+        }
         // The `quality` message re-tunes the capture + encoder; not an input event.
         if (msg && msg.type === "quality") {
+          if (opts.fixedMonitor != null) return; // aux quality is fixed at start
           if (typeof msg.maxW === "number") quality.maxW = clamp(msg.maxW, 320, 3840);
           if (typeof msg.quality === "number") quality.jpeg = clamp(msg.quality, 20, 95);
           if (typeof msg.fps === "number") quality.fps = clamp(msg.fps, 1, 120);
@@ -1025,7 +1065,8 @@ export function startHost(opts: HostOptions): () => void {
         }
         // Everything else is an input event — never inject before authorization.
         if (!authorized) return;
-        api.remoteInject(msg);
+        if (opts.fixedMonitor != null) api.remoteInjectOn(opts.fixedMonitor, msg);
+        else api.remoteInject(msg);
         // A click can move focus into (or out of) a PC text field. Poll focus a few
         // times right after so the phone learns to pop its keyboard with minimal
         // lag — while the tap's user-activation is still fresh on the phone.
@@ -1257,6 +1298,8 @@ export function startHost(opts: HostOptions): () => void {
       clearTimeout(sigRetry);
       sigRetry = null;
     }
+    for (const stop of auxStops.values()) stop();
+    auxStops.clear();
     teardownPeer();
     sig?.close();
     sig = null;

@@ -61,6 +61,7 @@ import {
   Headset,
   Plus,
   Trash2,
+  AppWindow,
 } from "lucide-react";
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { startGamepadBridge } from "../gamepad";
@@ -195,7 +196,7 @@ type Layout = { cw: number; ch: number; dispW: number; dispH: number; offX: numb
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-/** Container size + the object-contain image box within it (at zoom 1). */
+/** Container size + the object-contain image box within it (at zoom 1). Fallback only. */
 function measure(el: HTMLElement | null, natW: number, natH: number): Layout | null {
   if (!el || !natW || !natH) return null;
   const r = el.getBoundingClientRect();
@@ -218,18 +219,37 @@ function clampPan(l: Layout, zoom: number, panX: number, panY: number) {
   return { x: clamp(panX, -maxX, maxX), y: clamp(panY, -maxY, maxY) };
 }
 
-/** Normalized image coords (0..1) for a screen point, undoing pan+zoom. */
-function screenToNorm(l: Layout, left: number, top: number, zoom: number, panX: number, panY: number, cx: number, cy: number) {
-  const px = l.cw / 2 + (cx - left - l.cw / 2 - panX) / zoom;
-  const py = l.ch / 2 + (cy - top - l.ch / 2 - panY) / zoom;
-  return { x: clamp((px - l.offX) / l.dispW, 0, 1), y: clamp((py - l.offY) / l.dispH, 0, 1) };
+/**
+ * Map a client point → normalized image coords using the **live** video/canvas
+ * bounding box (already includes CSS pan/zoom). This stays correct across
+ * browser fullscreen, collapsing chrome, and orientation changes — unlike a
+ * cached object-contain Layout that can lag a frame behind the real paint.
+ */
+function clientToNorm(media: HTMLElement | null, clientX: number, clientY: number): { x: number; y: number } | null {
+  if (!media) return null;
+  const r = media.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return null;
+  return {
+    x: clamp((clientX - r.left) / r.width, 0, 1),
+    y: clamp((clientY - r.top) / r.height, 0, 1),
+  };
 }
 
-/** Container-relative pixel position of a normalized cursor, applying pan+zoom. */
-function normToScreen(l: Layout, zoom: number, panX: number, panY: number, nx: number, ny: number) {
-  const px = l.offX + nx * l.dispW;
-  const py = l.offY + ny * l.dispH;
-  return { x: l.cw / 2 + (px - l.cw / 2) * zoom + panX, y: l.ch / 2 + (py - l.ch / 2) * zoom + panY };
+/** Viewport-relative pixel of a normalized cursor, from the live media box. */
+function normToViewport(
+  viewport: HTMLElement | null,
+  media: HTMLElement | null,
+  nx: number,
+  ny: number,
+): { x: number; y: number } | null {
+  if (!viewport || !media) return null;
+  const vr = viewport.getBoundingClientRect();
+  const mr = media.getBoundingClientRect();
+  if (mr.width < 2 || mr.height < 2) return null;
+  return {
+    x: mr.left - vr.left + nx * mr.width,
+    y: mr.top - vr.top + ny * mr.height,
+  };
 }
 
 /** CSS cursor for absolute mouse/pen / Quest laser — mirrors the host desktop shape. */
@@ -275,6 +295,7 @@ export function ControlScreen({
   onEnterVr,
   vrMode = "pointer",
   onVrModeChange,
+  popoutMonitor = null,
 }: {
   link: RemoteLink;
   onNavigate?: (tab: NavTab) => void;
@@ -285,6 +306,8 @@ export function ControlScreen({
   /** Quest: pointer vs virtual Xbox pad for immersive sessions. */
   vrMode?: "pointer" | "gamepad";
   onVrModeChange?: (mode: "pointer" | "gamepad") => void;
+  /** When set, this tab is a multi-monitor pop-out locked to that display index. */
+  popoutMonitor?: number | null;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -822,9 +845,19 @@ export function ControlScreen({
   }, [link, showStats]);
 
   const selectMonitor = (i: number) => {
+    if (popoutMonitor != null) return; // pop-out tabs are locked to one display
     setMonitorIdx(i);
     send({ type: "monitor", index: i });
     resetView();
+  };
+
+  const openMonitorPopout = (i: number) => {
+    if (popoutMonitor != null) return;
+    send({ type: "auxHost", monitor: i });
+    const u = new URL(window.location.href);
+    u.searchParams.set("popout", "1");
+    u.searchParams.set("monitor", String(i));
+    window.open(u.toString(), `gt-mon-${i}`);
   };
 
   // Push quality to the desktop whenever it changes AND on every (re)connect.
@@ -858,36 +891,46 @@ export function ControlScreen({
   }, []);
 
   // Keep layout measurement fresh on resize / orientation / chrome / fullscreen.
-  // Stale layout after collapsing bars or toggling browser fullscreen is what
-  // makes the remote cursor land beside the finger/laser instead of under it.
+  // Browser fullscreen transitions finish asynchronously — pulse remeasures for ~1s.
   useEffect(() => {
     const refreshLayout = () => {
       const l = measure(viewportRef.current, natRef.current.w, natRef.current.h);
       if (l) layoutRef.current = l;
+      // Force cursor overlay to re-anchor against the live media box.
+      setCursor((c) => ({ ...c }));
     };
-    // Double-rAF: wait until the browser has applied the new flex sizes.
     const schedule = () => {
       requestAnimationFrame(() => {
         refreshLayout();
         requestAnimationFrame(refreshLayout);
       });
     };
-    schedule();
-    window.addEventListener("resize", schedule);
-    window.addEventListener("orientationchange", schedule);
+    const pulse = () => {
+      schedule();
+      for (const ms of [50, 120, 250, 450, 800]) window.setTimeout(schedule, ms);
+    };
+    pulse();
+    window.addEventListener("resize", pulse);
+    window.addEventListener("orientationchange", pulse);
+    document.addEventListener("fullscreenchange", pulse);
+    document.addEventListener("webkitfullscreenchange", pulse);
     const vv = window.visualViewport;
-    vv?.addEventListener("resize", schedule);
-    vv?.addEventListener("scroll", schedule);
+    vv?.addEventListener("resize", pulse);
+    vv?.addEventListener("scroll", pulse);
     let ro: ResizeObserver | undefined;
     if (viewportRef.current && typeof ResizeObserver !== "undefined") {
       ro = new ResizeObserver(schedule);
       ro.observe(viewportRef.current);
+      const media = videoRef.current || canvasRef.current;
+      if (media) ro.observe(media);
     }
     return () => {
-      window.removeEventListener("resize", schedule);
-      window.removeEventListener("orientationchange", schedule);
-      vv?.removeEventListener("resize", schedule);
-      vv?.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", pulse);
+      window.removeEventListener("orientationchange", pulse);
+      document.removeEventListener("fullscreenchange", pulse);
+      document.removeEventListener("webkitfullscreenchange", pulse);
+      vv?.removeEventListener("resize", pulse);
+      vv?.removeEventListener("scroll", pulse);
       ro?.disconnect();
     };
   }, [immersive, topCollapsed, dockCollapsed, panel, browserFs, typing, hasStream]);
@@ -927,19 +970,31 @@ export function ControlScreen({
     return l;
   };
 
+  /** The painted screen surface (video track or LAN canvas) — source of truth for hit-testing. */
+  const mediaEl = (): HTMLElement | null => {
+    const v = videoRef.current;
+    if (v && v.srcObject && v.videoWidth > 0) return v;
+    const c = canvasRef.current;
+    if (c && c.width > 0) return c;
+    return v ?? c;
+  };
+
   const setCursorPos = (nx: number, ny: number) => {
     cursorRef.current = { x: clamp(nx, 0, 1), y: clamp(ny, 0, 1) };
     // Edge pan-follow (zoomed in): keep the cursor comfortably inside the viewport.
-    const l = layoutRef.current ?? liveLayout();
-    if (l && zoomRef.current > 1.01) {
-      const s = normToScreen(l, zoomRef.current, panRef.current.x, panRef.current.y, cursorRef.current.x, cursorRef.current.y);
-      let px = panRef.current.x;
-      let py = panRef.current.y;
-      if (s.x < FOLLOW_MARGIN) px += FOLLOW_MARGIN - s.x;
-      else if (s.x > l.cw - FOLLOW_MARGIN) px -= s.x - (l.cw - FOLLOW_MARGIN);
-      if (s.y < FOLLOW_MARGIN) py += FOLLOW_MARGIN - s.y;
-      else if (s.y > l.ch - FOLLOW_MARGIN) py -= s.y - (l.ch - FOLLOW_MARGIN);
-      panRef.current = clampPan(l, zoomRef.current, px, py);
+    const l = liveLayout();
+    const media = mediaEl();
+    if (l && media && zoomRef.current > 1.01) {
+      const s = normToViewport(viewportRef.current, media, cursorRef.current.x, cursorRef.current.y);
+      if (s) {
+        let px = panRef.current.x;
+        let py = panRef.current.y;
+        if (s.x < FOLLOW_MARGIN) px += FOLLOW_MARGIN - s.x;
+        else if (s.x > l.cw - FOLLOW_MARGIN) px -= s.x - (l.cw - FOLLOW_MARGIN);
+        if (s.y < FOLLOW_MARGIN) py += FOLLOW_MARGIN - s.y;
+        else if (s.y > l.ch - FOLLOW_MARGIN) py -= s.y - (l.ch - FOLLOW_MARGIN);
+        panRef.current = clampPan(l, zoomRef.current, px, py);
+      }
     }
     commitView();
     queueMove(cursorRef.current.x, cursorRef.current.y);
@@ -1035,10 +1090,8 @@ export function ControlScreen({
 
   /** Absolute cursor from a viewport client point (laser / mouse / surface touchpad). */
   const moveAbsFromClient = (clientX: number, clientY: number) => {
-    const l = liveLayout();
-    if (!l || !viewportRef.current) return;
-    const r = rect();
-    const n = screenToNorm(l, r.left, r.top, zoomRef.current, panRef.current.x, panRef.current.y, clientX, clientY);
+    const n = clientToNorm(mediaEl(), clientX, clientY);
+    if (!n) return;
     setCursorPos(n.x, n.y);
   };
 
@@ -1549,10 +1602,9 @@ export function ControlScreen({
   // must never shrink the remote viewport.
   const bottomReserve = questBrowser ? 0 : kbInset;
   const cursorScreen = useMemo(() => {
-    const l = layoutRef.current;
-    return l ? normToScreen(l, zoom, pan.x, pan.y, cursor.x, cursor.y) : null;
+    return normToViewport(viewportRef.current, mediaEl(), cursor.x, cursor.y);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor, zoom, pan]);
+  }, [cursor, zoom, pan, hasStream, immersive, topCollapsed, dockCollapsed, browserFs]);
   // Trackpad / Quest: hide the OS pointer and draw RemoteCursor (shape mirrors host).
   // Desktop web mouse/pen: live CSS cursor instead (no double-cursor).
   const showRemoteCursor = mode === "trackpad" || questBrowser;
@@ -1635,14 +1687,34 @@ export function ControlScreen({
           </div>
 
           <div className="flex shrink-0 items-center gap-1 overflow-x-auto" style={{ scrollbarWidth: "none" }}>
-            {monitors.length > 1 && (
-              <button
-                onClick={() => selectMonitor((monitorIdx + 1) % monitors.length)}
-                className="flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1.5 text-xs font-700 text-ink-soft active:scale-95"
-                title="Switch display"
-              >
-                <Monitor className="h-3.5 w-3.5" /> {monitorIdx + 1}/{monitors.length}
-              </button>
+            {popoutMonitor != null ? (
+              <span className="flex items-center gap-1 rounded-lg bg-accent-3/15 px-2 py-1.5 text-xs font-700 text-accent-3">
+                <Monitor className="h-3.5 w-3.5" /> Display {popoutMonitor + 1}
+              </span>
+            ) : (
+              monitors.length > 1 && (
+                <>
+                  <button
+                    onClick={() => selectMonitor((monitorIdx + 1) % monitors.length)}
+                    className="flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1.5 text-xs font-700 text-ink-soft active:scale-95"
+                    title="Switch display in this tab"
+                  >
+                    <Monitor className="h-3.5 w-3.5" /> {monitorIdx + 1}/{monitors.length}
+                  </button>
+                  {monitors
+                    .filter((m) => m.index !== monitorIdx)
+                    .map((m) => (
+                      <button
+                        key={m.index}
+                        onClick={() => openMonitorPopout(m.index)}
+                        className="flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1.5 text-xs font-700 text-ink-soft active:scale-95"
+                        title={`Open ${m.name || `Display ${m.index + 1}`} in a new tab (side-by-side)`}
+                      >
+                        <AppWindow className="h-3.5 w-3.5" /> {m.index + 1}
+                      </button>
+                    ))}
+                </>
+              )
             )}
             <button
               onClick={onZoomButton}

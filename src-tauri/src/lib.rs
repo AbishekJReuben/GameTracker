@@ -349,6 +349,8 @@ pub fn run() {
             commands::remote_start_capture,
             commands::remote_set_capture_quality,
             commands::remote_stop_capture,
+            commands::remote_start_aux_capture,
+            commands::remote_stop_aux_capture,
             commands::remote_start_audio,
             commands::remote_stop_audio,
             commands::remote_textfield_active,
@@ -357,6 +359,7 @@ pub fn run() {
             commands::remote_list_monitors,
             commands::remote_read_media,
             commands::remote_inject,
+            commands::remote_inject_on,
             commands::remote_gamepad_available,
         ])
         .build(tauri::generate_context!())
