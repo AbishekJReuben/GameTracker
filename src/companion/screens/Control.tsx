@@ -21,6 +21,8 @@ import {
   Command,
   Maximize2,
   Minimize2,
+  Expand,
+  Shrink,
   Camera,
   MousePointerClick,
   Grip,
@@ -56,6 +58,9 @@ import {
   Ban,
   Grab,
   Gamepad2,
+  Headset,
+  Plus,
+  Trash2,
 } from "lucide-react";
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { startGamepadBridge } from "../gamepad";
@@ -63,6 +68,7 @@ import { apiGet } from "../link";
 import type { ConnectSnapshot } from "../cloud";
 import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
+import { isQuestBrowser } from "../device";
 
 type HostStats = RemoteCaptureStats & { producedFps?: number };
 type NetStats = { fps: number; kbps: number; w: number; h: number; jitterMs: number; lostPkts: number; dropped: number; freezes: number };
@@ -83,7 +89,7 @@ type Mod = "ctrl" | "alt" | "shift" | "win";
 type KbMode = "direct" | "buffered";
 type NavTab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
 /** Which bottom control panel is expanded (null = collapsed to just the tab strip).
- * (Keyboard is no longer a panel — it's an always-mounted floating compose bar.) */
+ * Keyboard uses a ghost input (Surface Keyboard / IME); phone gets a flex compose row. */
 type Panel = "mouse" | "keys" | "shortcuts" | "quality" | "gamepad";
 
 /** A pinnable key / shortcut: `keys` are the keycap labels (>1 → combo joined by +). */
@@ -96,6 +102,85 @@ type KeyDef = {
   /** For sticky modifiers, the modifier this key represents (drives active state). */
   mod?: Mod;
 };
+
+/** User-defined chord stored in `gt.remote.customShortcuts`. */
+type CustomShortcut = {
+  id: string;
+  label?: string;
+  mods: Mod[];
+  key: string;
+};
+
+const MOD_LABEL: Record<Mod, string> = { ctrl: "Ctrl", alt: "Alt", shift: "Shift", win: "Win" };
+const ALL_MODS: Mod[] = ["ctrl", "alt", "shift", "win"];
+
+/** Display label for a wire key name used in custom shortcuts. */
+function keyCapLabel(k: string): string {
+  const map: Record<string, string> = {
+    escape: "Esc",
+    tab: "Tab",
+    enter: "↵",
+    delete: "Del",
+    backspace: "⌫",
+    space: "Space",
+    home: "Home",
+    end: "End",
+    pageup: "PgUp",
+    pagedown: "PgDn",
+    insert: "Ins",
+    left: "←",
+    up: "↑",
+    down: "↓",
+    right: "→",
+  };
+  if (map[k]) return map[k];
+  if (/^f\d+$/i.test(k)) return k.toUpperCase();
+  return k.length === 1 ? k.toUpperCase() : k;
+}
+
+/** Keys the custom-shortcut editor can pick as the final chord key. */
+const SHORTCUT_KEY_OPTIONS: { value: string; label: string }[] = [
+  ...Array.from({ length: 26 }, (_, i) => {
+    const c = String.fromCharCode(97 + i);
+    return { value: c, label: c.toUpperCase() };
+  }),
+  ...Array.from({ length: 10 }, (_, i) => ({ value: String(i), label: String(i) })),
+  ...Array.from({ length: 12 }, (_, i) => ({ value: `f${i + 1}`, label: `F${i + 1}` })),
+  { value: "escape", label: "Esc" },
+  { value: "tab", label: "Tab" },
+  { value: "enter", label: "Enter" },
+  { value: "delete", label: "Del" },
+  { value: "backspace", label: "Bksp" },
+  { value: "space", label: "Space" },
+  { value: "home", label: "Home" },
+  { value: "end", label: "End" },
+  { value: "pageup", label: "PgUp" },
+  { value: "pagedown", label: "PgDn" },
+  { value: "insert", label: "Ins" },
+  { value: "left", label: "←" },
+  { value: "up", label: "↑" },
+  { value: "down", label: "↓" },
+  { value: "right", label: "→" },
+];
+
+function loadCustomShortcuts(): CustomShortcut[] {
+  try {
+    const raw = localStorage.getItem("gt.remote.customShortcuts");
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((x): x is CustomShortcut => !!x && typeof x === "object" && typeof (x as CustomShortcut).id === "string" && typeof (x as CustomShortcut).key === "string")
+      .map((x) => ({
+        id: x.id,
+        label: typeof x.label === "string" && x.label.trim() ? x.label.trim() : undefined,
+        mods: Array.isArray(x.mods) ? x.mods.filter((m): m is Mod => ALL_MODS.includes(m as Mod)) : [],
+        key: x.key,
+      }));
+  } catch {
+    return [];
+  }
+}
 
 // Content optimization: tunes the whole pipeline (downscale filter, JPEG chroma,
 // encoder content-hint + bitrate-degradation) for the kind of thing on screen.
@@ -147,21 +232,67 @@ function normToScreen(l: Layout, zoom: number, panX: number, panY: number, nx: n
   return { x: l.cw / 2 + (px - l.cw / 2) * zoom + panX, y: l.ch / 2 + (py - l.ch / 2) * zoom + panY };
 }
 
+/** CSS cursor for absolute mouse/pen / Quest laser — mirrors the host desktop shape. */
+function cssCursorFor(kind: string): string {
+  switch (kind) {
+    case "hand":
+      return "pointer";
+    case "text":
+      return "text";
+    case "busy":
+      return "wait";
+    case "move":
+      return "move";
+    case "resize-ns":
+      return "ns-resize";
+    case "resize-we":
+      return "ew-resize";
+    case "resize-nwse":
+      return "nwse-resize";
+    case "resize-nesw":
+      return "nesw-resize";
+    case "cross":
+      return "crosshair";
+    case "no":
+      return "not-allowed";
+    case "help":
+      return "help";
+    case "grab":
+      return "grabbing";
+    case "hidden":
+      return "none";
+    default:
+      return "default";
+  }
+}
+
 // ---------- component ----------
 export function ControlScreen({
   link,
   onNavigate,
   onDisconnect,
+  vrSupported,
+  onEnterVr,
+  vrMode = "pointer",
+  onVrModeChange,
 }: {
   link: RemoteLink;
   onNavigate?: (tab: NavTab) => void;
   onDisconnect?: () => void;
+  /** Quest: WebXR available — show Enter VR in the top bar. */
+  vrSupported?: boolean;
+  onEnterVr?: () => void;
+  /** Quest: pointer vs virtual Xbox pad for immersive sessions. */
+  vrMode?: "pointer" | "gamepad";
+  onVrModeChange?: (mode: "pointer" | "gamepad") => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const kbdRef = useRef<HTMLInputElement | null>(null);
+  /** Last WebRTC stream — kept so we can rebind after auth when the track was empty. */
+  const pendingStreamRef = useRef<MediaStream | null>(null);
 
   const [connected, setConnected] = useState(false);
   const [progress, setProgress] = useState<ConnectSnapshot | null>(null);
@@ -172,17 +303,24 @@ export function ControlScreen({
   const [hasStream, setHasStream] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
   const [soundOn, setSoundOn] = useState(false);
-  const [mode, setMode] = useState<Mode>("trackpad");
+  const [mode, setMode] = useState<Mode>(() => (isQuestBrowser() ? "touch" : "trackpad"));
   // Expanded bottom panel (null = collapsed). It pushes the viewport up, never overlaps.
   const [panel, setPanel] = useState<Panel | null>(null);
   const [immersive, setImmersive] = useState(false);
+  /** Browser Fullscreen API (web/Quest) — separate from in-app immersive chrome hide. */
+  const [browserFs, setBrowserFs] = useState(false);
   // Collapse the whole bottom dock (tab strip + panels) so the viewport fills the
-  // screen, while keeping the top status bar. A small handle restores it. Distinct
-  // from `immersive`, which also hides the top bar. Persisted so it sticks.
+  // screen. A small handle restores it. Distinct from `immersive`, which hides both
+  // top and bottom chrome. Persisted so it sticks.
   const [dockCollapsed, setDockCollapsed] = useState(() => localStorage.getItem("gt.remote.dockCollapsed") === "1");
   useEffect(() => {
     localStorage.setItem("gt.remote.dockCollapsed", dockCollapsed ? "1" : "0");
   }, [dockCollapsed]);
+  // Same idea for the top toolbar — independent of the bottom dock.
+  const [topCollapsed, setTopCollapsed] = useState(() => localStorage.getItem("gt.remote.topCollapsed") === "1");
+  useEffect(() => {
+    localStorage.setItem("gt.remote.topCollapsed", topCollapsed ? "1" : "0");
+  }, [topCollapsed]);
 
   // Soft-keyboard inset. `interactive-widget=resizes-content` (companion.html) is
   // supposed to shrink the layout viewport when the keyboard opens, but it isn't
@@ -219,6 +357,14 @@ export function ControlScreen({
   const [dragLock, setDragLock] = useState(false);
   const [mods, setMods] = useState<Set<Mod>>(new Set());
   const autoKbdRef = useRef(false); // guards the once-per-focus auto keyboard pop
+  const pcTextFieldRef = useRef(false);
+  const lastPointerGestureAt = useRef(0);
+  /** Quest: click armed keyboard; host hasn't confirmed text-field yet. */
+  const questKbdArmedRef = useRef(false);
+  /** Quest: host confirmed a PC text field — keep ghost focused, never timeout-blur. */
+  const questKbdLockedRef = useRef(false);
+  const kbdBlurTimer = useRef<number | null>(null);
+  const focusFalseTimer = useRef<number | null>(null);
 
   // Remote-cursor polish: the live desktop cursor shape (mirrored from the host),
   // a transient action "flash" (click/right-click/scroll ripple), and a drag flag.
@@ -278,6 +424,35 @@ export function ControlScreen({
       navigator.vibrate?.(10);
       return prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id];
     });
+
+  // Custom shortcuts (user-defined chords), persisted separately from builtins.
+  const [customShortcuts, setCustomShortcuts] = useState<CustomShortcut[]>(loadCustomShortcuts);
+  useEffect(() => {
+    localStorage.setItem("gt.remote.customShortcuts", JSON.stringify(customShortcuts));
+  }, [customShortcuts]);
+  const [addingShortcut, setAddingShortcut] = useState(false);
+  const [draftLabel, setDraftLabel] = useState("");
+  const [draftMods, setDraftMods] = useState<Set<Mod>>(() => new Set(["ctrl"]));
+  const [draftKey, setDraftKey] = useState("c");
+  const resetDraft = () => {
+    setDraftLabel("");
+    setDraftMods(new Set(["ctrl"]));
+    setDraftKey("c");
+  };
+  const saveCustomShortcut = () => {
+    const id = `custom-${Date.now()}`;
+    const label = draftLabel.trim() || undefined;
+    const mods = ALL_MODS.filter((m) => draftMods.has(m));
+    setCustomShortcuts((prev) => [...prev, { id, label, mods, key: draftKey }]);
+    setAddingShortcut(false);
+    resetDraft();
+    navigator.vibrate?.(10);
+  };
+  const deleteCustomShortcut = (id: string) => {
+    setCustomShortcuts((prev) => prev.filter((c) => c.id !== id));
+    setPinned((prev) => prev.filter((p) => p !== `s:${id}`));
+    navigator.vibrate?.(12);
+  };
 
   // View transform: refs drive the hot gesture path, state mirrors it for render.
   const [zoom, setZoom] = useState(1);
@@ -369,24 +544,31 @@ export function ControlScreen({
       if (!c) setHasFrame(false); // show the app-icon placeholder again on reconnect
     });
     const unsubProgress = link.onProgress?.(setProgress);
-    // Cloud: the screen arrives as a hardware-decoded WebRTC video track.
-    link.onStream((stream) => {
+    const bindStream = (stream: MediaStream, force = false) => {
+      pendingStreamRef.current = stream;
       const v = videoRef.current;
       if (!v) return;
-      v.srcObject = stream;
+      if (force || v.srcObject !== stream) v.srcObject = stream;
       setHasStream(true);
       setHasAudio(stream.getAudioTracks().length > 0);
       stream.addEventListener?.("addtrack", (e) => {
         if ((e as MediaStreamTrackEvent).track?.kind === "audio") setHasAudio(true);
       });
+      // Empty pre-auth tracks often need an explicit play() after frames start.
       v.play?.().catch(() => {});
-    });
+    };
+    // Cloud: the screen arrives as a hardware-decoded WebRTC video track.
+    const unsubStream = link.onStream((stream) => bindStream(stream, true));
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
-    link.onEvent((e) => {
+    const unsubEvent = link.onEvent((e) => {
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
       else if (e.event === "cursor") setCursorKind(String((e as { kind?: string }).kind || "arrow"));
       else if (e.event === "gamepad") setPadAvailable(!!(e as { available?: boolean }).available);
-      else if (e.event === "capstats") {
+      else if (e.event === "auth" && (e as { state?: string }).state === "ok") {
+        // Capture just started on the existing track — force a rebind + play.
+        const s = pendingStreamRef.current;
+        if (s) bindStream(s, true);
+      } else if (e.event === "capstats") {
         const cs = (e as { stats?: RemoteCaptureStats }).stats;
         if (!cs) return;
         const now = performance.now();
@@ -408,9 +590,70 @@ export function ControlScreen({
       t.push(now);
       while (t.length && now - t[0] > 1000) t.shift();
     });
-    return () => unsubProgress?.();
+    return () => {
+      unsubProgress?.();
+      unsubStream?.();
+      unsubEvent?.();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);
+
+  // If we're "connected" (authed) but no decoded frame yet, periodically rebind
+  // the stream — covers first-approval where the track was empty at attach time.
+  useEffect(() => {
+    if (!connected || hasFrame) return;
+    let n = 0;
+    const id = window.setInterval(() => {
+      const stream = pendingStreamRef.current;
+      const v = videoRef.current;
+      if (!stream || !v) return;
+      n++;
+      v.srcObject = null;
+      v.srcObject = stream;
+      v.play?.().catch(() => {});
+      if (n >= 8) window.clearInterval(id);
+    }, 1500);
+    return () => window.clearInterval(id);
+  }, [connected, hasFrame]);
+
+  // Track browser Fullscreen API state (web / Quest Browser).
+  useEffect(() => {
+    const onFs = () => {
+      const doc = document as Document & { webkitFullscreenElement?: Element | null };
+      setBrowserFs(!!(document.fullscreenElement || doc.webkitFullscreenElement));
+    };
+    document.addEventListener("fullscreenchange", onFs);
+    document.addEventListener("webkitfullscreenchange", onFs);
+    return () => {
+      document.removeEventListener("fullscreenchange", onFs);
+      document.removeEventListener("webkitfullscreenchange", onFs);
+    };
+  }, []);
+
+  const toggleBrowserFullscreen = () => {
+    const root = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => void;
+    };
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => void;
+    };
+    const active = document.fullscreenElement || doc.webkitFullscreenElement;
+    if (!active) {
+      if (root.requestFullscreen) void root.requestFullscreen().catch(() => {});
+      else root.webkitRequestFullscreen?.();
+    } else if (document.exitFullscreen) {
+      void document.exitFullscreen().catch(() => {});
+    } else {
+      doc.webkitExitFullscreen?.();
+    }
+  };
+  const browserFsSupported =
+    typeof document !== "undefined" &&
+    !!(
+      document.documentElement.requestFullscreen ||
+      (document.documentElement as HTMLElement & { webkitRequestFullscreen?: () => void }).webkitRequestFullscreen
+    );
 
   // Controller mode: while on (and connected), probe the PC for the virtual-gamepad
   // driver and stream the attached physical controller. Re-runs on reconnect so the
@@ -432,17 +675,60 @@ export function ControlScreen({
     };
   }, [controllerOn, connected, link]);
 
-  // Auto-open the on-screen keyboard exactly once per PC focus gain; show a chip.
-  const handleFocusEvent = (textField: boolean) => {
-    setPcTextField(textField);
-    if (textField) {
-      if (!autoKbdRef.current) {
-        autoKbdRef.current = true;
-        kbdRef.current?.focus();
-      }
-    } else {
-      autoKbdRef.current = false;
+  const clearKbdTimers = () => {
+    if (kbdBlurTimer.current != null) {
+      window.clearTimeout(kbdBlurTimer.current);
+      kbdBlurTimer.current = null;
     }
+    if (focusFalseTimer.current != null) {
+      window.clearTimeout(focusFalseTimer.current);
+      focusFalseTimer.current = null;
+    }
+  };
+
+  // Capture Surface Keyboard / IME into our ghost field. Must run inside a user
+  // gesture on Quest — a late WebRTC "focus" event alone cannot re-raise it.
+  const captureKeyboard = () => {
+    const el = kbdRef.current;
+    if (!el) return;
+    if (document.activeElement === el) return; // already latched — don't refocus/flicker
+    el.value = "";
+    el.focus({ preventScroll: true });
+  };
+
+  // Host says PC caret is in / out of a text field.
+  const handleFocusEvent = (textField: boolean) => {
+    if (textField) {
+      clearKbdTimers();
+      questKbdArmedRef.current = false;
+      questKbdLockedRef.current = true;
+      pcTextFieldRef.current = true;
+      autoKbdRef.current = true;
+      setPcTextField(true);
+      setTyping(true);
+      if (document.activeElement !== kbdRef.current) {
+        captureKeyboard();
+      }
+      return;
+    }
+
+    pcTextFieldRef.current = false;
+    setPcTextField(false);
+    // Quest: never auto-dismiss from host focus=false — the caret heuristic is
+    // flaky and was killing Surface Keyboard after ~2s. Manual Keyboard toggle /
+    // stopTyping is the only unlock (same as tapping the keyboard icon to open).
+    if (isQuestBrowser()) return;
+
+    if (focusFalseTimer.current != null) window.clearTimeout(focusFalseTimer.current);
+    focusFalseTimer.current = window.setTimeout(() => {
+      focusFalseTimer.current = null;
+      if (pcTextFieldRef.current) return;
+      questKbdLockedRef.current = false;
+      questKbdArmedRef.current = false;
+      autoKbdRef.current = false;
+      setTyping(false);
+      kbdRef.current?.blur();
+    }, 600);
   };
 
   // Video natural size drives the gesture/cursor geometry (mirrors the canvas path).
@@ -571,29 +857,40 @@ export function ControlScreen({
     return () => window.clearInterval(id);
   }, []);
 
-  // Keep layout measurement fresh on resize / orientation change. A ResizeObserver
-  // also catches the viewport shrinking/growing when a bottom panel opens/closes
-  // (it now occupies real space instead of overlaying) — without it the cursor and
-  // touch-to-screen mapping would drift by the panel's height.
+  // Keep layout measurement fresh on resize / orientation / chrome / fullscreen.
+  // Stale layout after collapsing bars or toggling browser fullscreen is what
+  // makes the remote cursor land beside the finger/laser instead of under it.
   useEffect(() => {
-    const remeasure = () => {
+    const refreshLayout = () => {
       const l = measure(viewportRef.current, natRef.current.w, natRef.current.h);
       if (l) layoutRef.current = l;
     };
-    remeasure();
-    window.addEventListener("resize", remeasure);
-    window.addEventListener("orientationchange", remeasure);
+    // Double-rAF: wait until the browser has applied the new flex sizes.
+    const schedule = () => {
+      requestAnimationFrame(() => {
+        refreshLayout();
+        requestAnimationFrame(refreshLayout);
+      });
+    };
+    schedule();
+    window.addEventListener("resize", schedule);
+    window.addEventListener("orientationchange", schedule);
+    const vv = window.visualViewport;
+    vv?.addEventListener("resize", schedule);
+    vv?.addEventListener("scroll", schedule);
     let ro: ResizeObserver | undefined;
     if (viewportRef.current && typeof ResizeObserver !== "undefined") {
-      ro = new ResizeObserver(remeasure);
+      ro = new ResizeObserver(schedule);
       ro.observe(viewportRef.current);
     }
     return () => {
-      window.removeEventListener("resize", remeasure);
-      window.removeEventListener("orientationchange", remeasure);
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("orientationchange", schedule);
+      vv?.removeEventListener("resize", schedule);
+      vv?.removeEventListener("scroll", schedule);
       ro?.disconnect();
     };
-  }, []);
+  }, [immersive, topCollapsed, dockCollapsed, panel, browserFs, typing, hasStream]);
 
   // Cancel any in-flight edge-pan frame if the screen unmounts mid-drag.
   useEffect(() => () => {
@@ -623,10 +920,17 @@ export function ControlScreen({
     setCursor({ ...cursorRef.current });
   };
 
+  /** Always re-read the viewport box before mapping — never trust a stale Layout. */
+  const liveLayout = (): Layout | null => {
+    const l = measure(viewportRef.current, natRef.current.w, natRef.current.h);
+    if (l) layoutRef.current = l;
+    return l;
+  };
+
   const setCursorPos = (nx: number, ny: number) => {
     cursorRef.current = { x: clamp(nx, 0, 1), y: clamp(ny, 0, 1) };
     // Edge pan-follow (zoomed in): keep the cursor comfortably inside the viewport.
-    const l = layoutRef.current;
+    const l = layoutRef.current ?? liveLayout();
     if (l && zoomRef.current > 1.01) {
       const s = normToScreen(l, zoomRef.current, panRef.current.x, panRef.current.y, cursorRef.current.x, cursorRef.current.y);
       let px = panRef.current.x;
@@ -642,7 +946,7 @@ export function ControlScreen({
   };
 
   const applyZoom = (nextZoom: number, focalX: number, focalY: number) => {
-    const l = layoutRef.current;
+    const l = liveLayout();
     if (!l) return;
     const z0 = zoomRef.current;
     const z1 = clamp(nextZoom, 1, MAX_ZOOM);
@@ -729,7 +1033,35 @@ export function ControlScreen({
   };
   const rect = () => viewportRef.current!.getBoundingClientRect();
 
+  /** Absolute cursor from a viewport client point (laser / mouse / surface touchpad). */
+  const moveAbsFromClient = (clientX: number, clientY: number) => {
+    const l = liveLayout();
+    if (!l || !viewportRef.current) return;
+    const r = rect();
+    const n = screenToNorm(l, r.left, r.top, zoomRef.current, panRef.current.x, panRef.current.y, clientX, clientY);
+    setCursorPos(n.x, n.y);
+  };
+
+  /** Mouse / pen / Quest surface touchpad — OS already moves an absolute cursor. */
+  const isMouseLike = (e: React.PointerEvent) => e.pointerType === "mouse" || e.pointerType === "pen";
+
   const onPointerDown = (e: React.PointerEvent) => {
+    // Mouse-like right / middle click (Quest surface touchpad two-finger = right).
+    if (isMouseLike(e)) {
+      moveAbsFromClient(e.clientX, e.clientY);
+      if (e.button === 2) {
+        e.preventDefault();
+        send({ type: "click", button: "right" });
+        return;
+      }
+      if (e.button === 1) {
+        e.preventDefault();
+        send({ type: "click", button: "middle" });
+        return;
+      }
+      if (e.button !== 0) return;
+    }
+
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
     const now = performance.now();
     pts.current.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY });
@@ -741,15 +1073,18 @@ export function ControlScreen({
       downCount.current = 1;
       touchPressed.current = false;
       armedDrag.current = false;
-      gesture.current = mode === "touch" ? "touchdrag" : "cursor";
-      if (mode === "trackpad") startEdgePan();
+      // Mouse-like devices are always absolute (surface touchpad / desktop mouse).
+      const abs = isMouseLike(e) || mode === "touch";
+      gesture.current = abs ? "touchdrag" : "cursor";
+      if (!abs && mode === "trackpad") startEdgePan();
 
-      if (mode === "touch") {
-        const l = layoutRef.current;
-        const r = rect();
-        if (l) {
-          const n = screenToNorm(l, r.left, r.top, zoomRef.current, panRef.current.x, panRef.current.y, e.clientX, e.clientY);
-          queueMove(n.x, n.y);
+      if (abs) {
+        moveAbsFromClient(e.clientX, e.clientY);
+        if (isMouseLike(e)) {
+          // Immediate press — OS already decided this is a click/drag start.
+          send({ type: "down", button: "left" });
+          touchPressed.current = true;
+          gesture.current = "dragging";
         }
       } else if (dragLock) {
         send({ type: "down", button: "left" });
@@ -758,9 +1093,9 @@ export function ControlScreen({
         armedDrag.current = now - lastTapUp.current < DOUBLE_MS; // double-tap-drag
       }
 
-      // Long-press → right click (unless we're already committed to a drag).
+      // Long-press → right click (touch / laser only — mouse has a real RMB).
       clearLong();
-      if (gesture.current !== "dragging" && !armedDrag.current) {
+      if (!isMouseLike(e) && gesture.current !== "dragging" && !armedDrag.current) {
         longTimer.current = window.setTimeout(() => {
           if (pts.current.size === 1 && maxMove.current < TAP_SLOP) {
             gesture.current = "none"; // consume the gesture; no click on release
@@ -784,7 +1119,13 @@ export function ControlScreen({
 
   const onPointerMove = (e: React.PointerEvent) => {
     const p = pts.current.get(e.pointerId);
-    if (!p) return;
+    // Hover: Quest surface touchpad / mouse / laser-without-trigger send
+    // pointermove with buttons===0 and no prior pointerdown. Phone fingers
+    // never hit this path (they always down first).
+    if (!p) {
+      if (e.buttons === 0) moveAbsFromClient(e.clientX, e.clientY);
+      return;
+    }
     const prevX = p.x;
     const prevY = p.y;
     p.x = e.clientX;
@@ -828,30 +1169,44 @@ export function ControlScreen({
     if (pts.current.size !== 1) return;
     if (travel > TAP_SLOP) clearLong();
 
-    if (mode === "touch") {
-      const l = layoutRef.current;
-      const r = rect();
-      if (l) {
-        const n = screenToNorm(l, r.left, r.top, zoomRef.current, panRef.current.x, panRef.current.y, e.clientX, e.clientY);
-        queueMove(n.x, n.y);
-        if (travel > TAP_SLOP && !touchPressed.current) {
-          send({ type: "down", button: "left" });
-          touchPressed.current = true;
-        }
+    // Absolute path: touch mode, or mouse/pen/surface touchpad (OS cursor is absolute).
+    if (isMouseLike(e) || mode === "touch") {
+      moveAbsFromClient(e.clientX, e.clientY);
+      if (!isMouseLike(e) && travel > TAP_SLOP && !touchPressed.current) {
+        send({ type: "down", button: "left" });
+        touchPressed.current = true;
       }
       return;
     }
 
-    // Trackpad: relative cursor movement.
+    // Trackpad: relative cursor movement (phone finger).
     if (armedDrag.current && gesture.current !== "dragging" && travel > TAP_SLOP) {
       gesture.current = "dragging";
       send({ type: "down", button: "left" });
     }
-    const l = layoutRef.current;
+    const l = liveLayout();
     if (!l) return;
     const speed = sensitivity / (l.dispW * zoomRef.current);
     setCursorPos(cursorRef.current.x + (e.clientX - prevX) * speed, cursorRef.current.y + (e.clientY - prevY) * speed);
   };
+
+  const onWheel = (e: WheelEvent) => {
+    // Quest surface touchpad two-finger scroll + mouse wheel.
+    e.preventDefault();
+    const dy = e.deltaY !== 0 ? (e.deltaY > 0 ? 1 : -1) : 0;
+    const dx = e.deltaX !== 0 ? (e.deltaX > 0 ? 1 : -1) : 0;
+    if (dx || dy) send({ type: "scroll", dx, dy });
+  };
+
+  // Non-passive wheel — React's onWheel is passive and can't preventDefault, so
+  // the browser would scroll the page instead of forwarding to the PC.
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [link]);
 
   const onPointerUp = (e: React.PointerEvent) => {
     pts.current.delete(e.pointerId);
@@ -866,6 +1221,10 @@ export function ControlScreen({
     if (pts.current.size === 0) {
       const g = gesture.current;
       const wasTap = maxMove.current < TAP_SLOP && now - downT.current < TAP_MS;
+      const primaryClick =
+        e.button === 0 &&
+        g !== "two" &&
+        (wasTap || g === "dragging" || g === "touchdrag" || g === "cursor");
 
       if (mode === "touch") {
         if (touchPressed.current) send({ type: "up", button: "left" });
@@ -878,6 +1237,17 @@ export function ControlScreen({
       } else if (g === "cursor" && wasTap && downCount.current === 1) {
         send({ type: "click", button: "left" });
         lastTapUp.current = now; // enables double-tap-drag & native double-click
+      }
+
+      // Quest: latch keyboard on click the same way the Keyboard icon does — stay
+      // focused until the user explicitly dismisses (no host/timeout auto-blur).
+      if (isQuestBrowser() && primaryClick) {
+        lastPointerGestureAt.current = now;
+        clearKbdTimers();
+        questKbdArmedRef.current = false;
+        questKbdLockedRef.current = true;
+        setTyping(true);
+        captureKeyboard();
       }
 
       gesture.current = "none";
@@ -1050,13 +1420,39 @@ export function ControlScreen({
   };
   // Reveal the floating compose bar + raise the soft keyboard (works whether the
   // dock is open, collapsed, or immersive — the field is always mounted).
+  // Clear before focus so Quest's overwrite-on-open can't look like "delete all".
   const startTyping = () => {
+    clearKbdTimers();
+    questKbdLockedRef.current = true;
+    questKbdArmedRef.current = false;
     setTyping(true);
-    window.setTimeout(() => kbdRef.current?.focus(), 30);
+    resetField();
+    window.setTimeout(() => kbdRef.current?.focus({ preventScroll: true }), 30);
   };
   const stopTyping = () => {
+    clearKbdTimers();
+    questKbdLockedRef.current = false;
+    questKbdArmedRef.current = false;
+    autoKbdRef.current = false;
+    pcTextFieldRef.current = false;
+    setPcTextField(false);
     kbdRef.current?.blur();
     setTyping(false);
+  };
+
+  /** Zoom chip: always visible. Tap resets when zoomed; tap at 1× zooms to 1.5×. */
+  const onZoomButton = () => {
+    const el = viewportRef.current;
+    const l = layoutRef.current;
+    if (!el || !l) {
+      resetView();
+      return;
+    }
+    const r = el.getBoundingClientRect();
+    const cx = r.width / 2;
+    const cy = r.height / 2;
+    if (zoomRef.current > 1.01) resetView();
+    else applyZoom(1.5, cx, cy);
   };
 
   // --- pinnable key / shortcut registry --------------------------------------
@@ -1068,6 +1464,16 @@ export function ControlScreen({
     { id: "enter", keys: ["↵"], label: "Enter", run: () => tapKey("enter") },
     { id: "backspace", keys: ["⌫"], label: "Bksp", run: () => tapKey("backspace") },
     { id: "delete", keys: ["Del"], run: () => tapKey("delete") },
+    { id: "home", keys: ["Home"], run: () => tapKey("home") },
+    { id: "end", keys: ["End"], run: () => tapKey("end") },
+    { id: "pageup", keys: ["PgUp"], run: () => tapKey("pageup") },
+    { id: "pagedown", keys: ["PgDn"], run: () => tapKey("pagedown") },
+    { id: "insert", keys: ["Ins"], run: () => tapKey("insert") },
+    { id: "printscreen", keys: ["PrtSc"], run: () => tapKey("printscreen") },
+    { id: "capslock", keys: ["Caps"], run: () => tapKey("capslock") },
+    { id: "numlock", keys: ["Num"], run: () => tapKey("numlock") },
+    { id: "scrolllock", keys: ["ScrLk"], run: () => tapKey("scrolllock") },
+    { id: "pause", keys: ["Pause"], run: () => tapKey("pause") },
     { id: "ctrl", keys: ["Ctrl"], run: () => toggleMod("ctrl"), mod: "ctrl" },
     { id: "alt", keys: ["Alt"], run: () => toggleMod("alt"), mod: "alt" },
     { id: "shift", keys: ["Shift"], run: () => toggleMod("shift"), mod: "shift" },
@@ -1099,18 +1505,27 @@ export function ControlScreen({
     { id: "paste", keys: ["Ctrl", "V"], label: "Paste", run: () => chord(["ctrl"], "v") },
     { id: "cut", keys: ["Ctrl", "X"], label: "Cut", run: () => chord(["ctrl"], "x") },
     { id: "undo", keys: ["Ctrl", "Z"], label: "Undo", run: () => chord(["ctrl"], "z") },
+    { id: "redo", keys: ["Ctrl", "Y"], label: "Redo", run: () => chord(["ctrl"], "y") },
+    { id: "save", keys: ["Ctrl", "S"], label: "Save", run: () => chord(["ctrl"], "s") },
     { id: "select-all", keys: ["Ctrl", "A"], label: "All", run: () => chord(["ctrl"], "a") },
     { id: "ctrl-alt-del", keys: ["Ctrl", "Alt", "Del"], label: "Secure", run: () => chord(["ctrl", "alt"], "delete") },
   ];
+  const customShortcutDefs: KeyDef[] = customShortcuts.map((c) => ({
+    id: c.id,
+    keys: [...c.mods.map((m) => MOD_LABEL[m]), keyCapLabel(c.key)],
+    label: c.label,
+    run: () => chord(c.mods, c.key),
+  }));
   // Pinned ids resolve against a combined registry (shortcut ids are prefixed to
   // avoid colliding with same-named special keys, e.g. "win").
   const registry = useMemo(() => {
     const m = new Map<string, KeyDef & { active?: boolean }>();
     for (const k of specialKeys) m.set(`k:${k.id}`, k);
     for (const s of shortcutKeys) m.set(`s:${s.id}`, s);
+    for (const s of customShortcutDefs) m.set(`s:${s.id}`, s);
     return m;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mods]);
+  }, [mods, customShortcuts]);
   const pinnedDefs = pinned
     .map((id) => {
       const def = registry.get(id);
@@ -1129,101 +1544,38 @@ export function ControlScreen({
   };
 
   const zoomed = zoom > 1.01 || pan.x !== 0 || pan.y !== 0;
+  const questBrowser = isQuestBrowser();
+  // Android soft-keyboard inset only — Quest Surface Keyboard sits on the desk and
+  // must never shrink the remote viewport.
+  const bottomReserve = questBrowser ? 0 : kbInset;
   const cursorScreen = useMemo(() => {
     const l = layoutRef.current;
     return l ? normToScreen(l, zoom, pan.x, pan.y, cursor.x, cursor.y) : null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cursor, zoom, pan]);
+  // Trackpad / Quest: hide the OS pointer and draw RemoteCursor (shape mirrors host).
+  // Desktop web mouse/pen: live CSS cursor instead (no double-cursor).
+  const showRemoteCursor = mode === "trackpad" || questBrowser;
+  const viewportCssCursor = showRemoteCursor
+    ? "none"
+    : cssCursorFor(dragging ? "grab" : cursorKind);
 
   return (
     <div
       className="flex h-full w-full flex-col overflow-hidden bg-black select-none"
-      style={{ paddingBottom: kbInset || undefined }}
+      style={{ paddingBottom: bottomReserve || undefined }}
     >
-      {/* ==== viewport area — takes the remaining height; shrinks when a panel opens ==== */}
-      <div className="relative min-h-0 flex-1">
-      {/* ---- screen viewport ---- */}
-      <div
-        ref={viewportRef}
-        className="absolute inset-0 flex items-center justify-center overflow-hidden touch-none"
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-      >
-        <video
-          ref={videoRef}
-          autoPlay
-          muted
-          playsInline
-          hidden={!hasStream}
-          onLoadedMetadata={onVideoSized}
-          onResize={onVideoSized}
-          className="max-h-full max-w-full select-none object-contain will-change-transform"
-          style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "center center" }}
-        />
-        <canvas
-          ref={canvasRef}
-          hidden={hasStream}
-          className="max-h-full max-w-full select-none object-contain will-change-transform"
-          style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "center center" }}
-        />
-        {mode === "trackpad" && connected && cursorScreen && (
-          <RemoteCursor x={cursorScreen.x} y={cursorScreen.y} kind={cursorKind} dragging={dragging} fx={cursorFx} />
-        )}
-        {/* App-icon placeholder for the ~1s gap before the first frame arrives. */}
-        <AnimatePresence>
-          {connected && !hasFrame && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="pointer-events-none absolute inset-0 grid place-items-center bg-black"
-            >
-              <motion.div
-                className="flex flex-col items-center gap-4"
-                animate={{ scale: [1, 1.05, 1], opacity: [0.75, 1, 0.75] }}
-                transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
-              >
-                <img src="/app-icon.png" alt="" className="h-24 w-24 rounded-3xl shadow-glow" />
-                <span className="flex items-center gap-2 text-xs font-700 text-ink-dim">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waking your screen…
-                </span>
-              </motion.div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-        {showReconnect && (
-          <div className="pointer-events-none absolute inset-0 grid place-items-center">
-            {progress ? (
-              <ConnectionProgress snapshot={progress} compact showSteps />
-            ) : (
-              <div className="flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm text-white backdrop-blur">
-                <Loader2 className="h-4 w-4 animate-spin" /> Reconnecting…
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* ---- immersive restore chip ---- */}
-      {immersive && (
-        <button onClick={() => setImmersive(false)} className="absolute left-3 top-3 z-50 flex items-center gap-1.5 rounded-full bg-black/55 px-3 py-1.5 text-xs font-700 text-white backdrop-blur active:scale-95">
-          <Minimize2 className="h-3.5 w-3.5" /> Show controls
-        </button>
-      )}
-
-      {/* ---- top status bar ---- */}
-      {!immersive && (
+      {/* ==== top toolbar — flex sibling (shrinks video); collapsible like the bottom dock ==== */}
+      {!immersive && !topCollapsed && (
         <div
-          className="absolute left-3 right-3 z-40 flex items-center justify-between gap-2"
-          style={{ top: "max(0.75rem, calc(env(safe-area-inset-top) + 0.25rem))" }}
+          className="relative z-40 flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-base/95 px-2 py-1.5 backdrop-blur"
+          style={{ paddingTop: "max(0.35rem, env(safe-area-inset-top))" }}
         >
-          <div className="relative flex items-center gap-2 rounded-2xl glass border border-white/[0.08] px-2.5 py-1.5 shadow-float">
+          <div className="relative flex min-w-0 items-center gap-2 rounded-xl bg-white/[0.04] px-2 py-1">
             {onNavigate && (
               <button
                 onClick={() => setNavOpen((o) => !o)}
-                className="grid h-7 w-7 place-items-center rounded-lg text-ink-soft active:bg-white/[0.08]"
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-soft active:bg-white/[0.08]"
                 title="Go to…"
               >
                 <Menu className="h-4 w-4" />
@@ -1282,47 +1634,258 @@ export function ControlScreen({
             )}
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex shrink-0 items-center gap-1 overflow-x-auto" style={{ scrollbarWidth: "none" }}>
             {monitors.length > 1 && (
               <button
                 onClick={() => selectMonitor((monitorIdx + 1) % monitors.length)}
-                className="flex items-center gap-1 rounded-xl glass border border-white/[0.08] px-2.5 py-1.5 text-xs font-700 text-ink-soft shadow-float active:scale-95"
+                className="flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1.5 text-xs font-700 text-ink-soft active:scale-95"
                 title="Switch display"
               >
                 <Monitor className="h-3.5 w-3.5" /> {monitorIdx + 1}/{monitors.length}
               </button>
             )}
-            {zoomed && (
-              <button onClick={resetView} className="flex items-center gap-1 rounded-xl glass border border-white/[0.08] px-2.5 py-1.5 text-xs font-700 text-white shadow-float active:scale-95">
-                <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
-              </button>
-            )}
+            <button
+              onClick={onZoomButton}
+              className={`flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-700 active:scale-95 ${
+                zoomed ? "bg-accent-3/20 text-white" : "bg-white/[0.04] text-ink-soft"
+              }`}
+              title={zoomed ? "Reset zoom" : "Zoom in"}
+            >
+              <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
+            </button>
             {hasAudio && (
               <button
                 onClick={toggleSound}
-                className={`grid h-9 w-9 place-items-center rounded-xl glass border shadow-float active:scale-95 ${
-                  soundOn ? "border-accent-3/40 text-accent-3" : "border-white/[0.08] text-ink-soft"
+                className={`grid h-8 w-8 place-items-center rounded-lg active:scale-95 ${
+                  soundOn ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.04] text-ink-soft"
                 }`}
                 title={soundOn ? "Mute PC sound" : "Play PC sound"}
               >
                 {soundOn ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
               </button>
             )}
-            <button onClick={screenshot} className="grid h-9 w-9 place-items-center rounded-xl glass border border-white/[0.08] text-ink-soft shadow-float active:scale-95" title="Save frame">
+            <button
+              onClick={screenshot}
+              className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.04] text-ink-soft active:scale-95"
+              title="Save frame"
+            >
               <Camera className="h-4 w-4" />
             </button>
-            <button onClick={() => setImmersive(true)} className="grid h-9 w-9 place-items-center rounded-xl glass border border-white/[0.08] text-ink-soft shadow-float active:scale-95" title="Fullscreen">
+            {vrSupported && onEnterVr && (
+              <>
+                {onVrModeChange && (
+                  <div className="flex overflow-hidden rounded-lg bg-white/[0.04]">
+                    <button
+                      onClick={() => onVrModeChange("pointer")}
+                      className={`grid h-8 w-8 place-items-center active:scale-95 ${
+                        vrMode === "pointer" ? "bg-accent-3/25 text-accent-3" : "text-ink-soft"
+                      }`}
+                      title="VR pointer mode"
+                    >
+                      <MousePointer2 className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={() => onVrModeChange("gamepad")}
+                      className={`grid h-8 w-8 place-items-center active:scale-95 ${
+                        vrMode === "gamepad" ? "bg-accent-3/25 text-accent-3" : "text-ink-soft"
+                      }`}
+                      title="VR gamepad mode"
+                    >
+                      <Gamepad2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
+                <button
+                  onClick={onEnterVr}
+                  className="flex items-center gap-1.5 rounded-lg bg-accent-3/15 px-2 py-1.5 text-xs font-700 text-accent-3 active:scale-95"
+                  title="Enter immersive VR"
+                >
+                  <Headset className="h-3.5 w-3.5" /> VR
+                </button>
+              </>
+            )}
+            {browserFsSupported && (
+              <button
+                onClick={toggleBrowserFullscreen}
+                className={`grid h-8 w-8 place-items-center rounded-lg active:scale-95 ${
+                  browserFs ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.04] text-ink-soft"
+                }`}
+                title={browserFs ? "Exit browser fullscreen" : "Browser fullscreen"}
+              >
+                {browserFs ? <Shrink className="h-4 w-4" /> : <Expand className="h-4 w-4" />}
+              </button>
+            )}
+            <button
+              onClick={() => setImmersive(true)}
+              className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.04] text-ink-soft active:scale-95"
+              title="Hide all chrome"
+            >
               <Maximize2 className="h-4 w-4" />
+            </button>
+            <button
+              onClick={() => setTopCollapsed(true)}
+              className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.04] text-ink-soft active:scale-95"
+              title="Hide toolbar"
+            >
+              <ChevronUp className="h-4 w-4" />
             </button>
           </div>
         </div>
       )}
 
-      {/* ---- performance / debug HUD ---- */}
-      {showStats && !immersive && (
+      {/* ==== viewport — video only; chrome above/below shrinks this, never overlays it ==== */}
+      <div className="relative min-h-0 flex-1">
+      {/* ---- screen viewport ---- */}
+      <div
+        ref={viewportRef}
+        className="absolute inset-0 flex items-center justify-center overflow-hidden touch-none"
+        style={{ cursor: viewportCssCursor }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        onContextMenu={(e) => e.preventDefault()}
+      >
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          hidden={!hasStream}
+          onLoadedMetadata={onVideoSized}
+          onResize={onVideoSized}
+          onPlaying={() => setHasFrame(true)}
+          onLoadedData={() => {
+            const v = videoRef.current;
+            if (v && v.videoWidth > 0) setHasFrame(true);
+          }}
+          className="max-h-full max-w-full select-none object-contain will-change-transform"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "center center",
+            cursor: "inherit",
+          }}
+        />
+        <canvas
+          ref={canvasRef}
+          hidden={hasStream}
+          className="max-h-full max-w-full select-none object-contain will-change-transform"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "center center",
+            cursor: "inherit",
+          }}
+        />
+        {showRemoteCursor && connected && cursorScreen && (
+          <RemoteCursor x={cursorScreen.x} y={cursorScreen.y} kind={cursorKind} dragging={dragging} fx={cursorFx} />
+        )}
+        {/* App-icon placeholder for the ~1s gap before the first frame arrives. */}
+        <AnimatePresence>
+          {connected && !hasFrame && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="pointer-events-none absolute inset-0 grid place-items-center bg-black"
+            >
+              <motion.div
+                className="flex flex-col items-center gap-4"
+                animate={{ scale: [1, 1.05, 1], opacity: [0.75, 1, 0.75] }}
+                transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
+              >
+                <img src="/app-icon.png" alt="" className="h-24 w-24 rounded-3xl shadow-glow" />
+                <span className="flex items-center gap-2 text-xs font-700 text-ink-dim">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waking your screen…
+                </span>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        {showReconnect && (
+          <div className="pointer-events-none absolute inset-0 grid place-items-center">
+            {progress ? (
+              <ConnectionProgress snapshot={progress} compact showSteps />
+            ) : (
+              <div className="flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm text-white backdrop-blur">
+                <Loader2 className="h-4 w-4 animate-spin" /> Reconnecting…
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ---- collapsed top / immersive restore chips (same pattern as bottom Controls) ---- */}
+      {(immersive || topCollapsed) && (
         <div
-          className="absolute right-3 z-30 w-[16.5rem] max-w-[80vw] rounded-2xl glass border border-white/[0.08] p-2.5 text-[10px] leading-relaxed text-ink-soft shadow-float"
-          style={{ top: "max(3.6rem, calc(env(safe-area-inset-top) + 3rem))" }}
+          className="absolute left-2 right-2 z-40 flex items-center justify-between gap-1.5"
+          style={{ top: "max(0.5rem, calc(env(safe-area-inset-top) + 0.25rem))" }}
+        >
+          <div className="flex items-center gap-1.5">
+            {connected && (
+              <span className="flex items-center gap-1.5 rounded-full bg-black/45 px-2.5 py-1 text-[10px] font-700 text-green backdrop-blur">
+                <span className="h-1.5 w-1.5 rounded-full bg-green" style={{ boxShadow: "0 0 6px #34d399" }} />
+                {fps} fps
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <motion.button
+              whileTap={{ scale: 0.92 }}
+              onClick={onZoomButton}
+              className="flex items-center gap-1 rounded-full bg-black/45 px-2.5 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
+              title={zoomed ? "Reset zoom" : "Zoom in"}
+            >
+              <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
+            </motion.button>
+            <motion.button
+              whileTap={{ scale: 0.9 }}
+              onClick={() => (typing ? stopTyping() : startTyping())}
+              className={`grid h-9 w-9 place-items-center rounded-full border backdrop-blur ${
+                typing ? "border-accent-3/50 bg-accent-3/30 text-white" : "border-white/15 bg-black/45 text-white/90"
+              }`}
+              title={typing ? "Stop typing" : "Keyboard"}
+            >
+              <Keyboard className="h-4 w-4" />
+            </motion.button>
+            {browserFsSupported && (
+              <motion.button
+                whileTap={{ scale: 0.9 }}
+                onClick={toggleBrowserFullscreen}
+                className={`grid h-9 w-9 place-items-center rounded-full border backdrop-blur ${
+                  browserFs ? "border-accent-3/50 bg-accent-3/30 text-white" : "border-white/15 bg-black/45 text-white/90"
+                }`}
+                title={browserFs ? "Exit browser fullscreen" : "Browser fullscreen"}
+              >
+                {browserFs ? <Shrink className="h-4 w-4" /> : <Expand className="h-4 w-4" />}
+              </motion.button>
+            )}
+            {immersive ? (
+              <motion.button
+                whileTap={{ scale: 0.92 }}
+                onClick={() => setImmersive(false)}
+                className="flex items-center gap-1.5 rounded-full bg-black/45 px-3 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
+                title="Show controls"
+              >
+                <Minimize2 className="h-4 w-4" /> Controls
+              </motion.button>
+            ) : (
+              <motion.button
+                whileTap={{ scale: 0.92 }}
+                onClick={() => setTopCollapsed(false)}
+                className="flex items-center gap-1.5 rounded-full bg-black/45 px-3 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
+                title="Show toolbar"
+              >
+                <ChevronDown className="h-4 w-4" /> Toolbar
+              </motion.button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ---- performance / debug HUD ---- */}
+      {showStats && !immersive && !topCollapsed && (
+        <div
+          className="absolute right-3 top-3 z-30 w-[16.5rem] max-w-[80vw] rounded-2xl glass border border-white/[0.08] p-2.5 text-[10px] leading-relaxed text-ink-soft shadow-float"
         >
           <div className="mb-1 flex items-center gap-1.5 text-[11px] font-800 text-white">
             <Gauge className="h-3.5 w-3.5 text-accent-3" /> Stream stats
@@ -1353,7 +1916,7 @@ export function ControlScreen({
       )}
 
       {/* ---- pinned quick-button rail (small, semi-transparent, screen edge) ---- */}
-      {!immersive && pinnedDefs.length > 0 && (
+      {!(typing && !questBrowser) && pinnedDefs.length > 0 && (
         <div
           className="pointer-events-none absolute right-1.5 top-1/2 z-30 flex max-h-[70%] -translate-y-1/2 flex-col gap-1.5 overflow-y-auto py-1"
           style={{ scrollbarWidth: "none" }}
@@ -1375,8 +1938,8 @@ export function ControlScreen({
         </div>
       )}
 
-      {/* ---- "tap to type" prompt when a PC text field is focused ---- */}
-      {!immersive && !typing && pcTextField && (
+      {/* ---- "tap to type" — phone fallback when auto-focus needs a gesture ---- */}
+      {!typing && pcTextField && !questBrowser && (
         <motion.button
           initial={{ y: 20, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
@@ -1388,27 +1951,30 @@ export function ControlScreen({
         </motion.button>
       )}
 
-      {/* ---- collapsed-dock floating helpers: tiny keyboard + restore handle ---- */}
-      {!immersive && dockCollapsed && (
+      {/* ---- collapsed-dock helpers: stay visible while typing (Controls must not vanish) ---- */}
+      {(immersive || dockCollapsed) && (
         <div
           className="absolute bottom-2 left-2 right-2 z-40 flex items-center justify-between"
           style={{ marginBottom: "env(safe-area-inset-bottom)" }}
         >
-          {!typing && (
-            <motion.button
-              initial={{ scale: 0, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              whileTap={{ scale: 0.9 }}
-              onClick={startTyping}
-              className="grid h-11 w-11 place-items-center rounded-full border border-white/15 bg-black/45 text-white/90 shadow-float backdrop-blur"
-              title="Keyboard"
-            >
-              <Keyboard className="h-5 w-5" />
-            </motion.button>
-          )}
+          <motion.button
+            initial={{ scale: 0, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            whileTap={{ scale: 0.9 }}
+            onClick={() => (typing ? stopTyping() : startTyping())}
+            className={`grid h-11 w-11 place-items-center rounded-full border shadow-float backdrop-blur ${
+              typing ? "border-accent-3/50 bg-accent-3/30 text-white" : "border-white/15 bg-black/45 text-white/90"
+            }`}
+            title={typing ? "Stop typing" : "Keyboard"}
+          >
+            <Keyboard className="h-5 w-5" />
+          </motion.button>
           <motion.button
             whileTap={{ scale: 0.92 }}
-            onClick={() => setDockCollapsed(false)}
+            onClick={() => {
+              if (immersive) setImmersive(false);
+              else setDockCollapsed(false);
+            }}
             className="ml-auto flex items-center gap-1.5 rounded-full bg-black/45 px-3 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
             title="Show controls"
           >
@@ -1416,64 +1982,77 @@ export function ControlScreen({
           </motion.button>
         </div>
       )}
-
-      {/* ---- always-mounted floating compose bar (keyboard) ---- */}
-      {/* The hidden field is mounted regardless of dock/immersive state so the
-          auto-keyboard and the floating keyboard button both work; the chrome
-          just slides in when `typing`. It sits above the dock / soft keyboard. */}
-      <motion.div
-        className="absolute inset-x-2 z-50"
-        style={{
-          bottom: dockCollapsed || immersive ? "calc(env(safe-area-inset-bottom) + 0.5rem)" : "0.5rem",
-          pointerEvents: typing ? "auto" : "none",
-        }}
-        animate={{ y: typing ? 0 : 40, opacity: typing ? 1 : 0 }}
-        transition={{ type: "spring", stiffness: 420, damping: 34 }}
-      >
-        <div className="flex items-center gap-1.5 rounded-2xl glass border border-white/[0.1] p-1.5 shadow-float">
-          <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
-            <button onClick={() => setKbMode("direct")} title="Direct: each keystroke is sent live" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "direct" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Keyboard className="h-4 w-4" /></button>
-            <button onClick={() => setKbMode("buffered")} title="Buffered: type, then send the whole line" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "buffered" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Send className="h-4 w-4" /></button>
-          </div>
-          <input
-            ref={kbdRef}
-            onInput={onKbdInput}
-            onKeyDown={onKbdKeyDown}
-            onCompositionStart={() => (composing.current = true)}
-            onCompositionEnd={() => {
-              composing.current = false;
-              onKbdInput();
-            }}
-            onFocus={() => {
-              setTyping(true);
-              resetField();
-            }}
-            onBlur={() => setTyping(false)}
-            className="min-w-0 flex-1 rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-sm text-white outline-none focus:border-accent-3"
-            placeholder={kbMode === "buffered" ? "Type, then Enter to send" : "Type — keys go to your PC"}
-            inputMode="text"
-            enterKeyHint={kbMode === "buffered" ? "send" : "done"}
-            autoCapitalize="none"
-            autoCorrect="off"
-            autoComplete="off"
-            spellCheck={false}
-          />
-          {kbMode === "buffered" && (
-            <button onClick={sendBuffer} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent-3 text-white active:scale-95" title="Send to PC">
-              <Send className="h-4 w-4" />
-            </button>
-          )}
-          <button onClick={stopTyping} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-ink-dim active:bg-white/[0.08]" title="Close">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      </motion.div>
       </div>{/* ==== end viewport area ==== */}
 
-      {/* ==== bottom control bar — collapsed = just the icon tab strip; expanding a
-             panel grows this section and shrinks the viewport above (never overlaps).
-             `dockCollapsed` removes the whole bar so the viewport fills the screen. ==== */}
-      {!immersive && !dockCollapsed && (
+      {/* Ghost input — on-screen, nearly invisible, no bar. Focus raises Surface Keyboard. */}
+      <input
+        ref={kbdRef}
+        onInput={onKbdInput}
+        onKeyDown={onKbdKeyDown}
+        onCompositionStart={() => (composing.current = true)}
+        onCompositionEnd={() => {
+          composing.current = false;
+          onKbdInput();
+        }}
+        onFocus={() => {
+          // Reset diff base on each focus session (Quest overwrite-on-open).
+          // Speculative click-capture must not flip phone chrome.
+          resetField();
+          if (pcTextFieldRef.current || questKbdLockedRef.current) setTyping(true);
+          if (!isQuestBrowser()) {
+            setTyping(true);
+            setDockCollapsed(true);
+            setPanel(null);
+          }
+        }}
+        onBlur={() => {
+          // Quest: reclaim focus while latched (Surface Keyboard can transiently
+          // blur the field). Never reclaim after an explicit stopTyping (lock cleared).
+          if (questKbdLockedRef.current) {
+            window.setTimeout(() => {
+              if (questKbdLockedRef.current && document.activeElement !== kbdRef.current) {
+                kbdRef.current?.focus({ preventScroll: true });
+              }
+            }, 0);
+            return;
+          }
+          setTyping(false);
+        }}
+        className="pointer-events-none fixed bottom-3 left-3 z-[60] h-7 w-7 border-0 p-0 outline-none"
+        style={{ opacity: 0.01, caretColor: "transparent" }}
+        aria-hidden={!typing}
+        inputMode="text"
+        enterKeyHint={kbMode === "buffered" ? "send" : "done"}
+        autoCapitalize="none"
+        autoCorrect="off"
+        autoComplete="off"
+        spellCheck={false}
+      />
+
+      {/* Phone-only compose row — flex sibling (shrinks video), never overlays stream */}
+      {typing && !questBrowser && (
+        <div
+          className="shrink-0 border-t border-white/10 bg-base/95 px-2 py-1.5 backdrop-blur"
+          style={{ paddingBottom: "max(0.35rem, env(safe-area-inset-bottom))" }}
+        >
+          <div className="flex items-center gap-1.5">
+            <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
+              <button onClick={() => setKbMode("direct")} title="Direct" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "direct" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Keyboard className="h-4 w-4" /></button>
+              <button onClick={() => setKbMode("buffered")} title="Buffered" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "buffered" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Send className="h-4 w-4" /></button>
+            </div>
+            <div className="min-w-0 flex-1 truncate px-2 text-xs text-ink-dim">
+              {kbMode === "buffered" ? "Type on the keyboard, then Send" : "Typing to PC…"}
+            </div>
+            {kbMode === "buffered" && (
+              <button onClick={sendBuffer} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent-3 text-white active:scale-95" title="Send"><Send className="h-4 w-4" /></button>
+            )}
+            <button onClick={stopTyping} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-ink-dim active:bg-white/[0.08]" title="Close"><X className="h-4 w-4" /></button>
+          </div>
+        </div>
+      )}
+
+      {/* ==== bottom control bar ==== */}
+      {!immersive && !dockCollapsed && !(typing && !questBrowser) && (
         <motion.div
           initial={{ y: 32, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
@@ -1539,6 +2118,85 @@ export function ControlScreen({
                   onTogglePin={() => togglePin(`s:${s.id}`)}
                 />
               ))}
+              {customShortcutDefs.map((s) => (
+                <KeyCapButton
+                  key={s.id}
+                  def={s}
+                  pinMode={pinMode}
+                  pinned={pinned.includes(`s:${s.id}`)}
+                  onFire={s.run}
+                  onTogglePin={() => togglePin(`s:${s.id}`)}
+                  deletable
+                  onDelete={() => deleteCustomShortcut(s.id)}
+                />
+              ))}
+              {addingShortcut ? (
+                <div className="flex shrink-0 items-center gap-1.5 rounded-xl border border-white/[0.1] bg-white/[0.04] px-2 py-1">
+                  <input
+                    value={draftLabel}
+                    onChange={(e) => setDraftLabel(e.target.value)}
+                    placeholder="Label"
+                    className="w-16 rounded-md border border-white/[0.08] bg-black/30 px-1.5 py-1 text-[10px] font-700 text-white outline-none placeholder:text-ink-faint focus:border-accent-3"
+                  />
+                  {ALL_MODS.map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() =>
+                        setDraftMods((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(m)) next.delete(m);
+                          else next.add(m);
+                          return next;
+                        })
+                      }
+                      className={`rounded-md px-1.5 py-1 text-[9px] font-800 uppercase ${
+                        draftMods.has(m) ? "bg-accent-3 text-white" : "bg-white/[0.06] text-ink-dim"
+                      }`}
+                    >
+                      {MOD_LABEL[m]}
+                    </button>
+                  ))}
+                  <select
+                    value={draftKey}
+                    onChange={(e) => setDraftKey(e.target.value)}
+                    className="max-w-[4.5rem] rounded-md border border-white/[0.08] bg-black/30 px-1 py-1 text-[10px] font-700 text-white outline-none"
+                  >
+                    {SHORTCUT_KEY_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={saveCustomShortcut}
+                    className="rounded-md bg-accent-3 px-2 py-1 text-[10px] font-800 text-white active:scale-95"
+                  >
+                    Add
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAddingShortcut(false);
+                      resetDraft();
+                    }}
+                    className="grid h-7 w-7 place-items-center rounded-md text-ink-dim active:bg-white/[0.08]"
+                    title="Cancel"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ) : (
+                <motion.button
+                  whileTap={{ scale: 0.9 }}
+                  onClick={() => setAddingShortcut(true)}
+                  className="relative flex h-9 w-9 shrink-0 flex-col items-center justify-center rounded-xl border border-dashed border-white/20 text-ink-dim active:bg-white/[0.06]"
+                  title="Add custom shortcut"
+                >
+                  <Plus className="h-4 w-4" />
+                </motion.button>
+              )}
             </div>
           )}
 
@@ -1811,7 +2469,8 @@ function KeyCombo({ keys, active, small }: { keys: string[]; active?: boolean; s
   );
 }
 /** A dock button rendering a keycap combo with a caption + pin overlay. In pin
- *  mode a tap toggles the pin instead of firing the key. */
+ *  mode a tap toggles the pin instead of firing the key. Custom shortcuts also
+ *  get a trash badge in pin mode so they can be deleted (builtins never are). */
 function KeyCapButton({
   def,
   pinMode,
@@ -1819,6 +2478,8 @@ function KeyCapButton({
   active,
   onFire,
   onTogglePin,
+  deletable,
+  onDelete,
 }: {
   def: KeyDef;
   pinMode: boolean;
@@ -1826,6 +2487,8 @@ function KeyCapButton({
   active?: boolean;
   onFire: () => void;
   onTogglePin: () => void;
+  deletable?: boolean;
+  onDelete?: () => void;
 }) {
   return (
     <motion.button
@@ -1843,6 +2506,19 @@ function KeyCapButton({
     >
       <KeyCombo keys={def.keys} active={active} />
       {def.label && <span className="text-[8.5px] font-700 leading-none text-ink-dim">{def.label}</span>}
+      {pinMode && deletable && onDelete && (
+        <span
+          role="button"
+          title="Delete custom shortcut"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          className="absolute -left-1.5 -top-1.5 grid h-4 w-4 place-items-center rounded-full border border-red/40 bg-black/70 text-red"
+        >
+          <Trash2 className="h-2.5 w-2.5" />
+        </span>
+      )}
       {pinMode && (
         <span
           className={`absolute -right-1.5 -top-1.5 grid h-4 w-4 place-items-center rounded-full border ${

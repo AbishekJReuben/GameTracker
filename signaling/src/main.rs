@@ -22,14 +22,15 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tower_http::services::{ServeDir, ServeFile};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -63,17 +64,35 @@ async fn main() {
         next_id: Arc::new(AtomicU64::new(1)),
     };
 
-    // Serve the built Meta Quest client. `/quest` (and any unknown path) falls back
-    // to quest.html; `/assets/*`, the manifest and the icon resolve to real files.
-    // The signaling routes stay explicit so they always win over the static fallback.
+    // Host both discovery clients from signaling/static:
+    //   / and /companion → companion.html (phone browser)
+    //   /quest           → quest.html     (Meta Quest headset)
+    // Assets resolve via ServeDir; /ws and /health always win.
     let static_dir = quest_static_dir();
-    let index = format!("{static_dir}/quest.html");
-    let serve = ServeDir::new(&static_dir).fallback(ServeFile::new(index));
-    println!("serving Quest client from {static_dir}");
+    let companion = PathBuf::from(format!("{static_dir}/companion.html"));
+    let quest = PathBuf::from(format!("{static_dir}/quest.html"));
+    let serve = ServeDir::new(&static_dir).fallback(ServeFile::new(companion.clone()));
+    println!("serving discovery clients from {static_dir}");
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
+        .route("/quest", {
+            let p = quest.clone();
+            get(move || serve_html(p.clone()))
+        })
+        .route("/quest/", {
+            let p = quest.clone();
+            get(move || serve_html(p.clone()))
+        })
+        .route("/companion", {
+            let p = companion.clone();
+            get(move || serve_html(p.clone()))
+        })
+        .route("/companion/", {
+            let p = companion.clone();
+            get(move || serve_html(p.clone()))
+        })
         .with_state(state)
         .fallback_service(serve);
 
@@ -87,7 +106,22 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-/// Locate the built Quest client (`signaling/static`). Order: `QUEST_STATIC_DIR`
+async fn serve_html(path: PathBuf) -> Response {
+    match tokio::fs::read_to_string(&path).await {
+        Ok(body) => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            Html(body),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            "client not built — run npm run discovery:build",
+        )
+            .into_response(),
+    }
+}
+
+/// Locate the built discovery clients (`signaling/static`). Order: `QUEST_STATIC_DIR`
 /// env override, `<exe dir>/static` (deployed alongside the binary), then the
 /// build machine's `signaling/static` (this server is self-hosted — built and run
 /// on the same PC, so the compile-time manifest path is valid at runtime).

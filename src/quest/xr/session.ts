@@ -144,12 +144,19 @@ export class ImmersiveSession {
   private gamepadSentAt = 0;
   private frameHandle = 0;
   private curFrame: XRFrame | null = null;
+  /** Host desktop cursor kind (arrow / text / hand / …) — drives the hit marker. */
+  private cursorKind = "arrow";
 
   constructor(
     private video: HTMLVideoElement,
     private getMode: () => Mode,
     private cb: SessionCallbacks,
   ) {}
+
+  /** Mirror the PC's cursor shape on the ray hit marker. */
+  setCursorKind(kind: string) {
+    this.cursorKind = kind || "arrow";
+  }
 
   static async isSupported(): Promise<boolean> {
     try {
@@ -172,9 +179,11 @@ export class ImmersiveSession {
   async start(): Promise<void> {
     if (this.session) return;
     if (!navigator.xr) throw new Error("WebXR is not available in this browser.");
-    // Ask for the system keyboard as an optional feature so focus() can raise it.
+    // Ask for the system keyboard as an optional feature so focus() can raise it
+    // (Meta Browser 26.1+ / WebXR keyboard docs). Surface Keyboard in flat 2D
+    // does not need this — only immersive sessions do.
     const session = await navigator.xr.requestSession("immersive-vr", {
-      optionalFeatures: ["local-floor", "layers"],
+      optionalFeatures: ["local-floor", "bounded-floor", "layers", "keyboard"],
     });
     this.session = session;
 
@@ -325,8 +334,21 @@ export class ImmersiveSession {
 
       // Ray + cursor for the active pointer (pointer mode only).
       if (pointer) {
-        this.drawRay(gl, pointer.origin, pointer.end, pointer.hit ? [0.36, 0.8, 1, 0.9] : [1, 1, 1, 0.28]);
-        if (pointer.hit) this.drawCursor(gl, pointer.hit);
+        const kind = this.cursorKind;
+        const rayCol =
+          kind === "hand"
+            ? [0.4, 0.9, 0.55, 0.95]
+            : kind === "text"
+              ? [0.55, 0.75, 1, 0.95]
+              : kind === "busy"
+                ? [1, 0.7, 0.25, 0.95]
+                : kind === "no"
+                  ? [1, 0.35, 0.4, 0.9]
+                  : pointer.hit
+                    ? [0.36, 0.8, 1, 0.9]
+                    : [1, 1, 1, 0.28];
+        this.drawRay(gl, pointer.origin, pointer.end, rayCol);
+        if (pointer.hit && kind !== "hidden") this.drawCursor(gl, pointer.hit, kind);
       }
     }
   };
@@ -357,24 +379,108 @@ export class ImmersiveSession {
     gl.drawArrays(gl.LINES, 0, 2);
   }
 
-  private drawCursor(gl: WebGLRenderingContext, at: Vec3) {
-    // A small screen-aligned quad at the hit point, nudged toward the viewer along
-    // the screen normal so it never z-fights with the video.
-    const s = CURSOR_SIZE;
+  private drawCursor(gl: WebGLRenderingContext, at: Vec3, kind: string) {
+    // Screen-aligned marker at the hit point, nudged toward the viewer so it
+    // never z-fights with the video. Shape + colour track the host cursor kind.
     const c = Math.cos(this.yaw);
     const sn = Math.sin(this.yaw);
-    const right: Vec3 = [c * s, 0, -sn * s];
-    const up: Vec3 = [0, s, 0];
-    const n: Vec3 = [sn * 0.01, 0, c * 0.01]; // 1cm toward the head
+    const rightU: Vec3 = [c, 0, -sn];
+    const upU: Vec3 = [0, 1, 0];
+    const n: Vec3 = [sn * 0.01, 0, c * 0.01];
     const p: Vec3 = [at[0] + n[0], at[1] + n[1], at[2] + n[2]];
-    const v = new Float32Array([
-      p[0] - right[0] - up[0], p[1] - right[1] - up[1], p[2] - right[2] - up[2],
-      p[0] + right[0] - up[0], p[1] + right[1] - up[1], p[2] + right[2] - up[2],
-      p[0] + right[0] + up[0], p[1] + right[1] + up[1], p[2] + right[2] + up[2],
-      p[0] - right[0] - up[0], p[1] - right[1] - up[1], p[2] - right[2] - up[2],
-      p[0] + right[0] + up[0], p[1] + right[1] + up[1], p[2] + right[2] + up[2],
-      p[0] - right[0] + up[0], p[1] - right[1] + up[1], p[2] - right[2] + up[2],
-    ]);
+    const sx = (x: number, y: number): Vec3 => [
+      p[0] + rightU[0] * x + upU[0] * y,
+      p[1] + rightU[1] * x + upU[1] * y,
+      p[2] + rightU[2] * x + upU[2] * y,
+    ];
+    const quad = (hw: number, hh: number) => {
+      const a = sx(-hw, -hh);
+      const b = sx(hw, -hh);
+      const d = sx(hw, hh);
+      const e = sx(-hw, hh);
+      return [a, b, d, a, d, e];
+    };
+    const bar = (x0: number, y0: number, x1: number, y1: number, t: number) => {
+      // Thick line as a thin quad between two points in screen plane.
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const len = Math.hypot(dx, dy) || 1;
+      const nx = (-dy / len) * t;
+      const ny = (dx / len) * t;
+      const a = sx(x0 + nx, y0 + ny);
+      const b = sx(x1 + nx, y1 + ny);
+      const d = sx(x1 - nx, y1 - ny);
+      const e = sx(x0 - nx, y0 - ny);
+      return [a, b, d, a, d, e];
+    };
+
+    let tris: Vec3[] = [];
+    let color: number[] = [1, 0.95, 0.4, 0.95];
+    const s = CURSOR_SIZE;
+
+    switch (kind) {
+      case "text": {
+        // I-beam: vertical stem + small top/bottom caps.
+        color = [0.7, 0.85, 1, 0.98];
+        tris = [
+          ...bar(0, -s * 1.1, 0, s * 1.1, s * 0.12),
+          ...bar(-s * 0.45, s * 1.1, s * 0.45, s * 1.1, s * 0.1),
+          ...bar(-s * 0.45, -s * 1.1, s * 0.45, -s * 1.1, s * 0.1),
+        ];
+        break;
+      }
+      case "hand": {
+        color = [0.45, 0.95, 0.6, 0.95];
+        tris = quad(s * 1.15, s * 1.15);
+        break;
+      }
+      case "busy": {
+        color = [1, 0.72, 0.2, 0.95];
+        tris = quad(s * 0.9, s * 0.9);
+        break;
+      }
+      case "cross":
+      case "move": {
+        color = [1, 1, 1, 0.95];
+        tris = [...bar(-s, 0, s, 0, s * 0.12), ...bar(0, -s, 0, s, s * 0.12)];
+        break;
+      }
+      case "resize-ns": {
+        color = [1, 0.95, 0.55, 0.95];
+        tris = [...bar(0, -s, 0, s, s * 0.14), ...quad(s * 0.35, s * 0.18)];
+        break;
+      }
+      case "resize-we": {
+        color = [1, 0.95, 0.55, 0.95];
+        tris = [...bar(-s, 0, s, 0, s * 0.14), ...quad(s * 0.18, s * 0.35)];
+        break;
+      }
+      case "resize-nwse":
+      case "resize-nesw": {
+        color = [1, 0.95, 0.55, 0.95];
+        const flip = kind === "resize-nesw" ? -1 : 1;
+        tris = [...bar(-s * flip, -s, s * flip, s, s * 0.14)];
+        break;
+      }
+      case "no": {
+        color = [1, 0.4, 0.45, 0.95];
+        tris = [...bar(-s * 0.8, -s * 0.8, s * 0.8, s * 0.8, s * 0.12), ...bar(-s * 0.8, s * 0.8, s * 0.8, -s * 0.8, s * 0.12)];
+        break;
+      }
+      default: {
+        // Arrow / help / grab / unknown — bright tip square.
+        color = [1, 0.95, 0.4, 0.95];
+        tris = quad(s, s);
+        break;
+      }
+    }
+
+    const v = new Float32Array(tris.length * 3);
+    for (let i = 0; i < tris.length; i++) {
+      v[i * 3] = tris[i][0];
+      v[i * 3 + 1] = tris[i][1];
+      v[i * 3 + 2] = tris[i][2];
+    }
     gl.useProgram(this.solidProg);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dynBuf);
     gl.bufferData(gl.ARRAY_BUFFER, v, gl.DYNAMIC_DRAW);
@@ -382,8 +488,8 @@ export class ImmersiveSession {
     gl.vertexAttribPointer(this.aPosSolid, 3, gl.FLOAT, false, 0, 0);
     gl.disable(gl.DEPTH_TEST);
     gl.uniformMatrix4fv(this.uVp, false, this.mVp);
-    gl.uniform4fv(this.uColor, [1, 0.95, 0.4, 0.95]);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.uniform4fv(this.uColor, color);
+    gl.drawArrays(gl.TRIANGLES, 0, tris.length);
     gl.enable(gl.DEPTH_TEST);
   }
 

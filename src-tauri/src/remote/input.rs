@@ -69,6 +69,12 @@ fn special_key(name: &str) -> Option<Key> {
         "pagedown" => Key::PageDown,
         "insert" | "ins" => Key::Insert,
         "capslock" | "caps" => Key::CapsLock,
+        "printscreen" | "printscr" | "prtsc" | "prtscr" => Key::PrintScr,
+        // enigo 0.3 spells this `Numlock` (not NumLock).
+        "numlock" | "num" => Key::Numlock,
+        // Windows: Key::Scroll (VK_SCROLL); Linux has ScrollLock — this app is Win-only.
+        "scrolllock" | "scroll" | "scrlk" => Key::Scroll,
+        "pause" | "break" => Key::Pause,
         // Modifiers — usable both as one-shot keys and as held (keydown/keyup) chords.
         "ctrl" | "control" => Key::Control,
         "alt" => Key::Alt,

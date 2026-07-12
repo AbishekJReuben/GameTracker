@@ -352,9 +352,9 @@ export function startHost(opts: HostOptions): () => void {
     }
   };
 
-  // Rapid focus re-checks right after a click, so the phone hears about a newly
-  // focused PC text field within ~100ms (fast enough that the tap's transient
-  // user-activation on the phone can still raise the soft keyboard).
+  // Rapid focus re-checks right after a click, so the guest can latch its
+  // Surface Keyboard / IME during the same user-gesture window. Quest caret
+  // detection can lag, so we probe longer/faster than a single poll.
   const pokeFocus = () => {
     let n = 0;
     const tick = async () => {
@@ -364,6 +364,9 @@ export function startHost(opts: HostOptions): () => void {
         if (active !== lastTextField) {
           lastTextField = active;
           dataCh.send(JSON.stringify({ event: "focus", textField: active }));
+        } else if (active) {
+          // Re-assert true so a guest that missed the edge still locks on.
+          dataCh.send(JSON.stringify({ event: "focus", textField: true }));
         }
         const kind = await api.remoteCursorKind();
         if (kind !== lastCursorKind) {
@@ -373,9 +376,9 @@ export function startHost(opts: HostOptions): () => void {
       } catch {
         /* ignore */
       }
-      if (++n < 4) window.setTimeout(tick, 90);
+      if (++n < 10) window.setTimeout(tick, 80);
     };
-    window.setTimeout(tick, 40);
+    window.setTimeout(tick, 16);
   };
 
   const stopAudio = () => {
@@ -778,6 +781,23 @@ export function startHost(opts: HostOptions): () => void {
         await startAudioCapture?.();
       } catch {
         /* audio is optional */
+      }
+      // First-approval path: the guest already attached an empty track before
+      // capture started. Force a keyframe (and a mute flip) so receivers that
+      // painted black don't sit forever on "Waking your screen…".
+      try {
+        const sender = videoSender as (RTCRtpSender & { generateKeyFrame?: () => Promise<void> }) | null;
+        await sender?.generateKeyFrame?.();
+      } catch {
+        /* optional API */
+      }
+      try {
+        if (videoTrack) {
+          videoTrack.enabled = false;
+          videoTrack.enabled = true;
+        }
+      } catch {
+        /* ignore */
       }
       if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "ok" }));
     };

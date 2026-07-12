@@ -140,6 +140,16 @@ export function ImmersiveScreen({
     }
   }, [stream]);
 
+  // Mirror host cursor kind onto the VR hit marker (text beam, hand, resize…).
+  useEffect(() => {
+    const unsub = link.onEvent((e) => {
+      if (e.event === "cursor") {
+        sessionRef.current?.setCursorKind(String((e as { kind?: string }).kind || "arrow"));
+      }
+    });
+    return () => unsub?.();
+  }, [link]);
+
   return (
     <div className="fixed inset-0 z-30 grid place-items-center bg-bg-base/95 text-ink">
       <div className="max-w-md px-8 text-center">

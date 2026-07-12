@@ -31,6 +31,14 @@ interface Manifest {
   notes?: string;
 }
 
+/** True when running inside a real Tauri webview (Android APK / desktop). */
+function isTauri(): boolean {
+  return Boolean(
+    (window as unknown as { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown }).__TAURI_INTERNALS__ ||
+      (window as unknown as { __TAURI__?: unknown }).__TAURI__,
+  );
+}
+
 /** True when running inside the phone companion bundle. */
 function isCompanion(): boolean {
   return Boolean((window as unknown as { __GT_COMPANION__?: boolean }).__GT_COMPANION__);
@@ -71,7 +79,7 @@ function cmpVersion(a: string, b: string): number {
  * a missed check is invisible.
  */
 export async function checkForUpdate(): Promise<UpdateInfo | null> {
-  if (!isCompanion()) return null;
+  if (!isCompanion() || !isTauri()) return null;
   try {
     const current = await getVersion();
     const m = await loadManifest();
@@ -96,8 +104,8 @@ export type UpdateCheck =
  * so a stuck auto-update is diagnosable instead of silently doing nothing.
  */
 export async function checkForUpdateVerbose(): Promise<UpdateCheck> {
-  if (!isCompanion()) {
-    return { status: "error", current: null, message: "Updates are only available in the installed app." };
+  if (!isCompanion() || !isTauri()) {
+    return { status: "error", current: null, message: "Updates are only available in the installed Android app." };
   }
   let current: string | null = null;
   try {

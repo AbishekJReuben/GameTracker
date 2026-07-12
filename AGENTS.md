@@ -546,39 +546,37 @@ in `update.ts` (`MANIFEST_URL`) must match the desktop updater's release host
 (`AbishekJReuben/GameTracker`).
 
 **Meta Quest 3 VR client (v3.8.x) — `quest.html` → `src/quest/**`.** A third Vite entry
-(alongside `index.html` / `companion.html`) is a headset-optimised remote that reuses the
-**exact same** P2P transport as the phone (`CloudConn`, `makeRtcLink`, `setCloudMode` from
-`src/companion/**`) — so pairing, auth, reconnection, and the WebRTC screen/audio/control
-channels are all shared, not reimplemented. Two ways to use it:
-- **Flat mode** (`FlatScreen.tsx`): the Quest laser is an ordinary PointerEvent stream —
-  absolute cursor moves + tap-click, hold→drag, long-press→right-click, thumbstick `wheel`
-  → scroll. Typing raises the **Quest system keyboard** from a hidden `<input>`.
-- **Immersive VR "big screen"** (`ImmersiveScreen.tsx` + `xr/session.ts`): a raw-WebGL
-  `immersive-vr` session (no 3D engine) draws the WebRTC `<video>` on a floating quad and
-  each controller's aiming ray + cursor. `xr/session.ts` translates controller input to
-  control messages: **trigger = left click/drag** (drag locks to the pressing hand),
-  **squeeze = right-click**, **thumbstick = scroll**, **A = keyboard**, **B = Enter**,
-  **X / left-stick-press = recenter**, **Y or hold-both-grips = exit**. A **gamepad mode**
-  folds both controllers into a virtual Xbox pad (reuses the ViGEm `gamepad` ControlMsg).
+(alongside `index.html` / `companion.html`). **Quest mounts the exact same `CompanionApp`
++ `ControlScreen` shell as Android** (tabs, docks, quality, shortcuts, keyboard, streaming)
+via `setCompanionRuntime()` hooks — muscle memory matches the phone. Quest-only extras:
+headset device name, Enter VR + pointer/gamepad toggle on the Control top bar, and
+`ImmersiveScreen` WebXR overlay. (`FlatScreen` / `QuestPairing` remain on disk unused.)
 
-Quest-specific gotchas that are already handled — do not regress:
-- **System keyboard has NO key events** (Meta only exposes the field's `value`) and **each
-  time it opens it overwrites the whole value**. `textDiff.ts` (`TextDiffSender`) diffs the
-  field on every `input` and **`reset()`s the field + diff-base right before every
-  `focus()`**, so an overwrite reads as "type the new chars", never "delete everything".
-  Needs Quest Browser **26.1+**. The hidden `<input>` must stay **in the DOM and on-screen**
-  (not `display:none`/off-screen) or typing scrolls the page.
+- **Flat / 2D** — identical to Android Control (laser = PointerEvents). Typing uses the
+  shared compose bar; field is reset before every `focus()` (Quest keyboard overwrite quirk).
+- **Immersive VR "big screen"** (`ImmersiveScreen.tsx` + `xr/session.ts`): raw-WebGL
+  `immersive-vr` session draws the WebRTC `<video>` on a floating quad. Mapping:
+  **trigger = left click/drag**, **squeeze = right-click**, **thumbstick = scroll**,
+  **A = keyboard**, **B = Enter**, **X / left-stick-press = recenter**,
+  **Y or hold-both-grips = exit**. Gamepad mode → virtual Xbox pad (ViGEm).
+
+Shared Control features (Android + Quest + discovery mobile browser):
+- Special keys include Home/End/PgUp/PgDn/Ins/PrtSc/Caps/Num/ScrLk/Pause + F-keys/media.
+- Shortcuts pane: builtins (Ctrl+C/V/X/Z/Y/S, Alt+Tab, …) + **custom shortcuts** persisted
+  in `gt.remote.customShortcuts` (pinMode trash deletes customs only).
+- Fullscreen (`immersive`): keyboard FAB + pinned rail + tap-to-type (same as dock-collapsed).
+
+Quest-specific gotchas — do not regress:
+- **System keyboard has NO key events** and **overwrites the whole value** each open.
+  Control resets before `focus()`; immersive still uses `textDiff.ts` (`TextDiffSender`).
+  Needs Quest Browser **26.1+**. Hidden `<input>` stays in-DOM and on-screen.
 - **Controller mapping is index-exact** (`meta-quest-touch-plus`, `xr-standard`):
   buttons `0`=trigger `1`=squeeze `3`=stick-press `4`=A/X `5`=B/Y, axes `2,3`=thumbstick.
-  `xr/input.ts` maps these to the XInput bitmask matching `remote/gamepad.rs`. The
-  ray/quad math and the pad mapping have unit tests in `xr/math.test.ts` (the part you
-  can't exercise without a headset) — keep them green.
-- **WebXR needs HTTPS**, so the **signaling server hosts the client** at `/quest` (see
-  §Self-hosting): `npm run quest:build` emits `signaling/static/`, and the axum server
-  serves it (`ServeDir` fallback; `/ws` + `/health` still win). `vite.quest.config.ts` is
-  the standalone build; `serve.ps1` auto-builds it if missing. Entering VR requires a user
-  gesture (the "Enter VR" tap provides it) — don't move `session.start()` out of that path.
-  The desktop Remote page shows the `…/quest` URL + the connection code.
+  Unit tests in `xr/math.test.ts` — keep them green.
+- **Discovery hosting (HTTPS):** `npm run discovery:build` (alias `quest:build`) emits
+  both `companion.html` + `quest.html` into `signaling/static/`. Signaling serves
+  `/` + `/companion` → phone browser companion, `/quest` → headset. `serve.ps1`
+  auto-builds if either is missing. Desktop Remote page shows both URLs.
 
 **Per-device auth + resilience + decode (v3.2.8).** The Remote page now has a **single**
 toggle (`remote_set_enabled` flips both `remote_enabled` and `remote_cloud_enabled`). Access

@@ -63,6 +63,7 @@ export default function RemotePage() {
     .replace(/^wss:\/\//, "https://")
     .replace(/^ws:\/\//, "http://")
     .replace(/\/+$/, "")}/quest`;
+  const companionUrl = questUrl.replace(/\/quest$/, "/companion");
 
   const refresh = useCallback(async () => {
     try {
@@ -312,6 +313,32 @@ export default function RemotePage() {
 
                 <div className="mt-4 border-t border-line pt-4">
                   <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+                    <Smartphone className="h-3.5 w-3.5" /> Mobile browser
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <code className="rounded-xl border border-line bg-white/[0.03] px-3 py-2 font-mono text-sm text-ink">
+                      {companionUrl}
+                    </code>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard?.writeText(companionUrl);
+                        pushToast({ kind: "success", title: "Companion link copied" });
+                      }}
+                      className="btn btn-ghost h-9"
+                      title="Copy the phone browser link"
+                    >
+                      <Copy className="h-4 w-4" /> Copy link
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-xs text-ink-faint">
+                    On a phone browser (no APK), open this link and enter the <b>connection code</b> above.
+                    Same companion UI as the Android app. Discovery root (<code className="text-ink-dim">/</code>) also
+                    serves this page.
+                  </p>
+                </div>
+
+                <div className="mt-4 border-t border-line pt-4">
+                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
                     <Headset className="h-3.5 w-3.5" /> Meta Quest headset
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -331,7 +358,7 @@ export default function RemotePage() {
                   </div>
                   <p className="mt-1.5 text-xs text-ink-faint">
                     In the <b>Meta Quest Browser</b>, open this link and enter the <b>connection code</b> above.
-                    Use it as a flat screen, or tap <b>Enter VR</b> for an immersive big screen you point at with
+                    Same companion shell as the phone — tap <b>Enter VR</b> for an immersive big screen you point at with
                     the controllers (trigger = click, thumbstick = scroll, <b>A</b> = keyboard). Served over HTTPS
                     by the signaling server, which WebXR requires.
                   </p>

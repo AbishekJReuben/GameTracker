@@ -15,12 +15,14 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo = Split-Path -Parent $here
 
-# Build the Meta Quest client (served at /quest over HTTPS) if it isn't built yet,
-# so "from anywhere in VR" works out of the box. Skip if already present.
-if (-not (Test-Path (Join-Path $here "static\quest.html"))) {
-    Write-Host "Building Meta Quest client (npm run quest:build)..." -ForegroundColor Cyan
+# Build discovery clients (companion + quest into signaling/static) if either is
+# missing, so phone browsers and the Quest headset work over HTTPS.
+$needsBuild = -not (Test-Path (Join-Path $here "static\quest.html")) `
+    -or -not (Test-Path (Join-Path $here "static\companion.html"))
+if ($needsBuild) {
+    Write-Host "Building discovery clients (npm run discovery:build)..." -ForegroundColor Cyan
     Push-Location $repo
-    try { npm run quest:build } finally { Pop-Location }
+    try { npm run discovery:build } finally { Pop-Location }
 }
 
 Write-Host "Building signaling server (release)..." -ForegroundColor Cyan

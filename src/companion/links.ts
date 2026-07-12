@@ -47,9 +47,9 @@ export interface RemoteLink {
   /** Deliver a raw tile wire-frame (LAN fallback; see capture.rs `TileEncoder`). */
   onFrame(cb: (frame: Uint8Array) => void): void;
   /** Deliver the inbound screen as a WebRTC media stream (cloud video-track path). */
-  onStream(cb: (stream: MediaStream) => void): void;
+  onStream(cb: (stream: MediaStream) => void): void | (() => void);
   /** Unsolicited host events (e.g. PC text-field focus). */
-  onEvent(cb: (e: { event: string; [k: string]: unknown }) => void): void;
+  onEvent(cb: (e: { event: string; [k: string]: unknown }) => void): void | (() => void);
   onStatus(cb: (connected: boolean) => void): void;
   /** Granular connect/reconnect progress (cloud WebRTC only). */
   onProgress?(cb: (s: ConnectSnapshot) => void): () => void;
@@ -161,10 +161,10 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
       frameCb = cb;
     },
     onStream(cb) {
-      conn.onStream(cb);
+      return conn.onStream(cb);
     },
     onEvent(cb) {
-      conn.onEvent(cb);
+      return conn.onEvent(cb);
     },
     onStatus(cb) {
       conn.onStatus((s) => cb(s === "connected"));

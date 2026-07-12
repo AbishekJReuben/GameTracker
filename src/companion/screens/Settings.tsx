@@ -11,7 +11,6 @@
  */
 
 import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import {
   Download,
   RefreshCw,
@@ -26,6 +25,7 @@ import {
 } from "lucide-react";
 import { checkForUpdateVerbose, installUpdate, type UpdateCheck } from "../update";
 import { deviceName } from "../device";
+import { getCompanionRuntime } from "../runtime";
 
 interface SettingsProps {
   /** The saved connection code (code 1). */
@@ -39,9 +39,15 @@ interface SettingsProps {
 }
 
 export function SettingsScreen({ code, onSaveKey, onDisconnect, onForget }: SettingsProps) {
+  const isTauri =
+    typeof window !== "undefined" &&
+    Boolean(
+      (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ ||
+        (window as unknown as { __TAURI__?: unknown }).__TAURI__,
+    );
   return (
     <div className="mx-auto max-w-xl space-y-4 p-4">
-      <UpdateSection />
+      {isTauri && <UpdateSection />}
       <ConnectionSection code={code} onSaveKey={onSaveKey} onDisconnect={onDisconnect} onForget={onForget} />
       <div className="pb-2 text-center text-[11px] text-ink-faint">GameTracker Remote · companion</div>
     </div>
@@ -63,14 +69,28 @@ function UpdateSection() {
   }, []);
 
   // Reflect native download/install progress while an install is running.
+  // Dynamic import: static `@tauri-apps/api/event` crashes in browser/Quest hosts.
   useEffect(() => {
     if (!installing) return;
-    const un = listen<{ phase: string; received: number; total: number }>("apk-update://progress", (e) => {
-      const { phase, received, total } = e.payload;
-      setPct(phase === "installing" ? 100 : total > 0 ? Math.round((received / total) * 100) : null);
-    });
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<{ phase: string; received: number; total: number }>("apk-update://progress", (e) => {
+          const { phase, received, total } = e.payload;
+          setPct(phase === "installing" ? 100 : total > 0 ? Math.round((received / total) * 100) : null);
+        }),
+      )
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        /* not in Tauri */
+      });
     return () => {
-      un.then((f) => f());
+      cancelled = true;
+      unlisten?.();
     };
   }, [installing]);
 
@@ -186,7 +206,9 @@ function ConnectionSection({ code, onSaveKey, onDisconnect, onForget }: Settings
         </span>
         <div>
           <div className="font-display text-base font-800">This connection</div>
-          <div className="text-[11px] text-ink-faint">{deviceName()}</div>
+          <div className="text-[11px] text-ink-faint">
+            {getCompanionRuntime().deviceName?.() ?? deviceName()}
+          </div>
         </div>
       </div>
 

@@ -5,6 +5,7 @@ import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { CloudConn, type ConnectSnapshot } from "./cloud";
 import { ConnectionProgress } from "./ConnectionProgress";
 import { deviceId, deviceName } from "./device";
+import { getCompanionRuntime } from "./runtime";
 
 export type Connected = { conn: CloudConn; code: string; signalUrl: string; secret: string };
 
@@ -63,7 +64,11 @@ export function Pairing({
     const key = secret.trim().toUpperCase();
     localStorage.setItem(LS_SIGNAL, url);
     localStorage.setItem(LS_SECRET, key);
-    const conn = new CloudConn(url, c, { deviceId: deviceId(), name: deviceName(), secret: key || undefined });
+    const conn = new CloudConn(url, c, {
+      deviceId: deviceId(),
+      name: getCompanionRuntime().deviceName?.() ?? deviceName(),
+      secret: key || undefined,
+    });
     activeConnRef.current = conn;
     const timeout = window.setTimeout(() => {
       setError(timeoutMessage(progressRef.current));

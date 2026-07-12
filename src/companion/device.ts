@@ -21,7 +21,16 @@ export function deviceId(): string {
 /** Best-effort friendly device name shown in the PC's approval prompt. */
 export function deviceName(): string {
   const ua = navigator.userAgent || "";
+  if (/OculusBrowser/i.test(ua)) {
+    const m = ua.match(/Quest[^);]*/i);
+    return m ? `Meta ${m[0].trim()}` : "Meta Quest";
+  }
   const m = ua.match(/Android[^;]*;\s*([^);]+?)\s*(?:Build|\))/i);
   const model = m?.[1]?.trim();
   return model && model.length > 1 ? model : "Android phone";
+}
+
+/** True inside Meta Quest Browser (surface keyboard / touchpad, WebXR). */
+export function isQuestBrowser(): boolean {
+  return /OculusBrowser/i.test(navigator.userAgent || "");
 }

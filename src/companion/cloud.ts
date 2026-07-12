@@ -84,8 +84,10 @@ export class CloudConn {
   private pending = new Map<number, Pending>();
   private chunks = new Map<number, { parts: string[]; got: number; n: number }>();
   private frameCb: ((b64: string) => void) | null = null;
-  private streamCb: ((s: MediaStream) => void) | null = null;
-  private eventCb: ((e: HostEvent) => void) | null = null;
+  /** Multi-subscriber: Control + Quest VR both need the same stream without clobbering. */
+  private streamCbs = new Set<(s: MediaStream) => void>();
+  /** Multi-subscriber: Control + ImmersiveScreen both need cursor/focus events. */
+  private eventCbs = new Set<(e: HostEvent) => void>();
   private statusCb: ((s: Status) => void) | null = null;
   // A dedicated terminal-denial callback the *app shell* owns for the whole life
   // of the connection. `statusCb` gets reassigned by whichever screen subscribes
@@ -406,8 +408,15 @@ export class CloudConn {
         this.videoReceiver = e.receiver;
         this.jitterTarget = JITTER_BASE;
         this.applyJitter();
+        // Capture is deferred until host auth — the track starts muted/empty. When
+        // frames finally arrive, re-notify so <video> rebinds (Quest/WebKit often
+        // won't paint a track that was silent at attach time).
+        e.track.onunmute = () => this.emitStream();
+        e.track.onmute = () => {
+          /* keep listeners; frames may resume after auth */
+        };
       }
-      this.streamCb?.(this.stream);
+      this.emitStream();
     };
     this.pc.ondatachannel = (e) => {
       if (this.pc !== pc) return; // superseded before channels arrived
@@ -597,6 +606,9 @@ export class CloudConn {
         if (state === "ok") {
           this.authed = true;
           this.emit("connected");
+          // Host just started capture on the existing track — nudge subscribers to
+          // re-attach so the first-approval path doesn't stick on "Waking…".
+          this.emitStream();
         } else if (state === "pending") {
           this.emit("pending");
         } else if (state === "denied") {
@@ -607,7 +619,7 @@ export class CloudConn {
           this.deniedCb?.();
         }
       }
-      this.eventCb?.(msg as HostEvent);
+      this.emitEvent(msg as HostEvent);
       return;
     }
     // Chunked response (large payloads split by the host): reassemble by id.
@@ -665,14 +677,39 @@ export class CloudConn {
   onFrame(cb: (b64: string) => void) {
     this.frameCb = cb;
   }
+  private emitStream() {
+    if (!this.stream) return;
+    for (const cb of this.streamCbs) {
+      try {
+        cb(this.stream);
+      } catch {
+        /* ignore subscriber errors */
+      }
+    }
+  }
   /** Subscribe to the inbound screen video stream (fires immediately if present). */
-  onStream(cb: (s: MediaStream) => void) {
-    this.streamCb = cb;
+  onStream(cb: (s: MediaStream) => void): () => void {
+    this.streamCbs.add(cb);
     if (this.stream) cb(this.stream);
+    return () => {
+      this.streamCbs.delete(cb);
+    };
+  }
+  private emitEvent(e: HostEvent) {
+    for (const cb of this.eventCbs) {
+      try {
+        cb(e);
+      } catch {
+        /* ignore subscriber errors */
+      }
+    }
   }
   /** Subscribe to unsolicited host events (e.g. `{event:"focus", textField}`). */
-  onEvent(cb: (e: HostEvent) => void) {
-    this.eventCb = cb;
+  onEvent(cb: (e: HostEvent) => void): () => void {
+    this.eventCbs.add(cb);
+    return () => {
+      this.eventCbs.delete(cb);
+    };
   }
   sendControl(msg: unknown) {
     if (this.chControl?.readyState === "open") this.chControl.send(JSON.stringify(msg));
@@ -744,5 +781,7 @@ export class CloudConn {
     this.sig?.close();
     this.sig = null;
     this.stream = null;
+    this.streamCbs.clear();
+    this.eventCbs.clear();
   }
 }

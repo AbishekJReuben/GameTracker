@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
-import { listen } from "@tauri-apps/api/event";
 import {
   LayoutDashboard,
   Library,
@@ -26,6 +25,7 @@ import { setCloudMode } from "./link";
 import { makeRtcLink, type RemoteLink } from "./links";
 import { CloudConn, type ConnectSnapshot } from "./cloud";
 import { deviceId, deviceName } from "./device";
+import { getCompanionRuntime } from "./runtime";
 import { ConnectionProgress } from "./ConnectionProgress";
 import { DashboardScreen } from "./screens/Dashboard";
 import { LibraryScreen } from "./screens/Library";
@@ -105,7 +105,11 @@ export function CompanionApp() {
     setActiveCode(code);
     const signalUrl = localStorage.getItem(LS_SIGNAL) || DEFAULT_SIGNAL_URL;
     const secret = localStorage.getItem(LS_SECRET) || undefined;
-    const c = new CloudConn(signalUrl, code, { deviceId: deviceId(), name: deviceName(), secret });
+    const c = new CloudConn(signalUrl, code, {
+      deviceId: deviceId(),
+      name: getCompanionRuntime().deviceName?.() ?? deviceName(),
+      secret,
+    });
     autoConnRef.current = c;
     setPendingConn(c);
     setPhase("autoconnecting");
@@ -275,6 +279,7 @@ export function CompanionApp() {
         </nav>
       )}
     </div>
+    {getCompanionRuntime().renderOverlay?.()}
     </>
   );
 }
@@ -288,17 +293,30 @@ function UpdateBanner({ info, onDismiss }: { info: UpdateInfo; onDismiss: () => 
   const [state, setState] = useState<"idle" | "needs-permission" | "working" | "error">("idle");
   const [pct, setPct] = useState<number | null>(null);
 
+  // Dynamic import: a static `@tauri-apps/api/event` import crashes in plain
+  // browser / Quest discovery hosts. Only load listen inside the APK when
+  // a download is actually in progress.
   useEffect(() => {
     if (state !== "working") return;
-    const un = listen<{ phase: string; received: number; total: number }>(
-      "apk-update://progress",
-      (e) => {
-        const { phase, received, total } = e.payload;
-        setPct(phase === "installing" ? 100 : total > 0 ? Math.round((received / total) * 100) : null);
-      },
-    );
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<{ phase: string; received: number; total: number }>("apk-update://progress", (e) => {
+          const { phase, received, total } = e.payload;
+          setPct(phase === "installing" ? 100 : total > 0 ? Math.round((received / total) * 100) : null);
+        }),
+      )
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        /* not in Tauri — progress stays indeterminate */
+      });
     return () => {
-      un.then((f) => f());
+      cancelled = true;
+      unlisten?.();
     };
   }, [state]);
 
@@ -385,8 +403,25 @@ function ControlTab({
   onDisconnect: () => void;
 }) {
   const link: RemoteLink = useMemo(() => makeRtcLink(conn), [conn]);
-  useEffect(() => () => link.close(), [link]);
-  return <ControlScreen link={link} onNavigate={onNavigate} onDisconnect={onDisconnect} />;
+  const rt = getCompanionRuntime();
+  useEffect(() => {
+    getCompanionRuntime().onControlReady?.(link);
+    return () => {
+      getCompanionRuntime().onControlReady?.(null);
+      link.close();
+    };
+  }, [link]);
+  return (
+    <ControlScreen
+      link={link}
+      onNavigate={onNavigate}
+      onDisconnect={onDisconnect}
+      vrSupported={rt.vrSupported}
+      onEnterVr={rt.onEnterVr}
+      vrMode={rt.vrMode}
+      onVrModeChange={rt.onVrModeChange}
+    />
+  );
 }
 
 function FullscreenSpinner({ label }: { label: string }) {

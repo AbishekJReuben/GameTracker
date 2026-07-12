@@ -10,10 +10,16 @@ the server relays their SDP offer/answer + ICE candidates. Once WebRTC punches a
 peer-to-peer path, this server goes idle. Traffic through it is a few kilobytes per
 session, so it runs comfortably on the smallest free tier.
 
-It **also hosts the Meta Quest client** (the VR remote) so a headset can open it over
-HTTPS — WebXR only runs in a secure context. Build the client with
-`npm run quest:build` (emits `signaling/static/`), and it's served at
-**`https://<your-tunnel-host>/quest`** (e.g. `https://discovery.chilloutgamestudio.com/quest`).
+It **also hosts the discovery web clients** so a phone browser or Meta Quest headset can
+open them over HTTPS (WebXR only runs in a secure context). Build with
+`npm run discovery:build` (or `quest:build` — same command); emits `signaling/static/` with
+both `companion.html` and `quest.html`:
+
+| Path | Client |
+|---|---|
+| `/` or `/companion` | Phone companion (mobile browser) |
+| `/quest` | Meta Quest headset (same shell + Enter VR) |
+
 The server looks for the static files at `$QUEST_STATIC_DIR`, then `<exe dir>/static`,
 then the build machine's `signaling/static` — so the repo-run setup just works. The
 signaling routes (`/ws`, `/health`) always take precedence over the static fallback.
@@ -68,6 +74,8 @@ To use a different domain, change `DEFAULT_SIGNAL_URL` in `src/lib/remoteConfig.
 - `GET /health` → `ok`
 - `GET /ws?room=<CODE>&role=<host|guest>` → the signaling WebSocket (relays to the
   other member of the room; rooms are capped at 2 peers).
+- `GET /` · `GET /companion` → companion.html (phone browser remote)
+- `GET /quest` → quest.html (Meta Quest remote)
 
 ## TURN (optional, for the hard networks)
 WebRTC needs a TURN server to relay when a direct connection can't be established. Easiest

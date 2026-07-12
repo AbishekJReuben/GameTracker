@@ -13,8 +13,9 @@ axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
-# Serves the built Meta Quest client (signaling/static) so the headset can open
-# it over the same Cloudflare HTTPS tunnel — WebXR requires a secure context.
+# Serves the built discovery clients (companion + quest under signaling/static)
+# so phones and the Meta Quest headset can open them over the same Cloudflare
+# HTTPS tunnel — WebXR requires a secure context.
 tower-http = { version = "0.5", features = ["fs"] }
 
 [profile.release]
