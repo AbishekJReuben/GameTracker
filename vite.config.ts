@@ -31,11 +31,14 @@ export default defineConfig(async () => ({
     target: "esnext",
     chunkSizeWarningLimit: 1500,
     rollupOptions: {
-      // Two entry points: the desktop app (index.html) and the phone companion
-      // (companion.html). The companion Tauri Android app ships the latter.
+      // Three entry points: the desktop app (index.html), the phone companion
+      // (companion.html, shipped by the companion Tauri Android app), and the
+      // Meta Quest client (quest.html — also built standalone for the signaling
+      // server by vite.quest.config.ts; see npm run quest:build).
       input: {
         main: path.resolve(__dirname, "index.html"),
         companion: path.resolve(__dirname, "companion.html"),
+        quest: path.resolve(__dirname, "quest.html"),
       },
     },
   },

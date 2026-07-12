@@ -29,6 +29,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
+use tower_http::services::{ServeDir, ServeFile};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -61,11 +63,19 @@ async fn main() {
         next_id: Arc::new(AtomicU64::new(1)),
     };
 
+    // Serve the built Meta Quest client. `/quest` (and any unknown path) falls back
+    // to quest.html; `/assets/*`, the manifest and the icon resolve to real files.
+    // The signaling routes stay explicit so they always win over the static fallback.
+    let static_dir = quest_static_dir();
+    let index = format!("{static_dir}/quest.html");
+    let serve = ServeDir::new(&static_dir).fallback(ServeFile::new(index));
+    println!("serving Quest client from {static_dir}");
+
     let app = Router::new()
-        .route("/", get(|| async { "GameTracker signaling server" }))
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
-        .with_state(state);
+        .with_state(state)
+        .fallback_service(serve);
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -75,6 +85,27 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     println!("signaling server listening on {addr}");
     axum::serve(listener, app).await.expect("serve");
+}
+
+/// Locate the built Quest client (`signaling/static`). Order: `QUEST_STATIC_DIR`
+/// env override, `<exe dir>/static` (deployed alongside the binary), then the
+/// build machine's `signaling/static` (this server is self-hosted — built and run
+/// on the same PC, so the compile-time manifest path is valid at runtime).
+fn quest_static_dir() -> String {
+    if let Ok(d) = std::env::var("QUEST_STATIC_DIR") {
+        if Path::new(&d).exists() {
+            return d;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("static");
+            if p.exists() {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+    }
+    concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string()
 }
 
 async fn ws_handler(

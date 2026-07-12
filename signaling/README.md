@@ -10,6 +10,14 @@ the server relays their SDP offer/answer + ICE candidates. Once WebRTC punches a
 peer-to-peer path, this server goes idle. Traffic through it is a few kilobytes per
 session, so it runs comfortably on the smallest free tier.
 
+It **also hosts the Meta Quest client** (the VR remote) so a headset can open it over
+HTTPS — WebXR only runs in a secure context. Build the client with
+`npm run quest:build` (emits `signaling/static/`), and it's served at
+**`https://<your-tunnel-host>/quest`** (e.g. `https://discovery.chilloutgamestudio.com/quest`).
+The server looks for the static files at `$QUEST_STATIC_DIR`, then `<exe dir>/static`,
+then the build machine's `signaling/static` — so the repo-run setup just works. The
+signaling routes (`/ws`, `/health`) always take precedence over the static fallback.
+
 ## What it costs
 
 - Direct P2P works on most home/office networks → traffic is peer-to-peer, this server

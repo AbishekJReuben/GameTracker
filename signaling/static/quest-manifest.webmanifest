@@ -1,0 +1,10 @@
+{
+  "name": "GameTracker VR Remote",
+  "short_name": "GT Remote",
+  "description": "View and control your gaming PC from Meta Quest — flat panel or immersive VR big screen.",
+  "start_url": "/quest",
+  "display": "standalone",
+  "background_color": "#06070d",
+  "theme_color": "#06070d",
+  "icons": [{ "src": "/app-icon.png", "sizes": "512x512", "type": "image/png" }]
+}

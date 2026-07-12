@@ -21,6 +21,7 @@ import {
   Clapperboard,
   Sparkles,
   Gamepad2,
+  Headset,
 } from "lucide-react";
 import { Eye, EyeOff, ExternalLink, DownloadCloud, Usb, Trash2, ShieldCheck as ShieldIcon, Clock, Loader2 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -54,6 +55,14 @@ export default function RemotePage() {
   // Keep the latest signaling URL from the backend without clobbering the user's
   // in-progress edit (only seed the draft once, when it's still empty).
   const seededSignal = useRef(false);
+
+  // HTTPS address where the signaling server hosts the Meta Quest client. WebXR
+  // needs a secure context, so we derive it from the (wss) signaling URL.
+  const questUrl = `${(status?.signalUrl || signalDraft || DEFAULT_SIGNAL_URL)
+    .trim()
+    .replace(/^wss:\/\//, "https://")
+    .replace(/^ws:\/\//, "http://")
+    .replace(/\/+$/, "")}/quest`;
 
   const refresh = useCallback(async () => {
     try {
@@ -299,6 +308,33 @@ export default function RemotePage() {
                       Optional. A phone that also enters this key is trusted <b>permanently</b> with no prompt.
                     </p>
                   </div>
+                </div>
+
+                <div className="mt-4 border-t border-line pt-4">
+                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-700 uppercase tracking-wider text-ink-dim">
+                    <Headset className="h-3.5 w-3.5" /> Meta Quest headset
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <code className="rounded-xl border border-line bg-white/[0.03] px-3 py-2 font-mono text-sm text-ink">
+                      {questUrl}
+                    </code>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard?.writeText(questUrl);
+                        pushToast({ kind: "success", title: "Quest link copied" });
+                      }}
+                      className="btn btn-ghost h-9"
+                      title="Copy the headset link"
+                    >
+                      <Copy className="h-4 w-4" /> Copy link
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-xs text-ink-faint">
+                    In the <b>Meta Quest Browser</b>, open this link and enter the <b>connection code</b> above.
+                    Use it as a flat screen, or tap <b>Enter VR</b> for an immersive big screen you point at with
+                    the controllers (trigger = click, thumbstick = scroll, <b>A</b> = keyboard). Served over HTTPS
+                    by the signaling server, which WebXR requires.
+                  </p>
                 </div>
 
                 <div className="mt-4 border-t border-line pt-4">

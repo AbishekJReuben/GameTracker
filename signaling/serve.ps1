@@ -13,6 +13,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repo = Split-Path -Parent $here
+
+# Build the Meta Quest client (served at /quest over HTTPS) if it isn't built yet,
+# so "from anywhere in VR" works out of the box. Skip if already present.
+if (-not (Test-Path (Join-Path $here "static\quest.html"))) {
+    Write-Host "Building Meta Quest client (npm run quest:build)..." -ForegroundColor Cyan
+    Push-Location $repo
+    try { npm run quest:build } finally { Pop-Location }
+}
 
 Write-Host "Building signaling server (release)..." -ForegroundColor Cyan
 cargo build --release --manifest-path "$here\Cargo.toml"
