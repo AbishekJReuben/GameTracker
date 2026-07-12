@@ -9,8 +9,14 @@
 //! silent sideload install).
 
 use std::io::Read;
+use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter, Manager};
+
+/// The `content://` URI of the APK last copied into the public Downloads folder
+/// (see [`save_apk_to_downloads`]). Remembered so [`open_downloaded_apk`] can hand
+/// exactly that file to the system installer as a fallback workaround.
+static LAST_DOWNLOADS_URI: Mutex<Option<String>> = Mutex::new(None);
 
 /// The companion's applicationId (identifier in `companion/src-tauri/tauri.conf.json`).
 /// Used to build the FileProvider authority and the explicit receiver class name.
@@ -38,6 +44,57 @@ pub async fn download_and_install_apk(app: AppHandle, url: String) -> Result<(),
     tauri::async_runtime::spawn_blocking(move || run_update(&app2, &url, &cache_dir))
         .await
         .map_err(|e| format!("update task panicked: {e}"))?
+}
+
+/// Workaround for when the in-place install won't go through (the system
+/// confirmation dialog never appears, or a "package appears invalid" error):
+/// download the APK (reusing the cached copy if present) and copy it into the
+/// user-visible **Downloads** folder. Returns the display path (e.g.
+/// `Download/GameTrackerRemote-3.9.5.apk`) so the UI can tell the user exactly
+/// where it landed, and remembers its content URI for [`open_downloaded_apk`].
+///
+/// `version` is optional and only used for the Downloads filename; when omitted
+/// we derive a name from the URL's last path segment.
+#[tauri::command]
+pub async fn save_apk_to_downloads(
+    app: AppHandle,
+    url: String,
+    version: Option<String>,
+) -> Result<String, String> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("no cache dir: {e}"))?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let apk_path = ensure_downloaded(&app2, &url, &cache_dir)?;
+        emit(&app2, "saving", 0, 0);
+        let display_name = version
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .map(|v| format!("GameTrackerRemote-{v}.apk"))
+            .or_else(|| {
+                url.rsplit('/')
+                    .next()
+                    .filter(|s| s.ends_with(".apk"))
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "GameTrackerRemote.apk".into());
+        save_to_downloads(&apk_path, &display_name)
+    })
+    .await
+    .map_err(|e| format!("save task panicked: {e}"))?
+}
+
+/// Hand the APK previously copied to Downloads (via [`save_apk_to_downloads`]) to
+/// the system installer through its `content://` URI — a second install path for
+/// when the cache-dir FileProvider one didn't take. Errors clearly if nothing was
+/// saved yet.
+#[tauri::command]
+pub async fn open_downloaded_apk() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(open_downloaded_apk_impl)
+        .await
+        .map_err(|e| format!("open task panicked: {e}"))?
 }
 
 /// Fetch the update manifest JSON over HTTP and return it as a string.
@@ -129,9 +186,39 @@ fn emit(app: &AppHandle, phase: &str, received: u64, total: u64) {
     );
 }
 
+/// Download (or reuse) the APK in the cache dir, then hand it to the installer.
 fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result<(), String> {
+    let apk_path = ensure_downloaded(app, url, cache_dir)?;
+    emit(app, "installing", 0, 0);
+    launch_installer(apk_path.to_string_lossy().as_ref()).map_err(|e| {
+        format!(
+            "Install step failed after a successful download: {e}. You can save the APK to Downloads and install it from there."
+        )
+    })
+}
+
+/// Ensure `cache_dir/update.apk` holds a valid APK for `url`. Reuses an existing
+/// cached file when it's already a plausible APK (ZIP magic + size), so the
+/// Downloads workaround doesn't re-download after a failed install.
+fn ensure_downloaded(
+    app: &AppHandle,
+    url: &str,
+    cache_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("mkdir cache: {e}"))?;
     let apk_path = cache_dir.join("update.apk");
+
+    if let Ok(meta) = std::fs::metadata(&apk_path) {
+        if meta.len() >= 1024 {
+            if let Ok(mut f) = std::fs::File::open(&apk_path) {
+                let mut magic = [0u8; 2];
+                if f.read_exact(&mut magic).is_ok() && magic == *b"PK" {
+                    emit(app, "downloading", meta.len(), meta.len());
+                    return Ok(apk_path);
+                }
+            }
+        }
+    }
 
     emit(app, "downloading", 0, 0);
     // GitHub's `releases/latest/download/<asset>` URL answers with a chain of 302
@@ -189,10 +276,7 @@ fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result
                 .into(),
         );
     }
-
-    emit(app, "installing", received, total);
-    launch_installer(apk_path.to_string_lossy().as_ref())?;
-    Ok(())
+    Ok(apk_path)
 }
 
 /// Hand the downloaded APK to the Android package installer.
@@ -590,4 +674,283 @@ fn open_unknown_sources_settings(
 #[cfg(not(target_os = "android"))]
 fn launch_installer(_apk_path: &str) -> Result<(), String> {
     Err("APK install is only supported on Android".into())
+}
+
+/// Copy `apk_path` into the public Downloads collection and remember its content URI.
+#[cfg(target_os = "android")]
+fn save_to_downloads(apk_path: &std::path::Path, display_name: &str) -> Result<String, String> {
+    use jni::objects::{JObject, JValue};
+
+    let bytes = std::fs::read(apk_path).map_err(|e| format!("read cached apk: {e}"))?;
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    let result = (|| -> Result<String, String> {
+        // ContentResolver resolver = context.getContentResolver();
+        let resolver = env
+            .call_method(context, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+            .map_err(|e| format!("getContentResolver: {e}"))?
+            .l()
+            .map_err(|e| e.to_string())?;
+
+        // ContentValues values = new ContentValues();
+        let values = env
+            .new_object("android/content/ContentValues", "()V", &[])
+            .map_err(|e| format!("ContentValues: {e}"))?;
+        let put_string = |env: &mut jni::AttachGuard, key: &str, val: &str| -> Result<(), String> {
+            let jk: JObject = env.new_string(key).map_err(|e| e.to_string())?.into();
+            let jv: JObject = env.new_string(val).map_err(|e| e.to_string())?.into();
+            env.call_method(
+                &values,
+                "put",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(&jk), JValue::Object(&jv)],
+            )
+            .map_err(|e| format!("put {key}: {e}"))?;
+            Ok(())
+        };
+        // MediaStore.MediaColumns.* string values (not the Java constant names).
+        put_string(&mut env, "_display_name", display_name)?;
+        put_string(&mut env, "mime_type", "application/vnd.android.package-archive")?;
+        // IS_PENDING = 1 while we write (API 29+ MediaStore.Downloads)
+        {
+            let jk: JObject = env.new_string("is_pending").map_err(|e| e.to_string())?.into();
+            let one = env
+                .new_object("java/lang/Integer", "(I)V", &[JValue::Int(1)])
+                .map_err(|e| e.to_string())?;
+            env.call_method(
+                &values,
+                "put",
+                "(Ljava/lang/String;Ljava/lang/Integer;)V",
+                &[JValue::Object(&jk), JValue::Object(&one)],
+            )
+            .map_err(|e| format!("put is_pending: {e}"))?;
+        }
+
+        // Uri collection = MediaStore.Downloads.getContentUri("external");
+        let external: JObject = env.new_string("external").map_err(|e| e.to_string())?.into();
+        let collection = env
+            .call_static_method(
+                "android/provider/MediaStore$Downloads",
+                "getContentUri",
+                "(Ljava/lang/String;)Landroid/net/Uri;",
+                &[JValue::Object(&external)],
+            )
+            .map_err(|e| format!("Downloads.getContentUri: {e}"))?
+            .l()
+            .map_err(|e| e.to_string())?;
+
+        // Uri item = resolver.insert(collection, values);
+        let item = env
+            .call_method(
+                &resolver,
+                "insert",
+                "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+                &[JValue::Object(&collection), JValue::Object(&values)],
+            )
+            .map_err(|e| format!("insert: {e}"))?
+            .l()
+            .map_err(|e| e.to_string())?;
+        if item.is_null() {
+            return Err(
+                "Couldn't create a file in Downloads (storage permission or MediaStore insert failed)"
+                    .into(),
+            );
+        }
+
+        // OutputStream out = resolver.openOutputStream(item);
+        let out = env
+            .call_method(
+                &resolver,
+                "openOutputStream",
+                "(Landroid/net/Uri;)Ljava/io/OutputStream;",
+                &[JValue::Object(&item)],
+            )
+            .map_err(|e| format!("openOutputStream: {e}"))?
+            .l()
+            .map_err(|e| e.to_string())?;
+        if out.is_null() {
+            return Err("Couldn't open Downloads file for writing".into());
+        }
+
+        // Write in chunks via JNI byte arrays.
+        const CHUNK: usize = 256 * 1024;
+        for chunk in bytes.chunks(CHUNK) {
+            let jbytes = env.byte_array_from_slice(chunk).map_err(|e| e.to_string())?;
+            env.call_method(&out, "write", "([B)V", &[JValue::Object(&JObject::from(jbytes))])
+                .map_err(|e| format!("write Downloads: {e}"))?;
+        }
+        let _ = env.call_method(&out, "flush", "()V", &[]);
+        env.call_method(&out, "close", "()V", &[])
+            .map_err(|e| format!("close Downloads: {e}"))?;
+
+        // Clear IS_PENDING so the file becomes visible in the Files/Downloads UI.
+        let done = env
+            .new_object("android/content/ContentValues", "()V", &[])
+            .map_err(|e| e.to_string())?;
+        {
+            let jk: JObject = env.new_string("is_pending").map_err(|e| e.to_string())?.into();
+            let zero = env
+                .new_object("java/lang/Integer", "(I)V", &[JValue::Int(0)])
+                .map_err(|e| e.to_string())?;
+            env.call_method(
+                &done,
+                "put",
+                "(Ljava/lang/String;Ljava/lang/Integer;)V",
+                &[JValue::Object(&jk), JValue::Object(&zero)],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let null_s = JObject::null();
+        let _ = env.call_method(
+            &resolver,
+            "update",
+            "(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I",
+            &[
+                JValue::Object(&item),
+                JValue::Object(&done),
+                JValue::Object(&null_s),
+                JValue::Object(&null_s),
+            ],
+        );
+
+        // Remember URI for open_downloaded_apk.
+        let uri_j = env
+            .call_method(&item, "toString", "()Ljava/lang/String;", &[])
+            .map_err(|e| e.to_string())?
+            .l()
+            .map_err(|e| e.to_string())?;
+        let uri_str: String = env
+            .get_string(&uri_j.into())
+            .map_err(|e| e.to_string())?
+            .into();
+        if let Ok(mut g) = LAST_DOWNLOADS_URI.lock() {
+            *g = Some(uri_str);
+        }
+
+        Ok(format!("Download/{display_name}"))
+    })();
+
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    result
+}
+
+#[cfg(not(target_os = "android"))]
+fn save_to_downloads(apk_path: &std::path::Path, display_name: &str) -> Result<String, String> {
+    // Desktop/dev stub: copy next to the cache path so the flow is testable.
+    let dest = apk_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(display_name);
+    std::fs::copy(apk_path, &dest).map_err(|e| format!("copy: {e}"))?;
+    if let Ok(mut g) = LAST_DOWNLOADS_URI.lock() {
+        *g = Some(dest.to_string_lossy().into_owned());
+    }
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "android")]
+fn open_downloaded_apk_impl() -> Result<(), String> {
+    use jni::objects::{JObject, JValue};
+
+    let uri_str = LAST_DOWNLOADS_URI
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .ok_or_else(|| {
+            "No APK has been saved to Downloads yet — tap \"Save to Downloads\" first.".to_string()
+        })?;
+
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    let result = (|| -> Result<(), String> {
+        let allowed = can_request_installs(&mut env, &context).unwrap_or(true);
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        if !allowed {
+            let _ = open_unknown_sources_settings(&mut env, &context);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            return Err(
+                "Android needs permission to install updates. We opened the setting — enable \
+                 \"Allow from this source\", then try again."
+                    .into(),
+            );
+        }
+
+        let juri: JObject = env.new_string(&uri_str).map_err(|e| e.to_string())?.into();
+        let uri = env
+            .call_static_method(
+                "android/net/Uri",
+                "parse",
+                "(Ljava/lang/String;)Landroid/net/Uri;",
+                &[JValue::Object(&juri)],
+            )
+            .map_err(|e| format!("Uri.parse: {e}"))?
+            .l()
+            .map_err(|e| e.to_string())?;
+
+        let action: JObject = env
+            .new_string("android.intent.action.VIEW")
+            .map_err(|e| e.to_string())?
+            .into();
+        let intent = env
+            .new_object(
+                "android/content/Intent",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&action)],
+            )
+            .map_err(|e| e.to_string())?;
+        let mime: JObject = env
+            .new_string("application/vnd.android.package-archive")
+            .map_err(|e| e.to_string())?
+            .into();
+        env.call_method(
+            &intent,
+            "setDataAndType",
+            "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
+            &[JValue::Object(&uri), JValue::Object(&mime)],
+        )
+        .map_err(|e| e.to_string())?;
+
+        const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+        const FLAG_GRANT_READ_URI_PERMISSION: i32 = 0x0000_0001;
+        env.call_method(
+            &intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[JValue::Int(FLAG_ACTIVITY_NEW_TASK | FLAG_GRANT_READ_URI_PERMISSION)],
+        )
+        .map_err(|e| e.to_string())?;
+
+        env.call_method(
+            context,
+            "startActivity",
+            "(Landroid/content/Intent;)V",
+            &[JValue::Object(&intent)],
+        )
+        .map_err(|e| format!("startActivity (Downloads APK): {e}"))?;
+        Ok(())
+    })();
+
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    result
+}
+
+#[cfg(not(target_os = "android"))]
+fn open_downloaded_apk_impl() -> Result<(), String> {
+    Err("Opening a saved APK is only supported on Android".into())
 }

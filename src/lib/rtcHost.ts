@@ -15,6 +15,8 @@ import { Channel } from "@tauri-apps/api/core";
 import { api, type RemoteCaptureStats } from "./api";
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "./rtc";
 import { auxMonitorRoom } from "./remoteConfig";
+// Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
+import audioFeederWorkletUrl from "./audioFeeder.worklet.js?url";
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
 export interface HostLiveStats {
@@ -280,12 +282,16 @@ export function startHost(opts: HostOptions): () => void {
   let videoSender: RTCRtpSender | null = null;
   let audioTrack: MediaStreamTrack | null = null;
   let audioCtx: AudioContext | null = null;
-  let audioNode: ScriptProcessorNode | null = null;
+  let audioNode: AudioWorkletNode | null = null;
   let focusTimer: number | null = null;
   let lastTextField = false;
   let lastCursorKind = "";
   let sigBackoff = 1000;
   let sigRetry: number | null = null;
+  // Set when the signaling server evicted us because ANOTHER host joined our
+  // room ("replaced"). Newest wins: reconnecting would evict the newcomer right
+  // back and the two hosts would trade the room forever, flapping every guest.
+  let hostReplaced = false;
   // Timestamp of the last message from the phone (input, quality, or heartbeat
   // ping — the guest pings every 5s while alive). Used to tell a *live* session
   // apart from a zombie one when signaling-level join/leave notices arrive.
@@ -596,189 +602,73 @@ export function startHost(opts: HostOptions): () => void {
   };
 
   /**
-   * Build a WebRTC **audio** track fed by Rust WASAPI-loopback PCM: float32 frames
-   * stream over a binary channel into a small jitter buffer, and a ScriptProcessor
-   * pulls from it into a `MediaStreamAudioDestinationNode` whose track we add to the
-   * peer connection. Underruns emit silence (no glitchy repeats); we cap the buffer
-   * so audio can't drift far behind the screen.
+   * Build a WebRTC **audio** track fed by Rust WASAPI-loopback PCM: float32 chunks
+   * are transferred (zero-copy) into an **AudioWorklet** that jitter-buffers,
+   * drift-resamples, and writes them into a `MediaStreamAudioDestinationNode`
+   * whose track we add to the peer connection.
+   *
+   * The worklet replaced a ScriptProcessorNode on purpose (crackle fix):
+   * ScriptProcessor runs its callback on the MAIN thread, so whenever a game
+   * loaded the machine — or the webview was busy decoding/compositing video
+   * frames — the callback missed its deadline and the phone heard crackling.
+   * `AudioWorkletProcessor.process()` runs on the dedicated real-time audio
+   * rendering thread, which page/game load can't jank. The buffering/resampling
+   * logic lives in `audioFeeder.worklet.js`; the main thread's only remaining
+   * job is forwarding chunks. **Do not move this back to ScriptProcessor.**
    */
   const buildAudioTrack = async (): Promise<{ track: MediaStreamTrack; start: () => Promise<void> } | null> => {
-    // Interleaved float32 chunks + a read head, acting as a bounded jitter buffer.
-    let chunks: Float32Array[] = [];
-    let head = 0;
-    let avail = 0; // interleaved samples currently buffered
-    // WASAPI shared-mode loopback is 48 kHz stereo in practice; we build the graph
-    // eagerly (for the offer) at that assumption and correct the channel count when
-    // capture actually starts. Capture is DEFERRED until the guest is authorized.
-    let channels = 2;
-
     try {
       audioCtx = new AudioContext({ sampleRate: 48000 });
     } catch {
       audioCtx = new AudioContext();
     }
     audioCtx.resume().catch(() => {}); // webview autoplay policy may suspend it
-    const dest = audioCtx.createMediaStreamDestination();
-    const sr = audioCtx.sampleRate || 48000;
-    const FRAME = 2048;
-
-    // Jitter-buffer envelope (ms → interleaved samples). The old code kept up to
-    // 400ms and, when it overflowed, dumped whole chunks — which added latency AND
-    // popped on every dump. Instead: PRIME before (re)starting playback so bursts
-    // are absorbed, hold a low TARGET for latency, and only trim when we drift past
-    // MAX (host audio clock slightly faster than ours) so lag can't run away.
-    const ms = (m: number) => Math.round((sr * m) / 1000) * channels;
-    // Lower envelope for less audible lag. The drift-adaptive resampler below does
-    // the heavy lifting (it steers toward TARGET with no trims/re-primes in steady
-    // state), so these can be tight without machine-gun underruns: prime ~70ms,
-    // hold ~90ms, only trim past ~180ms. Dropping much below this starts to click
-    // on Wi‑Fi jitter — this was tuned against the earlier 120/240 pop complaints.
-    let primeSamples = ms(70);
-    let targetSamples = ms(90);
-    let maxSamples = ms(180);
-    const recalcEnvelope = () => {
-      primeSamples = ms(70);
-      targetSamples = ms(90);
-      maxSamples = ms(180);
-    };
-
-    const ch = new Channel<ArrayBuffer>();
-    ch.onmessage = (buf) => {
-      const f32 = new Float32Array(buf as unknown as ArrayBuffer);
-      chunks.push(f32);
-      avail += f32.length;
-      // Runaway-latency guard: only kicks in past MAX, and trims down to TARGET in
-      // one splice (rare) rather than constantly shedding at a high ceiling.
-      if (avail > maxSamples) {
-        let drop = avail - targetSamples;
-        while (drop > 0 && chunks.length) {
-          const c = chunks[0];
-          const take = Math.min(drop, c.length - head);
-          head += take;
-          avail -= take;
-          drop -= take;
-          if (head >= c.length) {
-            chunks.shift();
-            head = 0;
-          }
-        }
-      }
-    };
-
-    // --- Streaming linear resampler (fixes the crackle) --------------------
-    // WASAPI loopback runs at the render endpoint's mix rate (`captureRate`,
-    // often 44.1k or 96/192k, not always 48k), but the AudioContext consumes at
-    // its own `sr`. Consuming at the wrong rate makes the jitter buffer drift —
-    // it periodically starves (underrun → re-prime pop) or overflows (hard trim
-    // pop). Instead we resample: read input frames at a fractional step
-    // `ratio = captureRate / sr`, linearly interpolating between consecutive
-    // frames, and gently nudge that ratio (±0.4%, inaudible) to steer the buffer
-    // toward TARGET — absorbing both a rate mismatch and slow host↔webview clock
-    // skew smoothly, with no trims or re-primes in steady state.
-    let captureRate = sr; // corrected once real format is known (start())
-    // Resampler state: `f0`/`f1` are the two input frames we interpolate between,
-    // `phase` in [0,1) is the position between them.
-    let f0: Float32Array | null = null;
-    let f1: Float32Array | null = null;
-    let phase = 0;
-
-    // Consume exactly one interleaved input frame (`channels` samples) from the
-    // jitter buffer, or null on underrun.
-    const readFrame = (): Float32Array | null => {
-      if (avail < channels) return null;
-      const fr = new Float32Array(channels);
-      let got = 0;
-      while (got < channels && chunks.length) {
-        const c = chunks[0];
-        const take = Math.min(channels - got, c.length - head);
-        fr.set(c.subarray(head, head + take), got);
-        got += take;
-        head += take;
-        avail -= take;
-        if (head >= c.length) {
-          chunks.shift();
-          head = 0;
-        }
-      }
-      return got === channels ? fr : null;
-    };
-
-    // Priming + a slew-limited gain ramp make every silence↔audio transition
-    // click-free: hard zero-fills (the source of the "popping") are ramped
-    // instead of stepped, and after an underrun we re-prime before resuming.
-    let priming = true;
-    let gain = 0;
-    const slew = 1 / Math.max(1, 0.006 * sr); // ~6ms to ramp fully in/out
-    const zero = new Float32Array(2); // reused "silent frame" on underrun
-
-    const node = audioCtx.createScriptProcessor(FRAME, 0, channels);
-    node.onaudioprocess = (e) => {
-      const out = e.outputBuffer;
-      const nch = out.numberOfChannels;
-      // Stay silent (and faded down) until enough is buffered to play cleanly.
-      if (priming) {
-        if (avail >= primeSamples) {
-          priming = false;
-          f0 = readFrame() ?? zero;
-          f1 = readFrame() ?? f0;
-          phase = 0;
-        } else {
-          for (let c = 0; c < nch; c++) out.getChannelData(c).fill(0);
-          gain = 0;
-          return;
-        }
-      }
-
-      // Drift-adaptive playback ratio: steer buffered frames toward TARGET.
-      const targetFrames = targetSamples / channels;
-      const availFrames = avail / channels;
-      const err = targetFrames > 0 ? (availFrames - targetFrames) / targetFrames : 0;
-      const ratio = (captureRate / sr) * (1 + Math.max(-0.004, Math.min(0.004, err * 0.05)));
-
-      const od: Float32Array[] = [];
-      for (let c = 0; c < nch; c++) od.push(out.getChannelData(c));
-
-      let g = gain;
-      let underran = false;
-      for (let i = 0; i < FRAME; i++) {
-        const a = f0 as Float32Array;
-        const b = f1 as Float32Array;
-        const tgt = underran ? 0 : 1;
-        g += Math.max(-slew, Math.min(slew, tgt - g));
-        for (let c = 0; c < nch; c++) {
-          const src = Math.min(c, channels - 1);
-          od[c][i] = (a[src] * (1 - phase) + b[src] * phase) * g;
-        }
-        phase += ratio;
-        while (phase >= 1) {
-          phase -= 1;
-          f0 = f1;
-          const nf = readFrame();
-          if (nf) {
-            f1 = nf;
-          } else {
-            // Buffer emptied mid-frame: hold the last sample and fade out.
-            f1 = f0;
-            underran = true;
-          }
-        }
-      }
-      gain = g;
-      // Ran dry this buffer → refill to PRIME before resuming (prevents
-      // machine-gun clicking when the network briefly starves the stream).
-      if (underran && avail < channels) priming = true;
-    };
+    try {
+      await audioCtx.audioWorklet.addModule(audioFeederWorkletUrl);
+    } catch (e) {
+      console.warn("[remote] audio worklet failed to load — desktop audio disabled:", e);
+      audioCtx.close().catch(() => {});
+      audioCtx = null;
+      return null;
+    }
+    const ctx = audioCtx;
+    const dest = ctx.createMediaStreamDestination();
+    const node = new AudioWorkletNode(ctx, "gt-pcm-feeder", {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+    });
     node.connect(dest);
     audioNode = node;
+
+    // Forward each PCM chunk into the worklet, TRANSFERRING the buffer so the
+    // main thread does no audio work beyond handing the bytes over.
+    const ch = new Channel<ArrayBuffer>();
+    ch.onmessage = (buf) => {
+      const ab = buf as unknown as ArrayBuffer;
+      try {
+        node.port.postMessage(ab, [ab]);
+      } catch {
+        /* node torn down */
+      }
+    };
+
     const track = dest.stream.getAudioTracks()[0] ?? null;
     if (!track) return null;
+    // Capture is DEFERRED until the guest is authorized (same as video). The
+    // graph is built eagerly at 48k stereo for the offer; once capture starts we
+    // tell the worklet the REAL mix format (WASAPI loopback runs at the render
+    // endpoint's rate — often 44.1k or 96/192k) and it re-primes if it differs.
     const start = async () => {
       const fmt = await api.remoteStartAudio(ch);
-      if (fmt) {
-        channels = Math.max(1, Math.min(2, fmt.channels));
-        if (fmt.sampleRate > 8000 && fmt.sampleRate <= 384000) captureRate = fmt.sampleRate;
+      const channels = fmt ? Math.max(1, Math.min(2, fmt.channels)) : 2;
+      const captureRate =
+        fmt && fmt.sampleRate > 8000 && fmt.sampleRate <= 384000 ? fmt.sampleRate : ctx.sampleRate;
+      try {
+        node.port.postMessage({ cfg: { channels, captureRate } });
+      } catch {
+        /* node torn down */
       }
-      recalcEnvelope(); // channel count now known → size the buffer correctly
     };
     return { track, start };
   };
@@ -1179,16 +1069,26 @@ export function startHost(opts: HostOptions): () => void {
         // the desktop Remote page's live session panel.
         if (++statsTick % 2 === 0) {
           let cs: RemoteCaptureStats | null = null;
-          try {
-            cs = await api.remoteCaptureStats();
-            if (data.readyState === "open") data.send(JSON.stringify({ event: "capstats", stats: cs, at: Date.now() }));
-          } catch {
-            /* ignore */
+          // `remote_capture_stats` reports the PRIMARY pipeline only, so aux
+          // (pop-out) hosts skip it — forwarding it would show the phone the
+          // wrong display's telemetry.
+          if (opts.fixedMonitor == null) {
+            try {
+              cs = await api.remoteCaptureStats();
+              if (data.readyState === "open") data.send(JSON.stringify({ event: "capstats", stats: cs, at: Date.now() }));
+            } catch {
+              /* ignore */
+            }
           }
           // Capture-stall watchdog: if we're authorized and connected but the Rust
           // capture stops producing frames (internal error / device change), restart
           // it in place so the session self-heals without a full rebuild.
-          if (cs && authorized && pc?.connectionState === "connected") {
+          // PRIMARY host only: `remote_capture_stats` reports the primary pipeline
+          // (aux pipelines don't write those counters), so an aux host watching it
+          // would misread the primary's idle counter as "my capture wedged" and
+          // call remoteStopCapture() — killing the PRIMARY session's screen from a
+          // pop-out tab, over and over.
+          if (cs && authorized && opts.fixedMonitor == null && pc?.connectionState === "connected") {
             if (cs.producedFrames === lastProduced) {
               if (!zeroSince) zeroSince = Date.now();
               else if (Date.now() - zeroSince > 5000) {
@@ -1231,10 +1131,22 @@ export function startHost(opts: HostOptions): () => void {
   // backoff. The guest re-joins on its own drops, which lands here as peer-joined
   // and rebuilds the peer — so recovery is automatic on both sides.
   const connectSignaling = () => {
-    if (stopped) return;
-    sig = new Signaling(opts.signalUrl, opts.code, "host");
-    sig.onMessage(async (m) => {
-      if (stopped) return;
+    if (stopped || hostReplaced) return;
+    const mySig = new Signaling(opts.signalUrl, opts.code, "host");
+    sig = mySig;
+    mySig.onMessage(async (m) => {
+      // Drop events from superseded sockets — a message delivered to an old
+      // socket right as we swap in a new one must not drive current state.
+      if (stopped || sig !== mySig) return;
+      if (m.type === "replaced") {
+        // Another host instance took over this room. Every monitor pop-out now
+        // has its own room, so a live collision means a second app instance is
+        // hosting the same code — stand down (newest wins) instead of fighting.
+        console.warn("[remote] another host took over the signaling room — standing down");
+        hostReplaced = true;
+        teardownPeer();
+        return;
+      }
       if (m.type === "peer-joined") {
         // A "peer-joined" can be an echo of a guest that's *already* attached:
         // when our own signaling socket drops and reconnects, the server
@@ -1261,11 +1173,11 @@ export function startHost(opts: HostOptions): () => void {
         if (pc?.connectionState !== "connected") teardownPeer();
       }
     });
-    sig.onClose(() => {
-      if (stopped) return;
+    mySig.onClose(() => {
+      if (stopped || sig !== mySig) return;
       scheduleSignalingRetry();
     });
-    sig
+    mySig
       .connect()
       .then(() => {
         sigBackoff = 1000; // reset backoff on a good connect
@@ -1276,7 +1188,7 @@ export function startHost(opts: HostOptions): () => void {
   };
 
   const scheduleSignalingRetry = () => {
-    if (stopped || sigRetry !== null) return;
+    if (stopped || hostReplaced || sigRetry !== null) return;
     const wait = sigBackoff;
     sigBackoff = Math.min(sigBackoff * 2, 30000);
     sigRetry = window.setTimeout(() => {

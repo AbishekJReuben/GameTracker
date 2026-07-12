@@ -6,6 +6,12 @@
  * GitHub Release, compare its version to the running app, and — if newer — let
  * the user tap to download + install (the native side hands the APK to Android's
  * package installer; see `companion/src-tauri/src/update.rs`).
+ *
+ * Install is a staged fallback chain (clear reasons at each step):
+ *   1. PackageInstaller session + legacy ACTION_VIEW (cache FileProvider)
+ *   2. Copy APK into public Downloads
+ *   3. Open that Downloads file with the system installer
+ *   4. Manual instructions (open Files → Downloads → tap the APK)
  */
 
 import { getVersion } from "@tauri-apps/api/app";
@@ -71,6 +77,12 @@ function cmpVersion(a: string, b: string): number {
     if (d !== 0) return d > 0 ? 1 : -1;
   }
   return 0;
+}
+
+function errMessage(e: unknown, fallback: string): string {
+  if (e instanceof Error && e.message) return e.message;
+  if (typeof e === "string" && e.trim()) return e;
+  return fallback;
 }
 
 /**
@@ -146,9 +158,143 @@ export async function openInstallSettings(): Promise<void> {
 }
 
 /**
- * Download the APK and launch the system installer. Resolves once the installer
- * has been handed the file (the OS then shows its one-tap install prompt).
+ * Download the APK and launch the system installer (PackageInstaller session,
+ * then legacy ACTION_VIEW). Resolves once the installer has been handed the
+ * file — stock Android still shows its own one-tap confirm dialog.
  */
 export async function installUpdate(url: string): Promise<void> {
   await invoke("download_and_install_apk", { url });
+}
+
+/** Copy the APK into public Downloads; returns a display path like `Download/…`. */
+export async function saveApkToDownloads(url: string, version?: string): Promise<string> {
+  return invoke<string>("save_apk_to_downloads", { url, version: version ?? null });
+}
+
+/** Open the APK previously saved by {@link saveApkToDownloads}. */
+export async function openDownloadedApk(): Promise<void> {
+  await invoke("open_downloaded_apk");
+}
+
+/** Stage in the install fallback chain (shown in Settings / the update panel). */
+export type InstallStep =
+  | "permission"
+  | "installer"
+  | "save-downloads"
+  | "open-downloads"
+  | "manual";
+
+export type InstallProgress = {
+  step: InstallStep;
+  /** Short status line for the UI. */
+  message: string;
+  /** Native failure reason for the previous step, when advancing. */
+  reason?: string;
+  /** Display path after a successful Downloads save. */
+  savedPath?: string;
+};
+
+export type InstallOutcome =
+  | { status: "handed-off"; method: "installer" | "downloads" }
+  | { status: "needs-permission"; message: string }
+  | {
+      status: "manual";
+      /** Why automatic install stopped. */
+      reason: string;
+      /** Where the APK was saved, if the Downloads step succeeded. */
+      savedPath?: string;
+      /** Per-step failure notes for the panel. */
+      failures: { step: InstallStep; reason: string }[];
+    };
+
+/**
+ * Run the full install fallback chain with clear reasons at each step:
+ * installer → save to Downloads → open Downloads → manual instructions.
+ */
+export async function installUpdateWithFallbacks(
+  info: UpdateInfo,
+  onProgress?: (p: InstallProgress) => void,
+): Promise<InstallOutcome> {
+  const failures: { step: InstallStep; reason: string }[] = [];
+  const progress = (p: InstallProgress) => onProgress?.(p);
+
+  if (!(await installPermissionGranted())) {
+    progress({
+      step: "permission",
+      message: 'Android needs "Allow from this source" before updates can install.',
+    });
+    try {
+      await openInstallSettings();
+    } catch {
+      /* best-effort */
+    }
+    return {
+      status: "needs-permission",
+      message:
+        'Enable "Allow from this source" for GameTracker Remote, then try Update again.',
+    };
+  }
+
+  progress({ step: "installer", message: "Downloading and opening the system installer…" });
+  try {
+    await installUpdate(info.url);
+    return { status: "handed-off", method: "installer" };
+  } catch (e) {
+    const reason = errMessage(
+      e,
+      "The system installer did not start after the download finished.",
+    );
+    failures.push({ step: "installer", reason });
+    progress({
+      step: "save-downloads",
+      message: "Installer failed — saving the APK to Downloads…",
+      reason,
+    });
+  }
+
+  let savedPath: string | undefined;
+  try {
+    savedPath = await saveApkToDownloads(info.url, info.version);
+    progress({
+      step: "open-downloads",
+      message: `Saved to ${savedPath}. Opening it with the system installer…`,
+      savedPath,
+    });
+  } catch (e) {
+    const reason = errMessage(e, "Couldn't copy the APK into Downloads.");
+    failures.push({ step: "save-downloads", reason });
+    progress({
+      step: "manual",
+      message: "Couldn't save to Downloads — install manually from a browser download.",
+      reason,
+    });
+    return {
+      status: "manual",
+      reason: failures.map((f) => f.reason).join(" → "),
+      failures,
+    };
+  }
+
+  try {
+    await openDownloadedApk();
+    return { status: "handed-off", method: "downloads" };
+  } catch (e) {
+    const reason = errMessage(
+      e,
+      "Couldn't open the Downloads APK with the system installer.",
+    );
+    failures.push({ step: "open-downloads", reason });
+    progress({
+      step: "manual",
+      message: `Open Files → Downloads and tap ${savedPath ?? "the APK"} to install.`,
+      reason,
+      savedPath,
+    });
+    return {
+      status: "manual",
+      reason: failures.map((f) => f.reason).join(" → "),
+      savedPath,
+      failures,
+    };
+  }
 }

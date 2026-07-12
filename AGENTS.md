@@ -598,3 +598,30 @@ decode-stall **watchdogs** (`cloud.ts`), and the host restarts capture if it pro
 dropping ~30% of frames on Android); companion default quality is **1920 / Text / sharpness
 100**; the phone always shows fps by the "Live" label and `companion.html` uses
 `interactive-widget=resizes-content` so the keyboard doesn't push the top bar off-screen.
+
+**v3.9.1 fixes — multi-monitor pop-out loop + gameplay audio crackle (do not regress):**
+- **Pop-out rooms:** `auxMonitorRoom` gives EVERY pop-out its own signaling room, including
+  monitor 0 (`code~m0`). The bare code is reserved for the primary session — mapping any
+  pop-out onto it drops a second host+guest pair into the primary room, and the server's
+  same-role eviction then makes both sessions kick each other in an endless
+  connect→evict→reconnect loop (both tabs flashing the screen for a second, forever).
+- **`replaced` = stand down (newest wins):** the signaling server sends `{"type":"replaced"}`
+  to a peer it evicts for a newer same-role join. A LIVE recipient must not auto-reconnect
+  (that evicts the newcomer back → the same ping-pong): the guest (`cloud.ts`) latches
+  `denied` and shows "Taken over by another tab or device"; the host (`rtcHost.ts`) sets
+  `hostReplaced` and stops signaling retries. Own-reconnect deliveries are filtered by
+  socket-identity guards (`sig !== mySig`), so this only fires for genuine second tabs/apps.
+- **Aux hosts skip the capture-stall watchdog + capstats:** `remote_capture_stats` reports
+  only the PRIMARY pipeline (aux pipelines don't write `ST_*`), so an aux host reading it
+  would misdiagnose a stall and call `remoteStopCapture()` — killing the primary session's
+  screen from a pop-out tab every 5s. Both blocks are gated on `opts.fixedMonitor == null`.
+- **Remote audio is an AudioWorklet (`src/lib/audioFeeder.worklet.js`), not a
+  ScriptProcessorNode.** ScriptProcessor callbacks run on the MAIN thread, so game/webview
+  load starved them → crackling during gameplay (YouTube-only was fine because the machine
+  was idle). The worklet runs on the real-time audio thread: jitter buffer + drift-adaptive
+  linear resampler + slew-limited gain live there (no per-frame allocs); the main thread only
+  forwards PCM chunks (`port.postMessage`, transferred). Its TARGET grows +40ms per underrun
+  (bursty IPC delivery under load) up to 250ms and eases back after ~10s clean. The module is
+  bundled via Vite `?url` import — CSP `default-src 'self'` blocks `blob:`/`data:` modules.
+- **WASAPI capture thread registers with MMCSS** (`AvSetMmThreadCharacteristicsW("Pro Audio")`,
+  `audio.rs`) so a running game can't starve the loopback loop. Best-effort, don't remove.

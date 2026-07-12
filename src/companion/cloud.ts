@@ -272,6 +272,24 @@ export class CloudConn {
       } else if (m.type === "room-full") {
         this.setProgress("reconnecting", "Room busy — retrying…");
         this.scheduleReconnect();
+      } else if (m.type === "replaced") {
+        // The server evicted this socket because a NEWER guest joined the same
+        // room. Our own reconnects never see this (the `sig !== this.sig` guard
+        // above drops messages to superseded sockets), so a live "replaced"
+        // means the user genuinely opened this room in another tab/device.
+        // Newest wins: auto-reconnecting from here would evict the newcomer
+        // right back and the two tabs would trade the room forever (screen for
+        // a second → kicked → reconnect → …). Stand down terminally instead —
+        // reuse the `denied` latch, which every reconnect path already respects.
+        this.denied = true;
+        this.clearReconnect();
+        this.clearOfferTimeout();
+        this.stopHeartbeat();
+        this.lastStatus = "denied";
+        this.statusCb?.("denied");
+        this.setProgress("denied", "Taken over by another tab or device");
+        this.pc?.close();
+        this.deniedCb?.();
       }
     });
     sig.onClose(() => {

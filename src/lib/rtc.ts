@@ -53,6 +53,11 @@ type SignalMsg =
   | { type: "peer-joined"; role?: string }
   | { type: "peer-left" }
   | { type: "room-full" }
+  // The server evicted this socket because a newer same-role peer joined the
+  // room. A live recipient must STAND DOWN (newest wins): auto-reconnecting
+  // would evict the newcomer right back and the two peers would trade the room
+  // in an endless connect→evict loop.
+  | { type: "replaced" }
   // `sid` tags the offer's session so the guest can tell an ICE-restart
   // renegotiation of the *current* session (apply in place, keep auth+decoder)
   // apart from a brand-new session (full rebuild). Absent on legacy hosts.

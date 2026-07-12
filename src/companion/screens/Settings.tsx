@@ -7,7 +7,7 @@
  * `../update.ts` (+ `companion/src-tauri/src/update.rs`). The launch-time banner
  * is easy to miss and swallows every failure; here the user can trigger a check
  * on demand and actually see the result (up to date, a download with progress,
- * or a specific error).
+ * or a specific error) plus Downloads / manual workarounds.
  */
 
 import { useEffect, useState } from "react";
@@ -23,7 +23,8 @@ import {
   Trash2,
   Info,
 } from "lucide-react";
-import { checkForUpdateVerbose, installUpdate, type UpdateCheck } from "../update";
+import { checkForUpdateVerbose, type UpdateCheck } from "../update";
+import { UpdatePanel } from "../UpdatePanel";
 import { deviceName } from "../device";
 import { getCompanionRuntime } from "../runtime";
 
@@ -54,49 +55,18 @@ export function SettingsScreen({ code, onSaveKey, onDisconnect, onForget }: Sett
   );
 }
 
-/** In-app updater: current version, manual check, and download+install. */
+/** In-app updater: current version, manual check, and download+install with fallbacks. */
 function UpdateSection() {
   const [check, setCheck] = useState<UpdateCheck | null>(null);
   const [checking, setChecking] = useState(false);
-  const [installing, setInstalling] = useState(false);
-  const [pct, setPct] = useState<number | null>(null);
-  const [installError, setInstallError] = useState<string | null>(null);
 
-  // Run a check automatically the first time the screen opens.
   useEffect(() => {
     void runCheck();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Reflect native download/install progress while an install is running.
-  // Dynamic import: static `@tauri-apps/api/event` crashes in browser/Quest hosts.
-  useEffect(() => {
-    if (!installing) return;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    import("@tauri-apps/api/event")
-      .then(({ listen }) =>
-        listen<{ phase: string; received: number; total: number }>("apk-update://progress", (e) => {
-          const { phase, received, total } = e.payload;
-          setPct(phase === "installing" ? 100 : total > 0 ? Math.round((received / total) * 100) : null);
-        }),
-      )
-      .then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      .catch(() => {
-        /* not in Tauri */
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [installing]);
-
   const runCheck = async () => {
     setChecking(true);
-    setInstallError(null);
     try {
       setCheck(await checkForUpdateVerbose());
     } finally {
@@ -104,92 +74,53 @@ function UpdateSection() {
     }
   };
 
-  const install = async () => {
-    if (check?.status !== "update-available") return;
-    setInstalling(true);
-    setPct(null);
-    setInstallError(null);
-    try {
-      await installUpdate(check.info.url);
-    } catch (e) {
-      setInstallError(e instanceof Error && e.message ? e.message : "Update failed. Please try again.");
-      setInstalling(false);
-    }
-  };
-
   const current = check && "current" in check ? check.current : null;
 
   return (
-    <section className="rounded-2xl border border-line bg-bg-900/60 p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent-sheen shadow-glow">
-          <Download className="h-4 w-4 text-white" />
-        </span>
-        <div>
-          <div className="font-display text-base font-800">App updates</div>
-          <div className="text-[11px] text-ink-faint">
-            Version {current ?? "…"}
-          </div>
-        </div>
-      </div>
-
-      {/* Status line */}
-      <div className="mb-3 min-h-[2.75rem] rounded-xl border border-line bg-white/[0.02] px-3 py-2.5 text-sm">
-        {checking ? (
-          <span className="flex items-center gap-2 text-ink-dim">
-            <Loader2 className="h-4 w-4 animate-spin" /> Checking for updates…
+    <section className="space-y-3">
+      <div className="rounded-2xl border border-line bg-bg-900/60 p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent-sheen shadow-glow">
+            <Download className="h-4 w-4 text-white" />
           </span>
-        ) : check?.status === "update-available" ? (
           <div>
-            <span className="flex items-center gap-2 font-700 text-accent-3">
-              <Info className="h-4 w-4" /> Update available · v{check.info.version}
-            </span>
-            {check.info.notes ? <p className="mt-1 whitespace-pre-wrap text-[12px] text-ink-dim">{check.info.notes}</p> : null}
+            <div className="font-display text-base font-800">App updates</div>
+            <div className="text-[11px] text-ink-faint">Version {current ?? "…"}</div>
           </div>
-        ) : check?.status === "up-to-date" ? (
-          <span className="flex items-center gap-2 text-green">
-            <CheckCircle2 className="h-4 w-4" /> You're on the latest version.
-          </span>
-        ) : check?.status === "error" ? (
-          <span className="flex items-center gap-2 text-amber">
-            <AlertTriangle className="h-4 w-4 shrink-0" /> {check.message}
-          </span>
-        ) : (
-          <span className="text-ink-faint">Tap "Check for updates".</span>
-        )}
+        </div>
+
+        <div className="mb-3 min-h-[2.75rem] rounded-xl border border-line bg-white/[0.02] px-3 py-2.5 text-sm">
+          {checking ? (
+            <span className="flex items-center gap-2 text-ink-dim">
+              <Loader2 className="h-4 w-4 animate-spin" /> Checking for updates…
+            </span>
+          ) : check?.status === "update-available" ? (
+            <div>
+              <span className="flex items-center gap-2 font-700 text-accent-3">
+                <Info className="h-4 w-4" /> Update available · v{check.info.version}
+              </span>
+            </div>
+          ) : check?.status === "up-to-date" ? (
+            <span className="flex items-center gap-2 text-green">
+              <CheckCircle2 className="h-4 w-4" /> You're on the latest version.
+            </span>
+          ) : check?.status === "error" ? (
+            <span className="flex items-center gap-2 text-amber">
+              <AlertTriangle className="h-4 w-4 shrink-0" /> {check.message}
+            </span>
+          ) : (
+            <span className="text-ink-faint">Tap "Check for updates".</span>
+          )}
+        </div>
+
+        <button onClick={runCheck} disabled={checking} className="btn btn-subtle h-11 w-full gap-2">
+          <RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} /> Check for updates
+        </button>
       </div>
 
-      {installError ? (
-        <div className="mb-3 flex items-center gap-2 rounded-xl border border-red/30 bg-red/5 px-3 py-2 text-[12px] text-red">
-          <AlertTriangle className="h-4 w-4 shrink-0" /> {installError}
-        </div>
+      {check?.status === "update-available" ? (
+        <UpdatePanel info={check.info} current={check.current} />
       ) : null}
-
-      {installing ? (
-        <div className="rounded-xl border border-line bg-white/[0.02] px-3 py-2.5">
-          <div className="mb-1.5 flex items-center justify-between text-[12px] font-700">
-            <span className="flex items-center gap-2 text-accent-3">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              {pct == null ? "Downloading…" : pct >= 100 ? "Opening installer…" : `Downloading… ${pct}%`}
-            </span>
-            {pct != null && pct < 100 ? <span className="tabular-nums text-ink-dim">{pct}%</span> : null}
-          </div>
-          <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
-            <div className="h-full rounded-full bg-accent-sheen transition-[width]" style={{ width: `${pct ?? 8}%` }} />
-          </div>
-        </div>
-      ) : (
-        <div className="flex gap-2">
-          <button onClick={runCheck} disabled={checking} className="btn btn-subtle h-11 flex-1 gap-2">
-            <RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} /> Check for updates
-          </button>
-          {check?.status === "update-available" ? (
-            <button onClick={install} className="btn btn-primary h-11 flex-1 gap-2">
-              <Download className="h-4 w-4" /> Update now
-            </button>
-          ) : null}
-        </div>
-      )}
     </section>
   );
 }

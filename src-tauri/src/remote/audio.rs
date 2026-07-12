@@ -72,6 +72,17 @@ where
     };
 
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    // Register this thread with MMCSS as "Pro Audio": at normal priority a
+    // running game can starve the capture loop long enough for the endpoint
+    // buffer to glitch (audible crackle on the phone during gameplay). MMCSS
+    // gives it the elevated scheduler class real audio engines use without
+    // starving the rest of the system. Best-effort — capture works without it.
+    {
+        use windows::core::w;
+        use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+        let mut task_index = 0u32;
+        let _ = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index);
+    }
     let result = (|| -> windows::core::Result<()> {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;

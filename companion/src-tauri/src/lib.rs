@@ -14,6 +14,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             update::download_and_install_apk,
+            update::save_apk_to_downloads,
+            update::open_downloaded_apk,
             update::fetch_update_manifest,
             update::install_permission_status,
             update::open_install_settings

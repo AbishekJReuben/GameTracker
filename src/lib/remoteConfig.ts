@@ -23,10 +23,17 @@ export const SIGNAL_PORT = 8080;
 
 /**
  * Per-monitor pop-out tabs join a sibling signaling room so each display can
- * stream independently (main room = primary connection, `code~m1` = monitor 1…).
+ * stream independently (`code~m0` = monitor 0, `code~m1` = monitor 1, …).
+ *
+ * EVERY pop-out gets its own sibling room — including monitor 0. The bare code
+ * is reserved for the primary session: mapping a pop-out onto it would drop a
+ * second host + second guest into the primary room, and the signaling server's
+ * same-role eviction would then make the two sessions kick each other out in an
+ * endless connect→evict→reconnect loop (both tabs flashing the screen for a
+ * second, forever).
  */
 export function auxMonitorRoom(code: string, monitor: number): string {
   const base = code.trim().toUpperCase();
-  if (monitor <= 0) return base;
+  if (!Number.isFinite(monitor) || monitor < 0) return base;
   return `${base}~m${monitor}`;
 }

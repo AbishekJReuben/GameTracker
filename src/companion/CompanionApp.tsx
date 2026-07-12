@@ -39,7 +39,8 @@ import { GameDetailScreen } from "./screens/GameDetail";
 import { useOpenGame, closeGame } from "./ui";
 import { ScreenErrorBoundary } from "./ErrorBoundary";
 import { PageTransitionFX } from "./PageTransitionFX";
-import { checkForUpdate, installUpdate, installPermissionGranted, openInstallSettings, type UpdateInfo } from "./update";
+import { checkForUpdate, type UpdateInfo } from "./update";
+import { UpdatePanel } from "./UpdatePanel";
 
 type Tab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
 type Phase = "boot" | "pairing" | "autoconnecting" | "connected" | "paused";
@@ -306,107 +307,39 @@ export function CompanionApp() {
 }
 
 /**
- * "Update available" banner shown at the top of the app when a newer companion
- * APK is published. Tapping Update downloads it and hands it to the Android
- * package installer; a small progress line reflects the download.
+ * "Update available" banner — tapping it opens the update panel with install
+ * fallbacks (system installer → Downloads → manual), instead of silently
+ * failing after a successful download.
  */
 function UpdateBanner({ info, onDismiss }: { info: UpdateInfo; onDismiss: () => void }) {
-  const [state, setState] = useState<"idle" | "needs-permission" | "working" | "error">("idle");
-  const [pct, setPct] = useState<number | null>(null);
-
-  // Dynamic import: a static `@tauri-apps/api/event` import crashes in plain
-  // browser / Quest discovery hosts. Only load listen inside the APK when
-  // a download is actually in progress.
-  useEffect(() => {
-    if (state !== "working") return;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    import("@tauri-apps/api/event")
-      .then(({ listen }) =>
-        listen<{ phase: string; received: number; total: number }>("apk-update://progress", (e) => {
-          const { phase, received, total } = e.payload;
-          setPct(phase === "installing" ? 100 : total > 0 ? Math.round((received / total) * 100) : null);
-        }),
-      )
-      .then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      .catch(() => {
-        /* not in Tauri — progress stays indeterminate */
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [state]);
-
-  const start = async () => {
-    // Ask for the "install unknown apps" permission up front. Without it, Android
-    // silently refuses the install intent — and older builds crashed at that
-    // point, closing the app before any prompt appeared. Bounce the user to the
-    // setting first; they grant it and tap Update again.
-    if (!(await installPermissionGranted())) {
-      setState("needs-permission");
-      try {
-        await openInstallSettings();
-      } catch {
-        /* best-effort — the message tells the user what to do */
-      }
-      return;
-    }
-    setState("working");
-    setPct(null);
-    try {
-      await installUpdate(info.url);
-    } catch {
-      setState("error");
-    }
-  };
+  const [open, setOpen] = useState(false);
 
   return (
-    <motion.div
-      initial={{ y: -60, opacity: 0 }}
-      animate={{ y: 0, opacity: 1 }}
-      className="fixed inset-x-0 top-0 z-50 border-b border-line bg-bg-900/95 backdrop-blur"
-      style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}
-    >
-      <div className="flex items-center gap-3 px-4 py-2.5">
-        <span className="grid h-9 w-9 flex-none place-items-center rounded-xl bg-accent-sheen shadow-glow">
-          <Download className="h-4 w-4 text-white" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-700">Update available · v{info.version}</div>
-          <div className="truncate text-[11px] text-ink-dim">
-            {state === "working"
-              ? pct == null
-                ? "Downloading…"
-                : pct >= 100
-                  ? "Opening installer…"
-                  : `Downloading… ${pct}%`
-              : state === "needs-permission"
-                ? "Allow installing apps from this source, then tap Update again."
-                : state === "error"
-                  ? "Update failed — tap to retry"
-                  : "A newer version of the companion is ready."}
-          </div>
-        </div>
-        {state === "working" && pct != null && pct < 100 ? (
-          <span className="text-xs font-700 tabular-nums text-accent-3">{pct}%</span>
-        ) : state === "working" ? (
-          <Loader2 className="h-4 w-4 animate-spin text-accent-3" />
-        ) : (
-          <button onClick={start} className="btn btn-primary h-8 px-3 text-xs">
-            {state === "error" ? "Retry" : "Update"}
+    <>
+      <motion.div
+        initial={{ y: -60, opacity: 0 }}
+        animate={{ y: 0, opacity: 1 }}
+        className="fixed inset-x-0 top-0 z-50 border-b border-line bg-bg-900/95 backdrop-blur"
+        style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}
+      >
+        <div className="flex w-full items-center gap-3 px-4 py-2.5">
+          <button type="button" onClick={() => setOpen(true)} className="flex min-w-0 flex-1 items-center gap-3 text-left">
+            <span className="grid h-9 w-9 flex-none place-items-center rounded-xl bg-accent-sheen shadow-glow">
+              <Download className="h-4 w-4 text-white" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-700">Update available · v{info.version}</div>
+              <div className="truncate text-[11px] text-ink-dim">Tap for install options &amp; workarounds</div>
+            </div>
+            <span className="btn btn-primary pointer-events-none h-8 px-3 text-xs">Update</span>
           </button>
-        )}
-        {state !== "working" && (
-          <button onClick={onDismiss} className="btn btn-ghost h-8 w-8 p-0 text-ink-dim" title="Dismiss">
+          <button type="button" onClick={onDismiss} className="btn btn-ghost h-8 w-8 p-0 text-ink-dim" title="Dismiss">
             <X className="h-4 w-4" />
           </button>
-        )}
-      </div>
-    </motion.div>
+        </div>
+      </motion.div>
+      {open ? <UpdatePanel info={info} sheet onClose={() => setOpen(false)} /> : null}
+    </>
   );
 }
 
