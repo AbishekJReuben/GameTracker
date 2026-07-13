@@ -28,6 +28,12 @@ jobs:
     outputs:
       release_id: ${{ steps.ensure.outputs.release_id }}
     steps:
+      # gh release create --verify-tag shells out to git, so the repo must be
+      # checked out (with tags) or the job dies with "not a git repository".
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Ensure GitHub Release exists
         id: ensure
         env:
