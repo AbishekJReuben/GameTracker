@@ -212,8 +212,13 @@ function measure(el: HTMLElement | null, natW: number, natH: number): Layout | n
   return { cw, ch, dispW, dispH, offX: (cw - dispW) / 2, offY: (ch - dispH) / 2 };
 }
 
-/** Clamp pan so the scaled image never reveals empty space beyond its edges. */
+/**
+ * Clamp pan so the scaled image stays inside the viewport.
+ * At zoom ≤ 1 (image fits / letterboxes) pan is forced to 0 — otherwise a stale
+ * pan from a taller pre-keyboard layout can shove the stream off the top.
+ */
 function clampPan(l: Layout, zoom: number, panX: number, panY: number) {
+  if (zoom <= 1.001) return { x: 0, y: 0 };
   const maxX = Math.max(0, (l.dispW * zoom - l.cw) / 2);
   const maxY = Math.max(0, (l.dispH * zoom - l.ch) / 2);
   return { x: clamp(panX, -maxX, maxX), y: clamp(panY, -maxY, maxY) };
@@ -345,32 +350,63 @@ export function ControlScreen({
     localStorage.setItem("gt.remote.topCollapsed", topCollapsed ? "1" : "0");
   }, [topCollapsed]);
 
-  // Soft-keyboard inset. `interactive-widget=resizes-content` (companion.html) is
-  // supposed to shrink the layout viewport when the keyboard opens, but it isn't
-  // honored on every Android WebView — when it falls back to pan mode the browser
-  // scrolls the focused input into view and pushes the screen off the top. Measure
-  // the keyboard height off the VisualViewport and reserve it as bottom padding so
-  // the flex column simply *shrinks* the viewport to fit above the keyboard. When
-  // resizes-content DOES work, layout and visual heights shrink together and this
-  // computes ~0, so the two approaches never fight.
+  // Soft-keyboard / VisualViewport handling.
+  // `interactive-widget=resizes-content` (companion.html) should shrink the layout
+  // viewport, but many Android WebViews fall back to *pan* mode: the focused
+  // ghost input is scrolled into view and the remote stream slides off the top.
+  // Dragging near the bottom while the keyboard is open can nudge offsetTop
+  // further. Fix: when a real keyboard is up, pin this screen to the *visual*
+  // viewport (fixed top/left/width/height) and zero document scroll so the
+  // stream can never leave the visible area. When resizes-content works,
+  // offsetTop≈0 and covered≈0 so we stay in normal flow.
   const [kbInset, setKbInset] = useState(0);
+  const [vvPin, setVvPin] = useState<{
+    top: number;
+    left: number;
+    width: number;
+    height: number;
+  } | null>(null);
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
     const update = () => {
       const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
       // Ignore sub-100px noise (address bar, rounding) — only real keyboards.
-      setKbInset((prev) => {
-        const next = covered > 100 ? Math.round(covered) : 0;
-        return next === prev ? prev : next;
-      });
+      const nextInset = covered > 100 ? Math.round(covered) : 0;
+      setKbInset((prev) => (nextInset === prev ? prev : nextInset));
+
+      if (nextInset > 0) {
+        // Kill any document scroll the IME applied, then pin to the visible band.
+        window.scrollTo(0, 0);
+        document.documentElement.scrollTop = 0;
+        document.body.scrollTop = 0;
+        const next = {
+          top: Math.round(vv.offsetTop),
+          left: Math.round(vv.offsetLeft),
+          width: Math.round(vv.width),
+          height: Math.round(vv.height),
+        };
+        setVvPin((prev) =>
+          prev &&
+          prev.top === next.top &&
+          prev.left === next.left &&
+          prev.width === next.width &&
+          prev.height === next.height
+            ? prev
+            : next,
+        );
+      } else {
+        setVvPin((prev) => (prev ? null : prev));
+      }
     };
     vv.addEventListener("resize", update);
     vv.addEventListener("scroll", update);
+    window.addEventListener("scroll", update, { passive: true });
     update();
     return () => {
       vv.removeEventListener("resize", update);
       vv.removeEventListener("scroll", update);
+      window.removeEventListener("scroll", update);
     };
   }, []);
   const [kbMode, setKbMode] = useState<KbMode>("direct");
@@ -890,12 +926,24 @@ export function ControlScreen({
     return () => window.clearInterval(id);
   }, []);
 
-  // Keep layout measurement fresh on resize / orientation / chrome / fullscreen.
-  // Browser fullscreen transitions finish asynchronously — pulse remeasures for ~1s.
+  // Keep layout measurement fresh on resize / orientation / chrome / fullscreen /
+  // keyboard pin. Remeasure + reclamp pan so a shrunk viewport can't leave a
+  // stale translate shoving the stream off-screen.
   useEffect(() => {
     const refreshLayout = () => {
       const l = measure(viewportRef.current, natRef.current.w, natRef.current.h);
-      if (l) layoutRef.current = l;
+      if (l) {
+        layoutRef.current = l;
+        const next = clampPan(l, zoomRef.current, panRef.current.x, panRef.current.y);
+        if (next.x !== panRef.current.x || next.y !== panRef.current.y) {
+          panRef.current = next;
+          setPan({ ...next });
+        }
+        if (zoomRef.current <= 1.001 && zoomRef.current !== 1) {
+          zoomRef.current = 1;
+          setZoom(1);
+        }
+      }
       // Force cursor overlay to re-anchor against the live media box.
       setCursor((c) => ({ ...c }));
     };
@@ -933,7 +981,7 @@ export function ControlScreen({
       vv?.removeEventListener("scroll", pulse);
       ro?.disconnect();
     };
-  }, [immersive, topCollapsed, dockCollapsed, panel, browserFs, typing, hasStream]);
+  }, [immersive, topCollapsed, dockCollapsed, panel, browserFs, typing, hasStream, kbInset, vvPin]);
 
   // Cancel any in-flight edge-pan frame if the screen unmounts mid-drag.
   useEffect(() => () => {
@@ -1598,13 +1646,14 @@ export function ControlScreen({
 
   const zoomed = zoom > 1.01 || pan.x !== 0 || pan.y !== 0;
   const questBrowser = isQuestBrowser();
-  // Android soft-keyboard inset only — Quest Surface Keyboard sits on the desk and
-  // must never shrink the remote viewport.
-  const bottomReserve = questBrowser ? 0 : kbInset;
+  // Pin to the visual viewport while the soft keyboard is up (Android WebView pan
+  // mode). Quest Surface Keyboard never shrinks the remote viewport.
+  const pinKb = !questBrowser && vvPin != null;
+  const bottomReserve = questBrowser || pinKb ? 0 : kbInset;
   const cursorScreen = useMemo(() => {
     return normToViewport(viewportRef.current, mediaEl(), cursor.x, cursor.y);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor, zoom, pan, hasStream, immersive, topCollapsed, dockCollapsed, browserFs]);
+  }, [cursor, zoom, pan, hasStream, immersive, topCollapsed, dockCollapsed, browserFs, kbInset, vvPin]);
   // Trackpad / Quest: hide the OS pointer and draw RemoteCursor (shape mirrors host).
   // Desktop web mouse/pen: live CSS cursor instead (no double-cursor).
   const showRemoteCursor = mode === "trackpad" || questBrowser;
@@ -1614,8 +1663,22 @@ export function ControlScreen({
 
   return (
     <div
-      className="flex h-full w-full flex-col overflow-hidden bg-black select-none"
-      style={{ paddingBottom: bottomReserve || undefined }}
+      className="relative flex h-full w-full flex-col overflow-hidden bg-black select-none"
+      style={{
+        overscrollBehavior: "none",
+        touchAction: "none",
+        paddingBottom: bottomReserve || undefined,
+        ...(pinKb && vvPin
+          ? {
+              position: "fixed",
+              top: vvPin.top,
+              left: vvPin.left,
+              width: vvPin.width,
+              height: vvPin.height,
+              zIndex: 40,
+            }
+          : null),
+      }}
     >
       {/* ==== top toolbar — flex sibling (shrinks video); collapsible like the bottom dock ==== */}
       {!immersive && !topCollapsed && (
@@ -2056,7 +2119,11 @@ export function ControlScreen({
       )}
       </div>{/* ==== end viewport area ==== */}
 
-      {/* Ghost input — on-screen, nearly invisible, no bar. Focus raises Surface Keyboard. */}
+      {/* Ghost input — ABSOLUTE inside this screen (not fixed to the layout
+          viewport). A fixed bottom-anchored field sits under the soft keyboard,
+          so Android pans the visual viewport and the stream slides off the top;
+          dragging near the bottom then worsens the offset. Keeping the caret
+          inside the pinned/shrunk screen stops that. */}
       <input
         ref={kbdRef}
         onInput={onKbdInput}
@@ -2076,6 +2143,8 @@ export function ControlScreen({
             setDockCollapsed(true);
             setPanel(null);
           }
+          // Belt-and-braces: undo any IME scroll the moment focus lands.
+          window.scrollTo(0, 0);
         }}
         onBlur={() => {
           // Quest: reclaim focus while latched (Surface Keyboard can transiently
@@ -2090,8 +2159,15 @@ export function ControlScreen({
           }
           setTyping(false);
         }}
-        className="pointer-events-none fixed bottom-3 left-3 z-[60] h-7 w-7 border-0 p-0 outline-none"
-        style={{ opacity: 0.01, caretColor: "transparent" }}
+        className="pointer-events-none absolute z-[60] h-7 w-7 border-0 p-0 outline-none"
+        style={{
+          opacity: 0.01,
+          caretColor: "transparent",
+          // Sit in the compose band (or just above the dock) — always inside the
+          // visible Control shell, never under the soft keyboard.
+          left: 12,
+          bottom: typing && !questBrowser ? 10 : 12,
+        }}
         aria-hidden={!typing}
         inputMode="text"
         enterKeyHint={kbMode === "buffered" ? "send" : "done"}
