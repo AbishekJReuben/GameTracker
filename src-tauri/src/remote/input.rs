@@ -14,8 +14,15 @@ pub enum ControlEvent {
     Move { x: f32, y: f32 },
     /// Move relatively (like trackpad).
     Moverel { dx: i32, dy: i32 },
-    /// Switch which monitor is captured and targeted for absolute positioning.
+    /// Switch which monitor is captured AND targeted for absolute positioning.
+    /// Sent by the PRIMARY tab's display switcher — the primary capture follows it.
     Monitor { index: usize },
+    /// Re-target absolute-input bounds at monitor `index` WITHOUT changing which
+    /// monitor is captured. Constructed internally (the phone never sends it) to pin
+    /// each event to the right display: a pop-out tab controls display 2 without
+    /// repointing display 1's capture, and the primary re-pins to its own display so
+    /// an interleaved pop-out event can't leave the shared cursor on the wrong screen.
+    InputMonitor { index: usize },
     /// Press-and-release a mouse button (optionally after moving there first).
     Click {
         x: Option<f32>,
@@ -122,9 +129,17 @@ impl Controller {
         Some(c)
     }
 
-    /// Point absolute input at monitor `index` (and tell the capture side too).
+    /// Point absolute input at monitor `index` AND make the capture follow it (the
+    /// primary tab's explicit display switch).
     fn set_monitor(&mut self, index: usize) {
         crate::remote::capture::set_selected_monitor(index);
+        self.set_input_bounds(index);
+    }
+
+    /// Point absolute input at monitor `index` WITHOUT changing the captured monitor.
+    /// Used to pin each event to the display it came from (primary vs a pop-out)
+    /// while the two share this single cursor/controller.
+    fn set_input_bounds(&mut self, index: usize) {
         if let Some((x, y, w, h)) = crate::remote::capture::monitor_bounds(index) {
             self.mx = x;
             self.my = y;
@@ -224,6 +239,10 @@ impl Controller {
                 self.set_monitor(index);
                 Ok(())
             }
+            ControlEvent::InputMonitor { index } => {
+                self.set_input_bounds(index);
+                Ok(())
+            }
             ControlEvent::Click { x, y, button } => {
                 if let (Some(x), Some(y)) = (x, y) {
                     let (px, py) = self.to_abs(x, y);
@@ -284,29 +303,47 @@ pub fn spawn_controller() -> Option<std::sync::mpsc::Sender<ControlEvent>> {
 static CONTROLLER: once_cell::sync::Lazy<parking_lot::Mutex<Option<std::sync::mpsc::Sender<ControlEvent>>>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
-/// Inject a single control event via the shared controller (used by the
-/// `remote_inject` command when driving input over a WebRTC data channel).
+/// Inject a single control event from the PRIMARY tab via the shared controller
+/// (the `remote_inject` command, WebRTC data channel).
+///
+/// Every event is preceded by a bounds-only pin to the primary-selected monitor, so
+/// a pop-out tab's interleaved input (which pins to its own display) can never leave
+/// the shared cursor mapped to the wrong screen. The explicit `Monitor` switch is
+/// exempt — it sets the bounds itself and is the only event allowed to move the
+/// globally-captured monitor.
 pub fn inject(ev: ControlEvent) {
     let mut guard = CONTROLLER.lock();
     if guard.is_none() {
         *guard = spawn_controller();
     }
     if let Some(tx) = guard.as_ref() {
-        if tx.send(ev).is_err() {
+        let needs_pin = !matches!(ev, ControlEvent::Monitor { .. });
+        let ok = (!needs_pin
+            || tx
+                .send(ControlEvent::InputMonitor { index: crate::remote::capture::selected_monitor() })
+                .is_ok())
+            && tx.send(ev).is_ok();
+        if !ok {
             *guard = None; // Thread died; a fresh one spawns on the next event.
         }
     }
 }
 
-/// Pin absolute input to `monitor`, then apply `ev` — both queued under one lock
-/// so a concurrent primary-tab inject can't land between the switch and the move.
+/// Inject a single control event from a pop-out tab locked to `monitor` (the
+/// `remote_inject_on` command). Pins absolute input to that display and applies the
+/// event under one lock so a concurrent primary inject can't land between them.
+///
+/// Crucially this pins **input bounds only** — it must NOT change `SELECTED_MONITOR`
+/// (the monitor the PRIMARY tab captures). Sending `ControlEvent::Monitor` here was
+/// the bug that made controlling a pop-out repoint the original tab's display and
+/// collapse both feeds onto one monitor.
 pub fn inject_on_monitor(monitor: usize, ev: ControlEvent) {
     let mut guard = CONTROLLER.lock();
     if guard.is_none() {
         *guard = spawn_controller();
     }
     if let Some(tx) = guard.as_ref() {
-        if tx.send(ControlEvent::Monitor { index: monitor }).is_err() || tx.send(ev).is_err() {
+        if tx.send(ControlEvent::InputMonitor { index: monitor }).is_err() || tx.send(ev).is_err() {
             *guard = None;
         }
     }

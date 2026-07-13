@@ -214,9 +214,46 @@ fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result
     })
 }
 
-/// Ensure `cache_dir/update.apk` holds a valid APK for `url`. Reuses an existing
-/// cached file when it's already a plausible APK (ZIP magic + size), so the
-/// Downloads workaround doesn't re-download after a failed install.
+/// A complete APK is a ZIP: it starts with the "PK" magic AND ends with an
+/// End-Of-Central-Directory record (signature `50 4B 05 06`) somewhere in the last
+/// ~64 KB (the ZIP comment can be up to 65535 bytes). Checking the EOCD — not just
+/// the 2-byte header — is what catches a **truncated or corrupted** download: the
+/// header-only check accepted a partial file that then failed to install with
+/// "package appears to be invalid".
+fn apk_looks_complete(path: &std::path::Path) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let len = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return false,
+    };
+    if len < 1024 {
+        return false;
+    }
+    let mut head = [0u8; 2];
+    if f.read_exact(&mut head).is_err() || &head != b"PK" {
+        return false;
+    }
+    let tail = std::cmp::min(len, 65_557) as usize; // 22-byte EOCD + max comment
+    if f.seek(SeekFrom::End(-(tail as i64))).is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; tail];
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    buf.windows(4).any(|w| w == [0x50, 0x4b, 0x05, 0x06])
+}
+
+/// Ensure `cache_dir/update.apk` holds a *complete, valid* APK for `url`, and return
+/// its path. Reuses an existing cached copy only when it passes the full integrity
+/// check, so a corrupt earlier download can't stick the user on "package invalid"
+/// forever (it used to be reused on every retry). Downloads to a `.part` temp file
+/// and only promotes it after verifying completeness, so the cache is never a
+/// half-written file.
 fn ensure_downloaded(
     app: &AppHandle,
     url: &str,
@@ -225,25 +262,29 @@ fn ensure_downloaded(
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("mkdir cache: {e}"))?;
     let apk_path = cache_dir.join("update.apk");
 
-    if let Ok(meta) = std::fs::metadata(&apk_path) {
-        if meta.len() >= 1024 {
-            if let Ok(mut f) = std::fs::File::open(&apk_path) {
-                let mut magic = [0u8; 2];
-                if f.read_exact(&mut magic).is_ok() && magic == *b"PK" {
-                    emit(app, "downloading", meta.len(), meta.len());
-                    return Ok(apk_path);
-                }
-            }
-        }
+    // Reuse only a verified-complete cached APK.
+    if apk_looks_complete(&apk_path) {
+        let len = std::fs::metadata(&apk_path).map(|m| m.len()).unwrap_or(0);
+        emit(app, "downloading", len, len);
+        return Ok(apk_path);
     }
+    let _ = std::fs::remove_file(&apk_path); // drop any corrupt/partial cache
 
     emit(app, "downloading", 0, 0);
+    let tmp_path = cache_dir.join("update.apk.part");
     // GitHub's `releases/latest/download/<asset>` URL answers with a chain of 302
     // redirects to a signed CDN object; ureq follows redirects by default. Send a
     // User-Agent (GitHub can reject blank-UA clients) and surface a clear error if
     // the final response isn't a 2xx so the UI can report *why* it failed.
+    //
+    // Accept-Encoding: identity — ureq 2 enables transparent gzip by default, and a
+    // Content-Encoding round-trip on an already-compressed binary APK can hand back
+    // altered bytes (the "package appears to be invalid" install failure, while the
+    // same asset downloaded by a browser installs fine). Forcing identity guarantees
+    // we store the exact release bytes.
     let resp = ureq::get(url)
         .set("User-Agent", "GameTrackerRemote-Updater")
+        .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| match e {
             ureq::Error::Status(code, _) => {
@@ -257,42 +298,41 @@ fn ensure_downloaded(
         .unwrap_or(0);
 
     let mut reader = resp.into_reader();
-    let mut file = std::fs::File::create(&apk_path).map_err(|e| format!("create apk: {e}"))?;
+    let mut file = std::fs::File::create(&tmp_path).map_err(|e| format!("create apk: {e}"))?;
     let mut buf = [0u8; 64 * 1024];
     let mut received: u64 = 0;
-    let mut magic = [0u8; 2]; // first two bytes — a real APK (ZIP) starts with "PK"
     loop {
         let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             break;
         }
-        if received == 0 && n >= 2 {
-            magic.copy_from_slice(&buf[..2]);
-        }
         std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("write: {e}"))?;
         received += n as u64;
         emit(app, "downloading", received, total);
     }
-    // Flush to disk before handing the path to another process (the installer).
+    // Flush to disk before validating / handing the path to another process.
     let _ = file.sync_all();
     drop(file);
 
-    // Guard against a truncated/HTML error body being handed to the package
-    // installer (which would fail with an opaque "parse error" — looking to the
-    // user like the update just didn't work). A real APK is a ZIP, comfortably
-    // larger than this floor and starting with the ZIP magic "PK".
-    if received < 1024 {
+    // Completeness: bytes must match Content-Length (when the server gave one) AND
+    // the file must be a structurally-complete ZIP. Either failing means a truncated
+    // or altered body — delete it and report, so a retry re-downloads cleanly instead
+    // of reusing a broken cache.
+    if total > 0 && received != total {
+        let _ = std::fs::remove_file(&tmp_path);
         return Err(format!(
-            "downloaded file is too small ({received} bytes) — the update may not be published yet"
+            "download incomplete ({received} of {total} bytes) — check your connection and try again"
         ));
     }
-    if magic != *b"PK" {
+    if !apk_looks_complete(&tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
         return Err(
-            "the downloaded file isn't a valid APK (the release asset may be missing or the \
-             link redirected to an error page) — try again shortly"
+            "the downloaded update looks incomplete or corrupted (not a valid APK) — please try again"
                 .into(),
         );
     }
+
+    std::fs::rename(&tmp_path, &apk_path).map_err(|e| format!("finalize apk: {e}"))?;
     Ok(apk_path)
 }
 

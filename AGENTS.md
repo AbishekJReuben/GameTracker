@@ -601,8 +601,25 @@ dropping ~30% of frames on Android); companion default quality is **1920 / Text 
 100**; the phone always shows fps by the "Live" label and `companion.html` uses
 `interactive-widget=resizes-content` so the keyboard doesn't push the top bar off-screen.
 
-**v3.9.5–3.9.9 remote fixes — multi-monitor pop-out (loop in 3.9.5 + frozen feed in 3.9.9) +
-gameplay audio crackle + Android update fallbacks (do not regress):**
+**v3.9.5–3.9.10 remote fixes — multi-monitor pop-out (loop 3.9.5, frozen feed 3.9.9, independent
+capture+control 3.9.10) + gameplay audio crackle + Android update (fallbacks + integrity) (do
+not regress):**
+- **Pop-out input is decoupled from the captured monitor (`input.rs`).** There is ONE process-wide
+  `Controller` (one system cursor). `ControlEvent::Monitor{index}` (the PRIMARY tab's display
+  switch) is the ONLY event allowed to move the global `SELECTED_MONITOR` that the primary capture
+  follows. The pop-out path (`inject_on_monitor`) now pins absolute-input bounds to its display via
+  the new bounds-only `ControlEvent::InputMonitor{index}` — it must NEVER send `Monitor`. Sending
+  `Monitor` there was the bug: controlling a pop-out repointed the original tab's capture and
+  collapsed both DXGI duplications onto one output. `inject` (primary) also re-pins to
+  `selected_monitor()` before each event so an interleaved pop-out event can't leave the shared
+  cursor mapped to the wrong screen. Net: two monitors stream + are controllable side-by-side.
+- **APK download integrity (`update.rs`).** In-app updates failed with "package appears to be
+  invalid" while the same release APK installed fine from a browser. Cause: `ureq` 2's default
+  transparent **gzip** could alter the binary, and the old check validated only the 2-byte "PK"
+  magic + a 1 KB floor — so a truncated/altered file passed AND was then reused from cache on every
+  retry. Fix: request `Accept-Encoding: identity`, download to a `.part` temp, verify received ==
+  Content-Length AND a valid ZIP End-Of-Central-Directory (`50 4B 05 06`) via `apk_looks_complete`,
+  then atomically rename into place; a corrupt cache is rejected and re-downloaded.
 - **Aux pop-out capture uses DXGI Desktop Duplication, not xcap.** Each pop-out pipeline
   (`start_aux_capture`) now owns a `dxdupe::Duplicator` targeting its monitor by desktop origin,
   same as the primary. Desktop Duplication allows one session PER OUTPUT per process (OS limit is
