@@ -1,9 +1,16 @@
 name: Release
 
 # Build, sign, and publish a GitHub Release whenever a version tag is pushed
-# (e.g. `git tag v3.1.0 && git push origin v3.1.0`). tauri-action produces the
-# NSIS installer, the signed updater artifact, and `latest.json` — which the app
-# polls from the "latest" release for silent in-place updates.
+# (e.g. `git tag v3.9.6 && git push personal v3.9.6`).
+#
+# Job order (intentional — APK first so phone builds are checkable without waiting
+# on the ~30 min Windows desktop build):
+#   1. create-release  — open the GitHub Release for the tag (seconds)
+#   2. android         — build/sign companion APK + apk-latest.json, upload
+#   3. desktop         — tauri-action NSIS + updater latest.json, upload
+#
+# `needs` enforces that sequence. tauri-action uploads into the pre-created
+# release via `releaseId` (it does not need to create the release itself).
 
 on:
   push:
@@ -15,47 +22,38 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: windows-latest
+  # Lightweight: open the Release so the APK job can attach assets immediately.
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.ensure.outputs.release_id }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Build and publish release
-        uses: tauri-apps/tauri-action@v0
+      - name: Ensure GitHub Release exists
+        id: ensure
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The updater private key generated with `tauri signer generate`.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Online metadata keys, baked into the binary at build time (see .env.example).
-          RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          STEAMGRIDDB_API_KEY: ${{ secrets.STEAMGRIDDB_API_KEY }}
-          STEAM_WEB_API_KEY: ${{ secrets.STEAM_WEB_API_KEY }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Tracker ${{ github.ref_name }}"
-          releaseDraft: false
-          prerelease: false
-          # Emit latest.json (the updater manifest) alongside the installer.
-          includeUpdaterJson: true
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — reusing it"
+          else
+            gh release create "$TAG" \
+              --title "Tracker $TAG" \
+              --generate-notes \
+              --verify-tag
+          fi
+          RID=$(gh release view "$TAG" --json id -q .id)
+          echo "release_id=$RID" >> "$GITHUB_OUTPUT"
+          echo "Release id=$RID"
 
-  # Build, sign, and attach the Android companion APK to the same Release, plus
-  # apk-latest.json (the manifest the phone polls for its own in-app updates).
-  # Tauri's updater plugin is desktop-only, so the phone uses a small custom flow
-  # (see companion/src-tauri/src/update.rs + src/companion/update.ts).
+  # Build, sign, and attach the Android companion APK + apk-latest.json.
+  # Runs BEFORE desktop so a bad APK is visible within minutes, not after the
+  # Windows installer finishes. Tauri's updater plugin is desktop-only; the phone
+  # uses the custom flow in companion/src-tauri/src/update.rs + src/companion/update.ts.
   android:
     runs-on: ubuntu-latest
-    needs: [release]
+    needs: [create-release]
     steps:
       - uses: actions/checkout@v4
 
@@ -130,3 +128,42 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ github.ref_name }}" GameTrackerRemote.apk apk-latest.json --clobber
+
+  # Windows desktop NSIS + signed updater artifacts. Starts only after the APK
+  # job succeeds so phone releases are verifiable first.
+  desktop:
+    runs-on: windows-latest
+    needs: [create-release, android]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish desktop release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The updater private key generated with `tauri signer generate`.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Online metadata keys, baked into the binary at build time (see .env.example).
+          RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          STEAMGRIDDB_API_KEY: ${{ secrets.STEAMGRIDDB_API_KEY }}
+          STEAM_WEB_API_KEY: ${{ secrets.STEAM_WEB_API_KEY }}
+        with:
+          # Upload into the release opened by create-release (do not recreate it).
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseName: "Tracker ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
+          # Emit latest.json (the updater manifest) alongside the installer.
+          includeUpdaterJson: true

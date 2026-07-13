@@ -526,9 +526,11 @@ across LAN-WS vs WebRTC). Reuses the desktop design system + types but talks str
 there); release APKs are **unsigned** — sign with the debug keystore (zipalign + apksigner) for
 sideloading. Input into elevated apps/games needs the desktop app run as admin.
 
-**CI APK release + phone auto-update (v3.2.8).** The `android` job in
-`.github/workflows/release.yml` builds/signs the companion APK on every `v*` tag and
-attaches `GameTrackerRemote.apk` + `apk-latest.json` to the same Release. It signs with a
+**CI APK release + phone auto-update (v3.2.8).** The Release workflow
+(`.github/workflows/release.yml`) runs **APK before desktop** on every `v*` tag:
+`create-release` → `android` (build/sign `GameTrackerRemote.apk` + `apk-latest.json`)
+→ `desktop` (NSIS + updater `latest.json`). That way a phone build is checkable within
+minutes instead of after the Windows installer. It signs with a
 **dedicated release keystore** from repo secrets (`ANDROID_KEYSTORE_BASE64`,
 `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) — a stable key so
 updates install over each other (switching from debug-signed needs a one-time

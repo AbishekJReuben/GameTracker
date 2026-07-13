@@ -106,11 +106,16 @@ For a Play-Store release, use a real keystore and the `.aab` instead.
 
 ## Automated releases (GitHub Actions)
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which — alongside the desktop
-installer — has an **`android` job** that builds, signs, and attaches
-`GameTrackerRemote.apk` **and** `apk-latest.json` to the same GitHub Release. The APK is
-signed in CI with a **dedicated release keystore** (not the debug keystore) so every
-release is signed with the same key and can install as an update over the previous one.
+Pushing a `v*` tag runs `.github/workflows/release.yml` in this order:
+
+1. **`create-release`** — opens the GitHub Release for the tag (seconds)
+2. **`android`** — builds, signs, and attaches `GameTrackerRemote.apk` + `apk-latest.json`
+3. **`desktop`** — builds the Windows NSIS installer + updater `latest.json`
+
+The APK job runs **before** the desktop build on purpose so phone builds are checkable
+within minutes instead of after the ~30 min Windows installer. The APK is signed in CI
+with a **dedicated release keystore** (not the debug keystore) so every release is signed
+with the same key and can install as an update over the previous one.
 
 The CI job re-runs `scripts/patch-android.mjs` after `tauri android init` (the same script
 `Build-Apk.ps1` runs locally) to re-apply the manifest customizations — cleartext traffic,
