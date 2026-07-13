@@ -485,40 +485,75 @@ function Push-Spark([string]$key, [double]$v) {
 }
 
 $script:MetricsScript = {
+  # Persistent runspace: $global:Cg* survives between cycles — cheap .NET deltas, no WMI perf counters.
   $m = @{ SigCpu=0.0; SigMemMB=0; SigPid=0; ActiveConns=0; NetUpKB=0.0; NetDownKB=0.0; CloudflaredCount=0 }
+  $nowT = [DateTime]::UtcNow
   try {
-    $listen = @(Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if ($listen.Count -gt 0) {
-      $m.ActiveConns = @(Get-NetTCPConnection -LocalPort 8080 -State Established -ErrorAction SilentlyContinue).Count
-      $proc = Get-Process -Id $listen[0].OwningProcess -ErrorAction SilentlyContinue
+    $ipProps = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+    $listening = $false
+    foreach ($lp in $ipProps.GetActiveTcpListeners()) { if ($lp.Port -eq 8080) { $listening = $true; break } }
+    if ($listening) {
+      foreach ($tc in $ipProps.GetActiveTcpConnections()) {
+        if ($tc.LocalEndPoint.Port -eq 8080 -and $tc.State -eq 'Established') { $m.ActiveConns++ }
+      }
+      $proc = $null
+      if ($global:CgSigPid) { $proc = Get-Process -Id $global:CgSigPid -ErrorAction SilentlyContinue }
+      if (-not $proc) {
+        $listen = @(Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($listen.Count -gt 0) {
+          $global:CgSigPid = [int]$listen[0].OwningProcess; $global:CgPrevCpu = $null
+          $proc = Get-Process -Id $global:CgSigPid -ErrorAction SilentlyContinue
+        }
+      }
       if ($proc) {
         $m.SigPid = $proc.Id; $m.SigMemMB = [int]([math]::Round($proc.WorkingSet64/1MB,0))
-        $perf = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter "IDProcess=$($proc.Id)" -ErrorAction SilentlyContinue)
-        if ($perf.Count -gt 0) { $m.SigCpu = [double]$perf[0].PercentProcessorTime }
-      }
-    }
+        $cpuS = $proc.TotalProcessorTime.TotalSeconds
+        if ($global:CgPrevCpu -and $global:CgPrevCpu.ProcId -eq $proc.Id) {
+          $dt = ($nowT - $global:CgPrevCpu.At).TotalSeconds
+          if ($dt -gt 0) { $m.SigCpu = [math]::Round([math]::Max(0.0, 100.0*($cpuS-$global:CgPrevCpu.Cpu)/$dt), 1) }
+        }
+        $global:CgPrevCpu = @{ ProcId=$proc.Id; Cpu=$cpuS; At=$nowT }
+      } else { $global:CgSigPid = 0 }
+    } else { $global:CgSigPid = 0 }
   } catch {}
   try {
     $m.CloudflaredCount = @(Get-Process -Name cloudflared -ErrorAction SilentlyContinue).Count
-    $ni = @(Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Loopback|isatap|Teredo|Pseudo' })
-    $up=0.0; $down=0.0; foreach ($n in $ni) { $up += [double]$n.BytesSentPersec; $down += [double]$n.BytesReceivedPersec }
-    $m.NetUpKB = [math]::Round($up/1KB,1); $m.NetDownKB = [math]::Round($down/1KB,1)
+    $sent=[double]0; $recv=[double]0
+    foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+      if ($nic.NetworkInterfaceType -eq 'Loopback' -or $nic.OperationalStatus -ne 'Up') { continue }
+      $st = $nic.GetIPStatistics(); $sent += $st.BytesSent; $recv += $st.BytesReceived
+    }
+    if ($global:CgPrevNet) {
+      $dt = ($nowT - $global:CgPrevNet.At).TotalSeconds
+      if ($dt -gt 0.5) {
+        $m.NetUpKB = [math]::Round([math]::Max(0.0,($sent-$global:CgPrevNet.Sent))/1KB/$dt,1)
+        $m.NetDownKB = [math]::Round([math]::Max(0.0,($recv-$global:CgPrevNet.Recv))/1KB/$dt,1)
+      }
+    }
+    $global:CgPrevNet = @{ Sent=$sent; Recv=$recv; At=$nowT }
   } catch {}
   $m
 }
 function Start-MetricsAsync {
   if ($null -ne $script:Metrics) { return }
   try {
-    $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState='MTA'; $rs.Open()
-    $ps = [PowerShell]::Create(); $ps.Runspace=$rs; $null=$ps.AddScript($script:MetricsScript.ToString())
-    $script:Metrics=$ps; $script:MetricsRs=$rs; $script:MetricsAsync=$ps.BeginInvoke()
-  } catch { $script:Metrics=$null; $script:MetricsRs=$null; $script:MetricsAsync=$null }
+    if ($null -eq $script:MetricsRs) {
+      $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState='MTA'; $rs.Open(); $script:MetricsRs=$rs
+    }
+    $ps = [PowerShell]::Create(); $ps.Runspace=$script:MetricsRs; $null=$ps.AddScript($script:MetricsScript.ToString())
+    $script:Metrics=$ps; $script:MetricsAsync=$ps.BeginInvoke()
+  } catch {
+    $script:Metrics=$null; $script:MetricsAsync=$null
+    if ($script:MetricsRs) { try { $script:MetricsRs.Dispose() } catch {}; $script:MetricsRs=$null }
+  }
 }
 function Receive-Metrics {
   if ($null -eq $script:Metrics -or -not $script:MetricsAsync.IsCompleted) { return }
-  $m=$null; try { $out=$script:Metrics.EndInvoke($script:MetricsAsync); if ($out) { $m=$out[-1] } } catch {}
-  try { $script:Metrics.Dispose() } catch {}; try { $script:MetricsRs.Dispose() } catch {}
-  $script:Metrics=$null; $script:MetricsRs=$null; $script:MetricsAsync=$null
+  $m=$null; $failed=$false
+  try { $out=$script:Metrics.EndInvoke($script:MetricsAsync); if ($out) { $m=$out[-1] } } catch { $failed=$true }
+  try { $script:Metrics.Dispose() } catch {}
+  $script:Metrics=$null; $script:MetricsAsync=$null
+  if ($failed -and $script:MetricsRs) { try { $script:MetricsRs.Dispose() } catch {}; $script:MetricsRs=$null }
   if ($m -is [hashtable]) { Apply-Metrics $m }
 }
 function Apply-Metrics($m) {
@@ -613,16 +648,23 @@ function Start-ProbeAsync {
     Port=$script:Port; AppHost=$script:Ctl.TxtAppHost.Text.Trim(); RepoRoot=$script:RepoRoot
   }
   try {
-    $rs=[runspacefactory]::CreateRunspace(); $rs.ApartmentState='MTA'; $rs.Open()
-    $ps=[PowerShell]::Create(); $ps.Runspace=$rs; $null=$ps.AddScript($script:ProbeScript.ToString()).AddArgument($arg)
-    $script:Probe=$ps; $script:ProbeRs=$rs; $script:ProbeAsync=$ps.BeginInvoke()
-  } catch { $script:Probe=$null; $script:ProbeRs=$null; $script:ProbeAsync=$null }
+    if ($null -eq $script:ProbeRs) {
+      $rs=[runspacefactory]::CreateRunspace(); $rs.ApartmentState='MTA'; $rs.Open(); $script:ProbeRs=$rs
+    }
+    $ps=[PowerShell]::Create(); $ps.Runspace=$script:ProbeRs; $null=$ps.AddScript($script:ProbeScript.ToString()).AddArgument($arg)
+    $script:Probe=$ps; $script:ProbeAsync=$ps.BeginInvoke()
+  } catch {
+    $script:Probe=$null; $script:ProbeAsync=$null
+    if ($script:ProbeRs) { try { $script:ProbeRs.Dispose() } catch {}; $script:ProbeRs=$null }
+  }
 }
 function Receive-Probe {
   if ($null -eq $script:Probe -or -not $script:ProbeAsync.IsCompleted) { return }
-  $r=$null; try { $out=$script:Probe.EndInvoke($script:ProbeAsync); if ($out) { $r=$out[-1] } } catch { Add-LogLine "Probe error: $_" 'WARN' }
-  try { $script:Probe.Dispose() } catch {}; try { $script:ProbeRs.Dispose() } catch {}
-  $script:Probe=$null; $script:ProbeRs=$null; $script:ProbeAsync=$null
+  $r=$null; $failed=$false
+  try { $out=$script:Probe.EndInvoke($script:ProbeAsync); if ($out) { $r=$out[-1] } } catch { $failed=$true; Add-LogLine "Probe error: $_" 'WARN' }
+  try { $script:Probe.Dispose() } catch {}
+  $script:Probe=$null; $script:ProbeAsync=$null
+  if ($failed -and $script:ProbeRs) { try { $script:ProbeRs.Dispose() } catch {}; $script:ProbeRs=$null }
   if ($r -is [hashtable]) { Apply-ProbeResult $r }
 }
 function Apply-Traffic($t) {
@@ -787,8 +829,21 @@ $script:Ctl.ChkLocalOnly.Add_Unchecked({ $script:Ctl.TxtAppHost.IsEnabled=$true 
 $script:Ctl.CmbLogSource.Add_SelectionChanged({ if (-not $script:SuppressLogSourceChange) { Invoke-ServiceLogSelect (Get-LogSourceKey) } })
 $script:Ctl.BtnRefreshSvcLog.Add_Click({ Invoke-ServiceLogSelect (Get-LogSourceKey) })
 
+# Probing/metrics pause while minimized or hidden; immediate refresh on become-visible.
+$script:UiActive = $true
+function Update-UiActive {
+  $active = ($window.WindowState -ne 'Minimized' -and $window.IsVisible)
+  if ($active -and -not $script:UiActive) {
+    $script:UiActive = $true
+    $script:LastPollUtc=[datetime]::MinValue; $script:LastMetricsStartUtc=[datetime]::MinValue
+    Start-ProbeAsync; Start-MetricsAsync
+  } elseif (-not $active) { $script:UiActive = $false }
+}
+$window.Add_StateChanged({ Update-UiActive })
+$window.Add_IsVisibleChanged({ Update-UiActive })
+
 $uiTimer = New-Object Windows.Threading.DispatcherTimer
-$uiTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$uiTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
 $uiTimer.Add_Tick({
   try {
     $entry=$null; $drained=0; $added=$false
@@ -801,13 +856,15 @@ $uiTimer.Add_Tick({
         if ($script:Ctl.LbLogs.Items.Count -gt 2000) { $script:Ctl.LbLogs.Items.RemoveAt(0) }
       }
     }
-    if ($added -and $script:Ctl.ChkAutoScroll.IsChecked -and $script:Ctl.LbLogs.Items.Count -gt 0) {
+    if ($added -and $script:UiActive -and $script:Ctl.ChkAutoScroll.IsChecked -and $script:Ctl.LbLogs.Items.Count -gt 0) {
       $script:Ctl.LbLogs.ScrollIntoView($script:Ctl.LbLogs.Items[$script:Ctl.LbLogs.Items.Count-1])
     }
-    Receive-Probe; $now=[DateTime]::UtcNow
-    if ($null -eq $script:Probe -and ($now-$script:LastPollUtc).TotalMilliseconds -ge 4000) { Start-ProbeAsync; $script:LastPollUtc=$now }
-    Receive-Metrics
-    if ($null -eq $script:Metrics -and ($now-$script:LastMetricsStartUtc).TotalMilliseconds -ge 1500) { Start-MetricsAsync; $script:LastMetricsStartUtc=$now }
+    Receive-Probe; Receive-Metrics
+    if ($script:UiActive) {
+      $now=[DateTime]::UtcNow
+      if ($null -eq $script:Probe -and ($now-$script:LastPollUtc).TotalMilliseconds -ge 10000) { Start-ProbeAsync; $script:LastPollUtc=$now }
+      if ($null -eq $script:Metrics -and ($now-$script:LastMetricsStartUtc).TotalMilliseconds -ge 5000) { Start-MetricsAsync; $script:LastMetricsStartUtc=$now }
+    }
   } catch { Add-LogLine "tick error: $_" 'ERR' }
 })
 $uiTimer.Start()
@@ -815,4 +872,5 @@ Add-LogLine 'Discovery Control Center ready.' 'OK'
 if ($script:Ctl.ChkAutoStart.IsChecked) { Start-Stack } else { Start-ProbeAsync; Start-MetricsAsync }
 [void]$window.ShowDialog()
 $uiTimer.Stop()
+foreach ($o in @($script:Metrics,$script:Probe,$script:MetricsRs,$script:ProbeRs)) { if ($o) { try { $o.Dispose() } catch {} } }
 if ($script:RunnerProcess -and -not $script:RunnerProcess.HasExited) { try { $script:RunnerProcess.Kill() } catch {} }
