@@ -471,9 +471,17 @@ pub fn stop_capture() {
 
 // ---------------------------------------------------------------------------
 // Aux (pop-out) capture — one lightweight pipeline per monitor index so a second
-// browser tab can stream display 2 while the primary DXGI path keeps display 1.
-// Uses xcap full-frame grabs (no second Desktop Duplication session) so it can't
-// fight the primary pipeline for an output.
+// browser tab can stream display 2 while the primary path keeps display 1.
+//
+// Each aux pipeline uses its OWN persistent DXGI Desktop Duplication session,
+// targeting its monitor by desktop origin (same path the primary uses). Desktop
+// Duplication supports one session PER OUTPUT within a process — different
+// outputs never collide, and the OS limit is 4 concurrent duplication apps — so
+// the primary + several pop-outs coexist fine. This replaced an xcap
+// full-framebuffer grab that returned a stale/black or wrong-display image on
+// secondary monitors, which is why a pop-out tab connected but its visuals never
+// updated. xcap stays as a fallback for when duplication init fails on that
+// display (an exclusive-fullscreen game, a driver quirk).
 // ---------------------------------------------------------------------------
 
 struct AuxSlot {
@@ -524,37 +532,89 @@ where
     let fps = fps.clamp(1, 60);
     let quality = quality.clamp(20, 95) as u8;
 
+    let fast = quality < 65; // sharp downscale for text, fast for video-ish content
+
     std::thread::spawn(move || {
-        let budget = Duration::from_millis((1000 / fps).clamp(16, 1000) as u64);
+        let budget_ms = (1000 / fps).clamp(1, 1000);
+        let budget = Duration::from_millis(budget_ms as u64);
+        // Persistent duplication session for THIS monitor (recreated if lost).
+        #[cfg(windows)]
+        let mut dup: Option<super::dxdupe::Duplicator> = None;
         let mut last: Option<Arc<Vec<u8>>> = None;
         let mut last_wh = (0u32, 0u32);
         let mut last_emit = Instant::now() - Duration::from_secs(2);
+
         while slot.running.load(Ordering::SeqCst) && slot.gen.load(Ordering::SeqCst) == my_gen {
             let t0 = Instant::now();
-            let mut sent = false;
-            if let Some(rgba) = monitor_at(monitor).and_then(|m| m.capture_image().ok()) {
-                let (sw, sh) = (rgba.width(), rgba.height());
-                let raw = rgba.into_raw();
-                if let Some((rgb, w, h)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, false, false) {
-                    let changed = last.as_ref().map_or(true, |prev| {
-                        last_wh != (w, h) || prev.as_slice() != rgb.as_slice()
-                    });
-                    let stale = last_emit.elapsed() >= Duration::from_millis(900);
-                    if changed || stale {
-                        if let Some(jpg) = encode_frame(&rgb, w, h, quality) {
-                            let arc = Arc::new(rgb);
-                            last = Some(arc);
-                            last_wh = (w, h);
-                            emit(jpg);
-                            last_emit = Instant::now();
-                            sent = true;
+            // (rgb, out_w, out_h, from_dd). `from_dd` = came from Desktop Duplication
+            // (always a genuine change → skip the diff) vs the xcap fallback.
+            let mut scaled: Option<(Vec<u8>, u32, u32, bool)> = None;
+            let mut timed_out = false;
+
+            #[cfg(windows)]
+            {
+                if dup.is_none() {
+                    let (tx, ty) = monitor_bounds(monitor).map(|(x, y, _, _)| (x, y)).unwrap_or((0, 0));
+                    dup = super::dxdupe::Duplicator::new_for(tx, ty);
+                }
+                if let Some(d) = dup.as_mut() {
+                    match d.grab(budget_ms, max_w) {
+                        super::dxdupe::Grab::Frame { w: gw, h: gh, .. } => {
+                            if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(d.buffer(), gw, gh, max_w, fast, true) {
+                                scaled = Some((rgb, ow, oh, true));
+                            }
                         }
+                        super::dxdupe::Grab::Timeout => timed_out = true,
+                        super::dxdupe::Grab::Lost => dup = None,
+                    }
+                } else if let Some(rgba) = monitor_at(monitor).and_then(|m| m.capture_image().ok()) {
+                    let (sw, sh) = (rgba.width(), rgba.height());
+                    let raw = rgba.into_raw();
+                    if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, fast, false) {
+                        scaled = Some((rgb, ow, oh, false));
                     }
                 }
             }
-            let _ = sent;
+            #[cfg(not(windows))]
+            {
+                if let Some(rgba) = monitor_at(monitor).and_then(|m| m.capture_image().ok()) {
+                    let (sw, sh) = (rgba.width(), rgba.height());
+                    let raw = rgba.into_raw();
+                    if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, fast, false) {
+                        scaled = Some((rgb, ow, oh, false));
+                    }
+                }
+            }
+
+            if let Some((rgb, w, h, from_dd)) = scaled {
+                let changed = from_dd
+                    || last
+                        .as_ref()
+                        .map_or(true, |prev| last_wh != (w, h) || prev.as_slice() != rgb.as_slice());
+                let stale = last_emit.elapsed() >= Duration::from_millis(900);
+                if changed || stale {
+                    if let Some(jpg) = encode_frame(&rgb, w, h, quality) {
+                        emit(jpg);
+                        last_emit = Instant::now();
+                    }
+                }
+                last = Some(Arc::new(rgb));
+                last_wh = (w, h);
+            } else if let Some(prev) = last.as_ref() {
+                // Static screen / cursor-only update: re-send the last frame occasionally
+                // so a freshly-attached decoder still gets a keyframe.
+                if last_emit.elapsed() >= Duration::from_millis(900) {
+                    if let Some(jpg) = encode_frame(prev, last_wh.0, last_wh.1, quality) {
+                        emit(jpg);
+                        last_emit = Instant::now();
+                    }
+                }
+            }
+
+            // Desktop Duplication already blocked up to the budget waiting for a
+            // change; only sleep to hit target fps when it didn't (timeout / xcap).
             let elapsed = t0.elapsed();
-            if elapsed < budget {
+            if !timed_out && elapsed < budget {
                 std::thread::sleep(budget - elapsed);
             }
         }

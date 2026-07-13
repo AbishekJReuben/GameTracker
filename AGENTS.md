@@ -601,7 +601,14 @@ dropping ~30% of frames on Android); companion default quality is **1920 / Text 
 100**; the phone always shows fps by the "Live" label and `companion.html` uses
 `interactive-widget=resizes-content` so the keyboard doesn't push the top bar off-screen.
 
-**v3.9.1 fixes — multi-monitor pop-out loop + gameplay audio crackle (do not regress):**
+**v3.9.5–3.9.9 remote fixes — multi-monitor pop-out (loop in 3.9.5 + frozen feed in 3.9.9) +
+gameplay audio crackle + Android update fallbacks (do not regress):**
+- **Aux pop-out capture uses DXGI Desktop Duplication, not xcap.** Each pop-out pipeline
+  (`start_aux_capture`) now owns a `dxdupe::Duplicator` targeting its monitor by desktop origin,
+  same as the primary. Desktop Duplication allows one session PER OUTPUT per process (OS limit is
+  4 concurrent apps), so primary + pop-outs coexist. The old xcap full-framebuffer grab returned a
+  stale/black or wrong-display image on secondary monitors — the pop-out connected but its visuals
+  never updated. xcap remains only as the fallback when duplication init fails on that display.
 - **Pop-out rooms:** `auxMonitorRoom` gives EVERY pop-out its own signaling room, including
   monitor 0 (`code~m0`). The bare code is reserved for the primary session — mapping any
   pop-out onto it drops a second host+guest pair into the primary room, and the server's
