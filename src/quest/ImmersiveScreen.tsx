@@ -189,6 +189,16 @@ export function ImmersiveScreen({
         spellCheck={false}
         aria-label="VR keyboard input"
         onInput={() => diff.current.flush(kbdRef.current)}
+        onBeforeInput={(e) => {
+          // The Quest keyboard's own Return key surfaces only as a beforeinput
+          // line-break (never a key event), so forward it as a real PC Enter —
+          // matching the controller B button. Backspace is handled by the diff.
+          const it = (e.nativeEvent as InputEvent).inputType;
+          if (it === "insertLineBreak" || it === "insertParagraph") {
+            e.preventDefault();
+            send({ type: "key", name: "enter" });
+          }
+        }}
         onBlur={() => setKeyboardOpen(false)}
       />
     </div>

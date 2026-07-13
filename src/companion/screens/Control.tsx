@@ -102,6 +102,9 @@ type KeyDef = {
   run: () => void;
   /** For sticky modifiers, the modifier this key represents (drives active state). */
   mod?: Mod;
+  /** The single wire key name this cap maps to — set to make it hold-latchable in
+   *  Hold mode (keydown on first tap, keyup on the next). Combos/media stay tap-only. */
+  wire?: string;
 };
 
 /** User-defined chord stored in `gt.remote.customShortcuts`. */
@@ -483,6 +486,45 @@ export function ControlScreen({
       navigator.vibrate?.(10);
       return prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id];
     });
+
+  // Hold mode: latch keys down instead of tapping them. Tap once to press-and-hold
+  // (keydown), tap again to release (keyup) — so you can hold a key (arrows / a
+  // game key / a modifier combo) while doing other things, which a plain tap can't.
+  // `heldKeys` tracks the wire names currently held so they highlight and can be
+  // released together. Kept independent of the panel so a hold survives closing it.
+  const [holdMode, setHoldMode] = useState(false);
+  const [heldKeys, setHeldKeys] = useState<Set<string>>(new Set());
+  const heldKeysRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    heldKeysRef.current = heldKeys;
+  }, [heldKeys]);
+  const toggleHold = (wire: string) => {
+    navigator.vibrate?.(8);
+    setHeldKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(wire)) {
+        next.delete(wire);
+        send({ type: "keyup", name: wire });
+      } else {
+        next.add(wire);
+        send({ type: "keydown", name: wire });
+      }
+      return next;
+    });
+  };
+  const releaseAllHeld = () => {
+    if (heldKeysRef.current.size === 0) return;
+    heldKeysRef.current.forEach((w) => send({ type: "keyup", name: w }));
+    navigator.vibrate?.(12);
+    setHeldKeys(new Set());
+  };
+  // Never strand a held key on the PC: release everything when the screen unmounts.
+  useEffect(
+    () => () => {
+      heldKeysRef.current.forEach((w) => link.send({ type: "keyup", name: w }));
+    },
+    [link],
+  );
 
   // Custom shortcuts (user-defined chords), persisted separately from builtins.
   const [customShortcuts, setCustomShortcuts] = useState<CustomShortcut[]>(loadCustomShortcuts);
@@ -1453,12 +1495,66 @@ export function ControlScreen({
     resetField();
   };
 
+  // Pressing the soft-keyboard return key. Buffered mode flushes the composed line as
+  // text; direct mode fires a real PC Enter so the return key behaves like a physical
+  // one (chat, search, terminal). Reached from two paths that can both fire for one
+  // press — `keydown` (Android/hardware) and `beforeinput`/insertLineBreak (the only
+  // signal the Quest system keyboard emits) — so a short window dedupes them.
+  const lastEnterAt = useRef(0);
+  const sendPcEnter = () => {
+    const now = performance.now();
+    if (now - lastEnterAt.current < 80) return;
+    lastEnterAt.current = now;
+    if (kbMode === "buffered") sendBuffer();
+    else tapKey("enter");
+  };
+  // Backspace on an EMPTY field: the value can't shrink so the input-diff can't turn
+  // it into a PC backspace — forward it directly (direct mode only; buffered mode
+  // edits its local buffer). Deduped like Enter across keydown + beforeinput.
+  const lastBkspAt = useRef(0);
+  const sendEmptyBackspace = () => {
+    if (kbMode !== "direct") return;
+    if ((kbdRef.current?.value ?? "") !== "") return; // non-empty → let flushDiff handle it
+    const now = performance.now();
+    if (now - lastBkspAt.current < 40) return;
+    lastBkspAt.current = now;
+    send({ type: "key", name: "backspace" });
+  };
+
+  // `beforeinput` is emitted by soft keyboards even when `keydown` isn't — notably
+  // the Quest system keyboard, whose only observable signal is the input value / these
+  // events. It's the one place the Quest keyboard's own Enter and Backspace surface.
+  // A ref keeps the latest closures without re-binding the native listener each render.
+  const beforeInputRef = useRef<(e: InputEvent) => void>(() => {});
+  beforeInputRef.current = (e: InputEvent) => {
+    if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") {
+      e.preventDefault();
+      sendPcEnter();
+    } else if (e.inputType === "deleteContentBackward" && (kbdRef.current?.value ?? "") === "") {
+      sendEmptyBackspace();
+    }
+  };
+  useEffect(() => {
+    const el = kbdRef.current;
+    if (!el) return;
+    const h = (e: Event) => beforeInputRef.current(e as InputEvent);
+    el.addEventListener("beforeinput", h);
+    return () => el.removeEventListener("beforeinput", h);
+  }, []);
+
   const onKbdKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    // Android Enter must NEVER press Enter on the PC. Buffered mode sends the line;
-    // direct mode does nothing here (use the dock's Enter key for a real PC Enter).
     if (e.key === "Enter") {
       e.preventDefault();
-      if (kbMode === "buffered") sendBuffer();
+      sendPcEnter();
+      return;
+    }
+    if (e.key === "Backspace") {
+      // Non-empty: let flushDiff turn the shrinking value into backspaces. Empty:
+      // forward directly (repeat comes from the IME's own key-repeat).
+      if (kbMode === "direct" && (kbdRef.current?.value ?? "") === "") {
+        e.preventDefault();
+        sendEmptyBackspace();
+      }
       return;
     }
     // Hardware-keyboard navigation (soft keyboards rarely emit these).
@@ -1560,16 +1656,16 @@ export function ControlScreen({
   // Data-driven so the dock panels, the pin toggles, and the floating quick-button
   // rail all share one source of truth (keyed by stable `id` for persistence).
   const specialKeys: KeyDef[] = [
-    { id: "esc", keys: ["Esc"], run: () => tapKey("escape") },
-    { id: "tab", keys: ["Tab"], run: () => tapKey("tab") },
-    { id: "enter", keys: ["↵"], label: "Enter", run: () => tapKey("enter") },
-    { id: "backspace", keys: ["⌫"], label: "Bksp", run: () => tapKey("backspace") },
-    { id: "delete", keys: ["Del"], run: () => tapKey("delete") },
-    { id: "home", keys: ["Home"], run: () => tapKey("home") },
-    { id: "end", keys: ["End"], run: () => tapKey("end") },
-    { id: "pageup", keys: ["PgUp"], run: () => tapKey("pageup") },
-    { id: "pagedown", keys: ["PgDn"], run: () => tapKey("pagedown") },
-    { id: "insert", keys: ["Ins"], run: () => tapKey("insert") },
+    { id: "esc", keys: ["Esc"], wire: "escape", run: () => tapKey("escape") },
+    { id: "tab", keys: ["Tab"], wire: "tab", run: () => tapKey("tab") },
+    { id: "enter", keys: ["↵"], label: "Enter", wire: "enter", run: () => tapKey("enter") },
+    { id: "backspace", keys: ["⌫"], label: "Bksp", wire: "backspace", run: () => tapKey("backspace") },
+    { id: "delete", keys: ["Del"], wire: "delete", run: () => tapKey("delete") },
+    { id: "home", keys: ["Home"], wire: "home", run: () => tapKey("home") },
+    { id: "end", keys: ["End"], wire: "end", run: () => tapKey("end") },
+    { id: "pageup", keys: ["PgUp"], wire: "pageup", run: () => tapKey("pageup") },
+    { id: "pagedown", keys: ["PgDn"], wire: "pagedown", run: () => tapKey("pagedown") },
+    { id: "insert", keys: ["Ins"], wire: "insert", run: () => tapKey("insert") },
     { id: "printscreen", keys: ["PrtSc"], run: () => tapKey("printscreen") },
     { id: "capslock", keys: ["Caps"], run: () => tapKey("capslock") },
     { id: "numlock", keys: ["Num"], run: () => tapKey("numlock") },
@@ -1579,13 +1675,14 @@ export function ControlScreen({
     { id: "alt", keys: ["Alt"], run: () => toggleMod("alt"), mod: "alt" },
     { id: "shift", keys: ["Shift"], run: () => toggleMod("shift"), mod: "shift" },
     { id: "win", keys: ["Win"], run: () => toggleMod("win"), mod: "win" },
-    { id: "arrow-left", keys: ["←"], label: "Left", run: () => tapKey("left") },
-    { id: "arrow-up", keys: ["↑"], label: "Up", run: () => tapKey("up") },
-    { id: "arrow-down", keys: ["↓"], label: "Down", run: () => tapKey("down") },
-    { id: "arrow-right", keys: ["→"], label: "Right", run: () => tapKey("right") },
+    { id: "arrow-left", keys: ["←"], label: "Left", wire: "left", run: () => tapKey("left") },
+    { id: "arrow-up", keys: ["↑"], label: "Up", wire: "up", run: () => tapKey("up") },
+    { id: "arrow-down", keys: ["↓"], label: "Down", wire: "down", run: () => tapKey("down") },
+    { id: "arrow-right", keys: ["→"], label: "Right", wire: "right", run: () => tapKey("right") },
     ...Array.from({ length: 12 }, (_, i) => i + 1).map((n) => ({
       id: `f${n}`,
       keys: [`F${n}`],
+      wire: `f${n}`,
       run: () => tapKey(`f${n}`),
     })),
     { id: "voldown", keys: ["Vol−"], label: "Vol down", run: () => tapKey("volumedown") },
@@ -1735,7 +1832,8 @@ export function ControlScreen({
             )}
             {connected && (
               <span className="flex items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-ink-faint">
-                <Wifi className="h-3 w-3" /> {fps} fps
+                <Wifi className="h-3 w-3 shrink-0" />
+                <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
               </span>
             )}
             {pcTextField && (
@@ -1957,9 +2055,9 @@ export function ControlScreen({
         >
           <div className="flex items-center gap-1.5">
             {connected && (
-              <span className="flex items-center gap-1.5 rounded-full bg-black/45 px-2.5 py-1 text-[10px] font-700 text-green backdrop-blur">
-                <span className="h-1.5 w-1.5 rounded-full bg-green" style={{ boxShadow: "0 0 6px #34d399" }} />
-                {fps} fps
+              <span className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-black/45 px-2.5 py-1 text-[10px] font-700 text-green backdrop-blur">
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-green" style={{ boxShadow: "0 0 6px #34d399" }} />
+                <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
               </span>
             )}
           </div>
@@ -2061,10 +2159,14 @@ export function ControlScreen({
               <PinnedButton
                 key={pid}
                 def={def}
-                active={def.mod ? mods.has(def.mod) : false}
+                active={(def.mod ? mods.has(def.mod) : false) || (!!def.wire && heldKeys.has(def.wire))}
                 onRun={() => {
                   navigator.vibrate?.(8);
-                  def.run();
+                  // A latchable key toggles hold when Hold mode is on or it's already
+                  // held (so a held key can be released straight from the rail);
+                  // otherwise it just taps.
+                  if (def.wire && (holdMode || heldKeys.has(def.wire))) toggleHold(def.wire);
+                  else def.run();
                 }}
                 onUnpin={() => togglePin(pid)}
               />
@@ -2170,7 +2272,7 @@ export function ControlScreen({
         }}
         aria-hidden={!typing}
         inputMode="text"
-        enterKeyHint={kbMode === "buffered" ? "send" : "done"}
+        enterKeyHint={kbMode === "buffered" ? "send" : "enter"}
         autoCapitalize="none"
         autoCorrect="off"
         autoComplete="off"
@@ -2236,7 +2338,21 @@ export function ControlScreen({
 
           {panel === "keys" && (
             <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2.5">
-              <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
+              <PinModeToggle
+                active={pinMode}
+                onClick={() => {
+                  setPinMode((v) => !v);
+                  setHoldMode(false);
+                }}
+              />
+              <HoldModeToggle
+                active={holdMode}
+                onClick={() => {
+                  setHoldMode((v) => !v);
+                  setPinMode(false);
+                }}
+              />
+              {heldKeys.size > 0 && <ReleaseHeldButton count={heldKeys.size} onClick={releaseAllHeld} />}
               <Sep />
               {specialKeys.map((k) => (
                 <KeyCapButton
@@ -2245,7 +2361,10 @@ export function ControlScreen({
                   pinMode={pinMode}
                   pinned={pinned.includes(`k:${k.id}`)}
                   active={k.mod ? mods.has(k.mod) : false}
+                  holdMode={holdMode}
+                  held={!!k.wire && heldKeys.has(k.wire)}
                   onFire={k.run}
+                  onToggleHold={() => k.wire && toggleHold(k.wire)}
                   onTogglePin={() => togglePin(`k:${k.id}`)}
                 />
               ))}
@@ -2624,7 +2743,10 @@ function KeyCapButton({
   pinMode,
   pinned,
   active,
+  holdMode,
+  held,
   onFire,
+  onToggleHold,
   onTogglePin,
   deletable,
   onDelete,
@@ -2633,11 +2755,20 @@ function KeyCapButton({
   pinMode: boolean;
   pinned: boolean;
   active?: boolean;
+  /** Hold mode is on — a hold-latchable cap toggles keydown/keyup instead of tapping. */
+  holdMode?: boolean;
+  /** This cap is currently latched down. */
+  held?: boolean;
   onFire: () => void;
+  onToggleHold?: () => void;
   onTogglePin: () => void;
   deletable?: boolean;
   onDelete?: () => void;
 }) {
+  // A cap can be held if it maps to a single wire key (not a sticky modifier — those
+  // already latch via the mods set — and not a multi-key chord).
+  const holdable = !!def.wire && !def.mod;
+  const willHold = !!holdMode && holdable;
   return (
     <motion.button
       whileTap={pinMode ? { scale: 0.92 } : { scale: 0.86, y: 2 }}
@@ -2648,11 +2779,12 @@ function KeyCapButton({
           return;
         }
         navigator.vibrate?.(6);
-        onFire();
+        if (willHold) onToggleHold?.();
+        else onFire();
       }}
       className="relative flex shrink-0 flex-col items-center gap-0.5 rounded-xl px-1 py-0.5"
     >
-      <KeyCombo keys={def.keys} active={active} />
+      <KeyCombo keys={def.keys} active={active || held} />
       {def.label && <span className="text-[8.5px] font-700 leading-none text-ink-dim">{def.label}</span>}
       {pinMode && deletable && onDelete && (
         <span
@@ -2691,6 +2823,35 @@ function PinModeToggle({ active, onClick }: { active: boolean; onClick: () => vo
     >
       {active ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
       {active ? "Done" : "Pin"}
+    </button>
+  );
+}
+/** Toggle Hold mode: while on, tapping a key latches it down (keydown) until tapped
+ *  again (keyup), so a key can stay held while you do other things. */
+function HoldModeToggle({ active, onClick }: { active: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      title={active ? "Done holding" : "Hold: tap a key to press-and-hold it"}
+      className={`flex h-9 shrink-0 items-center gap-1 rounded-lg border px-2 text-[10px] font-800 uppercase tracking-wide transition active:scale-95 ${
+        active ? "border-accent-1 bg-accent-1/20 text-accent-1" : "border-white/[0.08] bg-white/[0.03] text-ink-dim"
+      }`}
+    >
+      <Grab className="h-3.5 w-3.5" />
+      {active ? "Done" : "Hold"}
+    </button>
+  );
+}
+/** Release-all pill shown while any key is latched down — one tap frees them. */
+function ReleaseHeldButton({ count, onClick }: { count: number; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      title="Release all held keys"
+      className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-accent-1/40 bg-accent-1/15 px-2 text-[10px] font-800 uppercase tracking-wide text-accent-1 transition active:scale-95"
+    >
+      <X className="h-3.5 w-3.5" />
+      {count} held
     </button>
   );
 }
