@@ -1,6 +1,6 @@
 [package]
 name = "gametracker-companion"
-version = "3.9.6"
+version = "3.9.7"
 description = "GameTracker Remote — phone companion"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -24,7 +24,12 @@ ureq = "2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
-ndk-context = "0.1"
+# Source of the Android JavaVM + activity for the JNI install path. tao 0.35+
+# (under tauri 2.x) keeps its own per-activity context map and no longer fills in
+# the `ndk-context` crate's global, so `ndk_context::android_context()` panics with
+# "android context was not initialized" — we read tao's `main_android_context()`
+# instead. Keep this in the same minor as the tao pinned by tauri-runtime-wry.
+tao = { version = "0.35", default-features = false }
 
 # NOTE: keep `panic = "unwind"` (the default) — do NOT set "abort" here.
 # The in-app APK updater runs a lot of fallible JNI (FileProvider, the install

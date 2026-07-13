@@ -140,13 +140,30 @@ pub async fn open_install_settings() -> Result<(), String> {
         .map_err(|e| format!("open settings panicked: {e}"))?
 }
 
+/// The JavaVM + activity for JNI calls, read from **tao's** per-activity context map.
+///
+/// tao 0.35+ (the windowing layer under tauri 2.x) no longer initializes the
+/// `ndk-context` crate's process-wide global — its multi-activity rework keeps its
+/// own `CONTEXTS` map instead — so the old `ndk_context::android_context()` call
+/// panicked with "android context was not initialized" on EVERY install/save path
+/// (the "task N panicked" errors in the update dialog). `context_jobject` is the
+/// activity (a leaked GlobalRef, valid for the app's lifetime); `None` can only
+/// happen before the first activity finishes creating, which can't be the case
+/// while the webview is already invoking commands.
+#[cfg(target_os = "android")]
+fn tao_android_context() -> Result<tao::platform::android::prelude::AndroidContext, String> {
+    tao::platform::android::prelude::main_android_context().ok_or_else(|| {
+        "Android activity context is not available yet — try again in a moment".to_string()
+    })
+}
+
 #[cfg(target_os = "android")]
 fn check_install_permission() -> Result<bool, String> {
     use jni::objects::JObject;
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let ctx = tao_android_context()?;
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.java_vm.cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let context = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
     let allowed = can_request_installs(&mut env, &context).unwrap_or(true);
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_clear();
@@ -157,10 +174,10 @@ fn check_install_permission() -> Result<bool, String> {
 #[cfg(target_os = "android")]
 fn open_install_settings_impl() -> Result<(), String> {
     use jni::objects::JObject;
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let ctx = tao_android_context()?;
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.java_vm.cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let context = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
     let r = open_unknown_sources_settings(&mut env, &context);
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_describe();
@@ -294,10 +311,10 @@ fn ensure_downloaded(
 fn launch_installer(apk_path: &str) -> Result<(), String> {
     use jni::objects::JObject;
 
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let ctx = tao_android_context()?;
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.java_vm.cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let context = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
 
     // Gate up front: without "install unknown apps" the system silently refuses.
     // Bounce the user to the exact settings screen and return a clear message
@@ -682,10 +699,10 @@ fn save_to_downloads(apk_path: &std::path::Path, display_name: &str) -> Result<S
     use jni::objects::{JObject, JValue};
 
     let bytes = std::fs::read(apk_path).map_err(|e| format!("read cached apk: {e}"))?;
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let ctx = tao_android_context()?;
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.java_vm.cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let context = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
 
     let result = (|| -> Result<String, String> {
         // ContentResolver resolver = context.getContentResolver();
@@ -866,10 +883,10 @@ fn open_downloaded_apk_impl() -> Result<(), String> {
             "No APK has been saved to Downloads yet — tap \"Save to Downloads\" first.".to_string()
         })?;
 
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let ctx = tao_android_context()?;
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.java_vm.cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let context = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
 
     let result = (|| -> Result<(), String> {
         let allowed = can_request_installs(&mut env, &context).unwrap_or(true);
