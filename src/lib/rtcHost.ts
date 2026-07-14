@@ -76,8 +76,17 @@ const CONTENT_NUM: Record<string, number> = { auto: 0, text: 1, video: 2 };
 /** Video-track content hint + bitrate-degradation preference per content mode. */
 function trackTuning(mode: string): { hint: string; degrade: RTCDegradationPreference } {
   if (mode === "text") return { hint: "detail", degrade: "maintain-resolution" };
+  // Default / video: keep frame rate under pressure — smoothness beats crispness
+  // for remote control (a soft frame is better than a hitch).
   if (mode === "video") return { hint: "motion", degrade: "maintain-framerate" };
-  return { hint: "text", degrade: "balanced" };
+  return { hint: "motion", degrade: "maintain-framerate" };
+}
+
+/** Intermediate JPEG quality for the Rust→canvas feed. The phone re-encodes via
+ *  WebRTC H.264 anyway, so q=100 just burns CPU/IPC (395KB frames) without a
+ *  visible win. Cap at 72; the Quality slider still raises detail up to that. */
+function jpegForRtc(q: number): number {
+  return Math.min(Math.max(20, q), 72);
 }
 
 /**
@@ -651,8 +660,8 @@ export function startHost(opts: HostOptions): () => void {
     // parallel encode) needs no picker and is already heavily optimized.
     const start = () =>
       opts.fixedMonitor != null
-        ? api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, quality.jpeg)
-        : api.remoteStartCapture(ch, quality.maxW, quality.fps, quality.jpeg);
+        ? api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg))
+        : api.remoteStartCapture(ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg));
     return { track, start };
   };
 
@@ -1052,7 +1061,7 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.bitrate === "number") quality.bitrate = msg.bitrate <= 0 ? 0 : clamp(msg.bitrate, 500, 40000);
           if (msg.mode === "auto" || msg.mode === "text" || msg.mode === "video") quality.mode = msg.mode;
           try {
-            api.remoteSetCaptureQuality(quality.maxW, quality.fps, quality.jpeg, CONTENT_NUM[quality.mode] ?? 0);
+            api.remoteSetCaptureQuality(quality.maxW, quality.fps, jpegForRtc(quality.jpeg), CONTENT_NUM[quality.mode] ?? 0);
           } catch {
             /* ignore */
           }
@@ -1150,19 +1159,52 @@ export function startHost(opts: HostOptions): () => void {
     let lastSend: { bytes: number; at: number } | null = null;
     // Read outbound video RTP stats (send bitrate/fps) + RTT so the desktop Remote
     // page can show a live session panel.
-    const readSendStats = async (): Promise<{ kbps: number; fps: number; rtt: number }> => {
-      if (!pc) return { kbps: 0, fps: 0, rtt: 0 };
+    const readSendStats = async (): Promise<{
+      kbps: number;
+      fps: number;
+      rtt: number;
+      keyFramesEncoded: number;
+      framesEncoded: number;
+      nackCount: number;
+      pliCount: number;
+      firCount: number;
+      qpAvg: number;
+      codec: string;
+      bytesSent: number;
+    }> => {
+      const empty = {
+        kbps: 0,
+        fps: 0,
+        rtt: 0,
+        keyFramesEncoded: 0,
+        framesEncoded: 0,
+        nackCount: 0,
+        pliCount: 0,
+        firCount: 0,
+        qpAvg: 0,
+        codec: "",
+        bytesSent: 0,
+      };
+      if (!pc) return empty;
       let report: RTCStatsReport;
       try {
         report = await pc.getStats();
       } catch {
-        return { kbps: 0, fps: 0, rtt: 0 };
+        return empty;
       }
       let out: any = null;
+      let codecId = "";
       let rtt = 0;
+      const codecs = new Map<string, string>();
       report.forEach((s: any) => {
-        if (s.type === "outbound-rtp" && s.kind === "video") out = s;
-        if (s.type === "candidate-pair" && s.nominated && typeof s.currentRoundTripTime === "number") rtt = s.currentRoundTripTime;
+        if (s.type === "codec" && s.mimeType) codecs.set(s.id, String(s.mimeType).replace(/^video\//i, ""));
+        if (s.type === "outbound-rtp" && s.kind === "video") {
+          out = s;
+          codecId = s.codecId ?? "";
+        }
+        if (s.type === "candidate-pair" && s.nominated && typeof s.currentRoundTripTime === "number") {
+          rtt = s.currentRoundTripTime;
+        }
       });
       let kbps = 0;
       if (out) {
@@ -1170,7 +1212,21 @@ export function startHost(opts: HostOptions): () => void {
         if (lastSend && now > lastSend.at) kbps = Math.round(((out.bytesSent - lastSend.bytes) * 8) / (now - lastSend.at));
         lastSend = { bytes: out.bytesSent, at: now };
       }
-      return { kbps, fps: Math.round(out?.framesPerSecond ?? 0), rtt: Math.round(rtt * 1000) };
+      const framesEncoded = out?.framesEncoded ?? 0;
+      const qpSum = out?.qpSum ?? 0;
+      return {
+        kbps,
+        fps: Math.round(out?.framesPerSecond ?? 0),
+        rtt: Math.round(rtt * 1000),
+        keyFramesEncoded: out?.keyFramesEncoded ?? 0,
+        framesEncoded,
+        nackCount: out?.nackCount ?? 0,
+        pliCount: out?.pliCount ?? 0,
+        firCount: out?.firCount ?? 0,
+        qpAvg: framesEncoded > 0 ? Math.round(qpSum / framesEncoded) : 0,
+        codec: codecs.get(codecId) ?? "",
+        bytesSent: out?.bytesSent ?? 0,
+      };
     };
     data.onopen = () => {
       // If authorization somehow completed before this channel opened, make sure
@@ -1208,7 +1264,53 @@ export function startHost(opts: HostOptions): () => void {
           if (opts.fixedMonitor == null) {
             try {
               cs = await api.remoteCaptureStats();
-              if (data.readyState === "open") data.send(JSON.stringify({ event: "capstats", stats: cs, at: Date.now() }));
+            } catch {
+              /* ignore */
+            }
+          }
+          // Primary hosts always read the outbound link stats — the encoder-stall
+          // watchdog needs them even when no desktop UI is subscribed. One read
+          // feeds the phone HUD, the stall watchdog, and the desktop panel.
+          const link =
+            opts.fixedMonitor == null || opts.onStats
+              ? await readSendStats()
+              : {
+                  kbps: 0,
+                  fps: 0,
+                  rtt: 0,
+                  keyFramesEncoded: 0,
+                  framesEncoded: 0,
+                  nackCount: 0,
+                  pliCount: 0,
+                  firCount: 0,
+                  qpAvg: 0,
+                  codec: "",
+                  bytesSent: 0,
+                };
+          if (cs && opts.fixedMonitor == null && data.readyState === "open") {
+            try {
+              data.send(
+                JSON.stringify({
+                  event: "capstats",
+                  stats: cs,
+                  rtc: {
+                    sendKbps: link.kbps,
+                    sendFps: link.fps,
+                    rtt: link.rtt,
+                    keyFrames: link.keyFramesEncoded,
+                    framesEnc: link.framesEncoded,
+                    nack: link.nackCount,
+                    pli: link.pliCount,
+                    fir: link.firCount,
+                    qp: link.qpAvg,
+                    codec: link.codec,
+                    encMaxKbps: Math.round(appliedCapBps / 1000),
+                    jpegQ: jpegForRtc(quality.jpeg),
+                    content: quality.mode,
+                  },
+                  at: Date.now(),
+                }),
+              );
             } catch {
               /* ignore */
             }
@@ -1239,9 +1341,6 @@ export function startHost(opts: HostOptions): () => void {
               zeroSince = 0;
             }
           }
-          // Primary hosts always read the outbound link stats — the encoder-stall
-          // watchdog needs them even when no desktop UI is subscribed.
-          const link = opts.fixedMonitor == null || opts.onStats ? await readSendStats() : { kbps: 0, fps: 0, rtt: 0 };
           // Encoder-stall watchdog: Rust producing frames at a real rate while the
           // WebRTC encoder sends 0 fps for ~5s means the encoder wedged (classic
           // trigger: a mid-stream resolution increase). Rebuild the track in place.

@@ -71,7 +71,22 @@ import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { isQuestBrowser } from "../device";
 
-type HostStats = RemoteCaptureStats & { producedFps?: number };
+type HostRtcStats = {
+  sendKbps: number;
+  sendFps: number;
+  rtt: number;
+  keyFrames: number;
+  framesEnc: number;
+  nack: number;
+  pli: number;
+  fir: number;
+  qp: number;
+  codec: string;
+  encMaxKbps: number;
+  jpegQ: number;
+  content: string;
+};
+type HostStats = RemoteCaptureStats & { producedFps?: number; rtc?: HostRtcStats };
 type NetStats = {
   fps: number;
   kbps: number;
@@ -87,6 +102,15 @@ type NetStats = {
   bufMs: number;
   /** Avg hardware/software decode time per frame over the last sample window (ms). */
   decMs: number;
+  /** App-requested jitterBufferTarget (ms). */
+  jbTargetMs: number;
+  packetsReceived: number;
+  nackCount: number;
+  pliCount: number;
+  firCount: number;
+  keyFramesDecoded: number;
+  framesRendered: number;
+  framesDecoded: number;
 };
 
 // ---------- tuning constants ----------
@@ -598,7 +622,7 @@ export function ControlScreen({
   // crisp desktop: 1920-wide, Text mode, max sharpness. Persisted so a tuned
   // setup (e.g. lower res + Video mode for gaming) survives app restarts.
   const [streamQ, setStreamQ] = useState(() => {
-    const dflt = { maxW: 1920, quality: 100, fps: 40, bitrate: 12000 };
+    const dflt = { maxW: 1920, quality: 72, fps: 40, bitrate: 12000 };
     try {
       const raw = localStorage.getItem("gt.remote.streamQ");
       if (!raw) return dflt;
@@ -724,8 +748,9 @@ export function ControlScreen({
         const s = pendingStreamRef.current;
         if (s) bindStream(s, true);
       } else if (e.event === "capstats") {
-        const cs = (e as { stats?: RemoteCaptureStats }).stats;
+        const cs = (e as { stats?: RemoteCaptureStats; rtc?: HostRtcStats }).stats;
         if (!cs) return;
+        const rtc = (e as { rtc?: HostRtcStats }).rtc;
         const now = performance.now();
         const prev = prodRef.current;
         let producedFps: number | undefined;
@@ -734,7 +759,7 @@ export function ControlScreen({
           if (df >= 0) producedFps = Math.round((df * 1000) / (now - prev.at));
         }
         prodRef.current = { frames: cs.producedFrames, at: now };
-        setHostStats({ ...cs, producedFps });
+        setHostStats({ ...cs, producedFps, rtc });
       }
     });
     // LAN fallback: JPEG tile frames drawn to the canvas.
@@ -1012,8 +1037,16 @@ export function ControlScreen({
         rttMs: s.rttMs,
         bufMs: Math.round(bufMs),
         decMs: Math.round(decMs * 10) / 10,
+        jbTargetMs: s.jitterTargetMs ?? 0,
+        packetsReceived: s.packetsReceived ?? 0,
+        nackCount: s.nackCount ?? 0,
+        pliCount: s.pliCount ?? 0,
+        firCount: s.firCount ?? 0,
+        keyFramesDecoded: s.keyFramesDecoded ?? 0,
+        framesRendered: s.framesRendered ?? 0,
+        framesDecoded: s.framesDecoded ?? 0,
       });
-    }, 1000);
+    }, 500);
     return () => {
       alive = false;
       window.clearInterval(id);
@@ -2245,39 +2278,82 @@ export function ControlScreen({
         </div>
       )}
 
-      {/* ---- performance / debug HUD ---- */}
+      {/* ---- performance / debug HUD (dense 2-col — double the telemetry, same footprint) ---- */}
       {showStats && !immersive && !topCollapsed && (
-        <div
-          className="absolute right-3 top-3 z-30 w-[16.5rem] max-w-[80vw] rounded-2xl glass border border-white/[0.08] p-2.5 text-[10px] leading-relaxed text-ink-soft shadow-float"
-        >
-          <div className="mb-1 flex items-center gap-1.5 text-[11px] font-800 text-white">
-            <Gauge className="h-3.5 w-3.5 text-accent-3" /> Stream stats
+        <div className="absolute right-2 top-2 z-30 w-[17.5rem] max-w-[92vw] rounded-xl border border-white/[0.1] bg-black/70 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md">
+          <div className="mb-1 flex items-center justify-between gap-1.5">
+            <span className="flex items-center gap-1 text-[10px] font-800 text-white">
+              <Gauge className="h-3 w-3 text-accent-3" /> Stream stats
+            </span>
+            {net && (
+              <span
+                className={`rounded px-1 py-0.5 font-800 tabular-nums ${
+                  Math.round(net.rttMs / 2 + net.bufMs + net.decMs) <= 50
+                    ? "bg-green/20 text-green"
+                    : Math.round(net.rttMs / 2 + net.bufMs + net.decMs) <= 100
+                      ? "bg-amber/20 text-amber"
+                      : "bg-red/20 text-red"
+                }`}
+              >
+                ~{Math.max(1, Math.round(net.rttMs / 2 + net.bufMs + net.decMs))}ms
+              </span>
+            )}
           </div>
-          <StatRow k="Display (phone)" v={`${fps} fps${res ? ` · ${res}` : ""}`} />
-          {net && (
-            <>
-              <StatRow k="Decode" v={`${net.fps} fps · ${net.w}×${net.h}`} />
-              <StatRow k="Bitrate" v={net.kbps >= 1000 ? `${(net.kbps / 1000).toFixed(1)} Mbps` : `${net.kbps} kbps`} />
-              {/* One-way network + jitter-buffer dwell + decode — the phone-side
-                  share of glass-to-glass latency (host capture/encode shown below). */}
-              <StatRow k="Latency (est.)" v={`~${Math.max(1, Math.round(net.rttMs / 2 + net.bufMs + net.decMs))} ms`} />
-              <StatRow k="RTT · buffer · decode" v={`${net.rttMs} · ${net.bufMs} · ${net.decMs.toFixed(1)} ms`} />
-              <StatRow k="Jitter / loss" v={`${net.jitterMs} ms · ${net.lostPkts} pkt`} />
-              <StatRow k="Dropped / freezes" v={`${net.dropped} · ${net.freezes}`} />
-            </>
-          )}
+          <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+            <StatCell k="Display" v={`${fps} fps`} />
+            <StatCell k="Decode" v={net ? `${net.fps} fps` : "—"} />
+            <StatCell k="Res out" v={net && net.w ? `${net.w}×${net.h}` : res || "—"} />
+            <StatCell
+              k="Bitrate ↓"
+              v={net ? (net.kbps >= 1000 ? `${(net.kbps / 1000).toFixed(1)}M` : `${net.kbps}k`) : "—"}
+            />
+            <StatCell k="RTT" v={net ? `${net.rttMs} ms` : "—"} />
+            <StatCell k="Buffer" v={net ? `${net.bufMs} ms` : "—"} hi={!!net && net.bufMs > 60} />
+            <StatCell k="JB target" v={net ? `${net.jbTargetMs} ms` : "—"} />
+            <StatCell k="Decode ms" v={net ? `${net.decMs.toFixed(1)}` : "—"} />
+            <StatCell k="Jitter" v={net ? `${net.jitterMs} ms` : "—"} />
+            <StatCell k="Loss" v={net ? `${net.lostPkts} pkt` : "—"} />
+            <StatCell k="Drop / frz" v={net ? `${net.dropped} · ${net.freezes}` : "—"} hi={!!net && net.freezes > 10} />
+            <StatCell k="NACK/PLI" v={net ? `${net.nackCount} · ${net.pliCount}` : "—"} />
+            <StatCell k="FIR / IDR↓" v={net ? `${net.firCount} · ${net.keyFramesDecoded}` : "—"} />
+            <StatCell k="Pkts ↓" v={net ? `${net.packetsReceived}` : "—"} />
+            <StatCell k="Decoded" v={net ? `${net.framesDecoded}` : "—"} />
+            <StatCell k="Rendered" v={net ? `${net.framesRendered || "—"}` : "—"} />
+          </div>
           {hostStats && (
             <>
-              <div className="my-1 border-t border-white/[0.06]" />
-              <StatRow k="Host produce" v={`${hostStats.producedFps ?? "–"} fps (target ${hostStats.fps})`} />
-              <StatRow k="Capture / scale" v={`${hostStats.captureMs.toFixed(1)} · ${hostStats.scaleMs.toFixed(1)} ms`} />
-              <StatRow k="Encode" v={`${hostStats.encodeMs.toFixed(1)} ms`} />
-              <StatRow k="Frame size" v={`${(hostStats.frameBytes / 1024).toFixed(0)} KB`} />
-              <StatRow k="Resolution" v={`${hostStats.nativeW}×${hostStats.nativeH} → ${hostStats.outW}×${hostStats.outH}`} />
+              <div className="my-1 border-t border-white/[0.08]" />
+              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+                <StatCell k="Host prod" v={`${hostStats.producedFps ?? "–"}/${hostStats.fps}`} />
+                <StatCell k="Send fps" v={hostStats.rtc ? `${hostStats.rtc.sendFps}` : "—"} />
+                <StatCell k="Cap/scl" v={`${hostStats.captureMs.toFixed(0)}·${hostStats.scaleMs.toFixed(0)}`} />
+                <StatCell k="JPEG ms" v={`${hostStats.encodeMs.toFixed(1)}`} />
+                <StatCell k="Host Σ" v={`${(hostStats.captureMs + hostStats.scaleMs + hostStats.encodeMs).toFixed(0)} ms`} />
+                <StatCell k="JPEG KB" v={`${(hostStats.frameBytes / 1024).toFixed(0)}`} hi={hostStats.frameBytes > 200_000} />
+                <StatCell k="Native" v={`${hostStats.nativeW}×${hostStats.nativeH}`} />
+                <StatCell k="Out" v={`${hostStats.outW}×${hostStats.outH}`} />
+                <StatCell
+                  k="Send ↑"
+                  v={
+                    hostStats.rtc
+                      ? hostStats.rtc.sendKbps >= 1000
+                        ? `${(hostStats.rtc.sendKbps / 1000).toFixed(1)}M`
+                        : `${hostStats.rtc.sendKbps}k`
+                      : "—"
+                  }
+                />
+                <StatCell k="Enc max" v={hostStats.rtc ? `${hostStats.rtc.encMaxKbps}k` : "—"} />
+                <StatCell k="Codec" v={hostStats.rtc?.codec || "—"} />
+                <StatCell k="QP avg" v={hostStats.rtc ? `${hostStats.rtc.qp}` : "—"} />
+                <StatCell k="IDR ↑" v={hostStats.rtc ? `${hostStats.rtc.keyFrames}` : "—"} />
+                <StatCell k="NACK↑/PLI↑" v={hostStats.rtc ? `${hostStats.rtc.nack}·${hostStats.rtc.pli}` : "—"} />
+                <StatCell k="JPEG q" v={hostStats.rtc ? `${hostStats.rtc.jpegQ}` : "—"} />
+                <StatCell k="Mode" v={hostStats.rtc?.content || "—"} />
+              </div>
             </>
           )}
-          <div className="mt-1.5 rounded-lg bg-white/[0.04] px-2 py-1 text-[10px] font-700 text-accent-3">
-            {bottleneckHint(hostStats, net)}
+          <div className="mt-1 rounded-md bg-white/[0.05] px-1.5 py-0.5 text-[9px] font-700 text-accent-3">
+            {bottleneckHint(hostStats, net, fps)}
           </div>
         </div>
       )}
@@ -2792,31 +2868,47 @@ function CursorFx({ kind, dir }: { kind: "left" | "right" | "scroll"; dir?: numb
 }
 
 // ---------- small UI pieces ----------
-function StatRow({ k, v }: { k: string; v: string }) {
+function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {
   return (
-    <div className="flex items-center justify-between gap-2">
-      <span className="text-ink-faint">{k}</span>
-      <span className="font-700 text-white">{v}</span>
+    <div className="flex min-w-0 items-baseline justify-between gap-1">
+      <span className="shrink-0 text-ink-faint">{k}</span>
+      <span className={`truncate font-700 tabular-nums ${hi ? "text-amber" : "text-white"}`}>{v}</span>
     </div>
   );
 }
 
-/** A plain-language guess at where the frame-rate is being lost. */
-function bottleneckHint(host: HostStats | null, net: NetStats | null): string {
+/** A plain-language guess at where latency / fps is being lost. */
+function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps?: number): string {
   if (!host && !net) return "Gathering stats…";
+  const phoneLag = net ? Math.round(net.rttMs / 2 + net.bufMs + net.decMs) : 0;
+  const hostMs = host ? host.captureMs + host.scaleMs + host.encodeMs : 0;
+  if (net && net.bufMs > 80) {
+    return `Buffer ${net.bufMs}ms (target ${net.jbTargetMs}) — main lag. Want ≤40.`;
+  }
+  if (net && phoneLag > 60 && net.bufMs > 45) {
+    return `Phone lag ~${phoneLag}ms — shrink buffer/target.`;
+  }
+  if (host && host.frameBytes > 220_000) {
+    return `JPEG ${(host.frameBytes / 1024).toFixed(0)}KB — heavy IPC; q capped for RTC.`;
+  }
   const target = host?.fps ?? 30;
   const produced = host?.producedFps;
-  const hostCpuMs = host ? host.captureMs + host.scaleMs + host.encodeMs : 0;
-  // Host can't produce near the target and is spending real time doing it → CPU-bound.
-  if (host && produced != null && produced < target * 0.75 && hostCpuMs > 12) {
-    const worst = host.encodeMs >= host.scaleMs && host.encodeMs >= host.captureMs ? "encode" : host.scaleMs >= host.captureMs ? "downscale" : "capture";
-    return `Bottleneck: host CPU (${worst}). Lower resolution or sharpness.`;
+  if (host && produced != null && produced < target * 0.75 && hostMs > 12) {
+    const worst =
+      host.encodeMs >= host.scaleMs && host.encodeMs >= host.captureMs
+        ? "encode"
+        : host.scaleMs >= host.captureMs
+          ? "downscale"
+          : "capture";
+    return `Host CPU (${worst} ${hostMs.toFixed(0)}ms). Lower res/fps.`;
   }
-  // Host produces fine but the phone decodes far fewer → network or decoder limited.
   if (host && net && produced != null && produced > 0 && net.fps < produced * 0.7) {
-    return "Bottleneck: network / decoder. Lower bitrate (resolution/fps).";
+    return "Net/decoder behind host produce. Lower bitrate.";
   }
-  if (net && net.freezes > 0 && net.fps < target * 0.6) return "Bottleneck: unstable link (freezes).";
+  if (net && displayFps != null && net.fps > 0 && displayFps < net.fps * 0.7) {
+    return "Display behind decode — phone UI thread busy.";
+  }
+  if (net && phoneLag <= 50) return `Pipeline lean (~${phoneLag}ms phone lag).`;
   return "Pipeline healthy.";
 }
 

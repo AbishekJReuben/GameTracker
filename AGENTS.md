@@ -671,14 +671,15 @@ not regress):**
   `click`/`down`/`up` the guest re-sends the last lossy move on the RELIABLE control
   channel — same-stream ordering guarantees button events never land on a stale cursor.
   Only absolute moves may use the lossy path (`moverel` would double-apply if anchored).
-- **Receiver jitter buffer: windowed adaptation, base 100ms** (`cloud.ts`). The drop ratio
-  is computed per 3s watchdog tick (deltas), not cumulative-forever — one early burst no
-  longer pins the buffer (and latency) high for the whole session. Base sits at 100ms to
-  absorb Chromium's ~1s HW-H.264 IDR spikes (see pass 3 below); bursty decoders still
-  climb +40ms/tick to 300ms. Guard: skip ticks with <5 frames in the window (static
-  screen ≈ 1 keep-alive fps).
+- **Receiver jitter buffer: lean ~40ms target** (`cloud.ts`). Windowed drop-ratio
+  adaptation only — **never grow off freezeCount** (Chromium's ~1Hz IDR hitch
+  increments freezes even at 258ms dwell). Cap 120ms on real drops; snap back to
+  40ms when clean. Phone lag ≈ RTT/2 + buffer + decode — buffer was the 281ms
+  culprit when freeze-driven growth bloated it.
 - **Quality settings persist** on the phone (`gt.remote.streamQ`, `gt.remote.contentMode`
-  in localStorage) — a tuned setup survives app restarts.
+  in localStorage) — a tuned setup survives app restarts. Default sharpness 72
+  (WebRTC re-encodes; q=100 wasted IPC on ~400KB JPEGs). Host clamps intermediate
+  JPEG to ≤72 regardless of the slider.
 
 **v3.9.13+ streaming/latency pass 2 (do not regress):**
 - **`RemoteLink.send` returns a delivery boolean** (true = handed to an OPEN channel;
@@ -699,12 +700,9 @@ not regress):**
   truth on the gesture hot path; React state (zoom/pan/cursor) now updates at most once
   per animation frame instead of once per 90–120Hz pointer event — a full ControlScreen
   re-render per touch move was starving the phone's compositor exactly while dragging.
-- **Adaptive jitter-buffer floor** (`cloud.ts`): base stays 100ms, but 10 consecutive
-  clean watchdog windows (<3% drops over 30s) let the floor ease toward `JITTER_MIN`
-  60ms. Any bad window (>15% drops) **or a visible freeze** (`freezeCount` delta)
-  resets the floor to 100, raises the buffer, and holds easing for ~12s so we don't
-  sawtooth around Chromium's 1Hz IDR cadence. Never 0 — the target is a hint and
-  forcing it to nothing stutters.
+- **Adaptive jitter-buffer floor** (cloud.ts): fixed lean target **40ms**. Grows
+  only on >15% windowed drops (cap 120ms); eases back in 20ms steps. Freezes are
+  HUD-only — do not inflate the buffer off them. Never 0.
 - **Capture threads hold a `TimerBoost` RAII guard** (`capture.rs`,
   `timeBeginPeriod(1)`/`timeEndPeriod(1)`, needs the `Win32_Media` windows feature):
   Windows sleeps quantize to the ~15.6ms system tick, so the fps-pacing sleeps overshot
@@ -756,9 +754,12 @@ not regress):**
   **1.4×** the steady-state estimate so IDR spikes clear the RTP pacer instead of
   queueing a hitch. Browser APIs cannot lengthen Chromium's IDR period — don't try
   PLI loops (that *increases* keyframes).
-- **Guest (`cloud.ts`):** jitter base 100ms / floor 60ms; watch `freezeCount` deltas —
-  a freeze bumps the buffer, restores the floor, and holds easing ~12s; clean easing
-  steps by 10ms (not 20) so we don't dive back into underrun before the next IDR.
+- **Guest (`cloud.ts`):** jitter target **40ms** (cap 120 on real drops only). Watch
+  `freezeCount` for the HUD — do **not** grow the buffer off freezes (that produced
+  the 258ms buffer / 281ms lag while freezes kept climbing). Dense Stream stats HUD
+  shows phone + host RTC counters (JB target, NACK/PLI/FIR, IDR↑/↓, QP, JPEG q,
+  send fps) in a 2-col grid. Intermediate JPEG for the WebRTC canvas path is capped
+  at q72 (`jpegForRtc`) so ~400KB frames stop burning host IPC/CPU.
   Forcing `jitterBufferTarget` to 0 (Selkies anti-pattern) reintroduces stutter —
   never do that ([selkies#157](https://github.com/selkies-project/selkies/issues/157),
   [MDN jitterBufferTarget](https://developer.mozilla.org/en-US/docs/Web/API/RTCRtpReceiver/jitterBufferTarget)).

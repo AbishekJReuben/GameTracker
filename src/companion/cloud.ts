@@ -67,6 +67,20 @@ export type RtcInboundVideoStats = {
   jitterBufferEmittedCount: number;
   /** Cumulative seconds spent decoding (delta / framesDecoded = per-frame decode ms). */
   totalDecodeTime: number;
+  /** App-requested jitterBufferTarget currently applied (ms). */
+  jitterTargetMs: number;
+  /** Packets received (cumulative). */
+  packetsReceived: number;
+  /** NACK count (receiver asked for retransmits). */
+  nackCount: number;
+  /** PLI count (picture loss → keyframe requests). */
+  pliCount: number;
+  /** FIR count (full intra requests). */
+  firCount: number;
+  /** Keyframes decoded (cumulative). */
+  keyFramesDecoded: number;
+  /** Frames rendered (if reported). */
+  framesRendered: number;
   at: number;
 };
 
@@ -77,27 +91,22 @@ const BACKOFF_MIN = 1500;
 const BACKOFF_MAX = 30000;
 const WATCHDOG_MS = 3000; // health-check cadence
 const HARD_RESET_MS = 60000; // transport down this long → full teardown + rebuild
-// Receiver jitter buffer (ms): the old 20ms was so tight that late frames were
-// dropped (≈30% on Android). A larger buffer trades a little latency for far
-// fewer drops; it adapts up when the decoder falls behind and eases back.
+// Receiver jitter buffer (ms). This is the dominant phone-side latency term
+// (stats HUD: "buffer"). Target ~40ms so glass-to-glass stays near one frame
+// of headroom on a LAN/Tailscale link (RTT/2 + buffer + decode ≈ 40–60ms).
 //
-// Base rests at 100ms (was 80): Chromium's HW H.264 encoder inserts a large IDR
-// ~every 1s at ≥720p, and that spike needs a few frames of dwell headroom or
-// the viewer sees a periodic micro-hitch while data-channel input stays smooth.
-// Adaptation is WINDOWED (drop ratio + freezeCount measured per watchdog tick
-// instead of cumulative-forever). Sustained-clean links may ease toward
-// JITTER_MIN, but freezes lock easing for several ticks so we don't sawtooth
-// around the IDR cadence.
-const JITTER_BASE = 100;
-const JITTER_MAX = 300;
-// Sustained-clean links may ease the buffer BELOW the base, down to this hard
-// floor — never 0 (forcing the target empty causes visible stutter when the
-// buffer wants room). Floor is earned and forfeited on freezes/drops.
-const JITTER_MIN = 60;
-/** Consecutive clean watchdog ticks (3s each) required to unlock the low floor. */
-const JITTER_CLEAN_TICKS = 10;
-/** After a visible freeze, hold the buffer (no easing) for this many ticks. */
-const JITTER_EASE_HOLD_TICKS = 4;
+// IMPORTANT: do NOT grow the buffer off freezeCount. Chromium's ~1Hz HW-H.264
+// IDR hitch increments freezeCount even with a fat buffer (we measured 239
+// freezes at 258ms dwell) — freeze-driven growth only added latency without
+// curing the hitch. Host-side timestamp pacing + bitrate headroom handle IDRs;
+// the buffer only reacts to real DROP ratio (late frames discarded).
+//
+// Never force 0 (Selkies anti-pattern — stutter when the UA wants room).
+const JITTER_BASE = 40;
+const JITTER_MAX = 120;
+const JITTER_MIN = 40;
+/** Consecutive clean watchdog ticks (3s each) before easing from a raised target. */
+const JITTER_CLEAN_TICKS = 2;
 
 export class CloudConn {
   private sig: Signaling | null = null;
@@ -159,10 +168,8 @@ export class CloudConn {
   private sinkActive = false;
   private winBytes = 0;
   private stallTicks = 0;
-  // Freeze counter baseline (freezeCount increments exactly when the viewer SEES
-  // a stutter — an inter-frame gap far above the average) + easing hold-off.
+  // Freeze counter baseline — tracked for the HUD only (not used to inflate buffer).
   private winFreezes = 0;
-  private easeHoldTicks = 0;
   // Session id of the offer that built the current pc. A later offer with the SAME
   // id is an ICE-restart renegotiation (apply in place); a different id is a new
   // session (full rebuild). Lets a transient network drop re-route sub-second
@@ -437,7 +444,6 @@ export class CloudConn {
     this.winBytes = 0;
     this.stallTicks = 0;
     this.winFreezes = 0;
-    this.easeHoldTicks = 0;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
     pipeIce(pc, this.sig!);
@@ -477,7 +483,7 @@ export class CloudConn {
       if (e.track.kind === "video") {
         this.videoReceiver = e.receiver;
         this.jitterTarget = JITTER_BASE;
-        this.jitterFloor = JITTER_BASE; // new decoder/session must re-earn the low floor
+        this.jitterFloor = JITTER_BASE; // lean target — no earned-lower floor
         this.jitterCleanTicks = 0;
         this.applyJitter();
         // Capture is deferred until host auth — the track starts muted/empty. When
@@ -693,51 +699,33 @@ export class CloudConn {
       // (a static screen decodes ~1 keep-alive per second).
       if (total < 5) return;
 
-      // freezeCount increments exactly when the viewer SEES a stutter (inter-frame
-      // gap far above the average) — the metric that matches the "smooth → hitch
-      // → smooth" complaint. Chromium's ~1s HW-H.264 IDR cadence is the usual
-      // culprit; treat freezes as hard evidence the buffer is too lean.
+      // Track freezes for the HUD only — IDR hitches inflate freezeCount even
+      // with a huge buffer, so we never grow jitterTarget off them.
       if (st.freezeCount < this.winFreezes) this.winFreezes = 0;
-      const dFreezes = st.freezeCount - this.winFreezes;
       this.winFreezes = st.freezeCount;
 
       const ratio = dDropped / total;
       const prev = this.jitterTarget;
-      if (dFreezes > 0) {
-        // Visible hitch: raise the buffer, restore the conservative floor, and
-        // freeze easing so we don't shrink again into the next IDR spike.
-        this.easeHoldTicks = JITTER_EASE_HOLD_TICKS;
+      if (ratio > 0.15) {
+        // Real late-frame drops: nudge up a little (capped lean).
         this.jitterCleanTicks = 0;
-        this.jitterFloor = JITTER_BASE;
-        this.jitterTarget = Math.min(
-          JITTER_MAX,
-          Math.max(this.jitterTarget, JITTER_BASE) + 40 * Math.min(dFreezes, 3),
-        );
-      } else if (this.easeHoldTicks > 0) {
-        // Hold steady through the post-freeze cooldown (still allow growing on drops).
-        this.easeHoldTicks--;
-        if (ratio > 0.15) {
-          this.jitterTarget = Math.min(JITTER_MAX, this.jitterTarget + 40);
-        }
-      } else if (ratio > 0.15) {
-        // Trouble: buffer up AND restore the conservative floor — it must be
-        // re-earned with another sustained clean stretch.
-        this.jitterCleanTicks = 0;
-        this.jitterFloor = JITTER_BASE;
-        this.jitterTarget = Math.min(JITTER_MAX, this.jitterTarget + 40);
-      } else if (ratio < 0.03) {
-        // Clean window: ease down slowly. After enough consecutive clean ticks the
-        // floor itself steps below the base toward JITTER_MIN.
+        this.jitterTarget = Math.min(JITTER_MAX, this.jitterTarget + 20);
+      } else if (ratio < 0.05) {
+        // Clean: snap back toward the low-latency base quickly.
         this.jitterCleanTicks++;
-        if (this.jitterCleanTicks >= JITTER_CLEAN_TICKS && this.jitterFloor > JITTER_MIN) {
-          this.jitterFloor = Math.max(JITTER_MIN, this.jitterFloor - 10);
+        if (this.jitterCleanTicks >= JITTER_CLEAN_TICKS) {
+          this.jitterTarget = Math.max(JITTER_MIN, this.jitterTarget - 20);
         }
-        // Ease by 10ms/tick (was 20) so we don't sawtooth into the next IDR.
-        this.jitterTarget = Math.max(this.jitterFloor, this.jitterTarget - 10);
       } else {
-        // Mid-band (3–15% drops): hold steady, but it's not "clean" — reset the streak.
         this.jitterCleanTicks = 0;
+        // Mid-band: drift toward BASE so a temporary bump doesn't stick.
+        if (this.jitterTarget > JITTER_BASE) {
+          this.jitterTarget = Math.max(JITTER_BASE, this.jitterTarget - 10);
+        }
       }
+      // Keep the floor pinned to the lean base (no earned-lower floor — 40ms is
+      // already the target latency budget).
+      this.jitterFloor = JITTER_BASE;
       if (this.jitterTarget !== prev) this.applyJitter();
     }, WATCHDOG_MS);
   }
@@ -946,6 +934,13 @@ export class CloudConn {
       jitterBufferDelay: inbound.jitterBufferDelay ?? 0,
       jitterBufferEmittedCount: inbound.jitterBufferEmittedCount ?? 0,
       totalDecodeTime: inbound.totalDecodeTime ?? 0,
+      jitterTargetMs: this.jitterTarget,
+      packetsReceived: inbound.packetsReceived ?? 0,
+      nackCount: inbound.nackCount ?? 0,
+      pliCount: inbound.pliCount ?? 0,
+      firCount: inbound.firCount ?? 0,
+      keyFramesDecoded: inbound.keyFramesDecoded ?? 0,
+      framesRendered: inbound.framesRendered ?? 0,
       at: Date.now(),
     };
   }
