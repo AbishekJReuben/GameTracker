@@ -62,6 +62,7 @@ import {
   Plus,
   Trash2,
   AppWindow,
+  SlidersHorizontal,
 } from "lucide-react";
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { startGamepadBridge } from "../gamepad";
@@ -71,6 +72,14 @@ import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { isQuestBrowser } from "../device";
 import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
+import {
+  loadStreamTune,
+  resetStreamTune,
+  saveStreamTune,
+  streamTuneIsCustom,
+  STREAM_TUNE_DEFAULTS,
+  type StreamTune,
+} from "../streamTune";
 
 type HostRtcStats = {
   sendKbps: number;
@@ -708,36 +717,35 @@ export function ControlScreen({
   const layoutRef = useRef<Layout | null>(null);
   const natRef = useRef({ w: 0, h: 0 });
 
-  // Live stream quality (sliders only). `bitrate` is kbps. Defaults tuned for a
-  // crisp desktop: 1920-wide, Text mode, max sharpness. Persisted so a tuned
-  // setup (e.g. lower res + Video mode for gaming) survives app restarts.
-  const [streamQ, setStreamQ] = useState(() => {
-    const dflt = { maxW: 1920, quality: 72, fps: 40, bitrate: 12000 };
-    try {
-      const raw = localStorage.getItem("gt.remote.streamQ");
-      if (!raw) return dflt;
-      const p = JSON.parse(raw) as Partial<typeof dflt>;
-      return {
-        maxW: clamp(Number(p.maxW) || dflt.maxW, 320, 3840),
-        quality: clamp(Number(p.quality) || dflt.quality, 20, 100),
-        fps: clamp(Number(p.fps) || dflt.fps, 10, 60),
-        bitrate: clamp(Number(p.bitrate) || dflt.bitrate, 500, 40000),
-      };
-    } catch {
-      return dflt;
-    }
-  });
-  useEffect(() => {
-    localStorage.setItem("gt.remote.streamQ", JSON.stringify(streamQ));
-  }, [streamQ]);
-  // Content optimization: sharpen for text/UI, smooth for video, or auto.
-  const [contentMode, setContentMode] = useState<ContentMode>(() => {
-    const m = localStorage.getItem("gt.remote.contentMode");
-    return m === "auto" || m === "text" || m === "video" ? m : "text";
-  });
-  useEffect(() => {
-    localStorage.setItem("gt.remote.contentMode", contentMode);
-  }, [contentMode]);
+  // Full streaming soft-spot (stats Tune panel + Quality dock). One object so
+  // host pipeline + guest JB stay in sync with localStorage.
+  const [tune, setTune] = useState<StreamTune>(() => loadStreamTune());
+  const [tuneOpen, setTuneOpen] = useState(false);
+  const patchTune = (partial: Partial<StreamTune>) => {
+    setTune((prev) => {
+      const next = { ...prev, ...partial };
+      saveStreamTune(next);
+      link.applyStreamTune?.(next);
+      return next;
+    });
+  };
+  const resetTuneToDefaults = () => {
+    const t = link.resetStreamDefaults?.() ?? resetStreamTune();
+    setTune(t ?? resetStreamTune());
+  };
+  // Legacy aliases used by the Quality dock row.
+  const streamQ = {
+    maxW: tune.maxW,
+    quality: tune.jpeg,
+    fps: tune.fps,
+    bitrate: tune.bitrateKbps,
+  };
+  const setStreamQ = (updater: (p: typeof streamQ) => typeof streamQ) => {
+    const next = updater(streamQ);
+    patchTune({ maxW: next.maxW, jpeg: next.quality, fps: next.fps, bitrateKbps: next.bitrate });
+  };
+  const contentMode = tune.contentMode;
+  const setContentMode = (m: ContentMode) => patchTune({ contentMode: m });
   const [showStats, setShowStats] = useState(false);
   const [fps, setFps] = useState(0);
   const [res, setRes] = useState("");
@@ -762,9 +770,25 @@ export function ControlScreen({
   const [padAvailable, setPadAvailable] = useState<boolean | null>(null);
 
   const activeQuality = useMemo<QualitySettings>(
-    () => ({ ...streamQ, mode: contentMode }),
-    [streamQ, contentMode],
+    () => ({
+      maxW: tune.maxW,
+      quality: tune.jpeg,
+      fps: tune.fps,
+      bitrate: tune.bitrateKbps,
+      mode: tune.contentMode,
+      jpegCap: tune.jpegCap,
+      bitrateHeadroom: tune.bitrateHeadroom,
+      minBitrateKbps: tune.minBitrateKbps,
+      startBitrateKbps: tune.startBitrateKbps,
+    }),
+    [tune],
   );
+
+  // Push guest-side JB / preferDirect as soon as the link is up.
+  useEffect(() => {
+    link.applyStreamTune?.(tune);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [link]);
 
   // Composite one delta wire-frame (see capture.rs `TileEncoder::encode`) onto the
   // canvas: only the changed tiles are present, so we draw them over the retained
@@ -2365,13 +2389,23 @@ export function ControlScreen({
         </AnimatePresence>
         {showReconnect && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
-            {progress ? (
-              <ConnectionProgress snapshot={progress} compact showSteps />
-            ) : (
-              <div className="flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm text-white backdrop-blur">
-                <Loader2 className="h-4 w-4 animate-spin" /> Reconnecting…
-              </div>
-            )}
+            <div className="pointer-events-auto">
+              {progress ? (
+                <ConnectionProgress
+                  snapshot={progress}
+                  compact
+                  showSteps
+                  onResetDefaults={() => {
+                    link.resetAndRebuild?.();
+                    setTune({ ...STREAM_TUNE_DEFAULTS });
+                  }}
+                />
+              ) : (
+                <div className="flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm text-white backdrop-blur">
+                  <Loader2 className="h-4 w-4 animate-spin" /> Reconnecting…
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -2441,7 +2475,7 @@ export function ControlScreen({
 
       {/* ---- performance / debug HUD (dense 2-col — double the telemetry, same footprint) ---- */}
       {showStats && !immersive && !topCollapsed && !pipView && (
-        <div className="absolute right-2 top-2 z-30 w-[17.5rem] max-w-[92vw] rounded-xl border border-white/[0.1] bg-black/70 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md">
+        <div className="absolute right-2 top-2 z-30 w-[18.5rem] max-w-[94vw] rounded-xl border border-white/[0.1] bg-black/70 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md">
           <div className="mb-1 flex items-center justify-between gap-1.5">
             <span className="flex items-center gap-1 text-[10px] font-800 text-white">
               <Gauge className="h-3 w-3 text-accent-3" /> Stream stats
@@ -2550,6 +2584,168 @@ export function ControlScreen({
           )}
           <div className="mt-1 rounded-md bg-white/[0.05] px-1.5 py-0.5 text-[9px] font-700 text-accent-3">
             {bottleneckHint(hostStats, net, fps, wcStats)}
+          </div>
+
+          {/* Collapsible soft-spot tuner — every streaming knob editable for A/B tests. */}
+          <div className="mt-1.5 border-t border-white/[0.08] pt-1.5">
+            <button
+              type="button"
+              onClick={() => setTuneOpen((o) => !o)}
+              className="flex w-full items-center justify-between gap-1 rounded-md px-1 py-0.5 text-[10px] font-800 text-white"
+            >
+              <span className="flex items-center gap-1">
+                <SlidersHorizontal className="h-3 w-3 text-accent-3" /> Tune
+                {streamTuneIsCustom(tune) && (
+                  <span className="rounded bg-amber/20 px-1 py-0.5 text-[8px] text-amber">custom</span>
+                )}
+              </span>
+              {tuneOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+            </button>
+            {tuneOpen && (
+              <div className="mt-1 max-h-[42vh] space-y-1.5 overflow-y-auto pr-0.5" style={{ scrollbarWidth: "thin" }}>
+                <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                  Drag to hunt the soft spot. Changes apply live. Reset restores shipped defaults.
+                </p>
+                <TuneRow
+                  label="Res"
+                  value={tune.maxW}
+                  min={480}
+                  max={3840}
+                  step={80}
+                  fmt={(v) => `${v}px`}
+                  onChange={(v) => patchTune({ maxW: v })}
+                />
+                <TuneRow
+                  label="JPEG q"
+                  value={tune.jpeg}
+                  min={20}
+                  max={95}
+                  step={1}
+                  fmt={(v) => `${v}`}
+                  onChange={(v) => patchTune({ jpeg: v })}
+                />
+                <TuneRow
+                  label="JPEG cap"
+                  value={tune.jpegCap}
+                  min={40}
+                  max={95}
+                  step={1}
+                  fmt={(v) => `${v}`}
+                  onChange={(v) => patchTune({ jpegCap: v })}
+                />
+                <TuneRow
+                  label="FPS"
+                  value={tune.fps}
+                  min={10}
+                  max={60}
+                  step={1}
+                  fmt={(v) => `${v}`}
+                  onChange={(v) => patchTune({ fps: v })}
+                />
+                <TuneRow
+                  label="Bitrate"
+                  value={tune.bitrateKbps}
+                  min={1000}
+                  max={40000}
+                  step={500}
+                  fmt={(v) => `${(v / 1000).toFixed(1)}M`}
+                  onChange={(v) => patchTune({ bitrateKbps: v })}
+                />
+                <TuneRow
+                  label="Headroom"
+                  value={Math.round(tune.bitrateHeadroom * 100)}
+                  min={100}
+                  max={250}
+                  step={5}
+                  fmt={(v) => `${(v / 100).toFixed(2)}×`}
+                  onChange={(v) => patchTune({ bitrateHeadroom: v / 100 })}
+                />
+                <TuneRow
+                  label="Min bitrate"
+                  value={tune.minBitrateKbps}
+                  min={500}
+                  max={8000}
+                  step={100}
+                  fmt={(v) => `${v}k`}
+                  onChange={(v) => patchTune({ minBitrateKbps: v })}
+                />
+                <TuneRow
+                  label="Start bitrate"
+                  value={tune.startBitrateKbps}
+                  min={1000}
+                  max={20000}
+                  step={500}
+                  fmt={(v) => `${(v / 1000).toFixed(1)}M`}
+                  onChange={(v) => patchTune({ startBitrateKbps: v })}
+                />
+                <TuneRow
+                  label="JB base"
+                  value={tune.jbBase}
+                  min={20}
+                  max={200}
+                  step={5}
+                  fmt={(v) => `${v}ms`}
+                  onChange={(v) => patchTune({ jbBase: v, jbMin: Math.min(tune.jbMin, v) })}
+                />
+                <TuneRow
+                  label="JB min"
+                  value={tune.jbMin}
+                  min={20}
+                  max={200}
+                  step={5}
+                  fmt={(v) => `${v}ms`}
+                  onChange={(v) => patchTune({ jbMin: Math.min(v, tune.jbBase) })}
+                />
+                <TuneRow
+                  label="JB max"
+                  value={tune.jbMax}
+                  min={40}
+                  max={400}
+                  step={10}
+                  fmt={(v) => `${v}ms`}
+                  onChange={(v) => patchTune({ jbMax: Math.max(v, tune.jbBase) })}
+                />
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-0.5">
+                  <span className="text-[9px] text-ink-faint">Content</span>
+                  <div className="flex rounded-md bg-white/[0.06] p-0.5">
+                    {(["text", "auto", "video"] as ContentMode[]).map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => patchTune({ contentMode: m })}
+                        className={`rounded px-1.5 py-0.5 text-[9px] font-700 capitalize ${
+                          tune.contentMode === m ? "bg-accent-3 text-white" : "text-ink-dim"
+                        }`}
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex items-center justify-between gap-2 px-0.5">
+                  <span className="text-[9px] text-ink-faint">Direct (WebCodecs)</span>
+                  <button
+                    type="button"
+                    onClick={() => patchTune({ preferDirect: !tune.preferDirect })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
+                      tune.preferDirect ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tune.preferDirect ? "ON" : "OFF"}
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={resetTuneToDefaults}
+                  className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.06] py-1.5 text-[10px] font-800 text-white active:bg-white/[0.12]"
+                >
+                  <RotateCcw className="h-3 w-3" /> Reset to defaults
+                  {!streamTuneIsCustom(tune) && (
+                    <span className="text-[8px] font-600 text-ink-faint">({STREAM_TUNE_DEFAULTS.maxW}·{STREAM_TUNE_DEFAULTS.fps}fps)</span>
+                  )}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -3069,6 +3265,43 @@ function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {
     <div className="flex min-w-0 items-baseline justify-between gap-1">
       <span className="shrink-0 text-ink-faint">{k}</span>
       <span className={`truncate font-700 tabular-nums ${hi ? "text-amber" : "text-white"}`}>{v}</span>
+    </div>
+  );
+}
+
+/** Full-width labelled slider for the stats Tune panel. */
+function TuneRow({
+  label,
+  min,
+  max,
+  step,
+  value,
+  fmt,
+  onChange,
+}: {
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  fmt: (v: number) => string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="px-0.5">
+      <div className="mb-0.5 flex items-center justify-between text-[9px] font-700">
+        <span className="text-ink-faint">{label}</span>
+        <span className="tabular-nums text-white">{fmt(value)}</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full accent-accent-3"
+      />
     </div>
   );
 }

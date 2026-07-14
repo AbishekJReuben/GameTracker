@@ -169,7 +169,11 @@ export function Pairing({
           )}
           {busy && progress && (
             <div className="mb-4">
-              <ConnectionProgress snapshot={progress} showSteps={!waiting} />
+              <ConnectionProgress
+                snapshot={progress}
+                showSteps={!waiting}
+                onResetDefaults={() => activeConnRef.current?.resetAndRebuild()}
+              />
             </div>
           )}
           {error && <ErrorBox>{error}</ErrorBox>}

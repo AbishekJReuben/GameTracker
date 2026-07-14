@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { Check, ChevronDown, ChevronUp, Loader2, Wrench } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, Loader2, RotateCcw, Wrench } from "lucide-react";
 import type { ConnectDetail, ConnectPhase, ConnectSnapshot } from "./cloud";
+import { resetStreamTune } from "./streamTune";
 
 const STEPS: { id: ConnectPhase; label: string }[] = [
   { id: "signaling", label: "Signaling server" },
@@ -138,10 +139,13 @@ export function ConnectionProgress({
   snapshot,
   compact = false,
   showSteps = true,
+  onResetDefaults,
 }: {
   snapshot: ConnectSnapshot;
   compact?: boolean;
   showSteps?: boolean;
+  /** Wipe experimental stream tune + optional reconnect (stuck connect recovery). */
+  onResetDefaults?: () => void;
 }) {
   const [countdown, setCountdown] = useState(snapshot.backoffMs);
 
@@ -155,6 +159,14 @@ export function ConnectionProgress({
   }, [snapshot.phase, snapshot.backoffMs, snapshot.attempt]);
 
   const showApproval = snapshot.phase === "pending_approval";
+  const stalled =
+    snapshot.phase !== "connected" &&
+    snapshot.phase !== "pending_approval" &&
+    (snapshot.detail?.phaseMs ?? 0) > STALL_HINT_MS;
+  const handleReset = () => {
+    resetStreamTune();
+    onResetDefaults?.();
+  };
 
   if (compact) {
     return (
@@ -197,6 +209,15 @@ export function ConnectionProgress({
             {snapshot.detail.authState}
             {snapshot.detail.authSent > 1 ? `×${snapshot.detail.authSent}` : ""} · {fmtAge(snapshot.detail.phaseMs)}
           </div>
+        )}
+        {stalled && (
+          <button
+            type="button"
+            onClick={handleReset}
+            className="mt-0.5 flex items-center gap-1 rounded-full bg-white/10 px-2.5 py-1 text-[10px] font-700 text-white/90"
+          >
+            <RotateCcw className="h-3 w-3" /> Reset stream defaults
+          </button>
         )}
       </div>
     );
@@ -271,6 +292,16 @@ export function ConnectionProgress({
       )}
 
       <DiagPanel snapshot={snapshot} />
+
+      {stalled && (
+        <button
+          type="button"
+          onClick={handleReset}
+          className="btn btn-subtle mt-3 flex h-10 w-full items-center justify-center gap-2 text-xs"
+        >
+          <RotateCcw className="h-3.5 w-3.5" /> Reset stream defaults &amp; retry
+        </button>
+      )}
     </div>
   );
 }

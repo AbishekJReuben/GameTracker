@@ -97,9 +97,9 @@ function trackTuning(mode: string): { hint: string; degrade: RTCDegradationPrefe
 
 /** Intermediate JPEG quality for the Rust→canvas feed. The phone re-encodes via
  *  WebRTC H.264 anyway, so q=100 just burns CPU/IPC (395KB frames) without a
- *  visible win. Cap at 72; the Quality slider still raises detail up to that. */
-function jpegForRtc(q: number): number {
-  return Math.min(Math.max(20, q), 72);
+ *  visible win. Cap defaults to 72; the Tune panel can raise/lower it. */
+function jpegForRtc(q: number, cap = 72): number {
+  return Math.min(Math.max(20, q), Math.max(40, cap));
 }
 
 /**
@@ -379,7 +379,19 @@ export function startHost(opts: HostOptions): () => void {
 
   // Live stream-quality state; the guest re-tunes it over the control channel.
   // `bitrate` is kbps (0 = auto: derive from resolution/fps via bitrateFor).
-  const quality = { maxW: 1600, jpeg: 70, fps: opts.fps ?? 30, mode: "auto" as string, bitrate: 0 };
+  // Host-pipeline extras (jpegCap / headroom / min / start) come from the phone's
+  // Tune panel via the `quality` message — defaults match the shipped soft spot.
+  const quality = {
+    maxW: 1600,
+    jpeg: 70,
+    fps: opts.fps ?? 30,
+    mode: "auto" as string,
+    bitrate: 0,
+    jpegCap: 72,
+    bitrateHeadroom: 1.4,
+    minBitrateKbps: 1500,
+    startBitrateKbps: 8000,
+  };
 
   // When set, composited frames are diverted from the WebRTC generator track into
   // the WebCodecs encoder → "video" data channel (the guest opted in with
@@ -408,8 +420,9 @@ export function startHost(opts: HostOptions): () => void {
     // Chromium's HW H.264 encoder inserts a large IDR ~every 1s at ≥720p (see
     // Flashphoner / discuss-webrtc). Without headroom the RTP pacer queues behind
     // that spike → a visible hitch every second while data-channel input stays
-    // smooth. Leave ~40% above the steady-state estimate so IDRs clear promptly.
-    const capBps = Math.round(steadyBps * 1.4);
+    // smooth. Leave ~40% above the steady-state estimate so IDRs clear promptly
+    // (Tune panel can change bitrateHeadroom).
+    const capBps = Math.round(steadyBps * quality.bitrateHeadroom);
     const p = sender.getParameters();
     if (!p.encodings || p.encodings.length === 0) p.encodings = [{}];
     p.encodings[0].maxBitrate = capBps;
@@ -417,7 +430,10 @@ export function startHost(opts: HostOptions): () => void {
     // Chromium accepts minBitrate on encodings even though it isn't in the W3C
     // IDL — floor BWE so screen share can't collapse to ~200kbps. Best-effort.
     const minBps = Math.min(Math.round(capBps * 0.25), 3_000_000);
-    (p.encodings[0] as RTCRtpEncodingParameters & { minBitrate?: number }).minBitrate = Math.max(1_500_000, minBps);
+    (p.encodings[0] as RTCRtpEncodingParameters & { minBitrate?: number }).minBitrate = Math.max(
+      quality.minBitrateKbps * 1000,
+      minBps,
+    );
     // Bias the transport toward the screen video: bandwidth allocation over the
     // other channels and DSCP marking on networks that honor it.
     p.encodings[0].priority = "high";
@@ -705,8 +721,8 @@ export function startHost(opts: HostOptions): () => void {
     // parallel encode) needs no picker and is already heavily optimized.
     const start = () =>
       opts.fixedMonitor != null
-        ? api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg))
-        : api.remoteStartCapture(ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg));
+        ? api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap))
+        : api.remoteStartCapture(ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap));
     return { track, start };
   };
 
@@ -1346,8 +1362,17 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.fps === "number") quality.fps = clamp(msg.fps, 1, 120);
           if (typeof msg.bitrate === "number") quality.bitrate = msg.bitrate <= 0 ? 0 : clamp(msg.bitrate, 500, 40000);
           if (msg.mode === "auto" || msg.mode === "text" || msg.mode === "video") quality.mode = msg.mode;
+          if (typeof msg.jpegCap === "number") quality.jpegCap = clamp(msg.jpegCap, 40, 95);
+          if (typeof msg.bitrateHeadroom === "number") quality.bitrateHeadroom = clamp(msg.bitrateHeadroom, 1.0, 2.5);
+          if (typeof msg.minBitrateKbps === "number") quality.minBitrateKbps = clamp(msg.minBitrateKbps, 500, 8000);
+          if (typeof msg.startBitrateKbps === "number") quality.startBitrateKbps = clamp(msg.startBitrateKbps, 1000, 20000);
           try {
-            api.remoteSetCaptureQuality(quality.maxW, quality.fps, jpegForRtc(quality.jpeg), CONTENT_NUM[quality.mode] ?? 0);
+            api.remoteSetCaptureQuality(
+              quality.maxW,
+              quality.fps,
+              jpegForRtc(quality.jpeg, quality.jpegCap),
+              CONTENT_NUM[quality.mode] ?? 0,
+            );
           } catch {
             /* ignore */
           }
@@ -1593,7 +1618,7 @@ export function startHost(opts: HostOptions): () => void {
                     qp: link.qpAvg,
                     codec: link.codec,
                     encMaxKbps: Math.round(appliedCapBps / 1000),
-                    jpegQ: jpegForRtc(quality.jpeg),
+                    jpegQ: jpegForRtc(quality.jpeg, quality.jpegCap),
                     content: quality.mode,
                   },
                   // WebCodecs direct-path telemetry (all cumulative except encMs/buf).
@@ -1722,7 +1747,10 @@ export function startHost(opts: HostOptions): () => void {
       } else if (m.type === "answer" && pc) {
         // Munge the guest's answer so the video encoder starts near its working
         // bitrate instead of ramping up from Chromium's ~300kbps default.
-        await pc.setRemoteDescription({ type: "answer", sdp: boostStartBitrate(m.sdp, 8000, 2500) });
+        await pc.setRemoteDescription({
+          type: "answer",
+          sdp: boostStartBitrate(m.sdp, quality.startBitrateKbps, Math.min(quality.minBitrateKbps, 4000)),
+        });
       } else if (m.type === "candidate" && pc) {
         try {
           await pc.addIceCandidate(m.candidate);

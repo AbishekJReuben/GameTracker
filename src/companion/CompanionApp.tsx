@@ -425,7 +425,10 @@ function Connecting({
         <h1 className="font-display text-xl font-800">Connecting to your PC</h1>
         <div className="mt-4 text-left">
           {snap ? (
-            <ConnectionProgress snapshot={snap} />
+            <ConnectionProgress
+              snapshot={snap}
+              onResetDefaults={() => conn?.resetAndRebuild()}
+            />
           ) : (
             <div className="flex items-center justify-center gap-2 text-sm text-ink-dim">
               <Loader2 className="h-4 w-4 animate-spin" />

@@ -798,6 +798,10 @@ not regress):**
   Streaming opts (WebCodecs, JB 40, A/V split, lossy move, stall-heal, host bitrate/JPEG)
   are **not** Tauri-gated — discovery web gets the same path. Control also takes a
   **Screen Wake Lock** while live so Chrome Android doesn't dim/throttle mid-stream.
+  Stream stats HUD has a collapsible **Tune** panel (res/JPEG/fps/bitrate/headroom/min/
+  start bitrate/JB base·min·max/content/direct) persisted in `gt.remote.streamTune`,
+  with **Reset to defaults**; stalled connect UI + `forceRebuild` also wipe tune back
+  to the soft spot so a bad experiment can't wedge pairing.
 - **HUD:** header shows the transport (`DIRECT`/`RTC`/`LAN`); wc mode swaps the top grid
   for measured stats (E2E, net+enc, decode ms, dec queue, frame KB, clock ±) and the host
   section gains H264 enc ms / skipped / channel buf. The lag pill uses the measured E2E.

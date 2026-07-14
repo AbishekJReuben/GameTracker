@@ -15,6 +15,7 @@
 
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc";
 import { isImmersiveActive, onImmersiveActiveChange } from "./runtime";
+import { loadStreamTune, resetStreamTune, type StreamTune } from "./streamTune";
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 /** "pending" = link up, awaiting host approval; "denied" = host rejected us. */
@@ -182,9 +183,10 @@ const NEG_STALL_MS = 20000;
 // the buffer only reacts to real DROP ratio (late frames discarded).
 //
 // Never force 0 (Selkies anti-pattern — stutter when the UA wants room).
-const JITTER_BASE = 40;
-const JITTER_MAX = 120;
-const JITTER_MIN = 40;
+// Soft-spot defaults; runtime values come from StreamTune (stats Tune panel).
+const JITTER_BASE_DEFAULT = 40;
+const JITTER_MAX_DEFAULT = 120;
+const JITTER_MIN_DEFAULT = 40;
 /** Consecutive clean watchdog ticks (3s each) before easing from a raised target. */
 const JITTER_CLEAN_TICKS = 2;
 
@@ -235,9 +237,13 @@ export class CloudConn {
   private authed = false; // host approved this device (streaming allowed)
   private denied = false; // host rejected us — stop auto-reconnecting
   private videoReceiver: RTCRtpReceiver | null = null;
-  private jitterTarget = JITTER_BASE;
-  /** Current lower bound for jitterTarget; eases toward JITTER_MIN on clean links. */
-  private jitterFloor = JITTER_BASE;
+  private jbBase = JITTER_BASE_DEFAULT;
+  private jbMax = JITTER_MAX_DEFAULT;
+  private jbMin = JITTER_MIN_DEFAULT;
+  private preferDirect = true;
+  private jitterTarget = JITTER_BASE_DEFAULT;
+  /** Current lower bound for jitterTarget; eases toward jbMin on clean links. */
+  private jitterFloor = JITTER_BASE_DEFAULT;
   private jitterCleanTicks = 0;
   private watchdogTimer: number | null = null;
   private lastHealthyAt = Date.now();
@@ -339,6 +345,46 @@ export class CloudConn {
       if (active) this.wcFallback("immersive VR needs the RTC video track");
       else if (this.authState === "ok") void this.maybeStartWc();
     });
+    // Apply persisted Tune-panel soft spot (JB + preferDirect) before first connect.
+    this.applyStreamTune(loadStreamTune(), false);
+  }
+
+  /**
+   * Apply guest-side tune knobs (jitter buffer + WebCodecs preference). Host-side
+   * capture/bitrate fields travel via the quality message from Control.
+   */
+  applyStreamTune(tune: StreamTune, reassert = true) {
+    this.jbBase = tune.jbBase;
+    this.jbMax = tune.jbMax;
+    this.jbMin = tune.jbMin;
+    const wantDirect = tune.preferDirect;
+    if (!wantDirect && this.preferDirect && (this.wcActive || this.wcRequestedAt)) {
+      this.wcFallback("Tune: direct path off");
+    }
+    this.preferDirect = wantDirect;
+    this.jitterTarget = Math.min(this.jbMax, Math.max(this.jbMin, this.jitterTarget || this.jbBase));
+    this.jitterFloor = this.jbBase;
+    if (reassert) {
+      this.applyJitter();
+      if (wantDirect) {
+        // Re-probe after a prior "preferDirect off" fallback permanently cleared support.
+        this.wcSupported = null;
+        if (this.authState === "ok" && !this.wcActive) void this.maybeStartWc();
+      }
+    }
+  }
+
+  /** Wipe tune prefs to shipped defaults and re-apply (used when connect is stuck). */
+  resetStreamDefaults() {
+    const t = resetStreamTune();
+    this.applyStreamTune(t, true);
+    return t;
+  }
+
+  /** Stuck-connect recovery: defaults + force a clean peer rebuild. */
+  resetAndRebuild() {
+    this.resetStreamDefaults();
+    this.forceRebuild("manual tune reset");
   }
 
   private onVisibility = () => {
@@ -700,8 +746,8 @@ export class CloudConn {
       this.stream.addTrack(e.track);
       if (e.track.kind === "video") {
         this.videoReceiver = e.receiver;
-        this.jitterTarget = JITTER_BASE;
-        this.jitterFloor = JITTER_BASE;
+        this.jitterTarget = this.jbBase;
+        this.jitterFloor = this.jbBase;
         this.jitterCleanTicks = 0;
         this.applyJitter();
         this.startJitterHold();
@@ -864,6 +910,7 @@ export class CloudConn {
     // Immersive VR textures the RTC `<video>` element — canvas WebCodecs would
     // leave the big screen black. Flat Quest / web / APK all opt in.
     if (isImmersiveActive()) return;
+    if (!this.preferDirect) return;
     if (this.wcSupported == null) {
       try {
         if (typeof VideoDecoder === "undefined") {
@@ -1200,6 +1247,22 @@ export class CloudConn {
     this.clearReconnect();
     this.noteEvent(`rebuild: ${reason}`);
     console.warn("[remote] forcing session rebuild:", reason);
+    // Cold-start / auth / negotiation wedges: wipe experimental Tune values that
+    // may have broken the handshake (extreme JB / bitrate / etc.) so the retry
+    // lands on known-good defaults.
+    if (
+      reason.includes("stalled") ||
+      reason.includes("unanswered") ||
+      reason.includes("no transport") ||
+      reason.includes("authorization")
+    ) {
+      try {
+        this.resetStreamDefaults();
+        this.noteEvent("tune reset → defaults");
+      } catch {
+        /* ignore */
+      }
+    }
     this.setProgress("reconnecting", "Connection stalled — rebuilding…");
     this.emit("disconnected");
     this.openSignaling(false).catch(() => this.scheduleReconnect());
@@ -1347,23 +1410,23 @@ export class CloudConn {
       if (ratio > 0.15) {
         // Real late-frame drops: nudge up a little (capped lean).
         this.jitterCleanTicks = 0;
-        this.jitterTarget = Math.min(JITTER_MAX, this.jitterTarget + 20);
+        this.jitterTarget = Math.min(this.jbMax, this.jitterTarget + 20);
       } else if (ratio < 0.05) {
         // Clean: snap back toward the low-latency base quickly.
         this.jitterCleanTicks++;
         if (this.jitterCleanTicks >= JITTER_CLEAN_TICKS) {
-          this.jitterTarget = Math.max(JITTER_MIN, this.jitterTarget - 20);
+          this.jitterTarget = Math.max(this.jbMin, this.jitterTarget - 20);
         }
       } else {
         this.jitterCleanTicks = 0;
         // Mid-band: drift toward BASE so a temporary bump doesn't stick.
-        if (this.jitterTarget > JITTER_BASE) {
-          this.jitterTarget = Math.max(JITTER_BASE, this.jitterTarget - 10);
+        if (this.jitterTarget > this.jbBase) {
+          this.jitterTarget = Math.max(this.jbBase, this.jitterTarget - 10);
         }
       }
       // Keep the floor pinned to the lean base (no earned-lower floor — 40ms is
       // already the target latency budget).
-      this.jitterFloor = JITTER_BASE;
+      this.jitterFloor = this.jbBase;
       if (this.jitterTarget !== prev) this.applyJitter();
     }, WATCHDOG_MS);
   }

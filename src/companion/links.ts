@@ -43,8 +43,23 @@ export type ControlMsg =
 export type ContentMode = "auto" | "text" | "video";
 
 /** Live stream-quality knobs the phone pushes to the desktop. `bitrate` (kbps) caps
- * the WebRTC encoder directly; 0/undefined means auto (derived from resolution/fps). */
-export type QualitySettings = { maxW: number; quality: number; fps: number; mode?: ContentMode; bitrate?: number };
+ * the WebRTC encoder directly; 0/undefined means auto (derived from resolution/fps).
+ * Optional host-pipeline fields come from the stats Tune panel (`streamTune.ts`). */
+export type QualitySettings = {
+  maxW: number;
+  quality: number;
+  fps: number;
+  mode?: ContentMode;
+  bitrate?: number;
+  /** Host: jpegForRtc cap (default 72). */
+  jpegCap?: number;
+  /** Host: maxBitrate = steady × headroom (default 1.4). */
+  bitrateHeadroom?: number;
+  /** Host: encoding / SDP min bitrate floor (kbps). */
+  minBitrateKbps?: number;
+  /** Host: SDP x-google-start-bitrate (kbps) on next answer. */
+  startBitrateKbps?: number;
+};
 
 export interface RemoteLink {
   /** Deliver a raw tile wire-frame (LAN fallback; see capture.rs `TileEncoder`). */
@@ -84,6 +99,12 @@ export interface RemoteLink {
   onWcFrame?(cb: (f: VideoFrame) => void): () => void;
   /** Live wc-path telemetry (null when inactive). */
   wcStats?(): WcStats | null;
+  /** Apply guest-side Tune panel knobs (JB + WebCodecs preference). */
+  applyStreamTune?(tune: import("./streamTune").StreamTune): void;
+  /** Wipe Tune prefs to shipped defaults (also used when connect is stuck). */
+  resetStreamDefaults?(): import("./streamTune").StreamTune | void;
+  /** Wipe tune + force peer rebuild (stuck connect). */
+  resetAndRebuild?(): void;
   close(): void;
 }
 
@@ -244,6 +265,15 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
     },
     wcStats() {
       return conn.wcInfo();
+    },
+    applyStreamTune(tune) {
+      conn.applyStreamTune(tune);
+    },
+    resetStreamDefaults() {
+      return conn.resetStreamDefaults();
+    },
+    resetAndRebuild() {
+      conn.resetAndRebuild();
     },
     close() {
       // The CloudConn is owned by CompanionApp; closing it happens on disconnect.
