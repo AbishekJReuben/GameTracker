@@ -46,10 +46,16 @@ The **Control** tab is a full remote-desktop surface (see `src/companion/screens
     browsers only raise the soft keyboard from a user gesture, so a prominent **"Tap to type on
     PC"** prompt + a tappable "Typing on PC" chip guarantee one-tap access), plus an always-visible
     floating keyboard button.
-- **Buttons & keys**: left/right/middle click, drag-lock, pointer speed, scroll; Esc/Tab/Enter/
-  Backspace/Del, arrow cluster, **sticky modifiers** (Ctrl/Alt/Shift/Win), F1–F12, media/volume.
+- **Buttons & keys**: left/right/middle click, **Hold** (momentary LMB for drag-select — pinnable),
+  drag-lock, pointer speed, scroll; Esc/Tab/Enter/Backspace/Del, arrow cluster, **sticky modifiers**
+  (Ctrl/Alt/Shift/Win), F1–F12, media/volume.
+- **Game keys dock** (Crosshair tab): WASD / Space / E / F / … holdable keys for games, **WASD+**
+  one-tap cluster + Select-hold pin, optional extra letter/digit keys. Same Pin mode as Keys/Shortcuts.
+- **Pinned floating chrome** (`gt.remote.controlChrome`): free-place pins (drag in Pin mode), per-pin
+  size/shape/theme/press-anim editor (long-press or gear), migrates legacy `gt.remote.pinned` /
+  `pinLayout`. Shared by APK, discovery web, and Quest flat.
 - **Shortcut macros**: Alt+Tab, Win, Show desktop, Task Manager, Alt+F4, Explorer, Copy/Paste/
-  Cut/Undo/Select-all, Ctrl+Alt+Del.
+  Cut/Undo/Select-all, Ctrl+Alt+Del + custom chords.
 - **Navigation**: a quick tab switcher (Stats / Library / Music) is reachable right from Control.
 - **Adjustable quality** — live presets *Fluid* (720p/60fps) · *Smooth* (900p/40fps) · *Balanced*
   · *HD* · *Ultra* · *Max 4K*, or custom resolution / sharpness / frame-rate; the desktop capture
@@ -57,7 +63,8 @@ The **Control** tab is a full remote-desktop surface (see `src/companion/screens
   and a **debug stats HUD** (enable in the Quality tab) that shows phone display fps, decode fps +
   bitrate + jitter + loss + dropped/frozen frames (WebRTC `getStats`), and host produce fps +
   capture/scale/encode ms + frame size + resolution — with a plain-language bottleneck guess
-  (host CPU vs network/decoder). (Lower-sharpness presets use a fast nearest-neighbour downscale —
+  (host CPU vs network/decoder). Collapsible **Tune** panel soft-spots every streaming knob
+  (`gt.remote.streamTune`). (Lower-sharpness presets use a fast nearest-neighbour downscale —
   the main fps lever on high-res/4K monitors.)
 
 ## Prerequisites (one-time, on your PC)

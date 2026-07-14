@@ -358,9 +358,11 @@ export default function RemotePage() {
                   </div>
                   <p className="mt-1.5 text-xs text-ink-faint">
                     In the <b>Meta Quest Browser</b>, open this link and enter the <b>connection code</b> above.
-                    Same companion shell as the phone — tap <b>Enter VR</b> for an immersive big screen you point at with
-                    the controllers (trigger = click, thumbstick = scroll, <b>A</b> = keyboard). Served over HTTPS
-                    by the signaling server, which WebXR requires.
+                    Same companion shell as the phone — tap <b>Enter VR</b> for an immersive big screen. Controllers:{" "}
+                    <b>trigger</b> = click/drag, <b>squeeze</b> = right-click, <b>thumbstick</b> = scroll, <b>A</b> =
+                    keyboard, <b>B</b> = Enter, <b>X</b> / left stick-press = recenter, <b>Y</b> or both grips = exit.
+                    Served over HTTPS by the signaling server (required for WebXR). Flat Control also has a{" "}
+                    <b>Game</b> keys dock (WASD+, pinnable Hold for drag-select).
                   </p>
                 </div>
 

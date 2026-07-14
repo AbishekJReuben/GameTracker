@@ -195,15 +195,15 @@ export function ImmersiveScreen({
       <div className="max-w-md px-8 text-center">
         <h2 className="font-display text-2xl font-800">You're in VR</h2>
         <p className="mt-2 text-ink-dim">
-          Put on your headset. Point at the screen and pull the <b>trigger</b> to click, hold for right-click, and push the{" "}
-          <b>thumbstick</b> to scroll.
+          Put on your headset. Point at the screen and pull the <b>trigger</b> to click (hold to drag),{" "}
+          <b>squeeze</b> for right-click, and push the <b>thumbstick</b> to scroll.
         </p>
         <ul className="mx-auto mt-4 max-w-xs space-y-1.5 text-left text-sm text-ink-dim">
           <li>
             <b>A</b> — open keyboard · <b>B</b> — Enter
           </li>
           <li>
-            <b>X</b> / left stick — recenter screen
+            <b>X</b> / left stick-press — recenter screen
           </li>
           <li>
             <b>Y</b> or hold both grips — exit VR

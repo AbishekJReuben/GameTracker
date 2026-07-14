@@ -20,6 +20,10 @@ both `companion.html` and `quest.html`:
 | `/` or `/companion` | Phone companion (mobile browser) |
 | `/quest` | Meta Quest headset (same shell + Enter VR) |
 
+Immersive VR uses WebXR (`optionalFeatures` includes `layers`). The Quest client must
+present via `updateRenderState({ layers: [XRWebGLLayer] })` when layers is granted — see
+`src/quest/xr/session.ts` (do not use `baseLayer` in that case).
+
 The server looks for the static files at `$QUEST_STATIC_DIR`, then `<exe dir>/static`,
 then the build machine's `signaling/static` — so the repo-run setup just works. The
 signaling routes (`/ws`, `/health`) always take precedence over the static fallback.

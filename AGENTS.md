@@ -561,11 +561,19 @@ headset device name, Enter VR + pointer/gamepad toggle on the Control top bar, a
   **trigger = left click/drag**, **squeeze = right-click**, **thumbstick = scroll**,
   **A = keyboard**, **B = Enter**, **X / left-stick-press = recenter**,
   **Y or hold-both-grips = exit**. Gamepad mode → virtual Xbox pad (ViGEm).
+  **WebXR layers:** session requests `optionalFeatures: ["layers", …]`. When Quest grants
+  `layers`, `updateRenderState({ baseLayer })` throws — must use
+  `updateRenderState({ layers: [webglLayer] })` and keep a cached `xrLayer` for the frame
+  loop (`renderState.baseLayer` is null under the layers API). Do not regress.
 
 Shared Control features (Android + Quest + discovery mobile browser):
 - Special keys include Home/End/PgUp/PgDn/Ins/PrtSc/Caps/Num/ScrLk/Pause + F-keys/media.
+- **Game keys** dock (WASD/Space/E/F/…, **WASD+** cluster, add-key, pinnable **Hold**/LMB).
 - Shortcuts pane: builtins (Ctrl+C/V/X/Z/Y/S, Alt+Tab, …) + **custom shortcuts** persisted
   in `gt.remote.customShortcuts` (pinMode trash deletes customs only).
+- **Control chrome** (`src/companion/controlChrome.ts`, `gt.remote.controlChrome`): free-place
+  pins, per-pin style editor (`PinEditorSheet`), toolbar scale prefs; dual-writes legacy
+  `gt.remote.pinned` / `pinLayout`.
 - Fullscreen (`immersive`): keyboard FAB + pinned rail + tap-to-type (same as dock-collapsed).
 
 Quest-specific gotchas — do not regress:
@@ -802,6 +810,12 @@ not regress):**
   start bitrate/JB base·min·max/content/direct) persisted in `gt.remote.streamTune`,
   with **Reset to defaults**; stalled connect UI + `forceRebuild` also wipe tune back
   to the soft spot so a bad experiment can't wedge pairing.
+- **Control chrome + Game keys (v3.9.22):** pinnable **Hold** (momentary LMB for drag-select),
+  Game dock (WASD+/extras), free-place animated pins with per-pin editor
+  (`controlChrome.ts` / `PinEditorSheet`). Shared APK/web/Quest flat.
+- **Quest WebXR layers fix (v3.9.22):** when `layers` is granted, set
+  `renderState.layers = [XRWebGLLayer]` (not `baseLayer`) or Enter VR throws
+  `Can't use baseLayer with layers feature requested`.
 - **HUD:** header shows the transport (`DIRECT`/`RTC`/`LAN`); wc mode swaps the top grid
   for measured stats (E2E, net+enc, decode ms, dec queue, frame KB, clock ±) and the host
   section gains H264 enc ms / skipped / channel buf. The lag pill uses the measured E2E.

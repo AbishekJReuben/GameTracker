@@ -6,7 +6,10 @@
  * screen, and translates controller input into high-level events the React layer
  * turns into remote-control messages. Raw WebGL (no 3D engine) keeps the bundle
  * small and gives full control over the ray/cursor overlay in a single WebGL
- * projection layer.
+ * projection layer (`XRWebGLLayer`). When the session has the WebXR `layers`
+ * feature enabled (Quest Browser grants it when listed in optionalFeatures), the
+ * layer MUST be set via `updateRenderState({ layers: [webglLayer] })` — using
+ * `baseLayer` throws.
  *
  * Two input modes:
  *   - "pointer": the aiming ray is a mouse. Trigger = left button (press/release,
@@ -82,6 +85,17 @@ const SOLID_FS = `
 precision mediump float; uniform vec4 uColor;
 void main() { gl_FragColor = uColor; }`;
 
+/** True if the live XRSession has the named feature enabled (e.g. `"layers"`). */
+function sessionHasFeature(session: XRSession, name: string): boolean {
+  const feats = (session as XRSession & { enabledFeatures?: ReadonlySet<string> | readonly string[] })
+    .enabledFeatures;
+  if (!feats) return false;
+  if (typeof (feats as ReadonlySet<string>).has === "function") {
+    return (feats as ReadonlySet<string>).has(name);
+  }
+  return Array.isArray(feats) && (feats as readonly string[]).includes(name);
+}
+
 function compile(gl: WebGLRenderingContext, type: number, src: string): WebGLShader {
   const sh = gl.createShader(type)!;
   gl.shaderSource(sh, src);
@@ -109,6 +123,9 @@ export class ImmersiveSession {
   private refSpace: XRReferenceSpace | null = null;
   private gl: WebGLRenderingContext | null = null;
   private canvas: HTMLCanvasElement | null = null;
+  /** Projection layer we draw into — kept explicitly because `renderState.baseLayer`
+   *  is null when the session has the WebXR `layers` feature enabled. */
+  private xrLayer: XRWebGLLayer | null = null;
 
   private screenProg!: WebGLProgram;
   private solidProg!: WebGLProgram;
@@ -195,7 +212,25 @@ export class ImmersiveSession {
     await (gl as unknown as { makeXRCompatible?: () => Promise<void> }).makeXRCompatible?.();
 
     this.initGl(gl);
-    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+    // WebXR Layers: if `layers` was granted (Quest Browser does when listed in
+    // optionalFeatures), `updateRenderState({ baseLayer })` throws
+    // "Can't use baseLayer with layers feature requested". Use the layers[]
+    // path instead; XRWebGLLayer is a valid projection entry in that array.
+    // When layers wasn't granted, fall back to classic baseLayer.
+    const webglLayer = new XRWebGLLayer(session, gl);
+    this.xrLayer = webglLayer;
+    // Spec: with the `layers` feature enabled, baseLayer is illegal — use layers[].
+    // Prefer enabledFeatures when present; otherwise try baseLayer and fall back
+    // (Quest has been seen to grant layers without a readable enabledFeatures set).
+    if (sessionHasFeature(session, "layers")) {
+      session.updateRenderState({ layers: [webglLayer] });
+    } else {
+      try {
+        session.updateRenderState({ baseLayer: webglLayer });
+      } catch {
+        session.updateRenderState({ layers: [webglLayer] });
+      }
+    }
 
     // Prefer a floor-relative space so the screen sits at a comfortable height.
     this.refSpace = await session
@@ -302,7 +337,7 @@ export class ImmersiveSession {
     this.frameHandle = session.requestAnimationFrame(this.onFrame);
     this.curFrame = frame;
 
-    const layer = session.renderState.baseLayer;
+    const layer = this.xrLayer ?? session.renderState.baseLayer;
     if (!layer) return;
     const pose = frame.getViewerPose(this.refSpace);
 
@@ -641,6 +676,7 @@ export class ImmersiveSession {
     this.refSpace = null;
     this.gl = null;
     this.canvas = null;
+    this.xrLayer = null;
     this.curFrame = null;
     this.dragHand = null;
     this.lastUv = null;

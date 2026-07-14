@@ -25,6 +25,9 @@ Built with **Tauri 2 (Rust)** + **React / TypeScript / Tailwind / Framer Motion*
 - **Sessions log** — full filterable table (game, date range, min duration, hide-AFK) with CSV/JSON export.
 - **100% local** — your data never leaves your machine. SQLite at
   `%LocalAppData%\com.chilloutgames.gametracker\gametracker.db`.
+- **Remote + phone/Quest companion** — stream and control the PC from Android, a mobile
+  browser, or Meta Quest (WebRTC + optional Immersive VR). See `companion/README.md`,
+  `signaling/README.md`, and the Remote page in-app.
 
 ## Requirements
 

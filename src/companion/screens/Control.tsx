@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { motion, AnimatePresence } from "motion/react";
+import { motion, AnimatePresence, useReducedMotion } from "motion/react";
 import {
   MousePointer2,
   Hand,
@@ -80,6 +80,21 @@ import {
   STREAM_TUNE_DEFAULTS,
   type StreamTune,
 } from "../streamTune";
+import {
+  GAME_KEY_WIRES,
+  LMB_HOLD_ID,
+  loadControlChrome,
+  saveControlChrome,
+  resolvePinStyle,
+  patchPinStyle,
+  pressMotion,
+  shapeClass,
+  chromeClass,
+  PIN_STYLE_DEFAULTS,
+  type ControlChrome,
+  type PinStyle,
+} from "../controlChrome";
+import { PinEditorSheet } from "../components/PinEditorSheet";
 
 type HostRtcStats = {
   sendKbps: number;
@@ -153,9 +168,9 @@ type KbMode = "direct" | "buffered";
 type NavTab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
 /** Which bottom control panel is expanded (null = collapsed to just the tab strip).
  * Keyboard uses a ghost input (Surface Keyboard / IME); phone gets a flex compose row. */
-type Panel = "mouse" | "keys" | "shortcuts" | "quality" | "gamepad";
+type Panel = "mouse" | "keys" | "shortcuts" | "game" | "quality" | "gamepad";
 
-/** A pinnable key / shortcut: `keys` are the keycap labels (>1 → combo joined by +). */
+/** A pinnable key / shortcut / action: `keys` are the keycap labels (>1 → combo). */
 type KeyDef = {
   id: string;
   keys: string[];
@@ -168,6 +183,8 @@ type KeyDef = {
    *  while the finger is down and keyup on release (natural hold). Combos/media
    *  stay tap-only; sticky modifiers use `mod` instead. */
   wire?: string;
+  /** Momentary mouse button hold (LMB select-drag). Mutually exclusive with wire. */
+  holdMouse?: "left" | "right" | "middle";
 };
 
 /** User-defined chord stored in `gt.remote.customShortcuts`. */
@@ -617,24 +634,49 @@ export function ControlScreen({
   const [composeText, setComposeText] = useState("");
   // Pinned keys/shortcuts → small, semi-transparent floating quick buttons pinned
   // to the screen edge so they're always one tap away without opening the dock.
-  const [pinned, setPinned] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem("gt.remote.pinned");
-      return raw ? (JSON.parse(raw) as string[]) : [];
-    } catch {
-      return [];
-    }
-  });
-  useEffect(() => {
-    localStorage.setItem("gt.remote.pinned", JSON.stringify(pinned));
-  }, [pinned]);
-  // Pin-edit mode: while on, tapping a key in the dock pins/unpins it instead of firing.
+  // Pinned keys/shortcuts/actions — free placement + per-pin chrome styles.
+  const [chrome, setChrome] = useState<ControlChrome>(() => loadControlChrome());
+  const persistChrome = (next: ControlChrome) => {
+    saveControlChrome(next);
+    setChrome(next);
+  };
+  const pinned = chrome.pinned;
+  const pinLayout = chrome.layout;
+  const [pinEditId, setPinEditId] = useState<string | null>(null);
+  const pinLayerRef = useRef<HTMLDivElement | null>(null);
+  const reducedMotion = useReducedMotion();
+  // Pin-edit mode: tap catalog to pin/unpin; drag floating pins; long-press/gear = style editor.
   const [pinMode, setPinMode] = useState(false);
-  const togglePin = (id: string) =>
-    setPinned((prev) => {
-      navigator.vibrate?.(10);
-      return prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id];
+  const togglePin = (id: string) => {
+    navigator.vibrate?.(10);
+    setChrome((prev) => {
+      const next = { ...prev };
+      if (prev.pinned.includes(id)) {
+        next.pinned = prev.pinned.filter((p) => p !== id);
+        const layout = { ...prev.layout };
+        delete layout[id];
+        next.layout = layout;
+      } else {
+        if (prev.pinned.length >= 24) return prev;
+        next.pinned = [...prev.pinned, id];
+        if (!prev.layout[id]) {
+          next.layout = {
+            ...prev.layout,
+            [id]: { x: 90, y: Math.min(82, 16 + prev.pinned.length * 9) },
+          };
+        }
+      }
+      saveControlChrome(next);
+      return next;
     });
+  };
+  const setPinLayoutPos = (id: string, x: number, y: number) => {
+    setChrome((prev) => {
+      const next = { ...prev, layout: { ...prev.layout, [id]: { x, y } } };
+      saveControlChrome(next);
+      return next;
+    });
+  };
 
   // Natural hold: while a finger is down on a holdable key (has `wire`), we send
   // keydown and keep it in `heldKeys` for highlight; keyup on release. No manual
@@ -642,9 +684,14 @@ export function ControlScreen({
   // still latch via `mods` (they're meant to stay down across other taps).
   const [heldKeys, setHeldKeys] = useState<Set<string>>(new Set());
   const heldKeysRef = useRef<Set<string>>(new Set());
+  const [heldMouse, setHeldMouse] = useState<Set<"left" | "right" | "middle">>(new Set());
+  const heldMouseRef = useRef(heldMouse);
   useEffect(() => {
     heldKeysRef.current = heldKeys;
   }, [heldKeys]);
+  useEffect(() => {
+    heldMouseRef.current = heldMouse;
+  }, [heldMouse]);
   const pressHold = (wire: string) => {
     if (heldKeysRef.current.has(wire)) return;
     navigator.vibrate?.(6);
@@ -664,16 +711,35 @@ export function ControlScreen({
       return next;
     });
   };
+  const pressMouseHold = (btn: "left" | "right" | "middle") => {
+    if (heldMouseRef.current.has(btn)) return;
+    // Don't double-down if sticky drag-lock already has LMB down.
+    if (btn === "left" && dragLock) return;
+    navigator.vibrate?.(6);
+    send({ type: "down", button: btn });
+    setHeldMouse((prev) => new Set(prev).add(btn));
+  };
+  const releaseMouseHold = (btn: "left" | "right" | "middle") => {
+    if (!heldMouseRef.current.has(btn)) return;
+    send({ type: "up", button: btn });
+    setHeldMouse((prev) => {
+      const next = new Set(prev);
+      next.delete(btn);
+      return next;
+    });
+  };
   const releaseAllHeld = () => {
-    if (heldKeysRef.current.size === 0) return;
     heldKeysRef.current.forEach((w) => send({ type: "keyup", name: w }));
+    heldMouseRef.current.forEach((b) => send({ type: "up", button: b }));
     navigator.vibrate?.(12);
     setHeldKeys(new Set());
+    setHeldMouse(new Set());
   };
-  // Never strand a held key on the PC: release everything when the screen unmounts.
+  // Never strand a held key/button on the PC: release everything when the screen unmounts.
   useEffect(
     () => () => {
       heldKeysRef.current.forEach((w) => link.send({ type: "keyup", name: w }));
+      heldMouseRef.current.forEach((b) => link.send({ type: "up", button: b }));
     },
     [link],
   );
@@ -703,7 +769,21 @@ export function ControlScreen({
   };
   const deleteCustomShortcut = (id: string) => {
     setCustomShortcuts((prev) => prev.filter((c) => c.id !== id));
-    setPinned((prev) => prev.filter((p) => p !== `s:${id}`));
+    setChrome((prev) => {
+      const pid = `s:${id}`;
+      const layout = { ...prev.layout };
+      delete layout[pid];
+      const styles = { ...prev.styles };
+      delete styles[pid];
+      const next = {
+        ...prev,
+        pinned: prev.pinned.filter((p) => p !== pid),
+        layout,
+        styles,
+      };
+      saveControlChrome(next);
+      return next;
+    });
     navigator.vibrate?.(12);
   };
 
@@ -711,6 +791,7 @@ export function ControlScreen({
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [cursor, setCursor] = useState({ x: 0.5, y: 0.5 });
+  const [zoomOpen, setZoomOpen] = useState(false);
   const zoomRef = useRef(1);
   const panRef = useRef({ x: 0, y: 0 });
   const cursorRef = useRef({ x: 0.5, y: 0.5 });
@@ -1985,20 +2066,34 @@ export function ControlScreen({
     setTyping(false);
   };
 
-  /** Zoom chip: always visible. Tap resets when zoomed; tap at 1× zooms to 1.5×. */
-  const onZoomButton = () => {
+  /** Apply zoom from the viewport center (slider / chip). */
+  const setZoomCentered = (z: number) => {
     const el = viewportRef.current;
-    const l = layoutRef.current;
+    const l = layoutRef.current ?? liveLayout();
     if (!el || !l) {
-      resetView();
+      zoomRef.current = clamp(z, 1, MAX_ZOOM);
+      if (zoomRef.current <= 1.01) panRef.current = { x: 0, y: 0 };
+      commitView();
       return;
     }
     const r = el.getBoundingClientRect();
-    const cx = r.width / 2;
-    const cy = r.height / 2;
-    if (zoomRef.current > 1.01) resetView();
-    else applyZoom(1.5, cx, cy);
+    applyZoom(z, r.width / 2, r.height / 2);
   };
+
+  /** Zoom chip: expand vertical slider; double-purpose reset via 1× on the slider. */
+  const onZoomButton = () => setZoomOpen((o) => !o);
+
+  // Close the zoom popover when tapping elsewhere.
+  useEffect(() => {
+    if (!zoomOpen) return;
+    const close = (e: PointerEvent) => {
+      const t = e.target as Element | null;
+      if (t?.closest?.("[data-zoom-chip]")) return;
+      setZoomOpen(false);
+    };
+    document.addEventListener("pointerdown", close, true);
+    return () => document.removeEventListener("pointerdown", close, true);
+  }, [zoomOpen]);
 
   // --- pinnable key / shortcut registry --------------------------------------
   // Data-driven so the dock panels, the pin toggles, and the floating quick-button
@@ -2062,16 +2157,53 @@ export function ControlScreen({
     label: c.label,
     run: () => chord(c.mods, c.key),
   }));
+  const gameKeyDefs: KeyDef[] = GAME_KEY_WIRES.map((wire) => {
+    if (wire === "shift" || wire === "ctrl") {
+      const mod = wire as Mod;
+      return {
+        id: wire,
+        keys: [MOD_LABEL[mod]],
+        label: MOD_LABEL[mod],
+        run: () => toggleMod(mod),
+        mod,
+      };
+    }
+    return {
+      id: wire,
+      keys: [keyCapLabel(wire)],
+      label: wire === "space" ? "Space" : undefined,
+      wire,
+      run: () => tapKey(wire),
+    };
+  });
+  const extraKeyDefs: KeyDef[] = chrome.extraKeys
+    .filter((w) => !(GAME_KEY_WIRES as readonly string[]).includes(w))
+    .map((wire) => ({
+      id: wire,
+      keys: [keyCapLabel(wire)],
+      wire,
+      run: () => tapKey(wire),
+    }));
+  const lmbHoldDef: KeyDef = {
+    id: "lmb-hold",
+    keys: ["LMB"],
+    label: "Hold",
+    holdMouse: "left",
+    run: () => {},
+  };
   // Pinned ids resolve against a combined registry (shortcut ids are prefixed to
   // avoid colliding with same-named special keys, e.g. "win").
   const registry = useMemo(() => {
     const m = new Map<string, KeyDef & { active?: boolean }>();
     for (const k of specialKeys) m.set(`k:${k.id}`, k);
+    for (const g of gameKeyDefs) m.set(`k:${g.id}`, g);
+    for (const g of extraKeyDefs) m.set(`k:${g.id}`, g);
     for (const s of shortcutKeys) m.set(`s:${s.id}`, s);
     for (const s of customShortcutDefs) m.set(`s:${s.id}`, s);
+    m.set(LMB_HOLD_ID, lmbHoldDef);
     return m;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mods, customShortcuts]);
+  }, [mods, customShortcuts, chrome.extraKeys]);
   const pinnedDefs = pinned
     .map((id) => {
       const def = registry.get(id);
@@ -2090,7 +2222,6 @@ export function ControlScreen({
     setSoundOn(next);
   };
 
-  const zoomed = zoom > 1.01 || pan.x !== 0 || pan.y !== 0;
   const questBrowser = isQuestBrowser();
   // Pin to the visual viewport while the soft keyboard is up (Android WebView pan
   // mode). Quest Surface Keyboard never shrinks the remote viewport.
@@ -2227,15 +2358,16 @@ export function ControlScreen({
                 </>
               )
             )}
-            <button
-              onClick={onZoomButton}
-              className={`flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-700 active:scale-95 ${
-                zoomed ? "bg-accent-3/20 text-white" : "bg-white/[0.04] text-ink-soft"
-              }`}
-              title={zoomed ? "Reset zoom" : "Zoom in"}
-            >
-              <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
-            </button>
+            <ZoomChip
+              zoom={zoom}
+              open={zoomOpen}
+              onToggle={onZoomButton}
+              onZoom={setZoomCentered}
+              onReset={() => {
+                resetView();
+                setZoomOpen(false);
+              }}
+            />
             {hasAudio && (
               <button
                 onClick={toggleSound}
@@ -2427,14 +2559,17 @@ export function ControlScreen({
             )}
           </div>
           <div className="flex items-center gap-1.5">
-            <motion.button
-              whileTap={{ scale: 0.92 }}
-              onClick={onZoomButton}
-              className="flex items-center gap-1 rounded-full bg-black/45 px-2.5 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
-              title={zoomed ? "Reset zoom" : "Zoom in"}
-            >
-              <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
-            </motion.button>
+            <ZoomChip
+              zoom={zoom}
+              open={zoomOpen}
+              onToggle={onZoomButton}
+              onZoom={setZoomCentered}
+              onReset={() => {
+                resetView();
+                setZoomOpen(false);
+              }}
+              compact
+            />
             {/* No keyboard chip here: immersive/collapsed-dock states already show
                 the bottom-left keyboard FAB, and the visible dock has its own
                 Keyboard tab — a second toggle up top was a confusing duplicate. */}
@@ -2750,31 +2885,73 @@ export function ControlScreen({
         </div>
       )}
 
-      {/* ---- pinned quick-button rail (small, semi-transparent, screen edge) ---- */}
+      {/* ---- free-place pinned quick buttons (drag in Pin mode; positions + styles saved) ---- */}
       {pinnedDefs.length > 0 && !pipView && (
-        <div
-          className="pointer-events-none absolute right-1.5 top-1/2 z-30 flex max-h-[70%] -translate-y-1/2 flex-col gap-1.5 overflow-y-auto py-1"
-          style={{ scrollbarWidth: "none" }}
-        >
-          <AnimatePresence initial={false}>
-            {pinnedDefs.map(({ pid, def }) => (
+        <div ref={pinLayerRef} className="pointer-events-none absolute inset-0 z-30 overflow-hidden">
+          {pinnedDefs.map(({ pid, def }, i) => {
+            const pos = pinLayout[pid] ?? { x: 90, y: Math.min(82, 16 + i * 9) };
+            const style = resolvePinStyle(chrome, pid);
+            const active =
+              (def.mod ? mods.has(def.mod) : false) ||
+              (!!def.wire && heldKeys.has(def.wire)) ||
+              (!!def.holdMouse && heldMouse.has(def.holdMouse));
+            return (
               <PinnedButton
                 key={pid}
                 def={def}
                 pinMode={pinMode}
-                active={(def.mod ? mods.has(def.mod) : false) || (!!def.wire && heldKeys.has(def.wire))}
+                style={style}
+                xPct={pos.x}
+                yPct={pos.y}
+                layerRef={pinLayerRef}
+                reducedMotion={!!reducedMotion}
+                active={active}
                 onRun={() => {
                   navigator.vibrate?.(8);
                   def.run();
                 }}
-                onHoldDown={() => def.wire && pressHold(def.wire)}
-                onHoldUp={() => def.wire && releaseHold(def.wire)}
+                onHoldDown={() => {
+                  if (def.wire) pressHold(def.wire);
+                  if (def.holdMouse) pressMouseHold(def.holdMouse);
+                }}
+                onHoldUp={() => {
+                  if (def.wire) releaseHold(def.wire);
+                  if (def.holdMouse) releaseMouseHold(def.holdMouse);
+                }}
                 onUnpin={() => togglePin(pid)}
+                onEdit={() => setPinEditId(pid)}
+                onMove={(x, y) => setPinLayoutPos(pid, x, y)}
               />
-            ))}
-          </AnimatePresence>
+            );
+          })}
         </div>
       )}
+
+      <AnimatePresence>
+        {pinEditId && registry.get(pinEditId) && (
+          <PinEditorSheet
+            key={pinEditId}
+            pinId={pinEditId}
+            title={
+              resolvePinStyle(chrome, pinEditId).customLabel ||
+              registry.get(pinEditId)!.label ||
+              registry.get(pinEditId)!.keys.join(" + ")
+            }
+            initial={resolvePinStyle(chrome, pinEditId)}
+            onSave={(st) => persistChrome(patchPinStyle(chrome, pinEditId, st))}
+            onReset={() => {
+              const styles = { ...chrome.styles };
+              delete styles[pinEditId];
+              persistChrome({ ...chrome, styles });
+            }}
+            onUnpin={() => {
+              togglePin(pinEditId);
+              setPinEditId(null);
+            }}
+            onClose={() => setPinEditId(null)}
+          />
+        )}
+      </AnimatePresence>
 
       {/* ---- "tap to type" — phone fallback when auto-focus needs a gesture ---- */}
       {!typing && pcTextField && !questBrowser && !pipView && (
@@ -2923,52 +3100,112 @@ export function ControlScreen({
         >
           {/* expanded control panels — each a single horizontally-scrollable row of icons */}
           {panel === "mouse" && (
-            <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2">
-              <IcoBtn active title={mode === "trackpad" ? "Trackpad mode" : "Direct-touch mode"} onClick={() => setMode((m) => (m === "trackpad" ? "touch" : "trackpad"))}>
+            <div className="flex items-end gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2">
+              <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
+              <Sep />
+              <IcoBtn
+                label={mode === "trackpad" ? "Pad" : "Touch"}
+                active
+                title={mode === "trackpad" ? "Trackpad mode" : "Direct-touch mode"}
+                onClick={() => setMode((m) => (m === "trackpad" ? "touch" : "trackpad"))}
+              >
                 {mode === "trackpad" ? <Pointer className="h-4 w-4" /> : <Hand className="h-4 w-4" />}
               </IcoBtn>
               <Sep />
-              <IcoBtn title="Left click" onClick={() => send({ type: "click", button: "left" })}><MousePointer2 className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Right click" onClick={() => send({ type: "click", button: "right" })}><MousePointerClick className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Middle click" onClick={() => send({ type: "click", button: "middle" })}><Command className="h-4 w-4" /></IcoBtn>
+              <IcoBtn label="Left" title="Left click" onClick={() => send({ type: "click", button: "left" })}>
+                <MousePointer2 className="h-4 w-4" />
+              </IcoBtn>
+              <IcoBtn label="Right" title="Right click" onClick={() => send({ type: "click", button: "right" })}>
+                <MousePointerClick className="h-4 w-4" />
+              </IcoBtn>
+              <IcoBtn label="Mid" title="Middle click" onClick={() => send({ type: "click", button: "middle" })}>
+                <Command className="h-4 w-4" />
+              </IcoBtn>
+              <HoldIcoBtn
+                label="Hold"
+                active={heldMouse.has("left") || pinMode}
+                title={
+                  pinMode
+                    ? pinned.includes(LMB_HOLD_ID)
+                      ? "Unpin select-hold"
+                      : "Pin select-hold"
+                    : "Hold left mouse to drag-select"
+                }
+                pinned={pinned.includes(LMB_HOLD_ID)}
+                pinMode={pinMode}
+                onPinToggle={() => togglePin(LMB_HOLD_ID)}
+                onHoldDown={() => pressMouseHold("left")}
+                onHoldUp={() => releaseMouseHold("left")}
+              >
+                <Grab className="h-4 w-4" />
+              </HoldIcoBtn>
               {mode === "trackpad" && (
-                <IcoBtn active={dragLock} title={dragLock ? "Drag lock: ON" : "Drag lock"} onClick={() => { if (dragLock) { send({ type: "up", button: "left" }); setDragLock(false); } else setDragLock(true); }}>
+                <IcoBtn
+                  label="Drag"
+                  active={dragLock}
+                  title={dragLock ? "Drag lock: ON" : "Drag lock (sticky)"}
+                  onClick={() => {
+                    if (dragLock) {
+                      send({ type: "up", button: "left" });
+                      setDragLock(false);
+                    } else setDragLock(true);
+                  }}
+                >
                   <Hand className="h-4 w-4" />
                 </IcoBtn>
               )}
-              <IcoBtn title="Scroll up" onClick={() => send({ type: "scroll", dy: -3 })}><ChevronUp className="h-4 w-4" /></IcoBtn>
-              <IcoBtn title="Scroll down" onClick={() => send({ type: "scroll", dy: 3 })}><ChevronDown className="h-4 w-4" /></IcoBtn>
+              <IcoBtn label="Up" title="Scroll up" onClick={() => send({ type: "scroll", dy: -3 })}>
+                <ChevronUp className="h-4 w-4" />
+              </IcoBtn>
+              <IcoBtn label="Down" title="Scroll down" onClick={() => send({ type: "scroll", dy: 3 })}>
+                <ChevronDown className="h-4 w-4" />
+              </IcoBtn>
               <Sep />
-              <div className="flex shrink-0 items-center gap-1.5 pr-1" title="Pointer speed">
-                <Gauge className="h-3.5 w-3.5 text-ink-dim" />
-                <input type="range" min="0.6" max="3.5" step="0.1" value={sensitivity} onChange={(e) => setSensitivity(parseFloat(e.target.value))} className="w-24 accent-accent-3" />
-                <span className="w-7 text-[10px] font-700 text-white">{sensitivity.toFixed(1)}×</span>
+              <div className="flex shrink-0 flex-col items-center gap-0.5 pr-1" title="Pointer speed">
+                <div className="flex items-center gap-1.5">
+                  <Gauge className="h-3.5 w-3.5 text-ink-dim" />
+                  <input
+                    type="range"
+                    min="0.6"
+                    max="3.5"
+                    step="0.1"
+                    value={sensitivity}
+                    onChange={(e) => setSensitivity(parseFloat(e.target.value))}
+                    className="w-24 accent-accent-3"
+                  />
+                  <span className="w-7 text-[10px] font-700 text-white">{sensitivity.toFixed(1)}×</span>
+                </div>
+                <span className="text-[8px] font-700 leading-none text-ink-dim">Speed</span>
               </div>
             </div>
           )}
 
           {panel === "keys" && (
-            <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2.5">
-              <PinModeToggle
-                active={pinMode}
-                onClick={() => setPinMode((v) => !v)}
-              />
-              {heldKeys.size > 0 && <ReleaseHeldButton count={heldKeys.size} onClick={releaseAllHeld} />}
-              <Sep />
-              {specialKeys.map((k) => (
-                <KeyCapButton
-                  key={k.id}
-                  def={k}
-                  pinMode={pinMode}
-                  pinned={pinned.includes(`k:${k.id}`)}
-                  active={k.mod ? mods.has(k.mod) : false}
-                  held={!!k.wire && heldKeys.has(k.wire)}
-                  onFire={k.run}
-                  onHoldDown={() => k.wire && pressHold(k.wire)}
-                  onHoldUp={() => k.wire && releaseHold(k.wire)}
-                  onTogglePin={() => togglePin(`k:${k.id}`)}
-                />
-              ))}
+            <div className="relative border-b border-white/5">
+              {/* Float above the row so "N held" never shoves keys sideways. */}
+              {heldKeys.size + heldMouse.size > 0 && (
+                <div className="pointer-events-auto absolute bottom-full left-2 z-20 mb-1">
+                  <ReleaseHeldButton count={heldKeys.size + heldMouse.size} onClick={releaseAllHeld} />
+                </div>
+              )}
+              <div className="flex items-center gap-1.5 overflow-x-auto px-2 py-2.5">
+                <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
+                <Sep />
+                {specialKeys.map((k) => (
+                  <KeyCapButton
+                    key={k.id}
+                    def={k}
+                    pinMode={pinMode}
+                    pinned={pinned.includes(`k:${k.id}`)}
+                    active={k.mod ? mods.has(k.mod) : false}
+                    held={!!k.wire && heldKeys.has(k.wire)}
+                    onFire={k.run}
+                    onHoldDown={() => k.wire && pressHold(k.wire)}
+                    onHoldUp={() => k.wire && releaseHold(k.wire)}
+                    onTogglePin={() => togglePin(`k:${k.id}`)}
+                  />
+                ))}
+              </div>
             </div>
           )}
 
@@ -3087,6 +3324,128 @@ export function ControlScreen({
             </div>
           )}
 
+          {panel === "game" && (
+            <div className="relative border-b border-white/5">
+              {heldKeys.size + heldMouse.size > 0 && (
+                <div className="pointer-events-auto absolute bottom-full left-2 z-20 mb-1">
+                  <ReleaseHeldButton count={heldKeys.size + heldMouse.size} onClick={releaseAllHeld} />
+                </div>
+              )}
+              <div
+                className="flex origin-left items-center gap-1.5 overflow-x-auto px-2 py-2.5"
+                style={{ zoom: chrome.toolbars.game?.scale ?? 1 }}
+              >
+                <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
+                <button
+                  type="button"
+                  title="Toolbar size"
+                  onClick={() => {
+                    setChrome((prev) => {
+                      const cur = prev.toolbars.game?.scale ?? 1;
+                      const scale = cur >= 1.15 ? 0.9 : Math.round((cur + 0.1) * 10) / 10;
+                      const next = {
+                        ...prev,
+                        toolbars: {
+                          ...prev.toolbars,
+                          game: { order: [], hidden: [], density: "comfy" as const, scale },
+                        },
+                      };
+                      saveControlChrome(next);
+                      return next;
+                    });
+                  }}
+                  className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-white/[0.08] bg-white/[0.03] px-2 text-[10px] font-800 text-ink-dim"
+                >
+                  <SlidersHorizontal className="h-3.5 w-3.5" />
+                  {Math.round((chrome.toolbars.game?.scale ?? 1) * 100)}%
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const cluster = ["k:w", "k:a", "k:s", "k:d", "k:space"];
+                    setChrome((prev) => {
+                      const next = { ...prev, pinned: [...prev.pinned], layout: { ...prev.layout } };
+                      const baseX = 72;
+                      const baseY = 62;
+                      const offsets: Record<string, { x: number; y: number }> = {
+                        "k:w": { x: baseX, y: baseY },
+                        "k:a": { x: baseX - 10, y: baseY + 10 },
+                        "k:s": { x: baseX, y: baseY + 10 },
+                        "k:d": { x: baseX + 10, y: baseY + 10 },
+                        "k:space": { x: baseX, y: baseY + 22 },
+                      };
+                      for (const id of cluster) {
+                        if (!next.pinned.includes(id) && next.pinned.length < 24) next.pinned.push(id);
+                        next.layout[id] = offsets[id] ?? { x: 80, y: 70 };
+                      }
+                      if (!next.pinned.includes(LMB_HOLD_ID) && next.pinned.length < 24) {
+                        next.pinned.push(LMB_HOLD_ID);
+                        next.layout[LMB_HOLD_ID] = { x: 14, y: 78 };
+                        next.styles = {
+                          ...next.styles,
+                          [LMB_HOLD_ID]: {
+                            ...PIN_STYLE_DEFAULTS,
+                            scale: 1.25,
+                            w: 1.5,
+                            shape: "pill",
+                            chrome: "solid",
+                            anim: "glow",
+                            labelMode: "label",
+                            customLabel: "Select",
+                            theme: { bg: "rgba(124,92,255,0.4)", border: "#7c5cff", accent: "#7c5cff", fg: "#fff" },
+                          },
+                        };
+                      }
+                      saveControlChrome(next);
+                      return next;
+                    });
+                    setPinMode(true);
+                    navigator.vibrate?.(12);
+                  }}
+                  className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-accent-3/40 bg-accent-3/15 px-2 text-[10px] font-800 text-accent-3"
+                >
+                  WASD+
+                </button>
+                <Sep />
+                {[...gameKeyDefs, ...extraKeyDefs].map((k) => (
+                  <KeyCapButton
+                    key={k.id}
+                    def={k}
+                    pinMode={pinMode}
+                    pinned={pinned.includes(`k:${k.id}`)}
+                    active={k.mod ? mods.has(k.mod) : false}
+                    held={!!k.wire && heldKeys.has(k.wire)}
+                    onFire={k.run}
+                    onHoldDown={() => k.wire && pressHold(k.wire)}
+                    onHoldUp={() => k.wire && releaseHold(k.wire)}
+                    onTogglePin={() => togglePin(`k:${k.id}`)}
+                  />
+                ))}
+                <button
+                  type="button"
+                  title="Add a letter/digit key"
+                  onClick={() => {
+                    const k = window.prompt("Add key (a-z or 0-9):", "g");
+                    if (!k) return;
+                    const wire = k.trim().toLowerCase();
+                    if (!/^[a-z0-9]$/.test(wire)) return;
+                    setChrome((prev) => {
+                      if (prev.extraKeys.includes(wire) || (GAME_KEY_WIRES as readonly string[]).includes(wire)) {
+                        return prev;
+                      }
+                      const next = { ...prev, extraKeys: [...prev.extraKeys, wire].slice(0, 48) };
+                      saveControlChrome(next);
+                      return next;
+                    });
+                  }}
+                  className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-dashed border-white/20 text-ink-dim"
+                >
+                  <Plus className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
           {panel === "gamepad" && (
             <div className="flex flex-col gap-2 border-b border-white/5 px-3 py-2.5">
               <div className="flex flex-wrap items-center gap-2">
@@ -3123,6 +3482,7 @@ export function ControlScreen({
           <div className="flex items-center gap-1 px-1.5 py-1.5">
             <Tab active={panel === "mouse"} onClick={() => openPanel("mouse")} title="Mouse"><MousePointer2 className="h-5 w-5" /></Tab>
             <Tab active={panel === "keys"} onClick={() => openPanel("keys")} title="Special keys"><Command className="h-5 w-5" /></Tab>
+            <Tab active={panel === "game"} onClick={() => openPanel("game")} title="Game keys"><Crosshair className="h-5 w-5" /></Tab>
             <Tab active={panel === "shortcuts"} onClick={() => openPanel("shortcuts")} title="Shortcuts"><Grip className="h-5 w-5" /></Tab>
             <Tab active={typing} onClick={() => (typing ? stopTyping() : startTyping())} title="Keyboard"><Keyboard className="h-5 w-5" /></Tab>
             <Tab active={panel === "gamepad" || controllerOn} onClick={() => openPanel("gamepad")} title="Controller"><Gamepad2 className="h-5 w-5" /></Tab>
@@ -3359,23 +3719,190 @@ function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps
 function Sep() {
   return <span className="mx-0.5 h-6 w-px shrink-0 bg-white/10" />;
 }
-/** Square icon button used across the panels. */
-function IcoBtn({ onClick, active, title, children }: { onClick: () => void; active?: boolean; title?: string; children: React.ReactNode }) {
+
+/** Top-bar zoom control: chip expands into a vertical slider, collapses on outside tap. */
+function ZoomChip({
+  zoom,
+  open,
+  onToggle,
+  onZoom,
+  onReset,
+  compact = false,
+}: {
+  zoom: number;
+  open: boolean;
+  onToggle: () => void;
+  onZoom: (z: number) => void;
+  onReset: () => void;
+  compact?: boolean;
+}) {
+  const zoomed = zoom > 1.01;
+  return (
+    <div data-zoom-chip className="relative">
+      <button
+        type="button"
+        onClick={onToggle}
+        className={`flex items-center gap-1 active:scale-95 ${
+          compact
+            ? "rounded-full bg-black/45 px-2.5 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
+            : `rounded-lg px-2 py-1.5 text-xs font-700 ${zoomed || open ? "bg-accent-3/20 text-white" : "bg-white/[0.04] text-ink-soft"}`
+        }`}
+        title="Zoom"
+      >
+        <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
+        <ChevronDown className={`h-3 w-3 opacity-70 transition ${open ? "rotate-180" : ""}`} />
+      </button>
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: -6, scale: 0.92 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -6, scale: 0.92 }}
+            transition={{ type: "spring", stiffness: 480, damping: 28 }}
+            className="absolute right-0 top-full z-50 mt-1.5 flex flex-col items-center gap-1.5 rounded-2xl border border-white/15 bg-black/80 px-2.5 py-2 shadow-float backdrop-blur-md"
+          >
+            <span className="text-[9px] font-800 tabular-nums text-white">{zoom.toFixed(1)}×</span>
+            <input
+              type="range"
+              min={1}
+              max={MAX_ZOOM}
+              step={0.1}
+              value={zoom}
+              onChange={(e) => onZoom(parseFloat(e.target.value))}
+              className="h-28 w-7 cursor-pointer accent-accent-3"
+              style={{ writingMode: "vertical-lr", direction: "rtl" }}
+              aria-label="Zoom level"
+            />
+            <button
+              type="button"
+              onClick={onReset}
+              className="rounded-md bg-white/[0.08] px-2 py-0.5 text-[9px] font-800 text-ink-soft active:bg-white/[0.14]"
+            >
+              Reset
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+/** Square icon button used across the panels — optional tiny caption under the icon. */
+function IcoBtn({
+  onClick,
+  active,
+  title,
+  label,
+  children,
+}: {
+  onClick: () => void;
+  active?: boolean;
+  title?: string;
+  label?: string;
+  children: React.ReactNode;
+}) {
   return (
     <motion.button
       whileTap={{ scale: 0.86 }}
       transition={{ type: "spring", stiffness: 600, damping: 20 }}
-      // Keep the ghost input focused (soft keyboard up) when panel buttons are
-      // used mid-typing — see Tab for the full rationale.
       onPointerDown={(e) => e.preventDefault()}
       onClick={() => {
         navigator.vibrate?.(5);
         onClick();
       }}
       title={title}
-      className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg border ${active ? "border-accent-3 bg-accent-3/15 text-white" : "border-white/[0.06] bg-white/[0.03] text-ink-soft active:bg-white/[0.08]"}`}
+      className="flex shrink-0 flex-col items-center gap-0.5"
     >
-      {children}
+      <span
+        className={`grid h-9 w-9 place-items-center rounded-lg border ${
+          active
+            ? "border-accent-3 bg-accent-3/15 text-white"
+            : "border-white/[0.06] bg-white/[0.03] text-ink-soft active:bg-white/[0.08]"
+        }`}
+      >
+        {children}
+      </span>
+      {label && <span className="max-w-[2.75rem] truncate text-[8px] font-700 leading-none text-ink-dim">{label}</span>}
+    </motion.button>
+  );
+}
+
+/** Momentary hold icon (LMB select) — pin-mode tap toggles pin; otherwise press-and-hold. */
+function HoldIcoBtn({
+  label,
+  title,
+  active,
+  pinMode,
+  pinned,
+  onPinToggle,
+  onHoldDown,
+  onHoldUp,
+  children,
+}: {
+  label: string;
+  title?: string;
+  active?: boolean;
+  pinMode: boolean;
+  pinned: boolean;
+  onPinToggle: () => void;
+  onHoldDown: () => void;
+  onHoldUp: () => void;
+  children: React.ReactNode;
+}) {
+  const holding = useRef(false);
+  return (
+    <motion.button
+      whileTap={{ scale: 0.86, y: 2 }}
+      transition={{ type: "spring", stiffness: 600, damping: 20 }}
+      title={title}
+      className="relative flex shrink-0 flex-col items-center gap-0.5"
+      onPointerDown={(e) => {
+        e.preventDefault();
+        if (pinMode) return;
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+        holding.current = true;
+        onHoldDown();
+      }}
+      onPointerUp={(e) => {
+        if (holding.current) {
+          holding.current = false;
+          try {
+            e.currentTarget.releasePointerCapture?.(e.pointerId);
+          } catch {
+            /* ignore */
+          }
+          onHoldUp();
+          return;
+        }
+      }}
+      onPointerCancel={() => {
+        if (!holding.current) return;
+        holding.current = false;
+        onHoldUp();
+      }}
+      onClick={() => {
+        if (pinMode) onPinToggle();
+      }}
+    >
+      <span
+        className={`grid h-9 w-9 place-items-center rounded-lg border ${
+          active
+            ? "border-accent-3 bg-accent-3/25 text-white shadow-glow"
+            : "border-white/[0.06] bg-white/[0.03] text-ink-soft"
+        }`}
+      >
+        {children}
+      </span>
+      <span className="max-w-[2.75rem] truncate text-[8px] font-700 leading-none text-ink-dim">{label}</span>
+      {pinMode && (
+        <span
+          className={`absolute -right-0.5 -top-0.5 grid h-3.5 w-3.5 place-items-center rounded-full border ${
+            pinned ? "border-accent-3 bg-accent-3 text-white" : "border-white/25 bg-black/70 text-ink-dim"
+          }`}
+        >
+          <Pin className="h-2 w-2" />
+        </span>
+      )}
     </motion.button>
   );
 }
@@ -3510,7 +4037,7 @@ function PinModeToggle({ active, onClick }: { active: boolean; onClick: () => vo
   return (
     <button
       onClick={onClick}
-      title={active ? "Done pinning" : "Pin keys to a floating quick bar"}
+      title={active ? "Done — drag floating pins to place them" : "Pin keys, then drag floating pins anywhere"}
       className={`flex h-9 shrink-0 items-center gap-1 rounded-lg border px-2 text-[10px] font-800 uppercase tracking-wide transition active:scale-95 ${
         active ? "border-accent-3 bg-accent-3/20 text-accent-3" : "border-white/[0.08] bg-white/[0.03] text-ink-dim"
       }`}
@@ -3526,51 +4053,187 @@ function ReleaseHeldButton({ count, onClick }: { count: number; onClick: () => v
     <button
       onClick={onClick}
       title="Release all held keys"
-      className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-accent-1/40 bg-accent-1/15 px-2 text-[10px] font-800 uppercase tracking-wide text-accent-1 transition active:scale-95"
+      className="flex h-8 shrink-0 items-center gap-1 rounded-lg border border-accent-1/40 bg-black/75 px-2 text-[10px] font-800 uppercase tracking-wide text-accent-1 shadow-float backdrop-blur transition active:scale-95"
     >
       <X className="h-3.5 w-3.5" />
       {count} held
     </button>
   );
 }
-/** A pinned quick button on the floating edge rail — small + semi-transparent.
- *  Holdable keys use natural press-and-hold (keydown while down). Unpin only in
- *  Pin mode (tap the rail button) — long-press used to unpin and stole holds. */
+/**
+ * Free-floating pinned quick button. In Pin mode: drag to place, tap to unpin,
+ * gear / long-press opens the style editor. Outside Pin mode: tap/hold fires.
+ */
 function PinnedButton({
   def,
   pinMode,
+  style,
+  reducedMotion,
   active,
+  xPct,
+  yPct,
+  layerRef,
   onRun,
   onHoldDown,
   onHoldUp,
   onUnpin,
+  onEdit,
+  onMove,
 }: {
   def: KeyDef;
   pinMode: boolean;
+  style: PinStyle;
+  reducedMotion: boolean;
   active?: boolean;
+  xPct: number;
+  yPct: number;
+  layerRef: React.RefObject<HTMLDivElement | null>;
   onRun: () => void;
   onHoldDown?: () => void;
   onHoldUp?: () => void;
   onUnpin: () => void;
+  onEdit: () => void;
+  onMove: (xPct: number, yPct: number) => void;
 }) {
-  const holdable = !!def.wire && !def.mod;
+  const holdable = (!!def.wire && !def.mod) || !!def.holdMouse;
   const holding = useRef(false);
+  const drag = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    origX: number;
+    origY: number;
+    moved: boolean;
+    longTimer: number | null;
+  } | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [rippling, setRippling] = useState(false);
+  const motionCfg = pressMotion(style.anim, reducedMotion);
+  const baseW = 44 * style.w * style.scale;
+  const baseH = 36 * style.h * style.scale;
+
+  const toPct = (clientX: number, clientY: number) => {
+    const layer = layerRef.current;
+    if (!layer) return { x: xPct, y: yPct };
+    const r = layer.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return { x: xPct, y: yPct };
+    return {
+      x: clamp(((clientX - r.left) / r.width) * 100, 4, 96),
+      y: clamp(((clientY - r.top) / r.height) * 100, 6, 94),
+    };
+  };
+
+  const clearLong = () => {
+    const d = drag.current;
+    if (d?.longTimer != null) {
+      window.clearTimeout(d.longTimer);
+      d.longTimer = null;
+    }
+  };
+
+  const showKeys = style.labelMode === "keys" || style.labelMode === "keys+label";
+  const showLabel =
+    style.labelMode === "label" ||
+    style.labelMode === "keys+label" ||
+    style.labelMode === "icon";
+  const labelText = style.customLabel || def.label || (style.labelMode === "icon" ? def.keys[0] : undefined);
+
+  const themeStyle: React.CSSProperties = {
+    left: `${xPct}%`,
+    top: `${yPct}%`,
+    touchAction: "none",
+    width: baseW,
+    minHeight: baseH,
+    opacity: active ? Math.min(1, style.opacity + 0.15) : style.opacity,
+    background: style.theme.bg,
+    borderColor: style.theme.border,
+    color: style.theme.fg,
+    boxShadow:
+      active && (style.anim === "glow" || style.theme.accent)
+        ? `0 0 18px ${style.theme.accent || "rgba(124,92,255,0.55)"}`
+        : undefined,
+  };
+
   return (
     <motion.button
-      layout
-      initial={{ opacity: 0, x: 24, scale: 0.8 }}
-      animate={{ opacity: active ? 1 : 0.55, x: 0, scale: 1 }}
-      exit={{ opacity: 0, x: 24, scale: 0.8 }}
-      whileTap={{ scale: 0.9, opacity: 1 }}
-      transition={{ type: "spring", stiffness: 500, damping: 30 }}
+      initial={{ opacity: 0, scale: 0.8 }}
+      animate={{
+        opacity: active ? 1 : style.opacity,
+        scale: dragging ? 1.08 : 1,
+      }}
+      exit={{ opacity: 0, scale: 0.8 }}
+      whileTap={pinMode ? undefined : motionCfg.whileTap}
+      transition={pinMode ? { type: "spring", stiffness: 500, damping: 30 } : motionCfg.transition}
+      style={themeStyle}
+      className={`pointer-events-auto absolute flex -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-0.5 overflow-hidden border px-1.5 py-1 backdrop-blur ${shapeClass(style.shape)} ${chromeClass(style.chrome, !!active)} ${
+        pinMode ? "ring-1 ring-accent-3/60" : ""
+      } ${dragging ? "z-40 shadow-glow" : "z-30"}`}
+      title={
+        pinMode
+          ? `Drag to place · tap unpin · long-press edit ${def.keys.join(" + ")}`
+          : holdable
+            ? `${def.keys.join(" + ")} — press and hold`
+            : `${def.keys.join(" + ")}${def.label ? ` (${def.label})` : ""}`
+      }
       onPointerDown={(e) => {
-        e.preventDefault(); // don't steal focus from the ghost input (keyboard stays up)
-        if (pinMode || !holdable) return;
+        e.preventDefault();
+        e.stopPropagation();
         e.currentTarget.setPointerCapture?.(e.pointerId);
+        if (style.anim === "ripple" && !reducedMotion) {
+          setRippling(true);
+          window.setTimeout(() => setRippling(false), 420);
+        }
+        if (pinMode) {
+          drag.current = {
+            pointerId: e.pointerId,
+            startX: e.clientX,
+            startY: e.clientY,
+            origX: xPct,
+            origY: yPct,
+            moved: false,
+            longTimer: window.setTimeout(() => {
+              const d = drag.current;
+              if (!d || d.moved) return;
+              d.moved = true; // swallow unpin on release
+              navigator.vibrate?.(14);
+              onEdit();
+            }, 520),
+          };
+          return;
+        }
+        if (!holdable) return;
         holding.current = true;
         onHoldDown?.();
       }}
+      onPointerMove={(e) => {
+        const d = drag.current;
+        if (!d || d.pointerId !== e.pointerId) return;
+        const dx = e.clientX - d.startX;
+        const dy = e.clientY - d.startY;
+        if (!d.moved && Math.hypot(dx, dy) < 8) return;
+        if (!d.moved) {
+          d.moved = true;
+          clearLong();
+          setDragging(true);
+          navigator.vibrate?.(8);
+        }
+        const p = toPct(e.clientX, e.clientY);
+        onMove(p.x, p.y);
+      }}
       onPointerUp={(e) => {
+        const d = drag.current;
+        if (d && d.pointerId === e.pointerId) {
+          clearLong();
+          drag.current = null;
+          setDragging(false);
+          try {
+            e.currentTarget.releasePointerCapture?.(e.pointerId);
+          } catch {
+            /* ignore */
+          }
+          if (!d.moved) onUnpin();
+          return;
+        }
         if (holding.current) {
           holding.current = false;
           try {
@@ -3581,33 +4244,57 @@ function PinnedButton({
           onHoldUp?.();
           return;
         }
-        if (pinMode) {
-          onUnpin();
-          return;
-        }
-        if (!holdable) onRun();
+        if (!holdable && !pinMode) onRun();
       }}
       onPointerCancel={() => {
+        clearLong();
+        drag.current = null;
+        setDragging(false);
         if (!holding.current) return;
         holding.current = false;
         onHoldUp?.();
       }}
-      className={`pointer-events-auto relative flex items-center rounded-lg border px-1.5 py-1 backdrop-blur ${
-        active ? "border-accent-1/70 bg-black/55" : "border-white/10 bg-black/35"
-      } ${pinMode ? "ring-1 ring-accent-3/50" : ""}`}
-      title={
-        pinMode
-          ? `Tap to unpin ${def.keys.join(" + ")}`
-          : holdable
-            ? `${def.keys.join(" + ")} — press and hold`
-            : `${def.keys.join(" + ")}${def.label ? ` (${def.label})` : ""}`
-      }
     >
-      <KeyCombo keys={def.keys} active={active} small />
-      {pinMode && (
-        <span className="absolute -right-1 -top-1 grid h-3.5 w-3.5 place-items-center rounded-full bg-accent-3 text-white">
-          <PinOff className="h-2 w-2" />
+      {rippling && (
+        <motion.span
+          aria-hidden
+          className="pointer-events-none absolute inset-0 rounded-[inherit] bg-white/25"
+          initial={{ scale: 0.4, opacity: 0.55 }}
+          animate={{ scale: 1.6, opacity: 0 }}
+          transition={{ duration: 0.4 }}
+        />
+      )}
+      {showKeys && !(style.labelMode === "label" && labelText) && (
+        <KeyCombo keys={def.keys} active={active} small />
+      )}
+      {showLabel && labelText && style.labelMode !== "keys" && (
+        <span
+          className={`max-w-full truncate px-0.5 font-800 leading-tight ${
+            showKeys && style.labelMode === "keys+label" ? "text-[8px] text-ink-dim" : "text-[10px]"
+          }`}
+          style={{ color: style.theme.fg }}
+        >
+          {labelText}
         </span>
+      )}
+      {pinMode && (
+        <>
+          <span className="absolute -right-1 -top-1 grid h-3.5 w-3.5 place-items-center rounded-full bg-accent-3 text-white">
+            <PinOff className="h-2 w-2" />
+          </span>
+          <span
+            role="button"
+            title="Edit look"
+            className="absolute -bottom-1 -left-1 grid h-4 w-4 place-items-center rounded-full border border-white/20 bg-black/80 text-ink-soft"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onEdit();
+            }}
+          >
+            <SlidersHorizontal className="h-2.5 w-2.5" />
+          </span>
+        </>
       )}
     </motion.button>
   );
