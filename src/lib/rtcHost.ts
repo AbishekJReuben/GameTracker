@@ -811,6 +811,13 @@ export function startHost(opts: HostOptions): () => void {
     // Channels are created before the offer so no renegotiation is needed.
     // control = input, data = stats + events + heartbeat.
     const control = pc.createDataChannel("control");
+    // High-rate pointer moves ride a separate UNORDERED, NO-RETRANSMIT channel:
+    // a lost absolute move is superseded by the next one ~16ms later anyway, so
+    // retransmitting it only delays fresher input — and on the ordered control
+    // stream a lost move head-of-line blocks the clicks/keys queued behind it.
+    // The guest anchors a reliable move before every button event (see links.ts),
+    // so click positions never depend on the lossy stream.
+    const move = pc.createDataChannel("move", { ordered: false, maxRetransmits: 0 });
     const data = pc.createDataChannel("data");
     dataCh = data;
 
@@ -966,6 +973,8 @@ export function startHost(opts: HostOptions): () => void {
       }
     };
     control.onmessage = onControlMsg;
+    // Lossy pointer-move stream feeds the same handler (auth gate included).
+    move.onmessage = onControlMsg;
 
     data.onmessage = async (e) => {
       let req: { id?: number; path?: string; body?: any; ping?: number };

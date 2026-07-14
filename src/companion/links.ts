@@ -159,6 +159,12 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
   conn.onFrame((b64) => {
     if (frameCb) frameCb(base64ToBytes(b64));
   });
+  // Last absolute move sent via the LOSSY channel and not yet re-anchored. Button
+  // events are position-dependent, so before any click/down/up we re-send that
+  // move on the RELIABLE control channel — same-stream ordering then guarantees
+  // the host's cursor is at the finger's position when the button event lands,
+  // even if every lossy packet in between was dropped.
+  let unanchoredMove: ControlMsg | null = null;
   return {
     onFrame(cb) {
       frameCb = cb;
@@ -176,6 +182,21 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
       return conn.onProgress(cb);
     },
     send(msg) {
+      // Absolute pointer moves are idempotent and superseded by the next one, so
+      // they ride the unordered/no-retransmit "move" channel: a dropped packet
+      // never delays fresher input, and a burst of moves can't head-of-line
+      // block clicks/keys behind a stale retransmit on the control stream.
+      // (Relative moves would double-apply if re-anchored — they stay reliable,
+      // as does everything else.)
+      if (msg.type === "move") {
+        unanchoredMove = msg;
+        conn.sendMove(msg);
+        return;
+      }
+      if (unanchoredMove && (msg.type === "click" || msg.type === "down" || msg.type === "up")) {
+        conn.sendControl(unanchoredMove);
+        unanchoredMove = null;
+      }
       conn.sendControl(msg);
     },
     setQuality(q) {

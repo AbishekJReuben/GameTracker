@@ -71,7 +71,12 @@ const HARD_RESET_MS = 60000; // transport down this long → full teardown + reb
 // Receiver jitter buffer (ms): the old 20ms was so tight that late frames were
 // dropped (≈30% on Android). A larger buffer trades a little latency for far
 // fewer drops; it adapts up when the decoder falls behind and eases back.
-const JITTER_BASE = 120;
+// Base was 120ms, but with the adaptation now WINDOWED (drop ratio measured per
+// watchdog tick instead of cumulative-forever, so it genuinely eases back after
+// a rough patch) a leaner resting point is safe: 80ms shaves ~40ms off glass-to-
+// glass latency on a clean link, and a bursty decoder still climbs to 300ms
+// within a few ticks (+40ms per 3s tick at >15% drops).
+const JITTER_BASE = 80;
 const JITTER_MAX = 300;
 
 export class CloudConn {
@@ -79,6 +84,8 @@ export class CloudConn {
   private pc: RTCPeerConnection | null = null;
   private chScreen?: RTCDataChannel;
   private chControl?: RTCDataChannel;
+  /** Unordered / no-retransmit channel for high-rate pointer moves (see rtcHost). */
+  private chMove?: RTCDataChannel;
   private chData?: RTCDataChannel;
   private reqId = 1;
   private pending = new Map<number, Pending>();
@@ -117,6 +124,11 @@ export class CloudConn {
   private watchdogTimer: number | null = null;
   private lastHealthyAt = Date.now();
   private lastDecoded = -1;
+  // Baselines for the WINDOWED drop-ratio (deltas per watchdog tick). Cumulative
+  // totals were used before, which meant one early burst of drops kept the ratio
+  // (and thus the jitter buffer / latency) elevated for the whole session.
+  private winDecoded = 0;
+  private winDropped = 0;
   // Session id of the offer that built the current pc. A later offer with the SAME
   // id is an ICE-restart renegotiation (apply in place); a different id is a new
   // session (full rebuild). Lets a transient network drop re-route sub-second
@@ -386,6 +398,8 @@ export class CloudConn {
     // A new PC restarts inbound-RTP counters from 0, so the old frame count is
     // meaningless — reset it so the jitter-adaptation baseline is correct.
     this.lastDecoded = -1;
+    this.winDecoded = 0;
+    this.winDropped = 0;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
     pipeIce(pc, this.sig!);
@@ -447,6 +461,8 @@ export class CloudConn {
         // Send the auth handshake as soon as the guest→host channel is open.
         if (ch.readyState === "open") this.sendAuth();
         ch.onopen = () => this.sendAuth();
+      } else if (ch.label === "move") {
+        this.chMove = ch;
       } else if (ch.label === "data") {
         this.chData = ch;
         ch.onmessage = (ev) => this.onData(ev.data as string);
@@ -579,8 +595,21 @@ export class CloudConn {
       const st = await this.videoStats().catch(() => null);
       if (!st) return;
       if (st.framesDecoded > this.lastDecoded) this.lastDecoded = st.framesDecoded;
-      const total = st.framesDecoded + st.framesDropped;
-      const ratio = total > 0 ? st.framesDropped / total : 0;
+      // Windowed drop ratio: only what happened since the LAST tick. RTP counters
+      // are cumulative and reset with a new receiver, so guard against wrap/reset.
+      if (st.framesDecoded < this.winDecoded || st.framesDropped < this.winDropped) {
+        this.winDecoded = 0;
+        this.winDropped = 0;
+      }
+      const dDecoded = st.framesDecoded - this.winDecoded;
+      const dDropped = st.framesDropped - this.winDropped;
+      this.winDecoded = st.framesDecoded;
+      this.winDropped = st.framesDropped;
+      const total = dDecoded + dDropped;
+      // Need a handful of frames in the window for the ratio to mean anything
+      // (a static screen decodes ~1 keep-alive per second).
+      if (total < 5) return;
+      const ratio = dDropped / total;
       const prev = this.jitterTarget;
       if (ratio > 0.15) this.jitterTarget = Math.min(JITTER_MAX, this.jitterTarget + 40);
       else if (ratio < 0.03) this.jitterTarget = Math.max(JITTER_BASE, this.jitterTarget - 20);
@@ -731,6 +760,22 @@ export class CloudConn {
   }
   sendControl(msg: unknown) {
     if (this.chControl?.readyState === "open") this.chControl.send(JSON.stringify(msg));
+  }
+  /**
+   * Send over the lossy move channel when it's open; falls back to the reliable
+   * control channel (older hosts don't create "move"). Only for messages where
+   * the next update supersedes a lost one (absolute pointer moves).
+   */
+  sendMove(msg: unknown) {
+    if (this.chMove?.readyState === "open") {
+      try {
+        this.chMove.send(JSON.stringify(msg));
+        return;
+      } catch {
+        /* fall through to reliable */
+      }
+    }
+    this.sendControl(msg);
   }
   /**
    * Snapshot the inbound video RTP stats (decode-side fps, bytes, resolution,

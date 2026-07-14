@@ -651,3 +651,30 @@ not regress):**
   bundled via Vite `?url` import — CSP `default-src 'self'` blocks `blob:`/`data:` modules.
 - **WASAPI capture thread registers with MMCSS** (`AvSetMmThreadCharacteristicsW("Pro Audio")`,
   `audio.rs`) so a running game can't starve the loopback loop. Best-effort, don't remove.
+
+**v3.9.12 streaming-latency pass (do not regress):**
+- **No RGB conversion pass on the video-track path (`capture.rs`).** Frames stay packed
+  4-byte from capture to JPEG: `scale_u8x4` downscales U8x4→U8x4 and `encode_frame`/
+  `encode_jpeg_px` feed **BGRA (DXGI) / RGBA (xcap) directly to `jpeg-encoder`**
+  (`ColorType::Bgra`/`Rgba` — it drops alpha in its own per-MCU transform). The old
+  `u8x4_to_rgb` scalar pass read+wrote every pixel and allocated a fresh full-frame Vec
+  per frame; don't reintroduce it on the hot path. `RawFrame` carries `color`; the LAN
+  `TileEncoder` still uses `scale_u8x4_to_rgb` (it needs `RgbImage` for tile diffs).
+- **Capture + encoder threads register with MMCSS** (`boost_capture_thread()`, task class
+  "Capture") — primary capture, primary encoder, and every aux pop-out thread — so a
+  running game can't starve the screen pipeline (same fix as audio's "Pro Audio").
+- **Pointer moves ride a lossy WebRTC channel.** The host creates a third data channel
+  `"move"` (`ordered:false, maxRetransmits:0`, same `onControlMsg` handler + auth gate);
+  the guest (`links.ts makeRtcLink`) routes absolute `move` messages there so a dropped
+  move is never retransmitted (the next one supersedes it) and a burst can't head-of-line
+  block clicks/keys on the ordered control stream. **Anchor invariant:** before any
+  `click`/`down`/`up` the guest re-sends the last lossy move on the RELIABLE control
+  channel — same-stream ordering guarantees button events never land on a stale cursor.
+  Only absolute moves may use the lossy path (`moverel` would double-apply if anchored).
+- **Receiver jitter buffer: windowed adaptation, base 80ms** (`cloud.ts`). The drop ratio
+  is computed per 3s watchdog tick (deltas), not cumulative-forever — one early burst no
+  longer pins the buffer (and latency) high for the whole session. Base 120→80ms saves
+  ~40ms glass-to-glass; bursty decoders still climb +40ms/tick to 300ms. Guard: skip
+  ticks with <5 frames in the window (static screen ≈ 1 keep-alive fps).
+- **Quality settings persist** on the phone (`gt.remote.streamQ`, `gt.remote.contentMode`
+  in localStorage) — a tuned setup survives app restarts.

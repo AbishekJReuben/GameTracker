@@ -82,10 +82,45 @@ fn scale_u8x4_to_rgb(px4: &[u8], sw: u32, sh: u32, max_w: u32, fast: bool, swap_
     Some((u8x4_to_rgb(dst.buffer(), dw, dh, swap_rb), dw, dh))
 }
 
-/// Encode packed RGB to a JPEG via the SIMD encoder. `subsample_420` trades a
+/// Downscale a captured 4-byte-per-pixel frame to `max_w` (keeping aspect) and
+/// return it still packed as U8x4 — **no color conversion**. The video-track paths
+/// feed BGRA/RGBA straight to the JPEG encoder (it drops alpha during its own
+/// per-MCU color transform), so the old separate full-frame BGRA→RGB pass — a
+/// scalar read+write of every pixel plus a fresh allocation per frame — is gone.
+fn scale_u8x4(px4: &[u8], sw: u32, sh: u32, max_w: u32, fast: bool) -> Option<(Vec<u8>, u32, u32)> {
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    if sw <= max_w {
+        return Some((px4.to_vec(), sw, sh));
+    }
+    let dw = max_w;
+    let dh = (((sh as u64) * (dw as u64)) / (sw as u64)).max(1) as u32;
+    let src = ImageRef::new(sw, sh, px4, PixelType::U8x4).ok()?;
+    let mut dst = FirImage::new(dw, dh, PixelType::U8x4);
+    let alg = if fast {
+        ResizeAlg::Nearest
+    } else {
+        ResizeAlg::Convolution(FirFilter::Bilinear)
+    };
+    let opts = ResizeOptions::new().resize_alg(alg);
+    Resizer::new().resize(&src, &mut dst, &opts).ok()?;
+    Some((dst.into_vec(), dw, dh))
+}
+
+/// Bytes per pixel for the source layouts we feed the JPEG encoder.
+fn bpp_of(color: JpegColor) -> usize {
+    match color {
+        JpegColor::Rgb | JpegColor::Bgr | JpegColor::Ycbcr => 3,
+        _ => 4,
+    }
+}
+
+/// Encode packed pixels to a JPEG via the SIMD encoder. `subsample_420` trades a
 /// little chroma sharpness for speed + size (fine for the video-track path, whose
 /// H.264 stage is 4:2:0 anyway); tile/LAN paths pass `false` for crisp text.
-fn encode_jpeg_rgb(rgb: &[u8], w: u32, h: u32, quality: u8, subsample_420: bool) -> Option<Vec<u8>> {
+/// `color` names the source layout (Rgb / Bgra / Rgba — alpha is ignored).
+fn encode_jpeg_px(px: &[u8], w: u32, h: u32, quality: u8, subsample_420: bool, color: JpegColor) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut enc = JpegEnc::new(&mut buf, quality);
     enc.set_sampling_factor(if subsample_420 {
@@ -93,8 +128,13 @@ fn encode_jpeg_rgb(rgb: &[u8], w: u32, h: u32, quality: u8, subsample_420: bool)
     } else {
         SamplingFactor::R_4_4_4
     });
-    enc.encode(rgb, w as u16, h as u16, JpegColor::Rgb).ok()?;
+    enc.encode(px, w as u16, h as u16, color).ok()?;
     Some(buf)
+}
+
+/// RGB convenience wrapper (LAN tile path + one-shot grabs).
+fn encode_jpeg_rgb(rgb: &[u8], w: u32, h: u32, quality: u8, subsample_420: bool) -> Option<Vec<u8>> {
+    encode_jpeg_px(rgb, w, h, quality, subsample_420, JpegColor::Rgb)
 }
 
 /// Encode a full RGB frame for the WebRTC video-track feed. At high resolutions a
@@ -103,7 +143,7 @@ fn encode_jpeg_rgb(rgb: &[u8], w: u32, h: u32, quality: u8, subsample_420: bool)
 /// and packed into a "GS" container the host webview composites onto its canvas.
 /// Strip heights are 16-aligned (the 4:2:0 MCU height) so seams fall on block
 /// boundaries. Small frames just return a plain single JPEG (magic `FF D8`).
-fn encode_frame(rgb: &[u8], w: u32, h: u32, quality: u8) -> Option<Vec<u8>> {
+fn encode_frame(px: &[u8], w: u32, h: u32, quality: u8, color: JpegColor) -> Option<Vec<u8>> {
     // Text mode keeps full 4:4:4 chroma so glyph edges survive the JPEG → H.264
     // hand-off; auto/video use 4:2:0 (smaller + faster, and H.264 is 4:2:0 anyway).
     let sub420 = CAP_CONTENT.load(Ordering::Relaxed) != CONTENT_TEXT;
@@ -116,11 +156,11 @@ fn encode_frame(rgb: &[u8], w: u32, h: u32, quality: u8) -> Option<Vec<u8>> {
         1
     };
     if strips <= 1 {
-        return encode_jpeg_rgb(rgb, w, h, quality, sub420);
+        return encode_jpeg_px(px, w, h, quality, sub420, color);
     }
 
     // Split H into `strips` bands, each a multiple of 16 rows (last takes the rest).
-    let stride = (w * 3) as usize;
+    let stride = w as usize * bpp_of(color);
     let band = ((h / strips) / 16).max(1) * 16;
     let mut bands: Vec<(u32, u32)> = Vec::new();
     let mut y = 0u32;
@@ -143,7 +183,7 @@ fn encode_frame(rgb: &[u8], w: u32, h: u32, quality: u8) -> Option<Vec<u8>> {
         .map(|&(y0, bh)| {
             let start = y0 as usize * stride;
             let end = start + bh as usize * stride;
-            encode_jpeg_rgb(&rgb[start..end], w, bh, quality, sub420).map(|j| (y0, bh, j))
+            encode_jpeg_px(&px[start..end], w, bh, quality, sub420, color).map(|j| (y0, bh, j))
         })
         .collect();
 
@@ -176,6 +216,22 @@ pub fn thumbnail_data_url(path: &std::path::Path, max_w: u32) -> Option<String> 
     let mut buf = Vec::new();
     JpegEncoder::new_with_quality(&mut buf, 80).encode_image(&rgb).ok()?;
     Some(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(buf)))
+}
+
+/// Register the calling thread with MMCSS ("Capture" class) so a running game
+/// can't starve the screen pipeline — the same treatment the WASAPI loopback
+/// thread gets ("Pro Audio" in audio.rs). Under full game load the capture and
+/// encoder threads otherwise compete at normal priority with the game's worker
+/// pool and the produced fps sags exactly when remote play needs it most.
+/// Best-effort: streaming works without it.
+fn boost_capture_thread() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::w;
+        use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+        let mut task_index = 0u32;
+        let _ = AvSetMmThreadCharacteristicsW(w!("Capture"), &mut task_index);
+    }
 }
 
 /// Index (into `sorted_monitors`) of the display the phone is currently viewing.
@@ -535,6 +591,7 @@ where
     let fast = quality < 65; // sharp downscale for text, fast for video-ish content
 
     std::thread::spawn(move || {
+        boost_capture_thread();
         let budget_ms = (1000 / fps).clamp(1, 1000);
         let budget = Duration::from_millis(budget_ms as u64);
         // Persistent duplication session for THIS monitor (recreated if lost).
@@ -542,13 +599,15 @@ where
         let mut dup: Option<super::dxdupe::Duplicator> = None;
         let mut last: Option<Arc<Vec<u8>>> = None;
         let mut last_wh = (0u32, 0u32);
+        let mut last_color = JpegColor::Bgra;
         let mut last_emit = Instant::now() - Duration::from_secs(2);
 
         while slot.running.load(Ordering::SeqCst) && slot.gen.load(Ordering::SeqCst) == my_gen {
             let t0 = Instant::now();
-            // (rgb, out_w, out_h, from_dd). `from_dd` = came from Desktop Duplication
-            // (always a genuine change → skip the diff) vs the xcap fallback.
-            let mut scaled: Option<(Vec<u8>, u32, u32, bool)> = None;
+            // (px4, out_w, out_h, color, from_dd). Pixels stay 4-byte (BGRA from
+            // Desktop Duplication, RGBA from xcap) all the way to the JPEG encoder —
+            // no separate RGB conversion pass. `from_dd` = always a genuine change.
+            let mut scaled: Option<(Vec<u8>, u32, u32, JpegColor, bool)> = None;
             let mut timed_out = false;
 
             #[cfg(windows)]
@@ -560,8 +619,8 @@ where
                 if let Some(d) = dup.as_mut() {
                     match d.grab(budget_ms, max_w) {
                         super::dxdupe::Grab::Frame { w: gw, h: gh, .. } => {
-                            if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(d.buffer(), gw, gh, max_w, fast, true) {
-                                scaled = Some((rgb, ow, oh, true));
+                            if let Some((px, ow, oh)) = scale_u8x4(d.buffer(), gw, gh, max_w, fast) {
+                                scaled = Some((px, ow, oh, JpegColor::Bgra, true));
                             }
                         }
                         super::dxdupe::Grab::Timeout => timed_out = true,
@@ -570,8 +629,8 @@ where
                 } else if let Some(rgba) = monitor_at(monitor).and_then(|m| m.capture_image().ok()) {
                     let (sw, sh) = (rgba.width(), rgba.height());
                     let raw = rgba.into_raw();
-                    if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, fast, false) {
-                        scaled = Some((rgb, ow, oh, false));
+                    if let Some((px, ow, oh)) = scale_u8x4(&raw, sw, sh, max_w, fast) {
+                        scaled = Some((px, ow, oh, JpegColor::Rgba, false));
                     }
                 }
             }
@@ -580,31 +639,32 @@ where
                 if let Some(rgba) = monitor_at(monitor).and_then(|m| m.capture_image().ok()) {
                     let (sw, sh) = (rgba.width(), rgba.height());
                     let raw = rgba.into_raw();
-                    if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, fast, false) {
-                        scaled = Some((rgb, ow, oh, false));
+                    if let Some((px, ow, oh)) = scale_u8x4(&raw, sw, sh, max_w, fast) {
+                        scaled = Some((px, ow, oh, JpegColor::Rgba, false));
                     }
                 }
             }
 
-            if let Some((rgb, w, h, from_dd)) = scaled {
+            if let Some((px, w, h, color, from_dd)) = scaled {
                 let changed = from_dd
                     || last
                         .as_ref()
-                        .map_or(true, |prev| last_wh != (w, h) || prev.as_slice() != rgb.as_slice());
+                        .map_or(true, |prev| last_wh != (w, h) || prev.as_slice() != px.as_slice());
                 let stale = last_emit.elapsed() >= Duration::from_millis(900);
                 if changed || stale {
-                    if let Some(jpg) = encode_frame(&rgb, w, h, quality) {
+                    if let Some(jpg) = encode_frame(&px, w, h, quality, color) {
                         emit(jpg);
                         last_emit = Instant::now();
                     }
                 }
-                last = Some(Arc::new(rgb));
+                last = Some(Arc::new(px));
                 last_wh = (w, h);
+                last_color = color;
             } else if let Some(prev) = last.as_ref() {
                 // Static screen / cursor-only update: re-send the last frame occasionally
                 // so a freshly-attached decoder still gets a keyframe.
                 if last_emit.elapsed() >= Duration::from_millis(900) {
-                    if let Some(jpg) = encode_frame(prev, last_wh.0, last_wh.1, quality) {
+                    if let Some(jpg) = encode_frame(prev, last_wh.0, last_wh.1, quality, last_color) {
                         emit(jpg);
                         last_emit = Instant::now();
                     }
@@ -627,14 +687,18 @@ where
 struct RawFrame {
     /// Shared so the capture thread can also retain it for keep-alive without a
     /// full-frame copy (a 4K frame is ~25 MB — cloning it every frame was pure
-    /// memory-bandwidth waste). The encoder only reads it.
-    rgb: Arc<Vec<u8>>,
+    /// memory-bandwidth waste). The encoder only reads it. Pixels are packed
+    /// 4-byte (`color` says BGRA vs RGBA) — the JPEG encoder consumes them
+    /// directly, so no RGB conversion pass ever touches the frame.
+    px: Arc<Vec<u8>>,
     w: u32,
     h: u32,
     nat_w: u32,
     nat_h: u32,
     cap_us: u32,
     scale_us: u32,
+    /// Source pixel layout (Bgra = Desktop Duplication, Rgba = xcap fallback).
+    color: JpegColor,
     /// True when this frame carries genuinely new pixels (a fresh capture), false
     /// for a keep-alive re-send. Lets the encoder skip the whole-frame diff.
     changed: bool,
@@ -663,12 +727,13 @@ where
     // xcap/GDI fallback) + SIMD downscale, as fast as the target fps allows ----
     let cap_mail = mailbox.clone();
     std::thread::spawn(move || {
+        boost_capture_thread();
         #[cfg(windows)]
         let mut dup: Option<super::dxdupe::Duplicator> = None;
         let mut cur_mon = usize::MAX;
         // Last successfully scaled frame (shared), re-sent on idle so the encoder's
         // ~1s keep-alive still fires for a freshly attached decoder.
-        let mut last: Option<(Arc<Vec<u8>>, u32, u32, u32, u32)> = None;
+        let mut last: Option<(Arc<Vec<u8>>, u32, u32, u32, u32, JpegColor)> = None;
         let mut last_push = Instant::now() - Duration::from_secs(2);
 
         while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
@@ -686,11 +751,12 @@ where
             let sel = selected_monitor();
 
             let cap0 = Instant::now();
-            // Capture + downscale one frame → packed RGB. Tuple layout:
-            // (rgb, out_w, out_h, native_w, native_h, scale_us, from_dd). `from_dd` =
-            // came from Desktop Duplication (always a genuine change) vs the xcap
-            // fallback (which still needs a diff for the static-screen skip).
-            let mut scaled: Option<(Vec<u8>, u32, u32, u32, u32, u32, bool)> = None;
+            // Capture + downscale one frame → packed 4-byte pixels (kept in the
+            // source layout; the JPEG encoder drops alpha itself). Tuple layout:
+            // (px4, out_w, out_h, native_w, native_h, scale_us, color, from_dd).
+            // `from_dd` = came from Desktop Duplication (always a genuine change) vs
+            // the xcap fallback (which still needs a diff for the static-screen skip).
+            let mut scaled: Option<(Vec<u8>, u32, u32, u32, u32, u32, JpegColor, bool)> = None;
             let mut timed_out = false;
             let mut cap_us = 0u32;
 
@@ -712,8 +778,8 @@ where
                             let s0 = Instant::now();
                             // BGRA source (already GPU-downscaled to ~max_w); the CPU
                             // resize just trims to the exact target across all cores.
-                            if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(d.buffer(), gw, gh, max_w, fast, true) {
-                                scaled = Some((rgb, ow, oh, native_w, native_h, s0.elapsed().as_micros() as u32, true));
+                            if let Some((px, ow, oh)) = scale_u8x4(d.buffer(), gw, gh, max_w, fast) {
+                                scaled = Some((px, ow, oh, native_w, native_h, s0.elapsed().as_micros() as u32, JpegColor::Bgra, true));
                             }
                         }
                         super::dxdupe::Grab::Timeout => timed_out = true,
@@ -724,8 +790,8 @@ where
                     let (sw, sh) = (rgba.width(), rgba.height());
                     let raw = rgba.into_raw();
                     let s0 = Instant::now();
-                    if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, fast, false) {
-                        scaled = Some((rgb, ow, oh, sw, sh, s0.elapsed().as_micros() as u32, false));
+                    if let Some((px, ow, oh)) = scale_u8x4(&raw, sw, sh, max_w, fast) {
+                        scaled = Some((px, ow, oh, sw, sh, s0.elapsed().as_micros() as u32, JpegColor::Rgba, false));
                     }
                 }
             }
@@ -737,20 +803,20 @@ where
                     let (sw, sh) = (rgba.width(), rgba.height());
                     let raw = rgba.into_raw();
                     let s0 = Instant::now();
-                    if let Some((rgb, ow, oh)) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, fast, false) {
-                        scaled = Some((rgb, ow, oh, sw, sh, s0.elapsed().as_micros() as u32, false));
+                    if let Some((px, ow, oh)) = scale_u8x4(&raw, sw, sh, max_w, fast) {
+                        scaled = Some((px, ow, oh, sw, sh, s0.elapsed().as_micros() as u32, JpegColor::Rgba, false));
                     }
                 }
             }
 
-            if let Some((rgb, w, h, nat_w, nat_h, scale_us, from_dd)) = scaled {
+            if let Some((px, w, h, nat_w, nat_h, scale_us, color, from_dd)) = scaled {
                 // DD only ever yields changed frames; the xcap fallback diffs the
                 // scaled result against the previous to preserve the static skip.
                 let changed = from_dd
-                    || last.as_ref().map_or(true, |(prev, pw, ph, _, _)| {
-                        *pw != w || *ph != h || prev.as_slice() != rgb.as_slice()
+                    || last.as_ref().map_or(true, |(prev, pw, ph, _, _, _)| {
+                        *pw != w || *ph != h || prev.as_slice() != px.as_slice()
                     });
-                let rgb = Arc::new(rgb);
+                let px = Arc::new(px);
                 {
                     let (lock, cv) = &*cap_mail;
                     let mut slot = lock.lock();
@@ -758,18 +824,19 @@ where
                     // forward so coalescing can never swallow a real update.
                     let carried = slot.as_ref().map_or(false, |f| f.changed);
                     *slot = Some(RawFrame {
-                        rgb: rgb.clone(),
+                        px: px.clone(),
                         w,
                         h,
                         nat_w,
                         nat_h,
                         cap_us,
                         scale_us,
+                        color,
                         changed: changed || carried,
                     });
                     cv.notify_one();
                 }
-                last = Some((rgb, w, h, nat_w, nat_h));
+                last = Some((px, w, h, nat_w, nat_h, color));
                 last_push = Instant::now();
 
                 // Pace to target fps. Desktop Duplication already blocked up to the
@@ -781,19 +848,20 @@ where
                 }
             } else {
                 // No new frame. Re-send the last one occasionally for keep-alive.
-                if let Some((rgb, w, h, sw, sh)) = &last {
+                if let Some((px, w, h, sw, sh, color)) = &last {
                     if last_push.elapsed() >= Duration::from_millis(700) {
                         let (lock, cv) = &*cap_mail;
                         let mut slot = lock.lock();
                         let carried = slot.as_ref().map_or(false, |f| f.changed);
                         *slot = Some(RawFrame {
-                            rgb: rgb.clone(),
+                            px: px.clone(),
                             w: *w,
                             h: *h,
                             nat_w: *sw,
                             nat_h: *sh,
                             cap_us,
                             scale_us: 0,
+                            color: *color,
                             changed: carried,
                         });
                         cv.notify_one();
@@ -813,6 +881,7 @@ where
     // ---- encoder thread: change-detect + SIMD JPEG + emit ----
     let enc_mail = mailbox;
     std::thread::spawn(move || {
+        boost_capture_thread();
         let mut last_emit = Instant::now() - Duration::from_secs(2);
         while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
             let frame = {
@@ -845,7 +914,7 @@ where
             // no whole-frame diff here (a 4K memcmp per frame was pure overhead).
             if frame.changed || stale {
                 let enc0 = Instant::now();
-                if let Some(jpg) = encode_frame(&frame.rgb, frame.w, frame.h, quality) {
+                if let Some(jpg) = encode_frame(&frame.px, frame.w, frame.h, quality, frame.color) {
                     ST_ENC_US.store(enc0.elapsed().as_micros() as u32, Ordering::Relaxed);
                     ST_BYTES.store(jpg.len() as u32, Ordering::Relaxed);
                     ST_PRODUCED.fetch_add(1, Ordering::Relaxed);

@@ -102,8 +102,9 @@ type KeyDef = {
   run: () => void;
   /** For sticky modifiers, the modifier this key represents (drives active state). */
   mod?: Mod;
-  /** The single wire key name this cap maps to — set to make it hold-latchable in
-   *  Hold mode (keydown on first tap, keyup on the next). Combos/media stay tap-only. */
+  /** The single wire key name this cap maps to — press-and-hold sends keydown
+   *  while the finger is down and keyup on release (natural hold). Combos/media
+   *  stay tap-only; sticky modifiers use `mod` instead. */
   wire?: string;
 };
 
@@ -487,28 +488,31 @@ export function ControlScreen({
       return prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id];
     });
 
-  // Hold mode: latch keys down instead of tapping them. Tap once to press-and-hold
-  // (keydown), tap again to release (keyup) — so you can hold a key (arrows / a
-  // game key / a modifier combo) while doing other things, which a plain tap can't.
-  // `heldKeys` tracks the wire names currently held so they highlight and can be
-  // released together. Kept independent of the panel so a hold survives closing it.
-  const [holdMode, setHoldMode] = useState(false);
+  // Natural hold: while a finger is down on a holdable key (has `wire`), we send
+  // keydown and keep it in `heldKeys` for highlight; keyup on release. No manual
+  // "Hold mode" toggle — press-and-hold is the normal gesture. Sticky modifiers
+  // still latch via `mods` (they're meant to stay down across other taps).
   const [heldKeys, setHeldKeys] = useState<Set<string>>(new Set());
   const heldKeysRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     heldKeysRef.current = heldKeys;
   }, [heldKeys]);
-  const toggleHold = (wire: string) => {
-    navigator.vibrate?.(8);
+  const pressHold = (wire: string) => {
+    if (heldKeysRef.current.has(wire)) return;
+    navigator.vibrate?.(6);
+    send({ type: "keydown", name: wire });
     setHeldKeys((prev) => {
       const next = new Set(prev);
-      if (next.has(wire)) {
-        next.delete(wire);
-        send({ type: "keyup", name: wire });
-      } else {
-        next.add(wire);
-        send({ type: "keydown", name: wire });
-      }
+      next.add(wire);
+      return next;
+    });
+  };
+  const releaseHold = (wire: string) => {
+    if (!heldKeysRef.current.has(wire)) return;
+    send({ type: "keyup", name: wire });
+    setHeldKeys((prev) => {
+      const next = new Set(prev);
+      next.delete(wire);
       return next;
     });
   };
@@ -566,10 +570,35 @@ export function ControlScreen({
   const natRef = useRef({ w: 0, h: 0 });
 
   // Live stream quality (sliders only). `bitrate` is kbps. Defaults tuned for a
-  // crisp desktop: 1920-wide, Text mode, max sharpness.
-  const [streamQ, setStreamQ] = useState({ maxW: 1920, quality: 100, fps: 40, bitrate: 12000 });
+  // crisp desktop: 1920-wide, Text mode, max sharpness. Persisted so a tuned
+  // setup (e.g. lower res + Video mode for gaming) survives app restarts.
+  const [streamQ, setStreamQ] = useState(() => {
+    const dflt = { maxW: 1920, quality: 100, fps: 40, bitrate: 12000 };
+    try {
+      const raw = localStorage.getItem("gt.remote.streamQ");
+      if (!raw) return dflt;
+      const p = JSON.parse(raw) as Partial<typeof dflt>;
+      return {
+        maxW: clamp(Number(p.maxW) || dflt.maxW, 320, 3840),
+        quality: clamp(Number(p.quality) || dflt.quality, 20, 100),
+        fps: clamp(Number(p.fps) || dflt.fps, 10, 60),
+        bitrate: clamp(Number(p.bitrate) || dflt.bitrate, 500, 40000),
+      };
+    } catch {
+      return dflt;
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem("gt.remote.streamQ", JSON.stringify(streamQ));
+  }, [streamQ]);
   // Content optimization: sharpen for text/UI, smooth for video, or auto.
-  const [contentMode, setContentMode] = useState<ContentMode>("text");
+  const [contentMode, setContentMode] = useState<ContentMode>(() => {
+    const m = localStorage.getItem("gt.remote.contentMode");
+    return m === "auto" || m === "text" || m === "video" ? m : "text";
+  });
+  useEffect(() => {
+    localStorage.setItem("gt.remote.contentMode", contentMode);
+  }, [contentMode]);
   const [showStats, setShowStats] = useState(false);
   const [fps, setFps] = useState(0);
   const [res, setRes] = useState("");
@@ -2149,7 +2178,7 @@ export function ControlScreen({
       )}
 
       {/* ---- pinned quick-button rail (small, semi-transparent, screen edge) ---- */}
-      {!(typing && !questBrowser) && pinnedDefs.length > 0 && (
+      {pinnedDefs.length > 0 && (
         <div
           className="pointer-events-none absolute right-1.5 top-1/2 z-30 flex max-h-[70%] -translate-y-1/2 flex-col gap-1.5 overflow-y-auto py-1"
           style={{ scrollbarWidth: "none" }}
@@ -2159,15 +2188,14 @@ export function ControlScreen({
               <PinnedButton
                 key={pid}
                 def={def}
+                pinMode={pinMode}
                 active={(def.mod ? mods.has(def.mod) : false) || (!!def.wire && heldKeys.has(def.wire))}
                 onRun={() => {
                   navigator.vibrate?.(8);
-                  // A latchable key toggles hold when Hold mode is on or it's already
-                  // held (so a held key can be released straight from the rail);
-                  // otherwise it just taps.
-                  if (def.wire && (holdMode || heldKeys.has(def.wire))) toggleHold(def.wire);
-                  else def.run();
+                  def.run();
                 }}
+                onHoldDown={() => def.wire && pressHold(def.wire)}
+                onHoldUp={() => def.wire && releaseHold(def.wire)}
                 onUnpin={() => togglePin(pid)}
               />
             ))}
@@ -2242,7 +2270,7 @@ export function ControlScreen({
           if (pcTextFieldRef.current || questKbdLockedRef.current) setTyping(true);
           if (!isQuestBrowser()) {
             setTyping(true);
-            setDockCollapsed(true);
+            // Keep the bottom dock visible — users still need keys/pins while typing.
             setPanel(null);
           }
           // Belt-and-braces: undo any IME scroll the moment focus lands.
@@ -2302,7 +2330,7 @@ export function ControlScreen({
       )}
 
       {/* ==== bottom control bar ==== */}
-      {!immersive && !dockCollapsed && !(typing && !questBrowser) && (
+      {!immersive && !dockCollapsed && (
         <motion.div
           initial={{ y: 32, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
@@ -2340,17 +2368,7 @@ export function ControlScreen({
             <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2.5">
               <PinModeToggle
                 active={pinMode}
-                onClick={() => {
-                  setPinMode((v) => !v);
-                  setHoldMode(false);
-                }}
-              />
-              <HoldModeToggle
-                active={holdMode}
-                onClick={() => {
-                  setHoldMode((v) => !v);
-                  setPinMode(false);
-                }}
+                onClick={() => setPinMode((v) => !v)}
               />
               {heldKeys.size > 0 && <ReleaseHeldButton count={heldKeys.size} onClick={releaseAllHeld} />}
               <Sep />
@@ -2361,10 +2379,10 @@ export function ControlScreen({
                   pinMode={pinMode}
                   pinned={pinned.includes(`k:${k.id}`)}
                   active={k.mod ? mods.has(k.mod) : false}
-                  holdMode={holdMode}
                   held={!!k.wire && heldKeys.has(k.wire)}
                   onFire={k.run}
-                  onToggleHold={() => k.wire && toggleHold(k.wire)}
+                  onHoldDown={() => k.wire && pressHold(k.wire)}
+                  onHoldUp={() => k.wire && releaseHold(k.wire)}
                   onTogglePin={() => togglePin(`k:${k.id}`)}
                 />
               ))}
@@ -2736,17 +2754,18 @@ function KeyCombo({ keys, active, small }: { keys: string[]; active?: boolean; s
   );
 }
 /** A dock button rendering a keycap combo with a caption + pin overlay. In pin
- *  mode a tap toggles the pin instead of firing the key. Custom shortcuts also
- *  get a trash badge in pin mode so they can be deleted (builtins never are). */
+ *  mode a tap toggles the pin instead of firing the key. Holdable keys (single
+ *  wire) use press-and-hold: keydown while the finger is down, keyup on release.
+ *  Custom shortcuts also get a trash badge in pin mode so they can be deleted. */
 function KeyCapButton({
   def,
   pinMode,
   pinned,
   active,
-  holdMode,
   held,
   onFire,
-  onToggleHold,
+  onHoldDown,
+  onHoldUp,
   onTogglePin,
   deletable,
   onDelete,
@@ -2755,12 +2774,11 @@ function KeyCapButton({
   pinMode: boolean;
   pinned: boolean;
   active?: boolean;
-  /** Hold mode is on — a hold-latchable cap toggles keydown/keyup instead of tapping. */
-  holdMode?: boolean;
-  /** This cap is currently latched down. */
+  /** This cap is currently held down (finger still on it). */
   held?: boolean;
   onFire: () => void;
-  onToggleHold?: () => void;
+  onHoldDown?: () => void;
+  onHoldUp?: () => void;
   onTogglePin: () => void;
   deletable?: boolean;
   onDelete?: () => void;
@@ -2768,19 +2786,41 @@ function KeyCapButton({
   // A cap can be held if it maps to a single wire key (not a sticky modifier — those
   // already latch via the mods set — and not a multi-key chord).
   const holdable = !!def.wire && !def.mod;
-  const willHold = !!holdMode && holdable;
+  const holding = useRef(false);
   return (
     <motion.button
       whileTap={pinMode ? { scale: 0.92 } : { scale: 0.86, y: 2 }}
       transition={{ type: "spring", stiffness: 600, damping: 20 }}
+      onPointerDown={(e) => {
+        if (pinMode || !holdable) return;
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+        holding.current = true;
+        onHoldDown?.();
+      }}
+      onPointerUp={(e) => {
+        if (!holding.current) return;
+        holding.current = false;
+        try {
+          e.currentTarget.releasePointerCapture?.(e.pointerId);
+        } catch {
+          /* ignore */
+        }
+        onHoldUp?.();
+      }}
+      onPointerCancel={() => {
+        if (!holding.current) return;
+        holding.current = false;
+        onHoldUp?.();
+      }}
       onClick={() => {
         if (pinMode) {
           onTogglePin();
           return;
         }
+        // Holdable keys are driven by pointer down/up — ignore the click.
+        if (holdable) return;
         navigator.vibrate?.(6);
-        if (willHold) onToggleHold?.();
-        else onFire();
+        onFire();
       }}
       className="relative flex shrink-0 flex-col items-center gap-0.5 rounded-xl px-1 py-0.5"
     >
@@ -2826,23 +2866,7 @@ function PinModeToggle({ active, onClick }: { active: boolean; onClick: () => vo
     </button>
   );
 }
-/** Toggle Hold mode: while on, tapping a key latches it down (keydown) until tapped
- *  again (keyup), so a key can stay held while you do other things. */
-function HoldModeToggle({ active, onClick }: { active: boolean; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      title={active ? "Done holding" : "Hold: tap a key to press-and-hold it"}
-      className={`flex h-9 shrink-0 items-center gap-1 rounded-lg border px-2 text-[10px] font-800 uppercase tracking-wide transition active:scale-95 ${
-        active ? "border-accent-1 bg-accent-1/20 text-accent-1" : "border-white/[0.08] bg-white/[0.03] text-ink-dim"
-      }`}
-    >
-      <Grab className="h-3.5 w-3.5" />
-      {active ? "Done" : "Hold"}
-    </button>
-  );
-}
-/** Release-all pill shown while any key is latched down — one tap frees them. */
+/** Emergency release if a holdable key got stuck (rare pointer-cancel misses). */
 function ReleaseHeldButton({ count, onClick }: { count: number; onClick: () => void }) {
   return (
     <button
@@ -2855,35 +2879,28 @@ function ReleaseHeldButton({ count, onClick }: { count: number; onClick: () => v
     </button>
   );
 }
-/** A pinned quick button on the floating edge rail — small + semi-transparent,
- *  tap fires, long-press unpins (task: pinnable floating buttons). */
+/** A pinned quick button on the floating edge rail — small + semi-transparent.
+ *  Holdable keys use natural press-and-hold (keydown while down). Unpin only in
+ *  Pin mode (tap the rail button) — long-press used to unpin and stole holds. */
 function PinnedButton({
   def,
+  pinMode,
   active,
   onRun,
+  onHoldDown,
+  onHoldUp,
   onUnpin,
 }: {
   def: KeyDef;
+  pinMode: boolean;
   active?: boolean;
   onRun: () => void;
+  onHoldDown?: () => void;
+  onHoldUp?: () => void;
   onUnpin: () => void;
 }) {
-  const timer = useRef<number | null>(null);
-  const longFired = useRef(false);
-  const start = () => {
-    longFired.current = false;
-    timer.current = window.setTimeout(() => {
-      longFired.current = true;
-      navigator.vibrate?.(16);
-      onUnpin();
-    }, 550);
-  };
-  const clear = () => {
-    if (timer.current) {
-      clearTimeout(timer.current);
-      timer.current = null;
-    }
-  };
+  const holdable = !!def.wire && !def.mod;
+  const holding = useRef(false);
   return (
     <motion.button
       layout
@@ -2892,19 +2909,51 @@ function PinnedButton({
       exit={{ opacity: 0, x: 24, scale: 0.8 }}
       whileTap={{ scale: 0.9, opacity: 1 }}
       transition={{ type: "spring", stiffness: 500, damping: 30 }}
-      onPointerDown={start}
-      onPointerUp={() => {
-        clear();
-        if (!longFired.current) onRun();
+      onPointerDown={(e) => {
+        if (pinMode || !holdable) return;
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+        holding.current = true;
+        onHoldDown?.();
       }}
-      onPointerLeave={clear}
-      onPointerCancel={clear}
-      className={`pointer-events-auto flex items-center rounded-lg border px-1.5 py-1 backdrop-blur ${
+      onPointerUp={(e) => {
+        if (holding.current) {
+          holding.current = false;
+          try {
+            e.currentTarget.releasePointerCapture?.(e.pointerId);
+          } catch {
+            /* ignore */
+          }
+          onHoldUp?.();
+          return;
+        }
+        if (pinMode) {
+          onUnpin();
+          return;
+        }
+        if (!holdable) onRun();
+      }}
+      onPointerCancel={() => {
+        if (!holding.current) return;
+        holding.current = false;
+        onHoldUp?.();
+      }}
+      className={`pointer-events-auto relative flex items-center rounded-lg border px-1.5 py-1 backdrop-blur ${
         active ? "border-accent-1/70 bg-black/55" : "border-white/10 bg-black/35"
-      }`}
-      title={`${def.keys.join(" + ")}${def.label ? ` (${def.label})` : ""} — long-press to unpin`}
+      } ${pinMode ? "ring-1 ring-accent-3/50" : ""}`}
+      title={
+        pinMode
+          ? `Tap to unpin ${def.keys.join(" + ")}`
+          : holdable
+            ? `${def.keys.join(" + ")} — press and hold`
+            : `${def.keys.join(" + ")}${def.label ? ` (${def.label})` : ""}`
+      }
     >
       <KeyCombo keys={def.keys} active={active} small />
+      {pinMode && (
+        <span className="absolute -right-1 -top-1 grid h-3.5 w-3.5 place-items-center rounded-full bg-accent-3 text-white">
+          <PinOff className="h-2 w-2" />
+        </span>
+      )}
     </motion.button>
   );
 }
