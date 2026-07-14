@@ -366,7 +366,12 @@ export function startHost(opts: HostOptions): () => void {
     if (!videoSender) return;
     const sender = videoSender;
     // A manual bitrate (kbps) from the phone overrides the auto estimate.
-    const capBps = quality.bitrate > 0 ? quality.bitrate * 1000 : bitrateFor(quality);
+    const steadyBps = quality.bitrate > 0 ? quality.bitrate * 1000 : bitrateFor(quality);
+    // Chromium's HW H.264 encoder inserts a large IDR ~every 1s at ≥720p (see
+    // Flashphoner / discuss-webrtc). Without headroom the RTP pacer queues behind
+    // that spike → a visible hitch every second while data-channel input stays
+    // smooth. Leave ~40% above the steady-state estimate so IDRs clear promptly.
+    const capBps = Math.round(steadyBps * 1.4);
     const p = sender.getParameters();
     if (!p.encodings || p.encodings.length === 0) p.encodings = [{}];
     p.encodings[0].maxBitrate = capBps;
@@ -518,10 +523,25 @@ export function startHost(opts: HostOptions): () => void {
     // If the encoder ever falls behind, drop instead of queueing: a queued frame
     // is already stale, and backpressure here would turn into growing latency.
     let pendingWrites = 0;
+    // Pace MediaStreamTrackGenerator timestamps to the target fps. JPEG decode
+    // latency varies frame-to-frame; stamping with wall-clock-at-draw made the
+    // encoder see irregular inter-frame gaps, which the phone's de-jitter buffer
+    // treated as network jitter and periodically "corrected" (smooth → hitch →
+    // smooth). A monotonic cadence + explicit duration keeps playout even.
+    let nextTsUs = 0;
     const pushFrame = () => {
       if (!writer || pendingWrites > 2) return;
       try {
-        const vf = new VideoFrame(canvas, { timestamp: Math.round(performance.now() * 1000) });
+        const fps = Math.max(1, quality.fps);
+        const durUs = Math.round(1_000_000 / fps);
+        const nowUs = Math.round(performance.now() * 1000);
+        if (nextTsUs === 0 || nextTsUs < nowUs - durUs * 4) {
+          // First frame, or we fell far behind a stall — resync to wall clock.
+          nextTsUs = nowUs;
+        }
+        const ts = nextTsUs;
+        nextTsUs += durUs;
+        const vf = new VideoFrame(canvas, { timestamp: ts, duration: durUs });
         pendingWrites++;
         writer
           .write(vf)

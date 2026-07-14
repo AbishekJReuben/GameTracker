@@ -671,11 +671,12 @@ not regress):**
   `click`/`down`/`up` the guest re-sends the last lossy move on the RELIABLE control
   channel — same-stream ordering guarantees button events never land on a stale cursor.
   Only absolute moves may use the lossy path (`moverel` would double-apply if anchored).
-- **Receiver jitter buffer: windowed adaptation, base 80ms** (`cloud.ts`). The drop ratio
+- **Receiver jitter buffer: windowed adaptation, base 100ms** (`cloud.ts`). The drop ratio
   is computed per 3s watchdog tick (deltas), not cumulative-forever — one early burst no
-  longer pins the buffer (and latency) high for the whole session. Base 120→80ms saves
-  ~40ms glass-to-glass; bursty decoders still climb +40ms/tick to 300ms. Guard: skip
-  ticks with <5 frames in the window (static screen ≈ 1 keep-alive fps).
+  longer pins the buffer (and latency) high for the whole session. Base sits at 100ms to
+  absorb Chromium's ~1s HW-H.264 IDR spikes (see pass 3 below); bursty decoders still
+  climb +40ms/tick to 300ms. Guard: skip ticks with <5 frames in the window (static
+  screen ≈ 1 keep-alive fps).
 - **Quality settings persist** on the phone (`gt.remote.streamQ`, `gt.remote.contentMode`
   in localStorage) — a tuned setup survives app restarts.
 
@@ -698,11 +699,12 @@ not regress):**
   truth on the gesture hot path; React state (zoom/pan/cursor) now updates at most once
   per animation frame instead of once per 90–120Hz pointer event — a full ControlScreen
   re-render per touch move was starving the phone's compositor exactly while dragging.
-- **Adaptive jitter-buffer floor** (`cloud.ts`): base stays 80ms, but 10 consecutive
-  clean watchdog windows (<3% drops over 30s) let the floor ease to `JITTER_MIN` 40ms
-  (~40ms less glass-to-glass on proven-stable links). Any bad window (>15% drops)
-  resets the floor to 80 and buffers up as before; new sessions re-earn it. Never 0 —
-  the target is a hint and forcing it to nothing stutters.
+- **Adaptive jitter-buffer floor** (`cloud.ts`): base stays 100ms, but 10 consecutive
+  clean watchdog windows (<3% drops over 30s) let the floor ease toward `JITTER_MIN`
+  60ms. Any bad window (>15% drops) **or a visible freeze** (`freezeCount` delta)
+  resets the floor to 100, raises the buffer, and holds easing for ~12s so we don't
+  sawtooth around Chromium's 1Hz IDR cadence. Never 0 — the target is a hint and
+  forcing it to nothing stutters.
 - **Capture threads hold a `TimerBoost` RAII guard** (`capture.rs`,
   `timeBeginPeriod(1)`/`timeEndPeriod(1)`, needs the `Win32_Media` windows feature):
   Windows sleeps quantize to the ~15.6ms system tick, so the fps-pacing sleeps overshot
@@ -740,3 +742,23 @@ not regress):**
   (`composeText`, tail-truncated via `direction:rtl` + `unicode-bidi:plaintext`);
   the collapsed-top/immersive chip cluster has NO keyboard toggle — the bottom-left
   FAB (immersive/collapsed dock) and the dock's Keyboard tab are the only two.
+
+**v3.9.14+ periodic ~1s video hitch fix (do not regress):**
+- **Symptom:** input (data channel) stays butter-smooth while video is smooth → micro-
+  hitch → smooth on a ~1 Hz cadence. Classic Chromium HW-H.264 publisher behavior at
+  ≥720p ([Flashphoner keyframe notes](https://docs.flashphoner.com/static/WCS53/Streaming_video_functions/Stream_capturing_and_publishing_to_the_server/Key_frames_management_while_capturing_WebRTC_in_browser/) —
+  IDR every 1s; browsers don't expose a keyframe-interval knob —
+  [discuss-webrtc](https://groups.google.com/g/discuss-webrtc/c/Uv8COw8eJCM)). Compounded
+  by irregular `VideoFrame` timestamps (JPEG decode latency) and an aggressive
+  jitter-buffer ease that sawtoothed around each IDR.
+- **Host (`rtcHost.ts`):** pace `MediaStreamTrackGenerator` timestamps to `1/fps` with
+  an explicit `duration` (resync only after a multi-frame stall); apply `maxBitrate` at
+  **1.4×** the steady-state estimate so IDR spikes clear the RTP pacer instead of
+  queueing a hitch. Browser APIs cannot lengthen Chromium's IDR period — don't try
+  PLI loops (that *increases* keyframes).
+- **Guest (`cloud.ts`):** jitter base 100ms / floor 60ms; watch `freezeCount` deltas —
+  a freeze bumps the buffer, restores the floor, and holds easing ~12s; clean easing
+  steps by 10ms (not 20) so we don't dive back into underrun before the next IDR.
+  Forcing `jitterBufferTarget` to 0 (Selkies anti-pattern) reintroduces stutter —
+  never do that ([selkies#157](https://github.com/selkies-project/selkies/issues/157),
+  [MDN jitterBufferTarget](https://developer.mozilla.org/en-US/docs/Web/API/RTCRtpReceiver/jitterBufferTarget)).
