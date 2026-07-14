@@ -69,6 +69,8 @@ export type RtcInboundVideoStats = {
   totalDecodeTime: number;
   /** App-requested jitterBufferTarget currently applied (ms). */
   jitterTargetMs: number;
+  /** UA's own minimum delay estimate (ms) — when this ≫ target, A/V sync or network is padding. */
+  jitterBufferMinimumMs: number;
   /** Packets received (cumulative). */
   packetsReceived: number;
   /** NACK count (receiver asked for retransmits). */
@@ -132,6 +134,12 @@ export class CloudConn {
   // UI would sit on "Reconnecting…" forever. This is never reassigned by screens.
   private deniedCb: (() => void) | null = null;
   private stream: MediaStream | null = null;
+  /** Desktop audio — kept OFF the video MediaStream so Chromium never A/V-syncs
+   *  (lip-sync delays video to the audio jitter buffer — the classic ~200ms lag
+   *  with JB target still reporting 40). See discuss-webrtc "Chromium audio/video
+   *  sync leads to unexpected latency". */
+  private audioStream: MediaStream | null = null;
+  private audioCbs = new Set<(s: MediaStream | null) => void>();
   private lastStatus: Status | null = null;
   private closed = false;
   private connectedOnce = false;
@@ -434,6 +442,9 @@ export class CloudConn {
     this.setProgress("negotiating", "Setting up secure peer connection…");
     this.pc?.close();
     this.stream = null; // new session → new tracks; don't accumulate dead ones
+    this.audioStream = null;
+    this.stopJitterHold();
+    this.videoReceiver = null;
     this.authed = false; // every fresh peer requires re-authorization by the host
     this.videoReceiver = null;
     // A new PC restarts inbound-RTP counters from 0, so the old frame count is
@@ -469,26 +480,34 @@ export class CloudConn {
         this.scheduleReconnect();
       }
     };
-    // The screen now arrives as a real media track (hardware-decoded video). The
-    // host sends video and audio in separate streams (so the receiver never
-    // delays video to lip-sync with the audio jitter buffer); merge the tracks
-    // into one local stream for the single <video> element.
+    // The screen arrives as a real media track (hardware-decoded video). The
+    // host puts video and audio on SEPARATE signaled streams so Chromium's
+    // lip-sync synchronizer never delays video to the audio NetEq buffer.
+    // CRITICAL: keep them separate on the guest too — merging into one
+    // MediaStream for <video> re-enables A/V sync and was the cause of
+    // measured buffer ~200ms while jitterBufferTarget stayed at 40
+    // (jitterBufferTarget is only a MINIMUM in Chromium — A/V sync pads above it).
     this.pc.ontrack = (e) => {
       if (this.pc !== pc) return;
+      if (e.track.kind === "audio") {
+        if (!this.audioStream) this.audioStream = new MediaStream();
+        // Replace any prior audio track (ICE restart / renegotiation).
+        for (const t of this.audioStream.getAudioTracks()) this.audioStream.removeTrack(t);
+        this.audioStream.addTrack(e.track);
+        this.emitAudio();
+        return;
+      }
       if (!this.stream) this.stream = new MediaStream();
+      // Video only — never add audio here.
+      for (const t of this.stream.getVideoTracks()) this.stream.removeTrack(t);
       this.stream.addTrack(e.track);
-      // Shrink the receiver jitter buffer: screen control wants minimal latency, so
-      // trade a little jitter resilience for responsiveness. Not 0 (that stutters at
-      // high resolution) — a small target keeps the decoder from buffering ahead.
       if (e.track.kind === "video") {
         this.videoReceiver = e.receiver;
         this.jitterTarget = JITTER_BASE;
-        this.jitterFloor = JITTER_BASE; // lean target — no earned-lower floor
+        this.jitterFloor = JITTER_BASE;
         this.jitterCleanTicks = 0;
         this.applyJitter();
-        // Capture is deferred until host auth — the track starts muted/empty. When
-        // frames finally arrive, re-notify so <video> rebinds (Quest/WebKit often
-        // won't paint a track that was silent at attach time).
+        this.startJitterHold();
         e.track.onunmute = () => this.emitStream();
         e.track.onmute = () => {
           /* keep listeners; frames may resume after auth */
@@ -594,17 +613,45 @@ export class CloudConn {
 
   /** Apply the current jitter-buffer target to the inbound video receiver. */
   private applyJitter() {
-    const rx = this.videoReceiver as unknown as { jitterBufferTarget?: number; playoutDelayHint?: number } | null;
+    const rx = this.videoReceiver as unknown as {
+      jitterBufferTarget?: number;
+      playoutDelayHint?: number;
+      jitterBufferDelayHint?: number;
+    } | null;
     if (!rx) return;
+    // Chromium treats jitterBufferTarget as a MINIMUM (w3c/webrtc-extensions#199),
+    // not a cap. Re-asserting it (plus the legacy hints) keeps the UA from
+    // drifting upward after underruns when A/V sync is disabled. Never force 0.
     try {
-      rx.jitterBufferTarget = this.jitterTarget; // ms (modern Chromium)
+      rx.jitterBufferTarget = this.jitterTarget;
     } catch {
       /* unsupported */
     }
     try {
-      rx.playoutDelayHint = this.jitterTarget / 1000; // seconds (legacy name)
+      rx.playoutDelayHint = this.jitterTarget / 1000;
     } catch {
       /* unsupported */
+    }
+    try {
+      rx.jitterBufferDelayHint = this.jitterTarget / 1000;
+    } catch {
+      /* unsupported */
+    }
+  }
+
+  /** Re-assert the lean JB hint every 250ms so Chromium doesn't ratchet upward. */
+  private jitterHoldTimer: number | null = null;
+  private startJitterHold() {
+    this.stopJitterHold();
+    this.jitterHoldTimer = window.setInterval(() => {
+      if (this.closed || !this.videoReceiver) return;
+      this.applyJitter();
+    }, 250);
+  }
+  private stopJitterHold() {
+    if (this.jitterHoldTimer != null) {
+      window.clearInterval(this.jitterHoldTimer);
+      this.jitterHoldTimer = null;
     }
   }
 
@@ -847,12 +894,32 @@ export class CloudConn {
       }
     }
   }
+  private emitAudio() {
+    for (const cb of this.audioCbs) {
+      try {
+        cb(this.audioStream);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
   /** Subscribe to the inbound screen video stream (fires immediately if present). */
   onStream(cb: (s: MediaStream) => void): () => void {
     this.streamCbs.add(cb);
     if (this.stream) cb(this.stream);
     return () => {
       this.streamCbs.delete(cb);
+    };
+  }
+  /**
+   * Desktop audio track — separate from {@link onStream} on purpose so the
+   * <video> element never shares a MediaStream with audio (A/V sync lag).
+   */
+  onAudioStream(cb: (s: MediaStream | null) => void): () => void {
+    this.audioCbs.add(cb);
+    cb(this.audioStream);
+    return () => {
+      this.audioCbs.delete(cb);
     };
   }
   private emitEvent(e: HostEvent) {
@@ -935,6 +1002,10 @@ export class CloudConn {
       jitterBufferEmittedCount: inbound.jitterBufferEmittedCount ?? 0,
       totalDecodeTime: inbound.totalDecodeTime ?? 0,
       jitterTargetMs: this.jitterTarget,
+      jitterBufferMinimumMs:
+        (inbound.jitterBufferEmittedCount ?? 0) > 0
+          ? Math.round(((inbound.jitterBufferMinimumDelay ?? 0) / inbound.jitterBufferEmittedCount) * 1000)
+          : 0,
       packetsReceived: inbound.packetsReceived ?? 0,
       nackCount: inbound.nackCount ?? 0,
       pliCount: inbound.pliCount ?? 0,
@@ -975,12 +1046,15 @@ export class CloudConn {
     this.clearOfferTimeout();
     this.stopHeartbeat();
     this.stopWatchdog();
+    this.stopJitterHold();
     this.pc?.close();
     this.pc = null;
     this.sig?.close();
     this.sig = null;
     this.stream = null;
+    this.audioStream = null;
     this.streamCbs.clear();
+    this.audioCbs.clear();
     this.eventCbs.clear();
   }
 }

@@ -763,3 +763,17 @@ not regress):**
   Forcing `jitterBufferTarget` to 0 (Selkies anti-pattern) reintroduces stutter —
   never do that ([selkies#157](https://github.com/selkies-project/selkies/issues/157),
   [MDN jitterBufferTarget](https://developer.mozilla.org/en-US/docs/Web/API/RTCRtpReceiver/jitterBufferTarget)).
+
+**v3.9.16+ A/V-sync buffer lag (do not regress):**
+- **Symptom:** JB target shows 40ms but measured buffer stays ~200ms; decode fps
+  far below host produce; bitrate can collapse (~200kbps). Chromium implements
+  jitterBufferTarget as a *minimum* only ([webrtc-extensions#199](https://github.com/w3c/webrtc-extensions/issues/199)).
+- **Root cause:** guest merged host audio+video into one MediaStream for
+  <video>, re-enabling lip-sync — video is delayed to the audio NetEq buffer
+  ([discuss-webrtc A/V sync latency](https://groups.google.com/g/discuss-webrtc/c/ZvAHvkHsb0E)).
+  Host already sends separate streams; guest must keep them separate.
+- **Fix:** onStream = video only; onAudioStream + hidden <audio> for PC
+  sound; video element stays muted forever. Re-assert JB hint every 250ms.
+  Host SDP x-google-min-bitrate + encoding minBitrate floor so GCC cannot
+  crush the share to ~200kbps.
+

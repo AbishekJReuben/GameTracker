@@ -99,7 +99,7 @@ function jpegForRtc(q: number): number {
  * any parse failure returns the SDP untouched. RTX (`apt=`) fmtp lines are
  * skipped — the hint belongs on real codec payloads only.
  */
-function boostStartBitrate(sdp: string, startKbps: number): string {
+function boostStartBitrate(sdp: string, startKbps: number, minKbps = 2500): string {
   try {
     const lines = sdp.split("\r\n");
     const mline = lines.find((l) => l.startsWith("m=video"));
@@ -111,8 +111,17 @@ function boostStartBitrate(sdp: string, startKbps: number): string {
         if (l.startsWith("m=")) inVideo = l.startsWith("m=video");
         if (!inVideo) return l;
         const fm = /^a=fmtp:(\S+) (.+)$/.exec(l);
-        if (fm && pts.has(fm[1]) && !fm[2].includes("apt=") && !fm[2].includes("x-google-start-bitrate")) {
-          return `${l};x-google-start-bitrate=${startKbps}`;
+        if (fm && pts.has(fm[1]) && !fm[2].includes("apt=")) {
+          let params = fm[2];
+          if (!params.includes("x-google-start-bitrate")) {
+            params += `;x-google-start-bitrate=${startKbps}`;
+          }
+          // Floor so GCC can't collapse the screen share to ~200kbps (seen as
+          // decode 19fps / bitrate 208k while host still produces 60).
+          if (!params.includes("x-google-min-bitrate")) {
+            params += `;x-google-min-bitrate=${minKbps}`;
+          }
+          return `a=fmtp:${fm[1]} ${params}`;
         }
         return l;
       })
@@ -385,6 +394,10 @@ export function startHost(opts: HostOptions): () => void {
     if (!p.encodings || p.encodings.length === 0) p.encodings = [{}];
     p.encodings[0].maxBitrate = capBps;
     p.encodings[0].maxFramerate = quality.fps;
+    // Chromium accepts minBitrate on encodings even though it isn't in the W3C
+    // IDL — floor BWE so screen share can't collapse to ~200kbps. Best-effort.
+    const minBps = Math.min(Math.round(capBps * 0.25), 3_000_000);
+    (p.encodings[0] as RTCRtpEncodingParameters & { minBitrate?: number }).minBitrate = Math.max(1_500_000, minBps);
     // Bias the transport toward the screen video: bandwidth allocation over the
     // other channels and DSCP marking on networks that honor it.
     p.encodings[0].priority = "high";
@@ -1418,7 +1431,7 @@ export function startHost(opts: HostOptions): () => void {
       } else if (m.type === "answer" && pc) {
         // Munge the guest's answer so the video encoder starts near its working
         // bitrate instead of ramping up from Chromium's ~300kbps default.
-        await pc.setRemoteDescription({ type: "answer", sdp: boostStartBitrate(m.sdp, 4000) });
+        await pc.setRemoteDescription({ type: "answer", sdp: boostStartBitrate(m.sdp, 8000, 2500) });
       } else if (m.type === "candidate" && pc) {
         try {
           await pc.addIceCandidate(m.candidate);

@@ -51,6 +51,8 @@ export interface RemoteLink {
   onFrame(cb: (frame: Uint8Array) => void): void;
   /** Deliver the inbound screen as a WebRTC media stream (cloud video-track path). */
   onStream(cb: (stream: MediaStream) => void): void | (() => void);
+  /** Desktop audio only — never merged into the video stream (A/V sync lag). */
+  onAudioStream?(cb: (stream: MediaStream | null) => void): void | (() => void);
   /** Unsolicited host events (e.g. PC text-field focus). */
   onEvent(cb: (e: { event: string; [k: string]: unknown }) => void): void | (() => void);
   onStatus(cb: (connected: boolean) => void): void;
@@ -187,6 +189,9 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
     },
     onStream(cb) {
       return conn.onStream(cb);
+    },
+    onAudioStream(cb) {
+      return conn.onAudioStream(cb);
     },
     onEvent(cb) {
       return conn.onEvent(cb);

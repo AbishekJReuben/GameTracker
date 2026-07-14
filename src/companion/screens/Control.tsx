@@ -104,6 +104,8 @@ type NetStats = {
   decMs: number;
   /** App-requested jitterBufferTarget (ms). */
   jbTargetMs: number;
+  /** UA minimum delay estimate (ms). */
+  jbMinMs: number;
   packetsReceived: number;
   nackCount: number;
   pliCount: number;
@@ -360,6 +362,8 @@ export function ControlScreen({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  /** Separate from <video> — sharing a MediaStream with audio triggers A/V sync lag. */
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const kbdRef = useRef<HTMLInputElement | null>(null);
   /** Last WebRTC stream — kept so we can rebind after auth when the track was empty. */
@@ -374,6 +378,8 @@ export function ControlScreen({
   const [hasStream, setHasStream] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
   const [soundOn, setSoundOn] = useState(false);
+  const soundOnRef = useRef(false);
+  soundOnRef.current = soundOn;
   const [mode, setMode] = useState<Mode>(() => (isQuestBrowser() ? "touch" : "trackpad"));
   // Expanded bottom panel (null = collapsed). It pushes the viewport up, never overlaps.
   const [panel, setPanel] = useState<Panel | null>(null);
@@ -729,15 +735,23 @@ export function ControlScreen({
       if (!v) return;
       if (force || v.srcObject !== stream) v.srcObject = stream;
       setHasStream(true);
-      setHasAudio(stream.getAudioTracks().length > 0);
-      stream.addEventListener?.("addtrack", (e) => {
-        if ((e as MediaStreamTrackEvent).track?.kind === "audio") setHasAudio(true);
+      // Video element stays muted forever — PC sound rides audioRef.
+      v.muted = true;
+      stream.addEventListener?.("addtrack", () => {
+        /* video-only stream */
       });
-      // Empty pre-auth tracks often need an explicit play() after frames start.
       v.play?.().catch(() => {});
     };
     // Cloud: the screen arrives as a hardware-decoded WebRTC video track.
     const unsubStream = link.onStream((stream) => bindStream(stream, true));
+    const unsubAudio = link.onAudioStream?.((stream) => {
+      setHasAudio(!!stream && stream.getAudioTracks().length > 0);
+      const a = audioRef.current;
+      if (!a) return;
+      a.srcObject = stream;
+      a.muted = !soundOnRef.current;
+      if (soundOnRef.current) a.play?.().catch(() => {});
+    });
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     const unsubEvent = link.onEvent((e) => {
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
@@ -773,6 +787,7 @@ export function ControlScreen({
     return () => {
       unsubProgress?.();
       unsubStream?.();
+      unsubAudio?.();
       unsubEvent?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1038,6 +1053,7 @@ export function ControlScreen({
         bufMs: Math.round(bufMs),
         decMs: Math.round(decMs * 10) / 10,
         jbTargetMs: s.jitterTargetMs ?? 0,
+        jbMinMs: s.jitterBufferMinimumMs ?? 0,
         packetsReceived: s.packetsReceived ?? 0,
         nackCount: s.nackCount ?? 0,
         pliCount: s.pliCount ?? 0,
@@ -1897,13 +1913,14 @@ export function ControlScreen({
     })
     .filter((x): x is { pid: string; def: KeyDef } => x !== null);
   // Mobile browsers only allow audio to start from a user gesture, so PC sound is
-  // muted until the user taps this — then we unmute the video element's audio track.
+  // muted until the user taps this — then we unmute the *separate* audio element
+  // (video stays muted forever so Chromium never A/V-syncs the screen track).
   const toggleSound = () => {
-    const v = videoRef.current;
-    if (!v) return;
+    const a = audioRef.current;
+    if (!a) return;
     const next = !soundOn;
-    v.muted = !next;
-    if (next) v.play?.().catch(() => {});
+    a.muted = !next;
+    if (next) a.play?.().catch(() => {});
     setSoundOn(next);
   };
 
@@ -2167,6 +2184,8 @@ export function ControlScreen({
             cursor: "inherit",
           }}
         />
+        {/* Desktop audio — MUST stay off the video MediaStream (A/V sync). */}
+        <audio ref={audioRef} autoPlay playsInline className="hidden" />
         <canvas
           ref={canvasRef}
           hidden={hasStream}
@@ -2309,7 +2328,7 @@ export function ControlScreen({
             />
             <StatCell k="RTT" v={net ? `${net.rttMs} ms` : "—"} />
             <StatCell k="Buffer" v={net ? `${net.bufMs} ms` : "—"} hi={!!net && net.bufMs > 60} />
-            <StatCell k="JB target" v={net ? `${net.jbTargetMs} ms` : "—"} />
+            <StatCell k="JB tgt/min" v={net ? `${net.jbTargetMs}·${net.jbMinMs}` : "—"} />
             <StatCell k="Decode ms" v={net ? `${net.decMs.toFixed(1)}` : "—"} />
             <StatCell k="Jitter" v={net ? `${net.jitterMs} ms` : "—"} />
             <StatCell k="Loss" v={net ? `${net.lostPkts} pkt` : "—"} />
@@ -2883,6 +2902,9 @@ function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps
   const phoneLag = net ? Math.round(net.rttMs / 2 + net.bufMs + net.decMs) : 0;
   const hostMs = host ? host.captureMs + host.scaleMs + host.encodeMs : 0;
   if (net && net.bufMs > 80) {
+    if (net.jbMinMs > net.jbTargetMs + 40) {
+      return `UA min ${net.jbMinMs}ms ≫ target ${net.jbTargetMs} — A/V sync or arrival jitter.`;
+    }
     return `Buffer ${net.bufMs}ms (target ${net.jbTargetMs}) — main lag. Want ≤40.`;
   }
   if (net && phoneLag > 60 && net.bufMs > 45) {
