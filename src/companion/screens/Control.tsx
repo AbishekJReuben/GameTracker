@@ -91,8 +91,11 @@ import {
   shapeClass,
   chromeClass,
   PIN_STYLE_DEFAULTS,
+  nextToolbarScale,
+  toolbarScaleOf,
   type ControlChrome,
   type PinStyle,
+  type ToolbarId,
 } from "../controlChrome";
 import { PinEditorSheet } from "../components/PinEditorSheet";
 
@@ -157,7 +160,8 @@ const TAP_SLOP = 12; // max finger travel (px) still counted as a tap
 const DOUBLE_MS = 320; // window to chain a double-tap (→ double click / drag)
 const LONGPRESS_MS = 550; // hold to fire a right-click
 const SCROLL_STEP = 20; // finger px per wheel notch
-const MAX_ZOOM = 6;
+const MIN_ZOOM = 0.25; // 25% — match toolbar / pin scale floor
+const MAX_ZOOM = 10; // 1000%
 const FOLLOW_MARGIN = 72; // keep the cursor this far from the viewport edge when zoomed
 const EDGE_MARGIN = 56; // trackpad edge zone (px): a held finger here auto-pans the cursor
 const EDGE_SPEED = 0.016; // max cursor movement (fraction of the screen) per frame at the very edge
@@ -636,26 +640,31 @@ export function ControlScreen({
   // to the screen edge so they're always one tap away without opening the dock.
   // Pinned keys/shortcuts/actions — free placement + per-pin chrome styles.
   const [chrome, setChrome] = useState<ControlChrome>(() => loadControlChrome());
-  const persistChrome = (next: ControlChrome) => {
-    saveControlChrome(next);
-    setChrome(next);
+  /** Functional persist — never clobber concurrent pin moves / other style edits. */
+  const updateChrome = (fn: (prev: ControlChrome) => ControlChrome) => {
+    setChrome((prev) => {
+      const next = fn(prev);
+      saveControlChrome(next);
+      return next;
+    });
   };
   const pinned = chrome.pinned;
   const pinLayout = chrome.layout;
-  const [pinEditId, setPinEditId] = useState<string | null>(null);
+  const [pinEdit, setPinEdit] = useState<null | { id: string; title: string; initial: PinStyle }>(null);
   const pinLayerRef = useRef<HTMLDivElement | null>(null);
   const reducedMotion = useReducedMotion();
   // Pin-edit mode: tap catalog to pin/unpin; drag floating pins; long-press/gear = style editor.
   const [pinMode, setPinMode] = useState(false);
   const togglePin = (id: string) => {
     navigator.vibrate?.(10);
-    setChrome((prev) => {
+    updateChrome((prev) => {
       const next = { ...prev };
       if (prev.pinned.includes(id)) {
         next.pinned = prev.pinned.filter((p) => p !== id);
         const layout = { ...prev.layout };
         delete layout[id];
         next.layout = layout;
+        // Keep styles so re-pinning restores the customized look.
       } else {
         if (prev.pinned.length >= 24) return prev;
         next.pinned = [...prev.pinned, id];
@@ -666,16 +675,29 @@ export function ControlScreen({
           };
         }
       }
-      saveControlChrome(next);
       return next;
     });
   };
-  const setPinLayoutPos = (id: string, x: number, y: number) => {
-    setChrome((prev) => {
-      const next = { ...prev, layout: { ...prev.layout, [id]: { x, y } } };
-      saveControlChrome(next);
-      return next;
+  const bumpToolbarScale = (id: ToolbarId) => {
+    updateChrome((prev) => {
+      const cur = toolbarScaleOf(prev, id);
+      const prevTb = prev.toolbars[id];
+      return {
+        ...prev,
+        toolbars: {
+          ...prev.toolbars,
+          [id]: {
+            order: prevTb?.order ?? [],
+            hidden: prevTb?.hidden ?? [],
+            density: prevTb?.density ?? "comfy",
+            scale: nextToolbarScale(cur),
+          },
+        },
+      };
     });
+  };
+  const setPinLayoutPos = (id: string, x: number, y: number) => {
+    updateChrome((prev) => ({ ...prev, layout: { ...prev.layout, [id]: { x, y } } }));
   };
 
   // Natural hold: while a finger is down on a holdable key (has `wire`), we send
@@ -769,20 +791,18 @@ export function ControlScreen({
   };
   const deleteCustomShortcut = (id: string) => {
     setCustomShortcuts((prev) => prev.filter((c) => c.id !== id));
-    setChrome((prev) => {
+    updateChrome((prev) => {
       const pid = `s:${id}`;
       const layout = { ...prev.layout };
       delete layout[pid];
       const styles = { ...prev.styles };
       delete styles[pid];
-      const next = {
+      return {
         ...prev,
         pinned: prev.pinned.filter((p) => p !== pid),
         layout,
         styles,
       };
-      saveControlChrome(next);
-      return next;
     });
     navigator.vibrate?.(12);
   };
@@ -1520,7 +1540,7 @@ export function ControlScreen({
     const l = liveLayout();
     if (!l) return;
     const z0 = zoomRef.current;
-    const z1 = clamp(nextZoom, 1, MAX_ZOOM);
+    const z1 = clamp(nextZoom, MIN_ZOOM, MAX_ZOOM);
     // Keep the focal point fixed under the fingers while scaling.
     const fpx = l.cw / 2 + (focalX - l.cw / 2 - panRef.current.x) / z0;
     const fpy = l.ch / 2 + (focalY - l.ch / 2 - panRef.current.y) / z0;
@@ -2071,7 +2091,7 @@ export function ControlScreen({
     const el = viewportRef.current;
     const l = layoutRef.current ?? liveLayout();
     if (!el || !l) {
-      zoomRef.current = clamp(z, 1, MAX_ZOOM);
+      zoomRef.current = clamp(z, MIN_ZOOM, MAX_ZOOM);
       if (zoomRef.current <= 1.01) panRef.current = { x: 0, y: 0 };
       commitView();
       return;
@@ -2919,7 +2939,14 @@ export function ControlScreen({
                   if (def.holdMouse) releaseMouseHold(def.holdMouse);
                 }}
                 onUnpin={() => togglePin(pid)}
-                onEdit={() => setPinEditId(pid)}
+                onEdit={() => {
+                  const style = resolvePinStyle(chrome, pid);
+                  setPinEdit({
+                    id: pid,
+                    initial: style,
+                    title: style.customLabel || def.label || def.keys.join(" + "),
+                  });
+                }}
                 onMove={(x, y) => setPinLayoutPos(pid, x, y)}
               />
             );
@@ -2928,27 +2955,29 @@ export function ControlScreen({
       )}
 
       <AnimatePresence>
-        {pinEditId && registry.get(pinEditId) && (
+        {pinEdit && (
           <PinEditorSheet
-            key={pinEditId}
-            pinId={pinEditId}
-            title={
-              resolvePinStyle(chrome, pinEditId).customLabel ||
-              registry.get(pinEditId)!.label ||
-              registry.get(pinEditId)!.keys.join(" + ")
-            }
-            initial={resolvePinStyle(chrome, pinEditId)}
-            onSave={(st) => persistChrome(patchPinStyle(chrome, pinEditId, st))}
+            key={pinEdit.id}
+            pinId={pinEdit.id}
+            title={pinEdit.title}
+            initial={pinEdit.initial}
+            onSave={(st) => {
+              const id = pinEdit.id;
+              updateChrome((prev) => patchPinStyle(prev, id, st));
+            }}
             onReset={() => {
-              const styles = { ...chrome.styles };
-              delete styles[pinEditId];
-              persistChrome({ ...chrome, styles });
+              const id = pinEdit.id;
+              updateChrome((prev) => {
+                const styles = { ...prev.styles };
+                delete styles[id];
+                return { ...prev, styles };
+              });
             }}
             onUnpin={() => {
-              togglePin(pinEditId);
-              setPinEditId(null);
+              togglePin(pinEdit.id);
+              setPinEdit(null);
             }}
-            onClose={() => setPinEditId(null)}
+            onClose={() => setPinEdit(null)}
           />
         )}
       </AnimatePresence>
@@ -3100,7 +3129,14 @@ export function ControlScreen({
         >
           {/* expanded control panels — each a single horizontally-scrollable row of icons */}
           {panel === "mouse" && (
-            <div className="flex items-end gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2">
+            <div className="flex items-end gap-1 border-b border-white/5">
+              <div className="shrink-0 self-center py-2 pl-2">
+                <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "mouse")} onCycle={() => bumpToolbarScale("mouse")} />
+              </div>
+              <div
+                className="flex min-w-0 flex-1 items-end gap-1.5 overflow-x-auto py-2 pr-2"
+                style={{ zoom: toolbarScaleOf(chrome, "mouse") }}
+              >
               <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
               <Sep />
               <IcoBtn
@@ -3177,6 +3213,7 @@ export function ControlScreen({
                 </div>
                 <span className="text-[8px] font-700 leading-none text-ink-dim">Speed</span>
               </div>
+              </div>
             </div>
           )}
 
@@ -3188,7 +3225,14 @@ export function ControlScreen({
                   <ReleaseHeldButton count={heldKeys.size + heldMouse.size} onClick={releaseAllHeld} />
                 </div>
               )}
-              <div className="flex items-center gap-1.5 overflow-x-auto px-2 py-2.5">
+              <div className="flex items-center gap-1">
+                <div className="shrink-0 self-center py-2 pl-2">
+                  <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "keys")} onCycle={() => bumpToolbarScale("keys")} />
+                </div>
+                <div
+                  className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
+                  style={{ zoom: toolbarScaleOf(chrome, "keys") }}
+                >
                 <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
                 <Sep />
                 {specialKeys.map((k) => (
@@ -3205,12 +3249,20 @@ export function ControlScreen({
                     onTogglePin={() => togglePin(`k:${k.id}`)}
                   />
                 ))}
+                </div>
               </div>
             </div>
           )}
 
           {panel === "shortcuts" && (
-            <div className="flex items-center gap-1.5 overflow-x-auto border-b border-white/5 px-2 py-2.5">
+            <div className="flex items-center gap-1 border-b border-white/5">
+              <div className="shrink-0 self-center py-2 pl-2">
+                <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "shortcuts")} onCycle={() => bumpToolbarScale("shortcuts")} />
+              </div>
+              <div
+                className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
+                style={{ zoom: toolbarScaleOf(chrome, "shortcuts") }}
+              >
               <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
               <Sep />
               {shortcutKeys.map((s) => (
@@ -3302,11 +3354,19 @@ export function ControlScreen({
                   <Plus className="h-4 w-4" />
                 </motion.button>
               )}
+              </div>
             </div>
           )}
 
           {panel === "quality" && (
-            <div className="flex items-center gap-2 overflow-x-auto border-b border-white/5 px-2 py-2">
+            <div className="flex items-center gap-1 border-b border-white/5">
+              <div className="shrink-0 self-center py-2 pl-2">
+                <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "quality")} onCycle={() => bumpToolbarScale("quality")} />
+              </div>
+              <div
+                className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto py-2 pr-2"
+                style={{ zoom: toolbarScaleOf(chrome, "quality") }}
+              >
               <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
                 {CONTENT_MODES.map((m) => (
                   <button key={m.id} onClick={() => setContentMode(m.id)} title={`${m.label} — ${m.hint}`} className={`grid h-8 w-8 place-items-center rounded-md ${contentMode === m.id ? "bg-accent-3 text-white" : "text-ink-dim"}`}>
@@ -3321,6 +3381,7 @@ export function ControlScreen({
               <QSlider icon={<Wifi className="h-3.5 w-3.5" />} label="Mbps" min={1000} max={40000} step={500} value={streamQ.bitrate} fmt={(v) => (v / 1000).toFixed(1)} onChange={(v) => setStreamQ((p) => ({ ...p, bitrate: v }))} />
               <Sep />
               <IcoBtn active={showStats} title="Performance stats" onClick={() => setShowStats((s) => !s)}><Gauge className="h-4 w-4" /></IcoBtn>
+              </div>
             </div>
           )}
 
@@ -3331,39 +3392,20 @@ export function ControlScreen({
                   <ReleaseHeldButton count={heldKeys.size + heldMouse.size} onClick={releaseAllHeld} />
                 </div>
               )}
-              <div
-                className="flex origin-left items-center gap-1.5 overflow-x-auto px-2 py-2.5"
-                style={{ zoom: chrome.toolbars.game?.scale ?? 1 }}
-              >
-                <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
-                <button
-                  type="button"
-                  title="Toolbar size"
-                  onClick={() => {
-                    setChrome((prev) => {
-                      const cur = prev.toolbars.game?.scale ?? 1;
-                      const scale = cur >= 1.15 ? 0.9 : Math.round((cur + 0.1) * 10) / 10;
-                      const next = {
-                        ...prev,
-                        toolbars: {
-                          ...prev.toolbars,
-                          game: { order: [], hidden: [], density: "comfy" as const, scale },
-                        },
-                      };
-                      saveControlChrome(next);
-                      return next;
-                    });
-                  }}
-                  className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-white/[0.08] bg-white/[0.03] px-2 text-[10px] font-800 text-ink-dim"
+              <div className="flex items-center gap-1">
+                <div className="shrink-0 self-center py-2 pl-2">
+                  <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "game")} onCycle={() => bumpToolbarScale("game")} />
+                </div>
+                <div
+                  className="flex min-w-0 flex-1 origin-left items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
+                  style={{ zoom: toolbarScaleOf(chrome, "game") }}
                 >
-                  <SlidersHorizontal className="h-3.5 w-3.5" />
-                  {Math.round((chrome.toolbars.game?.scale ?? 1) * 100)}%
-                </button>
+                <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
                 <button
                   type="button"
                   onClick={() => {
                     const cluster = ["k:w", "k:a", "k:s", "k:d", "k:space"];
-                    setChrome((prev) => {
+                    updateChrome((prev) => {
                       const next = { ...prev, pinned: [...prev.pinned], layout: { ...prev.layout } };
                       const baseX = 72;
                       const baseY = 62;
@@ -3381,22 +3423,29 @@ export function ControlScreen({
                       if (!next.pinned.includes(LMB_HOLD_ID) && next.pinned.length < 24) {
                         next.pinned.push(LMB_HOLD_ID);
                         next.layout[LMB_HOLD_ID] = { x: 14, y: 78 };
-                        next.styles = {
-                          ...next.styles,
-                          [LMB_HOLD_ID]: {
-                            ...PIN_STYLE_DEFAULTS,
-                            scale: 1.25,
-                            w: 1.5,
-                            shape: "pill",
-                            chrome: "solid",
-                            anim: "glow",
-                            labelMode: "label",
-                            customLabel: "Select",
-                            theme: { bg: "rgba(124,92,255,0.4)", border: "#7c5cff", accent: "#7c5cff", fg: "#fff" },
-                          },
-                        };
+                        // Only seed Select-hold style if the user hasn't customized it yet.
+                        if (!next.styles[LMB_HOLD_ID]) {
+                          next.styles = {
+                            ...next.styles,
+                            [LMB_HOLD_ID]: {
+                              ...PIN_STYLE_DEFAULTS,
+                              scale: 1.25,
+                              w: 1.5,
+                              shape: "pill",
+                              chrome: "solid",
+                              anim: "glow",
+                              labelMode: "label",
+                              customLabel: "Select",
+                              theme: {
+                                bg: "rgba(124,92,255,0.4)",
+                                border: "#7c5cff",
+                                accent: "#7c5cff",
+                                fg: "#fff",
+                              },
+                            },
+                          };
+                        }
                       }
-                      saveControlChrome(next);
                       return next;
                     });
                     setPinMode(true);
@@ -3429,25 +3478,31 @@ export function ControlScreen({
                     if (!k) return;
                     const wire = k.trim().toLowerCase();
                     if (!/^[a-z0-9]$/.test(wire)) return;
-                    setChrome((prev) => {
+                    updateChrome((prev) => {
                       if (prev.extraKeys.includes(wire) || (GAME_KEY_WIRES as readonly string[]).includes(wire)) {
                         return prev;
                       }
-                      const next = { ...prev, extraKeys: [...prev.extraKeys, wire].slice(0, 48) };
-                      saveControlChrome(next);
-                      return next;
+                      return { ...prev, extraKeys: [...prev.extraKeys, wire].slice(0, 48) };
                     });
                   }}
                   className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-dashed border-white/20 text-ink-dim"
                 >
                   <Plus className="h-4 w-4" />
                 </button>
+                </div>
               </div>
             </div>
           )}
 
           {panel === "gamepad" && (
-            <div className="flex flex-col gap-2 border-b border-white/5 px-3 py-2.5">
+            <div className="flex gap-1 border-b border-white/5">
+              <div className="shrink-0 self-start py-2.5 pl-2">
+                <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "gamepad")} onCycle={() => bumpToolbarScale("gamepad")} />
+              </div>
+              <div
+                className="flex min-w-0 flex-1 flex-col gap-2 py-2.5 pr-3"
+                style={{ zoom: toolbarScaleOf(chrome, "gamepad") }}
+              >
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   onClick={() => setControllerOn((v) => !v)}
@@ -3475,6 +3530,7 @@ export function ControlScreen({
                   Plug or pair a controller to your phone, then play the game shown here — your controller drives the PC as an Xbox pad. Keep the game focused on the PC.
                 </p>
               )}
+              </div>
             </div>
           )}
 
@@ -3720,7 +3776,32 @@ function Sep() {
   return <span className="mx-0.5 h-6 w-px shrink-0 bg-white/10" />;
 }
 
-/** Top-bar zoom control: chip expands into a vertical slider, collapses on outside tap. */
+/** Compact 25%–1000% toolbar scale cycle — sits outside the zoomed row so it stays small. */
+function ToolbarScaleBtn({ scale, onCycle }: { scale: number; onCycle: () => void }) {
+  const pct = Math.round(scale * 100);
+  return (
+    <button
+      type="button"
+      title={`Toolbar ${pct}% — tap to cycle 25%–1000%`}
+      onPointerDown={(e) => e.preventDefault()}
+      onClick={() => {
+        navigator.vibrate?.(5);
+        onCycle();
+      }}
+      className={`flex h-6 shrink-0 items-center gap-0.5 rounded-md border px-1 text-[9px] font-800 tabular-nums leading-none active:scale-95 ${
+        Math.abs(scale - 1) > 0.02
+          ? "border-accent-3/40 bg-accent-3/15 text-accent-3"
+          : "border-white/[0.08] bg-white/[0.04] text-ink-dim"
+      }`}
+    >
+      <SlidersHorizontal className="h-2.5 w-2.5 opacity-80" />
+      {pct < 1000 ? `${pct}%` : "10×"}
+    </button>
+  );
+}
+
+/** Top-bar zoom control: chip expands into a vertical slider, collapses on outside tap.
+ *  Popover is `fixed` (not absolute) so `overflow-x-auto` on the toolbar can't clip it. */
 function ZoomChip({
   zoom,
   open,
@@ -3736,9 +3817,33 @@ function ZoomChip({
   onReset: () => void;
   compact?: boolean;
 }) {
-  const zoomed = zoom > 1.01;
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
+  const zoomed = zoom > 1.01 || zoom < 0.99;
+  const zoomLabel = zoom >= 10 ? `${Math.round(zoom)}×` : `${zoom.toFixed(1)}×`;
+
+  useEffect(() => {
+    if (!open) {
+      setPos(null);
+      return;
+    }
+    const place = () => {
+      const el = rootRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setPos({ top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
+
   return (
-    <div data-zoom-chip className="relative">
+    <div data-zoom-chip ref={rootRef} className="relative">
       <button
         type="button"
         onClick={onToggle}
@@ -3747,32 +3852,38 @@ function ZoomChip({
             ? "rounded-full bg-black/45 px-2.5 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
             : `rounded-lg px-2 py-1.5 text-xs font-700 ${zoomed || open ? "bg-accent-3/20 text-white" : "bg-white/[0.04] text-ink-soft"}`
         }`}
-        title="Zoom"
+        title="Zoom (25%–1000%)"
       >
-        <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
+        <RotateCcw className="h-3.5 w-3.5" /> {zoomLabel}
         <ChevronDown className={`h-3 w-3 opacity-70 transition ${open ? "rotate-180" : ""}`} />
       </button>
       <AnimatePresence>
-        {open && (
+        {open && pos && (
           <motion.div
             initial={{ opacity: 0, y: -6, scale: 0.92 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -6, scale: 0.92 }}
             transition={{ type: "spring", stiffness: 480, damping: 28 }}
-            className="absolute right-0 top-full z-50 mt-1.5 flex flex-col items-center gap-1.5 rounded-2xl border border-white/15 bg-black/80 px-2.5 py-2 shadow-float backdrop-blur-md"
+            data-zoom-chip
+            className="fixed z-[100] flex flex-col items-center gap-1.5 rounded-2xl border border-white/15 bg-black/90 px-2.5 py-2 shadow-float backdrop-blur-md"
+            style={{ top: pos.top, right: pos.right }}
           >
-            <span className="text-[9px] font-800 tabular-nums text-white">{zoom.toFixed(1)}×</span>
-            <input
-              type="range"
-              min={1}
-              max={MAX_ZOOM}
-              step={0.1}
-              value={zoom}
-              onChange={(e) => onZoom(parseFloat(e.target.value))}
-              className="h-28 w-7 cursor-pointer accent-accent-3"
-              style={{ writingMode: "vertical-lr", direction: "rtl" }}
-              aria-label="Zoom level"
-            />
+            <span className="text-[9px] font-800 tabular-nums text-white">{zoomLabel}</span>
+            {/* Rotated horizontal range — writing-mode vertical is unreliable on Android/WebView. */}
+            <div className="relative flex h-32 w-10 items-center justify-center">
+              <input
+                type="range"
+                min={MIN_ZOOM}
+                max={MAX_ZOOM}
+                step={0.05}
+                value={zoom}
+                onChange={(e) => onZoom(parseFloat(e.target.value))}
+                onInput={(e) => onZoom(parseFloat((e.target as HTMLInputElement).value))}
+                className="h-2 w-28 cursor-pointer accent-accent-3"
+                style={{ transform: "rotate(-90deg)" }}
+                aria-label="Zoom level"
+              />
+            </div>
             <button
               type="button"
               onClick={onReset}

@@ -812,7 +812,11 @@ not regress):**
   to the soft spot so a bad experiment can't wedge pairing.
 - **Control chrome + Game keys (v3.9.22):** pinnable **Hold** (momentary LMB for drag-select),
   Game dock (WASD+/extras), free-place animated pins with per-pin editor
-  (`controlChrome.ts` / `PinEditorSheet`). Shared APK/web/Quest flat.
+  (`controlChrome.ts` / `PinEditorSheet`). Shared APK/web/Quest flat. Pin editor draft is
+  frozen at open (no prop re-sync) so sliders/chips don't reset on Control re-renders.
+  Toolbar scale chips on every dock tab cycle **25%–1000%**; screen zoom **0.25×–10×**.
+  Zoom popover is `position:fixed` (toolbar `overflow-x-auto` was clipping the vertical
+  slider) with a rotated range input for Android/WebView reliability (v3.9.23).
 - **Quest WebXR layers fix (v3.9.22):** when `layers` is granted, set
   `renderState.layers = [XRWebGLLayer]` (not `baseLayer`) or Enter VR throws
   `Can't use baseLayer with layers feature requested`.

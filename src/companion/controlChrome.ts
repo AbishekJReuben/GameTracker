@@ -44,8 +44,28 @@ export type ToolbarPrefs = {
   order: string[];
   hidden: string[];
   density: "compact" | "comfy";
+  /** Toolbar CSS zoom — 0.25 (25%) … 10 (1000%). */
   scale: number;
 };
+
+export const TOOLBAR_SCALE_MIN = 0.25;
+export const TOOLBAR_SCALE_MAX = 10;
+/** Tap-cycle steps for the compact toolbar scale chip. */
+export const TOOLBAR_SCALE_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10] as const;
+
+export function clampToolbarScale(n: number): number {
+  return clamp(Number.isFinite(n) ? n : 1, TOOLBAR_SCALE_MIN, TOOLBAR_SCALE_MAX);
+}
+
+export function nextToolbarScale(cur: number): number {
+  const c = clampToolbarScale(cur);
+  const next = TOOLBAR_SCALE_STEPS.find((s) => s > c + 0.001);
+  return next ?? TOOLBAR_SCALE_STEPS[0];
+}
+
+export function toolbarScaleOf(c: ControlChrome, id: ToolbarId): number {
+  return clampToolbarScale(c.toolbars[id]?.scale ?? 1);
+}
 
 export type ControlChrome = {
   v: typeof CONTROL_CHROME_VERSION;
@@ -86,10 +106,14 @@ function asEnum<T extends string>(v: unknown, allowed: readonly T[], fallback: T
 export function normalizePinStyle(raw: Partial<PinStyle> | null | undefined, base = PIN_STYLE_DEFAULTS): PinStyle {
   const r = raw ?? {};
   const theme = (r.theme ?? {}) as PinTheme;
+  const num = (v: unknown, fallback: number) => {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
   return {
-    scale: clamp(Number(r.scale) || base.scale, 0.7, 2),
-    w: clamp(Number(r.w) || base.w, 0.6, 3),
-    h: clamp(Number(r.h) || base.h, 0.6, 2.5),
+    scale: clamp(num(r.scale, base.scale), 0.25, 10),
+    w: clamp(num(r.w, base.w), 0.25, 10),
+    h: clamp(num(r.h, base.h), 0.25, 10),
     shape: asEnum(r.shape, SHAPES, base.shape),
     chrome: asEnum(r.chrome, CHROMES, base.chrome),
     anim: asEnum(r.anim, ANIMS, base.anim),
@@ -101,7 +125,7 @@ export function normalizePinStyle(raw: Partial<PinStyle> | null | undefined, bas
     },
     labelMode: asEnum(r.labelMode, LABELS, base.labelMode),
     customLabel: typeof r.customLabel === "string" ? r.customLabel.slice(0, 24) : undefined,
-    opacity: clamp(Number(r.opacity) || base.opacity, 0.35, 1),
+    opacity: clamp(num(r.opacity, base.opacity), 0.35, 1),
   };
 }
 
@@ -114,7 +138,7 @@ function normalizeToolbar(raw: Partial<ToolbarPrefs> | undefined): ToolbarPrefs 
     order: Array.isArray(raw?.order) ? raw!.order.filter((x) => typeof x === "string").slice(0, 64) : [],
     hidden: Array.isArray(raw?.hidden) ? raw!.hidden.filter((x) => typeof x === "string").slice(0, 64) : [],
     density: raw?.density === "compact" ? "compact" : "comfy",
-    scale: clamp(Number(raw?.scale) || 1, 0.85, 1.25),
+    scale: clampToolbarScale(Number(raw?.scale) || 1),
   };
 }
 
@@ -124,7 +148,11 @@ export function normalizeControlChrome(raw: unknown): ControlChrome {
   const styles: Record<PinId, Partial<PinStyle>> = {};
   if (r.styles && typeof r.styles === "object") {
     for (const [id, st] of Object.entries(r.styles)) {
-      if (typeof id === "string" && st && typeof st === "object") styles[id] = st;
+      if (typeof id === "string" && st && typeof st === "object") {
+        // Persist a fully normalized copy so theme/scale survive round-trips and
+        // partial edits can't leave half-applied styles that look like a reset.
+        styles[id] = normalizePinStyle(st as Partial<PinStyle>, defaultStyle);
+      }
     }
   }
   const layout: Record<PinId, PinPlacement> = {};
