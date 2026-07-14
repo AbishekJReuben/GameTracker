@@ -14,6 +14,7 @@
  */
 
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc";
+import { isQuestBrowser } from "./device";
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 /** "pending" = link up, awaiting host approval; "denied" = host rejected us. */
@@ -58,6 +59,14 @@ export type RtcInboundVideoStats = {
   jitter: number;
   packetsLost: number;
   freezeCount: number;
+  /** Round-trip time (ms) over the active ICE candidate pair (0 if unknown). */
+  rttMs: number;
+  /** Cumulative seconds frames sat in the receiver jitter buffer (delta / emitted = dwell). */
+  jitterBufferDelay: number;
+  /** Cumulative frames emitted from the jitter buffer (pairs with jitterBufferDelay). */
+  jitterBufferEmittedCount: number;
+  /** Cumulative seconds spent decoding (delta / framesDecoded = per-frame decode ms). */
+  totalDecodeTime: number;
   at: number;
 };
 
@@ -78,6 +87,14 @@ const HARD_RESET_MS = 60000; // transport down this long → full teardown + reb
 // within a few ticks (+40ms per 3s tick at >15% drops).
 const JITTER_BASE = 80;
 const JITTER_MAX = 300;
+// Sustained-clean links may ease the buffer BELOW the base, down to this hard
+// floor — worth ~40ms more glass-to-glass on a stable LAN/Tailscale path. Never
+// 0: the target is a hint and forcing it to nothing causes visible stutter.
+// The floor is earned (30s of <3% drops) and forfeited on the first bad window,
+// so flaky links behave exactly as before.
+const JITTER_MIN = 40;
+/** Consecutive clean watchdog ticks (3s each) required to unlock the low floor. */
+const JITTER_CLEAN_TICKS = 10;
 
 export class CloudConn {
   private sig: Signaling | null = null;
@@ -121,6 +138,9 @@ export class CloudConn {
   private denied = false; // host rejected us — stop auto-reconnecting
   private videoReceiver: RTCRtpReceiver | null = null;
   private jitterTarget = JITTER_BASE;
+  /** Current lower bound for jitterTarget; eases toward JITTER_MIN on clean links. */
+  private jitterFloor = JITTER_BASE;
+  private jitterCleanTicks = 0;
   private watchdogTimer: number | null = null;
   private lastHealthyAt = Date.now();
   private lastDecoded = -1;
@@ -129,6 +149,13 @@ export class CloudConn {
   // (and thus the jitter buffer / latency) elevated for the whole session.
   private winDecoded = 0;
   private winDropped = 0;
+  // Decode-stall self-heal state. `sinkActive` = a Control screen has the video
+  // mounted and expects frames — the gate that makes stall detection safe (the
+  // old blanket decode-stall reconnect was removed because framesDecoded also
+  // stalls when the video simply isn't rendered, e.g. on the Stats tab).
+  private sinkActive = false;
+  private winBytes = 0;
+  private stallTicks = 0;
   // Session id of the offer that built the current pc. A later offer with the SAME
   // id is an ICE-restart renegotiation (apply in place); a different id is a new
   // session (full rebuild). Lets a transient network drop re-route sub-second
@@ -400,6 +427,8 @@ export class CloudConn {
     this.lastDecoded = -1;
     this.winDecoded = 0;
     this.winDropped = 0;
+    this.winBytes = 0;
+    this.stallTicks = 0;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
     pipeIce(pc, this.sig!);
@@ -439,6 +468,8 @@ export class CloudConn {
       if (e.track.kind === "video") {
         this.videoReceiver = e.receiver;
         this.jitterTarget = JITTER_BASE;
+        this.jitterFloor = JITTER_BASE; // new decoder/session must re-earn the low floor
+        this.jitterCleanTicks = 0;
         this.applyJitter();
         // Capture is deferred until host auth — the track starts muted/empty. When
         // frames finally arrive, re-notify so <video> rebinds (Quest/WebKit often
@@ -536,6 +567,16 @@ export class CloudConn {
     }
   }
 
+  /**
+   * Tell the connection whether a screen view is actively consuming the video
+   * (the Control screen sets this on mount/unmount). Gates the decode-stall
+   * self-heal so it can never fire while the stream is intentionally unwatched.
+   */
+  setVideoSink(active: boolean) {
+    this.sinkActive = active;
+    if (!active) this.stallTicks = 0;
+  }
+
   /** Apply the current jitter-buffer target to the inbound video receiver. */
   private applyJitter() {
     const rx = this.videoReceiver as unknown as { jitterBufferTarget?: number; playoutDelayHint?: number } | null;
@@ -605,14 +646,64 @@ export class CloudConn {
       const dDropped = st.framesDropped - this.winDropped;
       this.winDecoded = st.framesDecoded;
       this.winDropped = st.framesDropped;
+
+      // --- Decode-stall self-heal (the "raised resolution → frozen stream" fix).
+      // A mid-stream resolution INCREASE can wedge the phone's hardware H.264
+      // decoder: RTP bytes keep arriving but framesDecoded stops advancing, and
+      // no quality change recovers it — only a fresh decoder does. Detection is
+      // tightly gated (video mounted + page visible + real bytes flowing + zero
+      // decodes) so it can't fire when the stream is merely unwatched. Two-stage
+      // recovery: first ask the host to rebuild its encoder/track in place
+      // (fixes a wedged HOST encoder cheaply, ~6s); if frames still don't decode
+      // (~12s) rebuild the whole peer session — a new receiver + decoder, which
+      // is exactly what a manual disconnect/reconnect did. Quest is excluded:
+      // its immersive sessions consume the video off-DOM and page visibility
+      // semantics differ, so the gate can't be trusted there.
+      const dBytes = st.bytesReceived >= this.winBytes ? st.bytesReceived - this.winBytes : 0;
+      this.winBytes = st.bytesReceived;
+      if (this.sinkActive && !isQuestBrowser() && dDecoded === 0 && dBytes > 30_000) {
+        this.stallTicks++;
+        if (this.stallTicks === 2) {
+          this.sendControl({ type: "vreset" });
+        } else if (this.stallTicks >= 4) {
+          this.stallTicks = 0;
+          this.connecting = false;
+          this.backoff = BACKOFF_MIN;
+          this.clearReconnect();
+          this.setProgress("reconnecting", "Video stalled — rebuilding the stream…");
+          this.emit("disconnected");
+          this.openSignaling(false).catch(() => this.scheduleReconnect());
+          return;
+        }
+      } else if (dDecoded > 0) {
+        this.stallTicks = 0;
+      }
+
       const total = dDecoded + dDropped;
       // Need a handful of frames in the window for the ratio to mean anything
       // (a static screen decodes ~1 keep-alive per second).
       if (total < 5) return;
       const ratio = dDropped / total;
       const prev = this.jitterTarget;
-      if (ratio > 0.15) this.jitterTarget = Math.min(JITTER_MAX, this.jitterTarget + 40);
-      else if (ratio < 0.03) this.jitterTarget = Math.max(JITTER_BASE, this.jitterTarget - 20);
+      if (ratio > 0.15) {
+        // Trouble: buffer up AND restore the conservative floor — it must be
+        // re-earned with another sustained clean stretch.
+        this.jitterCleanTicks = 0;
+        this.jitterFloor = JITTER_BASE;
+        this.jitterTarget = Math.min(JITTER_MAX, this.jitterTarget + 40);
+      } else if (ratio < 0.03) {
+        // Clean window: ease down. After enough consecutive clean ticks the floor
+        // itself steps below the base toward JITTER_MIN, shaving up to ~40ms more
+        // latency on links that have proven stable.
+        this.jitterCleanTicks++;
+        if (this.jitterCleanTicks >= JITTER_CLEAN_TICKS && this.jitterFloor > JITTER_MIN) {
+          this.jitterFloor = Math.max(JITTER_MIN, this.jitterFloor - 20);
+        }
+        this.jitterTarget = Math.max(this.jitterFloor, this.jitterTarget - 20);
+      } else {
+        // Mid-band (3–15% drops): hold steady, but it's not "clean" — reset the streak.
+        this.jitterCleanTicks = 0;
+      }
       if (this.jitterTarget !== prev) this.applyJitter();
     }, WATCHDOG_MS);
   }
@@ -758,24 +849,31 @@ export class CloudConn {
       this.eventCbs.delete(cb);
     };
   }
-  sendControl(msg: unknown) {
-    if (this.chControl?.readyState === "open") this.chControl.send(JSON.stringify(msg));
+  /** Returns true when the message was handed to the open control channel. */
+  sendControl(msg: unknown): boolean {
+    if (this.chControl?.readyState !== "open") return false;
+    try {
+      this.chControl.send(JSON.stringify(msg));
+      return true;
+    } catch {
+      return false;
+    }
   }
   /**
    * Send over the lossy move channel when it's open; falls back to the reliable
    * control channel (older hosts don't create "move"). Only for messages where
    * the next update supersedes a lost one (absolute pointer moves).
    */
-  sendMove(msg: unknown) {
+  sendMove(msg: unknown): boolean {
     if (this.chMove?.readyState === "open") {
       try {
         this.chMove.send(JSON.stringify(msg));
-        return;
+        return true;
       } catch {
         /* fall through to reliable */
       }
     }
-    this.sendControl(msg);
+    return this.sendControl(msg);
   }
   /**
    * Snapshot the inbound video RTP stats (decode-side fps, bytes, resolution,
@@ -791,8 +889,13 @@ export class CloudConn {
       return null;
     }
     let inbound: any = null;
+    let rtt = 0;
     report.forEach((s: any) => {
       if (s.type === "inbound-rtp" && s.kind === "video") inbound = s;
+      // RTT of the nominated (active) candidate pair — the network leg of latency.
+      if (s.type === "candidate-pair" && s.nominated && typeof s.currentRoundTripTime === "number") {
+        rtt = s.currentRoundTripTime;
+      }
     });
     if (!inbound) return null;
     return {
@@ -805,6 +908,10 @@ export class CloudConn {
       jitter: inbound.jitter ?? 0,
       packetsLost: inbound.packetsLost ?? 0,
       freezeCount: inbound.freezeCount ?? 0,
+      rttMs: Math.round(rtt * 1000),
+      jitterBufferDelay: inbound.jitterBufferDelay ?? 0,
+      jitterBufferEmittedCount: inbound.jitterBufferEmittedCount ?? 0,
+      totalDecodeTime: inbound.totalDecodeTime ?? 0,
       at: Date.now(),
     };
   }

@@ -234,6 +234,31 @@ fn boost_capture_thread() {
     }
 }
 
+/// RAII guard that raises the Windows timer resolution to 1ms for the life of a
+/// capture loop. `thread::sleep` (and most OS waits) quantize to the system timer
+/// period — default ~15.6ms — so the fps-pacing sleeps between frames overshot by
+/// up to a full tick and a 25ms budget (40 fps) really ran at ~30 fps. Matched
+/// timeBeginPeriod/timeEndPeriod calls, so resolution is only boosted while a
+/// stream is actually running.
+struct TimerBoost;
+impl TimerBoost {
+    fn new() -> Self {
+        #[cfg(windows)]
+        unsafe {
+            let _ = windows::Win32::Media::timeBeginPeriod(1);
+        }
+        TimerBoost
+    }
+}
+impl Drop for TimerBoost {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            let _ = windows::Win32::Media::timeEndPeriod(1);
+        }
+    }
+}
+
 /// Index (into `sorted_monitors`) of the display the phone is currently viewing.
 static SELECTED_MONITOR: AtomicUsize = AtomicUsize::new(0);
 
@@ -592,6 +617,7 @@ where
 
     std::thread::spawn(move || {
         boost_capture_thread();
+        let _timer = TimerBoost::new(); // 1ms sleep precision for fps pacing
         let budget_ms = (1000 / fps).clamp(1, 1000);
         let budget = Duration::from_millis(budget_ms as u64);
         // Persistent duplication session for THIS monitor (recreated if lost).
@@ -747,6 +773,7 @@ where
     let cap_mail = mailbox.clone();
     std::thread::spawn(move || {
         boost_capture_thread();
+        let _timer = TimerBoost::new(); // 1ms sleep precision for fps pacing
         #[cfg(windows)]
         let mut dup: Option<super::dxdupe::Duplicator> = None;
         let mut cur_mon = usize::MAX;

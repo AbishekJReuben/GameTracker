@@ -678,3 +678,65 @@ not regress):**
   ticks with <5 frames in the window (static screen ≈ 1 keep-alive fps).
 - **Quality settings persist** on the phone (`gt.remote.streamQ`, `gt.remote.contentMode`
   in localStorage) — a tuned setup survives app restarts.
+
+**v3.9.13+ streaming/latency pass 2 (do not regress):**
+- **`RemoteLink.send` returns a delivery boolean** (true = handed to an OPEN channel;
+  `cloud.ts sendControl/sendMove` and the LAN WS link report it). Input-tied haptics key
+  off it: all touch right-click paths in `Control.tsx` go through `sendRightClick()`,
+  which vibrates ONLY when the click actually reached the PC — never on a dropped send
+  during a reconnect blip.
+- **Latency in the phone HUD.** `CloudConn.videoStats` also samples the nominated
+  candidate-pair `currentRoundTripTime` plus cumulative `jitterBufferDelay/
+  jitterBufferEmittedCount` and `totalDecodeTime`; Control computes windowed per-frame
+  averages and shows "Latency (est.) ≈ rtt/2 + buffer + decode" with the breakdown row.
+- **Display fps counts `presentedFrames` metadata, not rVFC callback invocations.**
+  Under main-thread load the browser skips `requestVideoFrameCallback` callbacks while
+  the compositor keeps presenting — counting invocations under-reported display fps
+  (the fake "decode 56 / display 32" gap). The cumulative `presentedFrames` delta
+  credits skipped callbacks (catch-up capped at 8 so tab-resume jumps can't spike it).
+- **View-state commits are rAF-coalesced (`commitView`).** Refs stay the source of
+  truth on the gesture hot path; React state (zoom/pan/cursor) now updates at most once
+  per animation frame instead of once per 90–120Hz pointer event — a full ControlScreen
+  re-render per touch move was starving the phone's compositor exactly while dragging.
+- **Adaptive jitter-buffer floor** (`cloud.ts`): base stays 80ms, but 10 consecutive
+  clean watchdog windows (<3% drops over 30s) let the floor ease to `JITTER_MIN` 40ms
+  (~40ms less glass-to-glass on proven-stable links). Any bad window (>15% drops)
+  resets the floor to 80 and buffers up as before; new sessions re-earn it. Never 0 —
+  the target is a hint and forcing it to nothing stutters.
+- **Capture threads hold a `TimerBoost` RAII guard** (`capture.rs`,
+  `timeBeginPeriod(1)`/`timeEndPeriod(1)`, needs the `Win32_Media` windows feature):
+  Windows sleeps quantize to the ~15.6ms system tick, so the fps-pacing sleeps overshot
+  and 40fps targets really ran ~30fps. Boosted only while a stream is running (primary
+  capture + every aux pop-out thread).
+- **Pointer moves send IMMEDIATELY, not on the next rAF** (`queueMove`, Control.tsx).
+  Browser pointermove events are already vsync-aligned, so queuing each move for the
+  NEXT requestAnimationFrame added a whole extra display frame (8–16ms) of input
+  latency. Moves now go out the moment they're computed, rate-limited to ≥4ms apart
+  with a trailing rAF flush for same-frame bursts — don't re-add the always-rAF queue.
+- **Host munges the guest's answer with `x-google-start-bitrate=4000`**
+  (`boostStartBitrate` in rtcHost.ts, applied at setRemoteDescription): skips
+  Chromium's ~300kbps cold-start BWE ramp so the first seconds aren't blurry. RTX
+  (`apt=`) fmtp lines are skipped; any parse failure falls back to the untouched SDP;
+  newer Chromium may ignore the hint (harmless — BWE converges on its own).
+- **Decode-stall self-heal ("raised resolution → frozen stream" fix).** A mid-stream
+  resolution INCREASE can wedge the phone's hardware H.264 decoder: bytes keep
+  arriving but `framesDecoded` stops, and no quality change recovers it — only a new
+  decoder. The guest watchdog (`cloud.ts`) detects it behind a strict gate —
+  `sinkActive` (Control screen mounted, via `RemoteLink.noteVideoSink` →
+  `CloudConn.setVideoSink`) + page visible + >30KB/3s inbound + 0 decoded — and heals
+  in two stages: at 2 ticks (~6s) it sends `{type:"vreset"}` (host rebuilds its
+  encoder/track in place via `rebuildVideoPipeline`, rate-limited 4s, fixes host-side
+  wedges); at 4 ticks (~12s) it rebuilds the whole peer session (fresh receiver +
+  decoder — what a manual reconnect did). The sink gate exists because the old
+  blanket decode-stall reconnect false-fired whenever the video wasn't rendered
+  (Stats tab) — do NOT remove it. Quest is excluded (immersive sessions consume the
+  video off-DOM; visibility semantics differ).
+- **Soft keyboard + dock coexist (Android).** Dock tabs, panel `IcoBtn`s,
+  `KeyCapButton`/`PinnedButton`, and the compose-row mode/Send buttons all
+  `preventDefault()` on pointerdown so a tap never steals focus from the ghost input
+  — the keyboard stays up while panels open/keys fire (previously the blur collapsed
+  the keyboard and the reflow swallowed the tap). The ghost-input `onFocus` no longer
+  force-closes an open panel. The compose bar mirrors the typed text live
+  (`composeText`, tail-truncated via `direction:rtl` + `unicode-bidi:plaintext`);
+  the collapsed-top/immersive chip cluster has NO keyboard toggle — the bottom-left
+  FAB (immersive/collapsed dock) and the dock's Keyboard tab are the only two.

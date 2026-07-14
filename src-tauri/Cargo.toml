@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.9.13"
+version = "3.9.14"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -80,6 +80,7 @@ windows = { version = "0.58", features = [
   "Win32_Graphics_Direct3D11",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
+  "Win32_Media",
   "Win32_Media_Audio",
   "Win32_Media_Audio_Endpoints",
   "Win32_Media_KernelStreaming",

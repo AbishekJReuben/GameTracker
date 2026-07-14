@@ -56,9 +56,21 @@ export interface RemoteLink {
   onStatus(cb: (connected: boolean) => void): void;
   /** Granular connect/reconnect progress (cloud WebRTC only). */
   onProgress?(cb: (s: ConnectSnapshot) => void): () => void;
-  send(msg: ControlMsg): void;
+  /**
+   * Returns true when the message was actually handed to an OPEN transport
+   * channel; false means it was dropped (disconnected / channel not ready).
+   * UI feedback tied to an input (e.g. the right-click vibration) must key off
+   * this so the phone never confirms an action the PC will never receive.
+   */
+  send(msg: ControlMsg): boolean;
   /** Re-tune the live screen stream (resolution / JPEG quality / frame rate). */
   setQuality(q: QualitySettings): void;
+  /**
+   * Tell the transport a screen view is actively consuming the video (Control
+   * mounts/unmounts). Gates the cloud link's decode-stall self-heal; the LAN
+   * link has no WebRTC decoder, so it omits this.
+   */
+  noteVideoSink?(active: boolean): void;
   /** Decode-side WebRTC video telemetry for the debug HUD (cloud only). */
   netStats(): Promise<RtcInboundVideoStats | null>;
   close(): void;
@@ -127,7 +139,11 @@ export function makeWsLink(): RemoteLink {
       cb(connected); // Report current state immediately (socket may already be open).
     },
     send(msg) {
-      if (controlWs?.readyState === WebSocket.OPEN) controlWs.send(JSON.stringify(msg));
+      if (controlWs?.readyState === WebSocket.OPEN) {
+        controlWs.send(JSON.stringify(msg));
+        return true;
+      }
+      return false;
     },
     setQuality(q) {
       quality = q;
@@ -190,19 +206,21 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
       // as does everything else.)
       if (msg.type === "move") {
         unanchoredMove = msg;
-        conn.sendMove(msg);
-        return;
+        return conn.sendMove(msg);
       }
       if (unanchoredMove && (msg.type === "click" || msg.type === "down" || msg.type === "up")) {
         conn.sendControl(unanchoredMove);
         unanchoredMove = null;
       }
-      conn.sendControl(msg);
+      return conn.sendControl(msg);
     },
     setQuality(q) {
       // The host intercepts `quality` messages on the control channel and re-tunes
       // its capture loop; they never reach the input injector.
       conn.sendControl({ type: "quality", ...q });
+    },
+    noteVideoSink(active) {
+      conn.setVideoSink(active);
     },
     netStats() {
       return conn.videoStats();

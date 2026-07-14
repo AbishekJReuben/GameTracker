@@ -72,7 +72,22 @@ import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { isQuestBrowser } from "../device";
 
 type HostStats = RemoteCaptureStats & { producedFps?: number };
-type NetStats = { fps: number; kbps: number; w: number; h: number; jitterMs: number; lostPkts: number; dropped: number; freezes: number };
+type NetStats = {
+  fps: number;
+  kbps: number;
+  w: number;
+  h: number;
+  jitterMs: number;
+  lostPkts: number;
+  dropped: number;
+  freezes: number;
+  /** Network round-trip (ms) on the active ICE pair. */
+  rttMs: number;
+  /** Avg time a frame sat in the receiver jitter buffer over the last sample window (ms). */
+  bufMs: number;
+  /** Avg hardware/software decode time per frame over the last sample window (ms). */
+  decMs: number;
+};
 
 // ---------- tuning constants ----------
 const TAP_MS = 260; // max press time still counted as a tap
@@ -451,13 +466,19 @@ export function ControlScreen({
   // All input goes through this wrapper so the on-screen cursor can react to the
   // action (click ripple, right-click ripple, scroll pulse, grabbing while dragging).
   // Non-mouse messages (keys/quality/text) pass straight through untouched.
+  // Returns the link's delivery result so gesture feedback (vibration) can be
+  // tied to the input actually reaching the PC.
   const send: RemoteLink["send"] = (msg) => {
     const m = msg as { type?: string; button?: string; dy?: number };
     if (m.type === "click") flashCursor(m.button === "right" ? "right" : m.button === "left" ? "left" : "left");
     else if (m.type === "scroll") flashCursor("scroll", m.dy ?? 0);
     else if (m.type === "down" && m.button) setDragging(true);
     else if (m.type === "up" && m.button) setDragging(false);
-    link.send(msg);
+    return link.send(msg);
+  };
+  /** Send a right click; vibrate ONLY if it was actually delivered to the PC. */
+  const sendRightClick = () => {
+    if (send({ type: "click", button: "right" })) navigator.vibrate?.(15);
   };
   // First frame received (video decoded or a canvas frame drawn) → hide the
   // app-icon "connecting" placeholder that fills the ~1s gap before pixels arrive.
@@ -467,6 +488,10 @@ export function ControlScreen({
   // auto-keyboard on PC focus and the collapsed floating keyboard button work,
   // regardless of dock state); `typing` reveals the compose chrome.
   const [typing, setTyping] = useState(false);
+  // Live mirror of the ghost field so the compose bar shows WHAT you've typed
+  // (not just a generic hint) — essential in buffered mode where nothing appears
+  // on the PC until Send.
+  const [composeText, setComposeText] = useState("");
   // Pinned keys/shortcuts → small, semi-transparent floating quick buttons pinned
   // to the screen edge so they're always one tap away without opening the dock.
   const [pinned, setPinned] = useState<string[]>(() => {
@@ -607,7 +632,7 @@ export function ControlScreen({
   const [hostStats, setHostStats] = useState<HostStats | null>(null);
   const [net, setNet] = useState<NetStats | null>(null);
   const prodRef = useRef<{ frames: number; at: number } | null>(null);
-  const netRef = useRef<{ bytes: number; at: number } | null>(null);
+  const netRef = useRef<{ bytes: number; at: number; jbDelay: number; jbCount: number; decT: number; decoded: number } | null>(null);
 
   // Multi-monitor.
   const [monitors, setMonitors] = useState<RemoteMonitor[]>([]);
@@ -880,17 +905,32 @@ export function ControlScreen({
   };
 
   // True fps off the video pipeline via requestVideoFrameCallback (cloud path).
+  // Count PRESENTED frames from the callback metadata, not callback invocations:
+  // under main-thread load the browser skips rVFC callbacks even though the
+  // compositor kept presenting frames, so counting invocations under-reported the
+  // display fps (it looked like "decode 56 / display 32" when the screen was
+  // actually showing nearly every decoded frame). `presentedFrames` is cumulative,
+  // so the delta between callbacks credits the skipped ones too.
   useEffect(() => {
     const v = videoRef.current as (HTMLVideoElement & {
-      requestVideoFrameCallback?: (cb: () => void) => number;
+      requestVideoFrameCallback?: (cb: (now: number, meta?: { presentedFrames?: number }) => void) => number;
       cancelVideoFrameCallback?: (h: number) => void;
     }) | null;
     if (!v || !hasStream || !v.requestVideoFrameCallback) return;
     let handle = 0;
-    const onVF = () => {
+    let lastPresented = 0;
+    const onVF = (_ts: number, meta?: { presentedFrames?: number }) => {
       const now = performance.now();
       const t = frameTimes.current;
-      t.push(now);
+      const pf = meta?.presentedFrames;
+      if (typeof pf === "number" && pf > 0) {
+        // Cap the catch-up so a tab resume (counter jump) can't spike the reading.
+        const n = lastPresented > 0 && pf > lastPresented ? Math.min(pf - lastPresented, 8) : 1;
+        lastPresented = pf;
+        for (let i = 0; i < n; i++) t.push(now);
+      } else {
+        t.push(now);
+      }
       while (t.length && now - t[0] > 1000) t.shift();
       setHasFrame(true);
       handle = v.requestVideoFrameCallback!(onVF);
@@ -940,8 +980,26 @@ export function ControlScreen({
       if (!alive || !s) return;
       const prev = netRef.current;
       let kbps = 0;
-      if (prev && s.at > prev.at) kbps = Math.round(((s.bytesReceived - prev.bytes) * 8) / (s.at - prev.at));
-      netRef.current = { bytes: s.bytesReceived, at: s.at };
+      let bufMs = 0;
+      let decMs = 0;
+      if (prev && s.at > prev.at) {
+        kbps = Math.round(((s.bytesReceived - prev.bytes) * 8) / (s.at - prev.at));
+        // Windowed per-frame averages from the cumulative RTP counters: how long a
+        // frame waited in the jitter buffer, and how long the decoder took. Together
+        // with RTT these make the glass-to-glass latency estimate for the HUD.
+        const dJb = s.jitterBufferEmittedCount - prev.jbCount;
+        if (dJb > 0) bufMs = ((s.jitterBufferDelay - prev.jbDelay) / dJb) * 1000;
+        const dDec = s.framesDecoded - prev.decoded;
+        if (dDec > 0) decMs = ((s.totalDecodeTime - prev.decT) / dDec) * 1000;
+      }
+      netRef.current = {
+        bytes: s.bytesReceived,
+        at: s.at,
+        jbDelay: s.jitterBufferDelay,
+        jbCount: s.jitterBufferEmittedCount,
+        decT: s.totalDecodeTime,
+        decoded: s.framesDecoded,
+      };
       setNet({
         fps: Math.round(s.framesPerSecond || 0),
         kbps,
@@ -951,6 +1009,9 @@ export function ControlScreen({
         lostPkts: s.packetsLost,
         dropped: s.framesDropped,
         freezes: s.freezeCount,
+        rttMs: s.rttMs,
+        bufMs: Math.round(bufMs),
+        decMs: Math.round(decMs * 10) / 10,
       });
     }, 1000);
     return () => {
@@ -1062,32 +1123,64 @@ export function ControlScreen({
     };
   }, [immersive, topCollapsed, dockCollapsed, panel, browserFs, typing, hasStream, kbInset, vvPin]);
 
-  // Cancel any in-flight edge-pan frame if the screen unmounts mid-drag.
+  // Cancel any in-flight edge-pan / view-commit frame if the screen unmounts mid-drag.
   useEffect(() => () => {
     if (edgeRaf.current != null) cancelAnimationFrame(edgeRaf.current);
+    if (viewRaf.current != null) cancelAnimationFrame(viewRaf.current);
   }, []);
 
-  // ----- coalesced pointer-move sending (one per animation frame) -----
+  // While this screen is mounted, the video is actively watched — arms the cloud
+  // link's decode-stall self-heal (a wedged phone decoder after a resolution bump
+  // is detected and the stream rebuilt automatically instead of freezing forever).
+  useEffect(() => {
+    link.noteVideoSink?.(true);
+    return () => link.noteVideoSink?.(false);
+  }, [link]);
+
+  // ----- pointer-move sending: immediate, with a short-interval coalescer -----
+  // Browser pointermove events are already vsync-aligned (~one per display frame),
+  // so the old "queue every move for the NEXT requestAnimationFrame" added a full
+  // extra frame (8–16ms) of input latency on top. Send immediately instead; the
+  // rAF only acts as a trailing flush for rare same-frame bursts (coalesced
+  // touch samples), rate-limited so the lossy move channel never floods.
+  const MOVE_MIN_MS = 4;
   const rafId = useRef<number | null>(null);
   const pendingMove = useRef<{ x: number; y: number } | null>(null);
-  const flush = () => {
-    rafId.current = null;
+  const lastMoveSentAt = useRef(0);
+  const flushMove = () => {
     const m = pendingMove.current;
     if (m) {
       pendingMove.current = null;
+      lastMoveSentAt.current = performance.now();
       send({ type: "move", x: m.x, y: m.y });
     }
   };
+  const rafFlushMove = () => {
+    rafId.current = null;
+    flushMove();
+  };
   const queueMove = (x: number, y: number) => {
     pendingMove.current = { x, y };
-    if (rafId.current == null) rafId.current = requestAnimationFrame(flush);
+    if (performance.now() - lastMoveSentAt.current >= MOVE_MIN_MS) flushMove();
+    else if (rafId.current == null) rafId.current = requestAnimationFrame(rafFlushMove);
   };
 
   // ----- transform commit helpers -----
+  // Refs are the source of truth on the hot gesture path; React state exists only
+  // to render. Coalesce state commits to ONE per animation frame — phone touch
+  // input fires at 90–120 Hz and a setState (= full ControlScreen re-render) per
+  // pointer event starved the main thread, which is exactly when the video
+  // compositor needs it. The refs are always current, so the coalesced commit
+  // renders the same final view.
+  const viewRaf = useRef<number | null>(null);
   const commitView = () => {
-    setZoom(zoomRef.current);
-    setPan({ ...panRef.current });
-    setCursor({ ...cursorRef.current });
+    if (viewRaf.current != null) return;
+    viewRaf.current = requestAnimationFrame(() => {
+      viewRaf.current = null;
+      setZoom(zoomRef.current);
+      setPan({ ...panRef.current });
+      setCursor({ ...cursorRef.current });
+    });
   };
 
   /** Always re-read the viewport box before mapping — never trust a stale Layout. */
@@ -1279,8 +1372,7 @@ export function ControlScreen({
         longTimer.current = window.setTimeout(() => {
           if (pts.current.size === 1 && maxMove.current < TAP_SLOP) {
             gesture.current = "none"; // consume the gesture; no click on release
-            send({ type: "click", button: "right" });
-            navigator.vibrate?.(15);
+            sendRightClick(); // haptic fires only if the click reached the PC
           }
         }, LONGPRESS_MS);
       }
@@ -1409,11 +1501,11 @@ export function ControlScreen({
       if (mode === "touch") {
         if (touchPressed.current) send({ type: "up", button: "left" });
         else if (wasTap && downCount.current === 1) send({ type: "click", button: "left" });
-        if (downCount.current === 2 && wasTap && twoMode.current === "undecided") send({ type: "click", button: "right" });
+        if (downCount.current === 2 && wasTap && twoMode.current === "undecided") sendRightClick();
       } else if (g === "dragging") {
         send({ type: "up", button: "left" });
       } else if (g === "two") {
-        if (twoMode.current === "undecided" && wasTap && downCount.current === 2) send({ type: "click", button: "right" });
+        if (twoMode.current === "undecided" && wasTap && downCount.current === 2) sendRightClick();
       } else if (g === "cursor" && wasTap && downCount.current === 1) {
         send({ type: "click", button: "left" });
         lastTapUp.current = now; // enables double-tap-drag & native double-click
@@ -1488,6 +1580,7 @@ export function ControlScreen({
     if (!el) return;
     el.value = "";
     prevVal.current = "";
+    setComposeText("");
   };
 
   /** Send whatever changed in the field since the last input (direct mode). */
@@ -1516,6 +1609,9 @@ export function ControlScreen({
   };
 
   const onKbdInput = () => {
+    // Mirror the field into the compose bar on every input — including during
+    // IME composition, so the preview always shows what's really been typed.
+    setComposeText(kbdRef.current?.value ?? "");
     if (kbMode === "buffered") return; // sent on Enter
     if (composing.current) return; // wait for compositionend (CJK/IME)
     flushDiff();
@@ -2111,16 +2207,9 @@ export function ControlScreen({
             >
               <RotateCcw className="h-3.5 w-3.5" /> {zoom.toFixed(1)}×
             </motion.button>
-            <motion.button
-              whileTap={{ scale: 0.9 }}
-              onClick={() => (typing ? stopTyping() : startTyping())}
-              className={`grid h-9 w-9 place-items-center rounded-full border backdrop-blur ${
-                typing ? "border-accent-3/50 bg-accent-3/30 text-white" : "border-white/15 bg-black/45 text-white/90"
-              }`}
-              title={typing ? "Stop typing" : "Keyboard"}
-            >
-              <Keyboard className="h-4 w-4" />
-            </motion.button>
+            {/* No keyboard chip here: immersive/collapsed-dock states already show
+                the bottom-left keyboard FAB, and the visible dock has its own
+                Keyboard tab — a second toggle up top was a confusing duplicate. */}
             {browserFsSupported && (
               <motion.button
                 whileTap={{ scale: 0.9 }}
@@ -2169,6 +2258,10 @@ export function ControlScreen({
             <>
               <StatRow k="Decode" v={`${net.fps} fps · ${net.w}×${net.h}`} />
               <StatRow k="Bitrate" v={net.kbps >= 1000 ? `${(net.kbps / 1000).toFixed(1)} Mbps` : `${net.kbps} kbps`} />
+              {/* One-way network + jitter-buffer dwell + decode — the phone-side
+                  share of glass-to-glass latency (host capture/encode shown below). */}
+              <StatRow k="Latency (est.)" v={`~${Math.max(1, Math.round(net.rttMs / 2 + net.bufMs + net.decMs))} ms`} />
+              <StatRow k="RTT · buffer · decode" v={`${net.rttMs} · ${net.bufMs} · ${net.decMs.toFixed(1)} ms`} />
               <StatRow k="Jitter / loss" v={`${net.jitterMs} ms · ${net.lostPkts} pkt`} />
               <StatRow k="Dropped / freezes" v={`${net.dropped} · ${net.freezes}`} />
             </>
@@ -2282,8 +2375,8 @@ export function ControlScreen({
           if (pcTextFieldRef.current || questKbdLockedRef.current) setTyping(true);
           if (!isQuestBrowser()) {
             setTyping(true);
-            // Keep the bottom dock visible — users still need keys/pins while typing.
-            setPanel(null);
+            // The dock (and any open panel) stays as-is — panels and the soft
+            // keyboard are allowed to coexist; dock buttons no longer steal focus.
           }
           // Belt-and-braces: undo any IME scroll the moment focus lands.
           window.scrollTo(0, 0);
@@ -2326,15 +2419,25 @@ export function ControlScreen({
           style={{ paddingBottom: "max(0.35rem, env(safe-area-inset-bottom))" }}
         >
           <div className="flex items-center gap-1.5">
+            {/* preventDefault on pointerdown: keep the ghost input focused so the
+                soft keyboard stays up across mode switches and Send taps. */}
             <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
-              <button onClick={() => setKbMode("direct")} title="Direct" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "direct" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Keyboard className="h-4 w-4" /></button>
-              <button onClick={() => setKbMode("buffered")} title="Buffered" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "buffered" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Send className="h-4 w-4" /></button>
+              <button onPointerDown={(e) => e.preventDefault()} onClick={() => setKbMode("direct")} title="Direct" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "direct" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Keyboard className="h-4 w-4" /></button>
+              <button onPointerDown={(e) => e.preventDefault()} onClick={() => setKbMode("buffered")} title="Buffered" className={`grid h-8 w-8 place-items-center rounded-md transition ${kbMode === "buffered" ? "bg-accent-3 text-white" : "text-ink-dim"}`}><Send className="h-4 w-4" /></button>
             </div>
-            <div className="min-w-0 flex-1 truncate px-2 text-xs text-ink-dim">
-              {kbMode === "buffered" ? "Type on the keyboard, then Send" : "Typing to PC…"}
+            {/* Live preview of the typed text; show the TAIL when it overflows
+                (the recent characters matter, not the start of the line). */}
+            <div className="min-w-0 flex-1 truncate px-2 text-xs" style={{ direction: composeText ? "rtl" : undefined }}>
+              {composeText ? (
+                <span className="font-600 text-white" style={{ unicodeBidi: "plaintext" }}>
+                  {composeText}
+                </span>
+              ) : (
+                <span className="text-ink-dim">{kbMode === "buffered" ? "Type on the keyboard, then Send" : "Typing to PC…"}</span>
+              )}
             </div>
             {kbMode === "buffered" && (
-              <button onClick={sendBuffer} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent-3 text-white active:scale-95" title="Send"><Send className="h-4 w-4" /></button>
+              <button onPointerDown={(e) => e.preventDefault()} onClick={sendBuffer} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent-3 text-white active:scale-95" title="Send"><Send className="h-4 w-4" /></button>
             )}
             <button onClick={stopTyping} className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-ink-dim active:bg-white/[0.08]" title="Close"><X className="h-4 w-4" /></button>
           </div>
@@ -2727,6 +2830,9 @@ function IcoBtn({ onClick, active, title, children }: { onClick: () => void; act
     <motion.button
       whileTap={{ scale: 0.86 }}
       transition={{ type: "spring", stiffness: 600, damping: 20 }}
+      // Keep the ghost input focused (soft keyboard up) when panel buttons are
+      // used mid-typing — see Tab for the full rationale.
+      onPointerDown={(e) => e.preventDefault()}
       onClick={() => {
         navigator.vibrate?.(5);
         onClick();
@@ -2804,6 +2910,7 @@ function KeyCapButton({
       whileTap={pinMode ? { scale: 0.92 } : { scale: 0.86, y: 2 }}
       transition={{ type: "spring", stiffness: 600, damping: 20 }}
       onPointerDown={(e) => {
+        e.preventDefault(); // don't steal focus from the ghost input (keyboard stays up)
         if (pinMode || !holdable) return;
         e.currentTarget.setPointerCapture?.(e.pointerId);
         holding.current = true;
@@ -2922,6 +3029,7 @@ function PinnedButton({
       whileTap={{ scale: 0.9, opacity: 1 }}
       transition={{ type: "spring", stiffness: 500, damping: 30 }}
       onPointerDown={(e) => {
+        e.preventDefault(); // don't steal focus from the ghost input (keyboard stays up)
         if (pinMode || !holdable) return;
         e.currentTarget.setPointerCapture?.(e.pointerId);
         holding.current = true;
@@ -2974,6 +3082,12 @@ function Tab({ onClick, active, title, children }: { onClick: () => void; active
   return (
     <motion.button
       whileTap={{ scale: 0.9 }}
+      // Don't take focus on tap: while the soft keyboard is up (ghost input
+      // focused), a focus-stealing tap blurred the field, collapsed the keyboard,
+      // and the resulting reflow often swallowed the tap entirely — panels felt
+      // un-openable while typing. Cancelling pointerdown's default keeps the
+      // ghost input focused (keyboard stays up); click still fires.
+      onPointerDown={(e) => e.preventDefault()}
       onClick={onClick}
       title={title}
       className={`relative grid h-9 flex-1 place-items-center rounded-lg transition ${active ? "text-white" : "text-ink-dim active:bg-white/[0.06]"}`}

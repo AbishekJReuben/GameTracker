@@ -80,6 +80,39 @@ function trackTuning(mode: string): { hint: string; degrade: RTCDegradationPrefe
   return { hint: "text", degrade: "balanced" };
 }
 
+/**
+ * Best-effort SDP hint: raise the encoder's INITIAL bandwidth estimate so the
+ * first seconds of a session aren't a blurry 300kbps ramp-up. Chromium reads
+ * `x-google-start-bitrate` (kbps) from the video fmtp lines of the description
+ * applied via setRemoteDescription on the sending side — i.e. the guest's answer
+ * here. Some Chromium versions ignore it, which is harmless; BWE still converges
+ * on its own within seconds either way, this only skips the cold start. Guarded:
+ * any parse failure returns the SDP untouched. RTX (`apt=`) fmtp lines are
+ * skipped — the hint belongs on real codec payloads only.
+ */
+function boostStartBitrate(sdp: string, startKbps: number): string {
+  try {
+    const lines = sdp.split("\r\n");
+    const mline = lines.find((l) => l.startsWith("m=video"));
+    if (!mline) return sdp;
+    const pts = new Set(mline.trim().split(" ").slice(3));
+    let inVideo = false;
+    return lines
+      .map((l) => {
+        if (l.startsWith("m=")) inVideo = l.startsWith("m=video");
+        if (!inVideo) return l;
+        const fm = /^a=fmtp:(\S+) (.+)$/.exec(l);
+        if (fm && pts.has(fm[1]) && !fm[2].includes("apt=") && !fm[2].includes("x-google-start-bitrate")) {
+          return `${l};x-google-start-bitrate=${startKbps}`;
+        }
+        return l;
+      })
+      .join("\r\n");
+  } catch {
+    return sdp;
+  }
+}
+
 /** Map the phone's quality knobs to a WebRTC encoder bitrate ceiling (bps). */
 function bitrateFor(q: { maxW: number; jpeg: number; fps: number }): number {
   const h = Math.round((q.maxW * 9) / 16);
@@ -691,6 +724,10 @@ export function startHost(opts: HostOptions): () => void {
     let encStallTicks = 0;
     let stallProduced = -1;
     let stallProducedAt = 0;
+    // Guest-requested video resets ("vreset", sent when ITS decoder sees bytes
+    // but no decoded frames). Rate-limited so a misbehaving guest can't make the
+    // host thrash the encoder.
+    let lastVresetAt = 0;
 
     // Self-heal for a wedged WebRTC VIDEO ENCODER. Raising the stream resolution
     // resizes the canvas, and some hardware H.264 encoders never recover from the
@@ -960,6 +997,18 @@ export function startHost(opts: HostOptions): () => void {
               /* grant persistence best-effort */
             }
             await authorize();
+          }
+          return;
+        }
+        // Guest video-reset request: its decoder is receiving bytes but decoding
+        // nothing. Rebuild the canvas + generator track + Rust feed in place
+        // (replaceTrack keeps the session/auth) — a fresh encoder emits a fresh
+        // keyframe/SPS, which un-wedges a stalled HOST-side pipeline.
+        if (msg && msg.type === "vreset") {
+          const now = Date.now();
+          if (authorized && now - lastVresetAt > 4000) {
+            lastVresetAt = now;
+            void rebuildVideoPipeline();
           }
           return;
         }
@@ -1248,7 +1297,9 @@ export function startHost(opts: HostOptions): () => void {
         const liveSession = pc?.connectionState === "connected" && Date.now() - lastGuestMsg < 8000;
         if (!liveSession) await startPeer();
       } else if (m.type === "answer" && pc) {
-        await pc.setRemoteDescription({ type: "answer", sdp: m.sdp });
+        // Munge the guest's answer so the video encoder starts near its working
+        // bitrate instead of ramping up from Chromium's ~300kbps default.
+        await pc.setRemoteDescription({ type: "answer", sdp: boostStartBitrate(m.sdp, 4000) });
       } else if (m.type === "candidate" && pc) {
         try {
           await pc.addIceCandidate(m.candidate);
