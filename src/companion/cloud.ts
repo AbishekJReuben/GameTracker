@@ -86,6 +86,31 @@ export type RtcInboundVideoStats = {
   at: number;
 };
 
+/** Live telemetry for the WebCodecs direct-video path (data-channel H.264). */
+export type WcStats = {
+  active: boolean;
+  /** Decoded frames per second over the last ~1s window. */
+  fps: number;
+  /** Inbound video bitrate (kbps) over the last ~1s window. */
+  kbps: number;
+  frames: number;
+  keyFrames: number;
+  bytes: number;
+  /** Average encoded frame size over the last window (KB). */
+  avgFrameKB: number;
+  /** Arrival → decoded-frame-out latency, EWMA (includes decoder queueing). */
+  decodeMs: number;
+  /** Host frame-capture → decoded on phone, clock-synced EWMA (excludes render). */
+  e2eMs: number;
+  /** Host frame-capture → arrival on phone, clock-synced EWMA (host encode + network). */
+  netMs: number;
+  /** Frames sitting in the decoder right now. */
+  queue: number;
+  codec: string;
+  /** RTT of the best clock-sync sample (quality of the e2e estimate). */
+  clockRttMs: number;
+};
+
 const HEARTBEAT_MS = 5000; // ping cadence
 const HEARTBEAT_DEAD_MS = 13000; // no pong within this → treat link as dead
 const OFFER_TIMEOUT_MS = 8000; // joined the room but no offer arrived → rejoin
@@ -183,6 +208,38 @@ export class CloudConn {
   // session (full rebuild). Lets a transient network drop re-route sub-second
   // without re-pairing, re-auth, or a decoder reset.
   private currentSid?: string;
+  // ---- WebCodecs direct-video path (bypasses the WebRTC jitter buffer). The
+  // host ships H.264 over the "video" data channel; we decode with VideoDecoder
+  // and hand frames straight to the Control screen's canvas — no playout delay.
+  private chVideo?: RTCDataChannel;
+  /** null = not probed yet; false latches OFF for this connection after failure. */
+  private wcSupported: boolean | null = null;
+  private wcActive = false;
+  private wcRequestedAt = 0; // vmode "wc" sent; frames must arrive or we revert
+  private wcDecoder: VideoDecoder | null = null;
+  private wcCodec = "";
+  private wcAwaitKey = true;
+  private wcKfReqAt = 0;
+  private wcErrors = 0;
+  private wcFrameCb: ((f: VideoFrame) => void) | null = null;
+  private wcHead: { key: boolean; seq: number; tsMs: number; len: number } | null = null;
+  private wcBuf: Uint8Array | null = null;
+  private wcGot = 0;
+  /** Per-frame bookkeeping keyed by chunk timestamp (µs) for latency stats. */
+  private wcMeta = new Map<number, { arrivedAt: number; tsMs: number; bytes: number }>();
+  private wcFrames = 0;
+  private wcKeys = 0;
+  private wcBytes = 0;
+  private wcDecMs = 0;
+  private wcE2eMs = 0;
+  private wcNetMs = 0;
+  private wcTimes: number[] = []; // decoded-frame times (fps window)
+  private wcByteWin: { at: number; bytes: number }[] = []; // arrival bytes (kbps window)
+  private wcLastFrameAt = 0;
+  private wcStallTicks = 0;
+  /** NTP-style clock samples from the data-channel heartbeat (host perf clock). */
+  private clockSamples: { rtt: number; off: number }[] = [];
+
   private progressListeners = new Set<(s: ConnectSnapshot) => void>();
   private progressPhase: ConnectPhase = "idle";
   private progressJob = "Starting…";
@@ -455,6 +512,8 @@ export class CloudConn {
     this.winBytes = 0;
     this.stallTicks = 0;
     this.winFreezes = 0;
+    // Fresh session → fresh WebCodecs negotiation (re-probed after auth-ok).
+    this.wcReset(true);
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
     pipeIce(pc, this.sig!);
@@ -528,6 +587,11 @@ export class CloudConn {
         ch.onopen = () => this.sendAuth();
       } else if (ch.label === "move") {
         this.chMove = ch;
+      } else if (ch.label === "video") {
+        // WebCodecs direct-video path: H.264 frames as [20-byte header + fragments].
+        this.chVideo = ch;
+        ch.binaryType = "arraybuffer";
+        ch.onmessage = (ev) => this.onWcMsg(ev.data);
       } else if (ch.label === "data") {
         this.chData = ch;
         ch.onmessage = (ev) => this.onData(ev.data as string);
@@ -549,6 +613,15 @@ export class CloudConn {
   private startHeartbeat() {
     this.stopHeartbeat();
     this.lastPong = Date.now();
+    // Immediate first ping: seeds the clock-sync samples so the wc path's
+    // end-to-end latency reading is meaningful within a second of connecting.
+    if (this.chData?.readyState === "open") {
+      try {
+        this.chData.send(JSON.stringify({ ping: Date.now() }));
+      } catch {
+        /* ignore */
+      }
+    }
     this.hbTimer = window.setInterval(() => {
       if (this.closed) return;
       // Backgrounded: timers are throttled and pongs may sit unprocessed, so a
@@ -609,6 +682,302 @@ export class CloudConn {
   setVideoSink(active: boolean) {
     this.sinkActive = active;
     if (!active) this.stallTicks = 0;
+    if (!active) this.wcStallTicks = 0;
+  }
+
+  // ---- WebCodecs direct-video path ------------------------------------------
+
+  /** Reset all wc state (new session / teardown). `reprobe` re-allows opt-in. */
+  private wcReset(reprobe: boolean) {
+    const wasActive = this.wcActive;
+    this.wcActive = false;
+    this.wcRequestedAt = 0;
+    this.wcAwaitKey = true;
+    this.wcHead = null;
+    this.wcBuf = null;
+    this.wcGot = 0;
+    this.wcMeta.clear();
+    this.wcStallTicks = 0;
+    this.wcErrors = 0;
+    this.chVideo = undefined;
+    try {
+      this.wcDecoder?.close();
+    } catch {
+      /* already closed */
+    }
+    this.wcDecoder = null;
+    if (reprobe) this.wcSupported = null;
+    if (wasActive) this.emitEvent({ event: "wc", active: false });
+  }
+
+  /** After auth-ok: probe local decode support and opt in to the wc path. */
+  private async maybeStartWc() {
+    if (this.closed || this.denied || this.wcActive || this.wcRequestedAt) return;
+    // Quest renders the stream through the <video> element (immersive VR draws it
+    // as a WebGL texture) — the canvas-based wc path would leave VR black.
+    if (isQuestBrowser()) return;
+    if (this.wcSupported == null) {
+      try {
+        if (typeof VideoDecoder === "undefined") {
+          this.wcSupported = false;
+        } else {
+          const r = await VideoDecoder.isConfigSupported({ codec: "avc1.640034", optimizeForLatency: true });
+          this.wcSupported = !!r.supported;
+        }
+      } catch {
+        this.wcSupported = false;
+      }
+    }
+    if (!this.wcSupported || this.closed || this.denied) return;
+    this.wcRequestedAt = Date.now();
+    this.sendControl({ type: "vmode", mode: "wc" });
+  }
+
+  /** Give up on the wc path for this session and resume the WebRTC track. */
+  private wcFallback(reason: string) {
+    if (!this.wcActive && !this.wcRequestedAt) return;
+    console.warn("[remote] direct-video path off — using the WebRTC track:", reason);
+    this.wcSupported = false; // don't retry until a fresh peer session
+    const wasActive = this.wcActive;
+    this.wcActive = false;
+    this.wcRequestedAt = 0;
+    this.wcAwaitKey = true;
+    try {
+      this.wcDecoder?.close();
+    } catch {
+      /* ignore */
+    }
+    this.wcDecoder = null;
+    this.sendControl({ type: "vmode", mode: "rtc" });
+    if (wasActive) this.emitEvent({ event: "wc", active: false });
+  }
+
+  /** Build (or rebuild) the VideoDecoder for the host-announced codec. */
+  private wcBuildDecoder(): boolean {
+    if (!this.wcCodec) return false;
+    try {
+      this.wcDecoder?.close();
+    } catch {
+      /* ignore */
+    }
+    const dec = new VideoDecoder({
+      output: (frame) => this.onWcFrameOut(frame),
+      error: (e) => {
+        console.warn("[remote] wc decoder error:", e);
+        this.wcErrors++;
+        if (this.wcDecoder === dec) this.wcDecoder = null;
+        try {
+          dec.close();
+        } catch {
+          /* ignore */
+        }
+        this.wcAwaitKey = true;
+        if (this.wcErrors > 4) this.wcFallback("repeated decoder errors");
+        else this.wcRequestKeyframe();
+      },
+    });
+    try {
+      dec.configure({ codec: this.wcCodec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+    } catch {
+      try {
+        dec.configure({ codec: this.wcCodec, optimizeForLatency: true });
+      } catch (e2) {
+        console.warn("[remote] wc decoder configure failed:", e2);
+        try {
+          dec.close();
+        } catch {
+          /* ignore */
+        }
+        this.wcFallback("decoder configure failed");
+        return false;
+      }
+    }
+    this.wcDecoder = dec;
+    this.wcAwaitKey = true;
+    return true;
+  }
+
+  private wcRequestKeyframe() {
+    const now = Date.now();
+    if (now - this.wcKfReqAt < 1000) return;
+    this.wcKfReqAt = now;
+    this.sendControl({ type: "vkf" });
+  }
+
+  /** One message on the "video" channel: JSON config, frame header, or fragment. */
+  private onWcMsg(data: unknown) {
+    // Config (string JSON): sent on activation and every encoder reconfigure.
+    if (typeof data === "string") {
+      try {
+        const cfg = JSON.parse(data) as { codec?: string };
+        if (cfg && typeof cfg.codec === "string" && cfg.codec) {
+          if (cfg.codec !== this.wcCodec || !this.wcDecoder) {
+            this.wcCodec = cfg.codec;
+            this.wcBuildDecoder();
+          }
+        }
+      } catch {
+        /* malformed config */
+      }
+      return;
+    }
+    if (!(data instanceof ArrayBuffer)) return;
+    // Header: 'G' 'V' flags 0 | seq u32 | tsMs f64 | len u32 (little-endian).
+    if (!this.wcHead) {
+      if (data.byteLength !== 20) return; // desync — wait for the next header
+      const dv = new DataView(data);
+      if (dv.getUint8(0) !== 0x47 || dv.getUint8(1) !== 0x56) return;
+      const len = dv.getUint32(16, true);
+      if (len === 0 || len > 16_000_000) return;
+      this.wcHead = {
+        key: (dv.getUint8(2) & 1) === 1,
+        seq: dv.getUint32(4, true),
+        tsMs: dv.getFloat64(8, true),
+        len,
+      };
+      this.wcBuf = new Uint8Array(len);
+      this.wcGot = 0;
+      return;
+    }
+    // Payload fragment (ordered reliable channel → simple append).
+    const head = this.wcHead;
+    const buf = this.wcBuf!;
+    const chunk = new Uint8Array(data);
+    const room = head.len - this.wcGot;
+    buf.set(chunk.subarray(0, Math.min(chunk.length, room)), this.wcGot);
+    this.wcGot += chunk.length;
+    if (this.wcGot < head.len) return;
+    this.wcHead = null;
+    this.wcBuf = null;
+    this.wcFeedFrame(head, buf);
+  }
+
+  /** A complete encoded frame arrived — account for it and hand it to the decoder. */
+  private wcFeedFrame(head: { key: boolean; seq: number; tsMs: number; len: number }, bytes: Uint8Array) {
+    const now = Date.now();
+    if (!this.wcActive) {
+      this.wcActive = true;
+      this.wcRequestedAt = 0;
+      this.emitEvent({ event: "wc", active: true });
+    }
+    this.wcLastFrameAt = now;
+    // Backgrounded (NOT PiP — a PiP window counts as visible): skip decoding to
+    // save battery; resync off a fresh keyframe when the app comes back.
+    if (document.hidden && !head.key) {
+      this.wcAwaitKey = true;
+      return;
+    }
+    this.wcBytes += head.len;
+    this.wcByteWin.push({ at: now, bytes: head.len });
+    while (this.wcByteWin.length && now - this.wcByteWin[0].at > 2000) this.wcByteWin.shift();
+    if (head.key) this.wcKeys++;
+    // A delta frame without its reference chain is garbage — wait for a keyframe.
+    if (this.wcAwaitKey && !head.key) {
+      this.wcRequestKeyframe();
+      return;
+    }
+    if (!this.wcDecoder && !this.wcBuildDecoder()) return;
+    if (head.key) this.wcAwaitKey = false;
+    const tsUs = Math.round(head.tsMs * 1000);
+    this.wcMeta.set(tsUs, { arrivedAt: now, tsMs: head.tsMs, bytes: head.len });
+    if (this.wcMeta.size > 120) {
+      const first = this.wcMeta.keys().next().value;
+      if (first !== undefined) this.wcMeta.delete(first);
+    }
+    try {
+      this.wcDecoder!.decode(
+        new EncodedVideoChunk({ type: head.key ? "key" : "delta", timestamp: tsUs, data: bytes }),
+      );
+      this.wcFrames++;
+    } catch (e) {
+      console.warn("[remote] wc decode submit failed:", e);
+      this.wcAwaitKey = true;
+      this.wcRequestKeyframe();
+    }
+  }
+
+  /** Decoded frame out: update latency stats and deliver to the render sink. */
+  private onWcFrameOut(frame: VideoFrame) {
+    const now = Date.now();
+    const meta = this.wcMeta.get(frame.timestamp);
+    if (meta) {
+      this.wcMeta.delete(frame.timestamp);
+      const dec = now - meta.arrivedAt;
+      this.wcDecMs = this.wcDecMs === 0 ? dec : this.wcDecMs * 0.85 + dec * 0.15;
+      const clk = this.bestClock();
+      if (clk) {
+        // Host perf clock ≈ guest Date clock + off  ⇒  host ts in guest time.
+        const capturedAtGuest = meta.tsMs - clk.off;
+        const e2e = now - capturedAtGuest;
+        const net = meta.arrivedAt - capturedAtGuest;
+        if (e2e > -50 && e2e < 5000) this.wcE2eMs = this.wcE2eMs === 0 ? e2e : this.wcE2eMs * 0.85 + e2e * 0.15;
+        if (net > -50 && net < 5000) this.wcNetMs = this.wcNetMs === 0 ? net : this.wcNetMs * 0.85 + net * 0.15;
+      }
+    }
+    const perfNow = performance.now();
+    this.wcTimes.push(perfNow);
+    while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
+    if (this.wcFrameCb) {
+      try {
+        this.wcFrameCb(frame); // sink owns the frame (draws + closes it)
+        return;
+      } catch {
+        /* fall through to close */
+      }
+    }
+    frame.close();
+  }
+
+  /** Best (lowest-RTT) clock-offset sample from the recent heartbeat window. */
+  private bestClock(): { off: number; rtt: number } | null {
+    if (this.clockSamples.length === 0) return null;
+    let best = this.clockSamples[0];
+    for (const s of this.clockSamples) if (s.rtt < best.rtt) best = s;
+    return best;
+  }
+
+  /**
+   * Register the render sink for direct-video frames (Control's canvas). The
+   * sink takes ownership of each VideoFrame and must close() it after drawing.
+   */
+  onWcFrame(cb: ((f: VideoFrame) => void) | null): () => void {
+    this.wcFrameCb = cb;
+    return () => {
+      if (this.wcFrameCb === cb) this.wcFrameCb = null;
+    };
+  }
+
+  /** Live wc-path telemetry for the HUD (null when the path isn't active). */
+  wcInfo(): WcStats | null {
+    if (!this.wcActive) return null;
+    const now = Date.now();
+    // Self-trim the fps window so a stalled flow reads 0, not the last value.
+    const perfNow = performance.now();
+    while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
+    let winBytes = 0;
+    let winFrames = 0;
+    for (const b of this.wcByteWin) {
+      if (now - b.at <= 1000) {
+        winBytes += b.bytes;
+        winFrames++;
+      }
+    }
+    const clk = this.bestClock();
+    return {
+      active: true,
+      fps: this.wcTimes.length,
+      kbps: Math.round((winBytes * 8) / 1000),
+      frames: this.wcFrames,
+      keyFrames: this.wcKeys,
+      bytes: this.wcBytes,
+      avgFrameKB: winFrames > 0 ? Math.round(winBytes / winFrames / 102.4) / 10 : 0,
+      decodeMs: Math.round(this.wcDecMs * 10) / 10,
+      e2eMs: Math.round(this.wcE2eMs),
+      netMs: Math.round(this.wcNetMs),
+      queue: this.wcDecoder?.decodeQueueSize ?? 0,
+      codec: this.wcCodec,
+      clockRttMs: clk ? Math.round(clk.rtt) : 0,
+    };
   }
 
   /** Apply the current jitter-buffer target to the inbound video receiver. */
@@ -690,6 +1059,24 @@ export class CloudConn {
         return;
       }
       if (!connected) return;
+      // WebCodecs-path health. Opt-in that never produced frames (old host, codec
+      // mismatch) reverts to the track; a live path that stops flowing while a
+      // screen is actually watching first asks for a keyframe, then reverts.
+      if (this.wcRequestedAt && !this.wcActive && Date.now() - this.wcRequestedAt > 6000) {
+        this.wcFallback("no direct-video frames after opt-in");
+      }
+      if (this.wcActive && this.sinkActive && !document.hidden) {
+        if (Date.now() - this.wcLastFrameAt > WATCHDOG_MS * 1.5) {
+          this.wcStallTicks++;
+          if (this.wcStallTicks === 2) this.wcRequestKeyframe();
+          else if (this.wcStallTicks >= 4) {
+            this.wcStallTicks = 0;
+            this.wcFallback("direct-video flow stalled");
+          }
+        } else {
+          this.wcStallTicks = 0;
+        }
+      }
       // Adaptive jitter buffer only. There is deliberately NO decode-stall reconnect:
       // `framesDecoded` stalls whenever the video isn't being *rendered* (e.g. the
       // user is on the Home/Library tab, not Control), which used to trigger a
@@ -803,7 +1190,18 @@ export class CloudConn {
       return;
     }
     if (typeof msg.pong === "number") {
-      this.lastPong = Date.now();
+      const now = Date.now();
+      this.lastPong = now;
+      // Clock sync: `t` is the host's perf clock at pong time; midpoint of our
+      // send/receive maps it onto our Date clock (best sample = lowest RTT).
+      const t = (msg as { t?: number }).t;
+      if (typeof t === "number") {
+        const rtt = now - msg.pong;
+        if (rtt >= 0 && rtt < 5000) {
+          this.clockSamples.push({ rtt, off: t - (msg.pong + now) / 2 });
+          if (this.clockSamples.length > 8) this.clockSamples.shift();
+        }
+      }
       return;
     }
     if (typeof msg.event === "string") {
@@ -816,6 +1214,9 @@ export class CloudConn {
           // Host just started capture on the existing track — nudge subscribers to
           // re-attach so the first-approval path doesn't stick on "Waking…".
           this.emitStream();
+          // Opt in to the WebCodecs direct-video path when this device can decode
+          // H.264 itself (bypasses the receiver jitter buffer entirely).
+          void this.maybeStartWc();
         } else if (state === "pending") {
           this.emit("pending");
         } else if (state === "denied") {
@@ -825,6 +1226,11 @@ export class CloudConn {
           this.pc?.close();
           this.deniedCb?.();
         }
+      }
+      // Host revoked the wc path (its encoder failed) — resume the WebRTC track.
+      if (msg.event === "vmode" && (msg as { mode?: string }).mode === "rtc") {
+        this.wcSupported = false;
+        this.wcReset(false);
       }
       this.emitEvent(msg as HostEvent);
       return;
@@ -1047,6 +1453,9 @@ export class CloudConn {
     this.stopHeartbeat();
     this.stopWatchdog();
     this.stopJitterHold();
+    this.wcReset(false);
+    this.wcFrameCb = null;
+    this.clockSamples = [];
     this.pc?.close();
     this.pc = null;
     this.sig?.close();

@@ -764,6 +764,43 @@ not regress):**
   never do that ([selkies#157](https://github.com/selkies-project/selkies/issues/157),
   [MDN jitterBufferTarget](https://developer.mozilla.org/en-US/docs/Web/API/RTCRtpReceiver/jitterBufferTarget)).
 
+**v3.9.18 direct-video path (WebCodecs over data channel) + auto-PiP + audio memory (do
+not regress):**
+- **The WebRTC jitter buffer was the unfixable ~170-260ms.** `jitterBufferTarget` is a
+  *minimum* only; Chromium's own delay estimator (fed by the bursty JPEG→canvas arrival
+  cadence) pinned playout far above the 40ms ask (`UA min 172ms` in the HUD) and no
+  receiver hint can push below it. Fix: **bypass the buffer entirely.** The guest opts in
+  with `{type:"vmode",mode:"wc"}` after auth-ok when `VideoDecoder` is available; the host
+  then stops feeding the `MediaStreamTrackGenerator` track and instead encodes each
+  composited canvas frame with **WebCodecs `VideoEncoder`** (H.264 annexb, `latencyMode:
+  "realtime"`, long GOP — keyframes only every 10s/on-demand, so no ~1Hz IDR hitch) and
+  ships it over a 4th reliable+ordered data channel **"video"** (20-byte header
+  `'G''V' flags seq u32 tsMs f64 len u32` + ≤60KB fragments). The guest decodes with
+  `VideoDecoder` (`optimizeForLatency`) and paints straight onto the Control canvas —
+  no RTP, no playout delay, no compositor sampling. Measured e2e is clock-synced via the
+  heartbeat (`pong` now carries host `performance.now()`; lowest-RTT-of-8 midpoint).
+- **Fallback is automatic and layered:** WebRTC track stays negotiated; guest reverts
+  (`vmode rtc`) on probe failure, opt-in timeout (6s), repeated decoder errors, or flow
+  stall (watchdog vkf at ~6s, revert at ~12s); host reverts on encoder failure and pushes
+  `{event:"vmode",mode:"rtc"}`. **Quest stays on the RTC track** (immersive VR consumes
+  the `<video>` element as a WebGL texture; the wc canvas path would leave VR black).
+  Host encoder-stall watchdog is gated on `!wcSink` (0 RTP fps is HEALTHY in wc mode).
+  Latest-wins everywhere: frames are skipped when `videoCh.bufferedAmount > 256KB` or
+  `encodeQueueSize > 2` — a backlog can only become latency.
+- **HUD:** header shows the transport (`DIRECT`/`RTC`/`LAN`); wc mode swaps the top grid
+  for measured stats (E2E, net+enc, decode ms, dec queue, frame KB, clock ±) and the host
+  section gains H264 enc ms / skipped / channel buf. The lag pill uses the measured E2E.
+- **Android auto-PiP:** `MainActivity.setPipWanted(bool)` (JNI static method; field-set
+  fallback for old builds) arms `setAutoEnterEnabled` on Android 12+ — the OS runs the
+  seamless YouTube-style shrink on home gesture/app-switch; 8–11 keep `onUserLeaveHint`
+  (gated `< S` so S+ can't double-trigger). Control detects the tiny PiP window
+  (`innerWidth ≤ 550 && innerHeight ≤ 350`) and hides ALL chrome — pure video.
+  Backgrounded-without-PiP guests skip decoding (delta frames dropped, resync by
+  keyframe on return) to save battery.
+- **PC sound remembers its state** (`gt.remote.soundOn`): restored on connect by
+  attempting an unmuted `play()`; if the platform still demands a gesture the toggle
+  falls back to off so one tap restores it.
+
 **v3.9.16+ A/V-sync buffer lag (do not regress):**
 - **Symptom:** JB target shows 40ms but measured buffer stays ~200ms; decode fps
   far below host produce; bitrate can collapse (~200kbps). Chromium implements

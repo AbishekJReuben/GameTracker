@@ -1,10 +1,13 @@
 //! Picture-in-picture gate for the Android shell.
 //!
-//! The webview flips `MainActivity.pipWanted` (a static Java field, see
-//! `scripts/patch-android.mjs`) over JNI while a remote session is live; the
-//! activity's `onUserLeaveHint` then shrinks the app into a floating 16:9 mini
-//! window (YouTube/AnyDesk style) instead of plain backgrounding. Gated so an
-//! unconnected app (dashboard, pairing) backgrounds normally.
+//! The webview calls `MainActivity.setPipWanted(bool)` (a static Kotlin method,
+//! see `scripts/patch-android.mjs`) over JNI while a remote session is live.
+//! On Android 12+ that arms `PictureInPictureParams.setAutoEnterEnabled`, so
+//! the OS itself runs the seamless YouTube-style shrink animation on the home
+//! gesture / app switch; Android 8–11 falls back to `onUserLeaveHint`. Gated so
+//! an unconnected app (dashboard, pairing) backgrounds normally. If the method
+//! is missing (older generated activity), the raw `pipWanted` field is set
+//! instead so the legacy leave-hint path still works.
 
 #[tauri::command]
 pub async fn set_pip_enabled(enabled: bool) -> Result<(), String> {
@@ -46,11 +49,21 @@ fn set_pip_impl(enabled: bool) -> Result<(), String> {
             .l()
             .map_err(|e| e.to_string())?;
         let class = JClass::from(class_obj);
-        let fid = env
-            .get_static_field_id(&class, "pipWanted", "Z")
-            .map_err(|e| format!("pipWanted field: {e}"))?;
-        env.set_static_field(&class, fid, JValue::Bool(u8::from(enabled)))
-            .map_err(|e| format!("set pipWanted: {e}"))?;
+        // Preferred: the static method — it also refreshes the live activity's
+        // PiP params so Android 12+ auto-enter engages without a restart.
+        let called = env
+            .call_static_method(&class, "setPipWanted", "(Z)V", &[JValue::Bool(u8::from(enabled))])
+            .is_ok();
+        if !called {
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            let fid = env
+                .get_static_field_id(&class, "pipWanted", "Z")
+                .map_err(|e| format!("pipWanted field: {e}"))?;
+            env.set_static_field(&class, fid, JValue::Bool(u8::from(enabled)))
+                .map_err(|e| format!("set pipWanted: {e}"))?;
+        }
         Ok(())
     })();
 

@@ -72,6 +72,19 @@ interface HostOptions {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
+// ---- WebCodecs direct-video path ("wc") ------------------------------------
+// H.264 candidates for the data-channel video path, most capable first
+// (High → Main → Constrained-Baseline, all level 5.2 so 4K60 fits).
+const WC_CODECS = ["avc1.640034", "avc1.4d0034", "avc1.42e034"];
+/** Fragment size for encoded frames on the SCTP channel (< 64KB interop limit). */
+const WC_FRAG = 61440;
+/** Skip encoding new frames while this many bytes sit unsent in the channel —
+ *  a backlog can only become latency, and the next frame supersedes this one. */
+const WC_MAX_BUFFERED = 262144;
+/** Recovery keyframe cadence (ms). Transport is reliable, so keyframes are only
+ *  for decoder recovery/joins — long GOPs also avoid Chromium's ~1Hz IDR hitch. */
+const WC_KEY_INTERVAL_MS = 10000;
+
 const CONTENT_NUM: Record<string, number> = { auto: 0, text: 1, video: 2 };
 /** Video-track content hint + bitrate-degradation preference per content mode. */
 function trackTuning(mode: string): { hint: string; degrade: RTCDegradationPreference } {
@@ -368,6 +381,13 @@ export function startHost(opts: HostOptions): () => void {
   // `bitrate` is kbps (0 = auto: derive from resolution/fps via bitrateFor).
   const quality = { maxW: 1600, jpeg: 70, fps: opts.fps ?? 30, mode: "auto" as string, bitrate: 0 };
 
+  // When set, composited frames are diverted from the WebRTC generator track into
+  // the WebCodecs encoder → "video" data channel (the guest opted in with
+  // {type:"vmode",mode:"wc"}). Owned by the current peer session (startPeer).
+  let wcSink: ((canvas: HTMLCanvasElement) => void) | null = null;
+  /** Tear down the current session's WebCodecs encoder (set by startPeer). */
+  let wcStop: (() => void) | null = null;
+
   const stopCapture = () => {
     try {
       if (opts.fixedMonitor != null) api.remoteStopAuxCapture(opts.fixedMonitor);
@@ -493,6 +513,8 @@ export function startHost(opts: HostOptions): () => void {
       clearInterval(focusTimer);
       focusTimer = null;
     }
+    wcStop?.();
+    wcStop = null;
     stopCapture();
     stopAudio();
     videoWriter?.close().catch(() => {});
@@ -552,6 +574,16 @@ export function startHost(opts: HostOptions): () => void {
     // smooth). A monotonic cadence + explicit duration keeps playout even.
     let nextTsUs = 0;
     const pushFrame = () => {
+      // Direct WebCodecs path active: the guest decodes H.264 off the data
+      // channel, so feeding the WebRTC track too would double-encode every frame.
+      if (wcSink) {
+        try {
+          wcSink(canvas);
+        } catch {
+          /* encoder mid-reconfigure */
+        }
+        return;
+      }
       if (!writer || pendingWrites > 2) return;
       try {
         const fps = Math.max(1, quality.fps);
@@ -943,6 +975,205 @@ export function startHost(opts: HostOptions): () => void {
     const move = pc.createDataChannel("move", { ordered: false, maxRetransmits: 0 });
     const data = pc.createDataChannel("data");
     dataCh = data;
+    // Reliable+ordered channel for the WebCodecs direct-video path. Created up
+    // front (no renegotiation); carries nothing until the guest opts in.
+    const videoCh = pc.createDataChannel("video");
+    videoCh.binaryType = "arraybuffer";
+
+    // ---- WebCodecs direct-video encoder (bypasses the receiver jitter buffer).
+    // The phone's dominant latency term was Chromium's video jitter buffer:
+    // `jitterBufferTarget` is only a MINIMUM, and the UA's own estimate (fed by
+    // the bursty JPEG→canvas arrival cadence) pinned playout ~170-260ms behind.
+    // Encoding H.264 ourselves and shipping it over a data channel lets the guest
+    // decode + present each frame the moment it arrives — Moonlight-style — while
+    // the WebRTC track stays negotiated as an instant fallback.
+    let wcEncoder: VideoEncoder | null = null;
+    let wcCodec = "";
+    let wcHw: HardwareAcceleration = "prefer-hardware";
+    let wcW = 0;
+    let wcH = 0;
+    let wcBps = 0;
+    let wcFps = 0;
+    let wcSeq = 0;
+    let wcForceKey = false;
+    let wcLastKeyAt = 0;
+    let wcEncMs = 0; // EWMA encode latency (frame submit → encoded chunk out)
+    let wcFrames = 0;
+    let wcBytes = 0;
+    let wcKeys = 0;
+    let wcSkipped = 0;
+    let wcDead = false; // hard failure this session — don't retry until a new peer
+
+    const wcTargetBps = () => (quality.bitrate > 0 ? quality.bitrate * 1000 : bitrateFor(quality));
+
+    /** Ship one encoded chunk: 20-byte header, then ≤WC_FRAG fragments. */
+    const wcSend = (chunk: EncodedVideoChunk) => {
+      if (videoCh.readyState !== "open") return;
+      const payload = new ArrayBuffer(chunk.byteLength);
+      chunk.copyTo(payload);
+      const head = new ArrayBuffer(20);
+      const dv = new DataView(head);
+      dv.setUint8(0, 0x47); // 'G'
+      dv.setUint8(1, 0x56); // 'V'
+      dv.setUint8(2, chunk.type === "key" ? 1 : 0);
+      dv.setUint8(3, 0);
+      dv.setUint32(4, wcSeq++ >>> 0, true);
+      dv.setFloat64(8, chunk.timestamp / 1000, true); // host perf.now() ms at capture
+      dv.setUint32(16, payload.byteLength, true);
+      try {
+        videoCh.send(head);
+        for (let off = 0; off < payload.byteLength; off += WC_FRAG) {
+          videoCh.send(new Uint8Array(payload, off, Math.min(WC_FRAG, payload.byteLength - off)));
+        }
+      } catch {
+        return; // channel died mid-frame; the guest resyncs off the next header
+      }
+      wcFrames++;
+      wcBytes += payload.byteLength;
+      if (chunk.type === "key") {
+        wcKeys++;
+        wcLastKeyAt = performance.now();
+      }
+    };
+
+    /** Stop the wc path. `notifyGuest` asks the phone to fall back to the track. */
+    const wcTeardown = (notifyGuest: boolean) => {
+      wcSink = null;
+      try {
+        wcEncoder?.close();
+      } catch {
+        /* already closed */
+      }
+      wcEncoder = null;
+      wcW = 0;
+      wcH = 0;
+      if (notifyGuest && dataCh?.readyState === "open") {
+        try {
+          dataCh.send(JSON.stringify({ event: "vmode", mode: "rtc" }));
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    wcStop = () => wcTeardown(false);
+
+    /** Encode one composited canvas frame (called from pushFrame via wcSink). */
+    const wcEncodeFrame = (canvas: HTMLCanvasElement) => {
+      const enc = wcEncoder;
+      if (!enc || enc.state === "closed" || videoCh.readyState !== "open") return;
+      const w = canvas.width;
+      const h = canvas.height;
+      if (w < 2 || h < 2) return;
+      const bps = wcTargetBps();
+      // (Re)configure on size/bitrate/fps changes. Cheap (no encoder rebuild) and
+      // the next frame is forced to a keyframe so the guest resyncs instantly.
+      if (w !== wcW || h !== wcH || bps !== wcBps || quality.fps !== wcFps) {
+        try {
+          enc.configure({
+            codec: wcCodec,
+            width: w,
+            height: h,
+            bitrate: bps,
+            framerate: quality.fps,
+            latencyMode: "realtime",
+            hardwareAcceleration: wcHw,
+            avc: { format: "annexb" },
+          });
+        } catch (e) {
+          console.warn("[remote] wc encoder configure failed — falling back to the RTC track:", e);
+          wcDead = true;
+          wcTeardown(true);
+          return;
+        }
+        wcW = w;
+        wcH = h;
+        wcBps = bps;
+        wcFps = quality.fps;
+        wcForceKey = true;
+        try {
+          videoCh.send(JSON.stringify({ codec: wcCodec, w, h }));
+        } catch {
+          /* guest resyncs from the next keyframe's in-band SPS/PPS */
+        }
+      }
+      // Latest-wins: a backlog in the channel or the encoder can only ever AGE the
+      // stream — skip this frame and let the next one carry the fresher pixels.
+      if (videoCh.bufferedAmount > WC_MAX_BUFFERED || enc.encodeQueueSize > 2) {
+        wcSkipped++;
+        return;
+      }
+      const key = wcForceKey || performance.now() - wcLastKeyAt > WC_KEY_INTERVAL_MS;
+      wcForceKey = false;
+      const vf = new VideoFrame(canvas, { timestamp: Math.round(performance.now() * 1000) });
+      try {
+        enc.encode(vf, { keyFrame: key });
+      } catch {
+        wcSkipped++;
+      } finally {
+        vf.close();
+      }
+    };
+
+    /** Guest opted in: pick a codec, build the encoder, divert the frame feed. */
+    const wcActivate = async () => {
+      if (wcSink || wcDead || pc !== myPc) return;
+      if (typeof VideoEncoder === "undefined") {
+        wcDead = true;
+        wcTeardown(true);
+        return;
+      }
+      // Probe at 4K60 so a codec accepted here always covers the live resolution.
+      let picked = "";
+      let pickedHw: HardwareAcceleration = "prefer-hardware";
+      for (const hw of ["prefer-hardware", "no-preference"] as HardwareAcceleration[]) {
+        for (const codec of WC_CODECS) {
+          try {
+            const r = await VideoEncoder.isConfigSupported({
+              codec,
+              width: 3840,
+              height: 2160,
+              bitrate: 12_000_000,
+              framerate: 60,
+              latencyMode: "realtime",
+              hardwareAcceleration: hw,
+              avc: { format: "annexb" },
+            });
+            if (r.supported) {
+              picked = codec;
+              pickedHw = hw;
+              break;
+            }
+          } catch {
+            /* try next */
+          }
+        }
+        if (picked) break;
+      }
+      if (pc !== myPc || wcSink) return; // superseded while probing
+      if (!picked) {
+        wcDead = true;
+        wcTeardown(true);
+        return;
+      }
+      wcCodec = picked;
+      wcHw = pickedHw;
+      wcEncoder = new VideoEncoder({
+        output: (chunk) => {
+          const ms = performance.now() - chunk.timestamp / 1000;
+          wcEncMs = wcEncMs === 0 ? ms : wcEncMs * 0.9 + ms * 0.1;
+          wcSend(chunk);
+        },
+        error: (e) => {
+          console.warn("[remote] wc encoder error — falling back to the RTC track:", e);
+          wcDead = true;
+          wcTeardown(true);
+        },
+      });
+      wcW = 0; // force configure on the first frame
+      wcH = 0;
+      wcForceKey = true;
+      wcSink = wcEncodeFrame;
+    };
 
     // Video and audio ride SEPARATE media streams on purpose: receivers only
     // lip-sync tracks grouped in the same signaled stream, and that sync makes
@@ -1054,6 +1285,25 @@ export function startHost(opts: HostOptions): () => void {
           }
           return;
         }
+        // Video-mode negotiation: "wc" = guest can decode H.264 off the data
+        // channel (WebCodecs) — no receiver jitter buffer; "rtc" = revert to the
+        // WebRTC track (guest decoder failed or the path underperformed there).
+        if (msg && msg.type === "vmode") {
+          // Guests only ask for "wc" after the auth-ok event, so `authorized` is
+          // normally already true; an unauthorized ask is simply ignored (the
+          // guest's own timeout then reverts it to the track).
+          if (msg.mode === "wc") {
+            if (authorized) void wcActivate();
+          } else {
+            wcTeardown(false);
+          }
+          return;
+        }
+        // Guest lost decode sync (error/reconfigure) — resync with a keyframe.
+        if (msg && msg.type === "vkf") {
+          wcForceKey = true;
+          return;
+        }
         // Multi-monitor pop-out: spin up (or keep) an aux host for that display.
         if (msg && msg.type === "auxHost" && typeof msg.monitor === "number") {
           ensureAuxHost(msg.monitor);
@@ -1131,8 +1381,10 @@ export function startHost(opts: HostOptions): () => void {
       }
       lastGuestMsg = Date.now();
       // Heartbeat: bounce a pong so the guest can detect a silently-dead link.
+      // `t` (host perf clock) lets the guest sync clocks (NTP-style midpoint) and
+      // turn per-frame host timestamps into a real end-to-end latency reading.
       if (typeof req.ping === "number") {
-        if (data.readyState === "open") data.send(JSON.stringify({ pong: req.ping }));
+        if (data.readyState === "open") data.send(JSON.stringify({ pong: req.ping, t: performance.now() }));
         return;
       }
       if (typeof req.id !== "number" || typeof req.path !== "string") return;
@@ -1321,6 +1573,20 @@ export function startHost(opts: HostOptions): () => void {
                     jpegQ: jpegForRtc(quality.jpeg),
                     content: quality.mode,
                   },
+                  // WebCodecs direct-path telemetry (all cumulative except encMs/buf).
+                  wc: wcSink
+                    ? {
+                        on: true,
+                        codec: wcCodec,
+                        encMs: Math.round(wcEncMs * 10) / 10,
+                        frames: wcFrames,
+                        bytes: wcBytes,
+                        keys: wcKeys,
+                        skipped: wcSkipped,
+                        bufKB: Math.round(videoCh.bufferedAmount / 1024),
+                        kbpsMax: Math.round(wcBps / 1000),
+                      }
+                    : { on: false },
                   at: Date.now(),
                 }),
               );
@@ -1365,7 +1631,9 @@ export function startHost(opts: HostOptions): () => void {
             }
             stallProduced = cs.producedFrames;
             stallProducedAt = now;
-            if (producedRate > 3 && link.fps === 0) {
+            // wc mode intentionally starves the WebRTC encoder (frames go out the
+            // data channel instead) — 0 RTP fps is healthy then, not a stall.
+            if (producedRate > 3 && link.fps === 0 && !wcSink) {
               encStallTicks++;
               if (encStallTicks >= 10) {
                 encStallTicks = -30; // ~15s cooldown before it may fire again

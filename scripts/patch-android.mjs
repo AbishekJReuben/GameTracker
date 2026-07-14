@@ -230,33 +230,69 @@ const save = (path, before, after, msg) => {
       `import android.util.Rational\n` +
       `import androidx.activity.enableEdgeToEdge\n` +
       `import androidx.core.view.WindowInsetsCompat\n` +
-      `import androidx.core.view.WindowInsetsControllerCompat\n\n` +
+      `import androidx.core.view.WindowInsetsControllerCompat\n` +
+      `import java.lang.ref.WeakReference\n\n` +
       `class MainActivity : TauriActivity() {\n` +
       `  companion object {\n` +
-      `    /** Set over JNI by the Rust \`set_pip_enabled\` command: true while the\n` +
-      `     *  webview has a live remote session, so leaving the app shrinks it into\n` +
-      `     *  a floating 16:9 mini window (YouTube/AnyDesk style) instead of plain\n` +
-      `     *  backgrounding. */\n` +
+      `    /** True while the webview has a live remote session (set over JNI by the\n` +
+      `     *  Rust \`set_pip_enabled\` command via [setPipWanted]) — leaving the app\n` +
+      `     *  then shrinks it into a floating 16:9 mini window (YouTube/AnyDesk\n` +
+      `     *  style) instead of plain backgrounding. */\n` +
       `    @JvmField var pipWanted = false\n` +
+      `    private var current: WeakReference<MainActivity>? = null\n\n` +
+      `    /** JNI entry point: flips the gate AND refreshes the live activity's PiP\n` +
+      `     *  params, so Android 12+'s auto-enter (the SEAMLESS system-animated\n` +
+      `     *  transition on the home gesture) engages/disengages immediately. */\n` +
+      `    @JvmStatic\n` +
+      `    fun setPipWanted(enabled: Boolean) {\n` +
+      `      pipWanted = enabled\n` +
+      `      val act = current?.get() ?: return\n` +
+      `      act.runOnUiThread { act.updatePipParams() }\n` +
+      `    }\n` +
       `  }\n\n` +
       `  override fun onCreate(savedInstanceState: Bundle?) {\n` +
       `    enableEdgeToEdge()\n` +
       `    super.onCreate(savedInstanceState)\n` +
+      `    current = WeakReference(this)\n` +
       `    // Follow the physical sensor in all four orientations, IGNORING the\n` +
       `    // system auto-rotate lock — holding the phone sideways for a moment\n` +
       `    // rotates the remote screen even with rotation lock on.\n` +
       `    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR\n` +
       `    hideSystemBars()\n` +
+      `    updatePipParams()\n` +
       `  }\n\n` +
       `  override fun onWindowFocusChanged(hasFocus: Boolean) {\n` +
       `    super.onWindowFocusChanged(hasFocus)\n` +
       `    // Re-hide after the bars are transiently shown (keyboard, app resume).\n` +
       `    if (hasFocus) hideSystemBars()\n` +
       `  }\n\n` +
-      `  // Home / recents while connected → floating 16:9 mini window.\n` +
+      `  /** Android 12+: auto-enter PiP is armed via params (the OS runs the smooth\n` +
+      `   *  shrink animation itself when the user swipes home — no flicker, exactly\n` +
+      `   *  like YouTube). Re-applied whenever the session-live gate flips. */\n` +
+      `  fun updatePipParams() {\n` +
+      `    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return\n` +
+      `    try {\n` +
+      `      setPictureInPictureParams(\n` +
+      `        PictureInPictureParams.Builder()\n` +
+      `          .setAspectRatio(Rational(16, 9))\n` +
+      `          .setAutoEnterEnabled(pipWanted)\n` +
+      `          .setSeamlessResizeEnabled(false)\n` +
+      `          .build()\n` +
+      `      )\n` +
+      `    } catch (_: Exception) {\n` +
+      `      // PiP unavailable (device/settings) — plain backgrounding is fine.\n` +
+      `    }\n` +
+      `  }\n\n` +
+      `  // Home / recents while connected → floating 16:9 mini window. Legacy path\n` +
+      `  // for Android 8–11 (S+ uses the auto-enter params above; entering again\n` +
+      `  // here would double-trigger, so it's gated to pre-S).\n` +
       `  override fun onUserLeaveHint() {\n` +
       `    super.onUserLeaveHint()\n` +
-      `    if (pipWanted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {\n` +
+      `    if (\n` +
+      `      pipWanted &&\n` +
+      `      Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&\n` +
+      `      Build.VERSION.SDK_INT < Build.VERSION_CODES.S\n` +
+      `    ) {\n` +
       `      try {\n` +
       `        enterPictureInPictureMode(\n` +
       `          PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()\n` +
@@ -280,7 +316,7 @@ const save = (path, before, after, msg) => {
       `      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE\n` +
       `  }\n` +
       `}\n`;
-    save(mainActivityPath, before, content, "rewrote MainActivity.kt (immersive + sensor rotate + PiP)");
+    save(mainActivityPath, before, content, "rewrote MainActivity.kt (immersive + sensor rotate + auto-enter PiP)");
   }
 }
 

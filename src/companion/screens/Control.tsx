@@ -66,7 +66,7 @@ import {
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { startGamepadBridge } from "../gamepad";
 import { apiGet } from "../link";
-import type { ConnectSnapshot } from "../cloud";
+import type { ConnectSnapshot, WcStats } from "../cloud";
 import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { isQuestBrowser } from "../device";
@@ -86,7 +86,18 @@ type HostRtcStats = {
   jpegQ: number;
   content: string;
 };
-type HostStats = RemoteCaptureStats & { producedFps?: number; rtc?: HostRtcStats };
+type HostWcStats = {
+  on: boolean;
+  codec?: string;
+  encMs?: number;
+  frames?: number;
+  bytes?: number;
+  keys?: number;
+  skipped?: number;
+  bufKB?: number;
+  kbpsMax?: number;
+};
+type HostStats = RemoteCaptureStats & { producedFps?: number; rtc?: HostRtcStats; wc?: HostWcStats };
 type NetStats = {
   fps: number;
   kbps: number;
@@ -377,9 +388,29 @@ export function ControlScreen({
   const [showReconnect, setShowReconnect] = useState(false);
   const [hasStream, setHasStream] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
-  const [soundOn, setSoundOn] = useState(false);
+  // PC sound remembers its last state: restored automatically on connect, with a
+  // graceful drop back to "off" if the platform still demands a fresh gesture.
+  const [soundOn, setSoundOn] = useState(() => localStorage.getItem("gt.remote.soundOn") === "1");
   const soundOnRef = useRef(false);
   soundOnRef.current = soundOn;
+  useEffect(() => {
+    localStorage.setItem("gt.remote.soundOn", soundOn ? "1" : "0");
+  }, [soundOn]);
+  // Direct-video path (WebCodecs over the data channel): frames render on the
+  // canvas — the <video> element (WebRTC track) hides while this is live.
+  const [wcActive, setWcActive] = useState(false);
+  const wcActiveRef = useRef(false);
+  wcActiveRef.current = wcActive;
+  // Android PiP: the OS shrinks the whole webview into a mini floating window.
+  // There is no direct signal inside the webview, but the PiP window is far
+  // smaller than any phone layout — hide ALL chrome and show pure video there.
+  const [pipView, setPipView] = useState(false);
+  useEffect(() => {
+    const check = () => setPipView(window.innerWidth <= 550 && window.innerHeight <= 350);
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
   const [mode, setMode] = useState<Mode>(() => (isQuestBrowser() ? "touch" : "trackpad"));
   // Expanded bottom panel (null = collapsed). It pushes the viewport up, never overlaps.
   const [panel, setPanel] = useState<Panel | null>(null);
@@ -661,6 +692,7 @@ export function ControlScreen({
   // Debug telemetry: host capture pipeline + decode-side WebRTC stats.
   const [hostStats, setHostStats] = useState<HostStats | null>(null);
   const [net, setNet] = useState<NetStats | null>(null);
+  const [wcStats, setWcStats] = useState<WcStats | null>(null);
   const prodRef = useRef<{ frames: number; at: number } | null>(null);
   const netRef = useRef<{ bytes: number; at: number; jbDelay: number; jbCount: number; decT: number; decoded: number } | null>(null);
 
@@ -750,14 +782,22 @@ export function ControlScreen({
       if (!a) return;
       a.srcObject = stream;
       a.muted = !soundOnRef.current;
-      if (soundOnRef.current) a.play?.().catch(() => {});
+      // Remembered "sound on": try to resume unmuted right away. If the platform
+      // still requires a user gesture, flip the toggle back off so the speaker
+      // button shows the true state and one tap restores it.
+      if (soundOnRef.current) a.play?.().catch(() => setSoundOn(false));
     });
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     const unsubEvent = link.onEvent((e) => {
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
       else if (e.event === "cursor") setCursorKind(String((e as { kind?: string }).kind || "arrow"));
       else if (e.event === "gamepad") setPadAvailable(!!(e as { available?: boolean }).available);
-      else if (e.event === "auth" && (e as { state?: string }).state === "ok") {
+      else if (e.event === "wc") {
+        // Direct-video path toggled: swap the render surface (canvas ↔ video).
+        const active = !!(e as { active?: boolean }).active;
+        setWcActive(active);
+        if (active) setHasFrame(false); // until the first decoded frame lands
+      } else if (e.event === "auth" && (e as { state?: string }).state === "ok") {
         // Capture just started on the existing track — force a rebind + play.
         const s = pendingStreamRef.current;
         if (s) bindStream(s, true);
@@ -765,6 +805,7 @@ export function ControlScreen({
         const cs = (e as { stats?: RemoteCaptureStats; rtc?: HostRtcStats }).stats;
         if (!cs) return;
         const rtc = (e as { rtc?: HostRtcStats }).rtc;
+        const wc = (e as { wc?: HostWcStats }).wc;
         const now = performance.now();
         const prev = prodRef.current;
         let producedFps: number | undefined;
@@ -773,7 +814,7 @@ export function ControlScreen({
           if (df >= 0) producedFps = Math.round((df * 1000) / (now - prev.at));
         }
         prodRef.current = { frames: cs.producedFrames, at: now };
-        setHostStats({ ...cs, producedFps, rtc });
+        setHostStats({ ...cs, producedFps, rtc, wc });
       }
     });
     // LAN fallback: JPEG tile frames drawn to the canvas.
@@ -793,10 +834,53 @@ export function ControlScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);
 
+  // Direct-video render sink: decoded VideoFrames are painted straight onto the
+  // canvas the instant they leave the decoder — no <video> element, no playout
+  // buffer, no compositor sampling. This is the whole point of the wc path.
+  useEffect(() => {
+    if (!link.onWcFrame) return;
+    const un = link.onWcFrame((frame) => {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        frame.close();
+        return;
+      }
+      const w = frame.displayWidth;
+      const h = frame.displayHeight;
+      if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width = w;
+        canvas.height = h;
+        natRef.current = { w, h };
+        setRes(`${w}×${h}`);
+        const l = measure(viewportRef.current, w, h);
+        if (l) layoutRef.current = l;
+        ctxRef.current = null; // canvas resize invalidates the 2d context state
+      }
+      if (!ctxRef.current) ctxRef.current = canvas.getContext("2d", { alpha: false, desynchronized: true });
+      try {
+        ctxRef.current?.drawImage(frame, 0, 0);
+      } catch {
+        /* decoder handed us a closed frame — skip */
+      } finally {
+        frame.close();
+      }
+      const now = performance.now();
+      const t = frameTimes.current;
+      t.push(now);
+      while (t.length && now - t[0] > 1000) t.shift();
+      setHasFrame(true);
+    });
+    return () => {
+      un?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [link]);
+
   // If we're "connected" (authed) but no decoded frame yet, periodically rebind
   // the stream — covers first-approval where the track was empty at attach time.
+  // Skipped on the wc path (frames don't ride the <video> element there).
   useEffect(() => {
-    if (!connected || hasFrame) return;
+    if (!connected || hasFrame || wcActive) return;
     let n = 0;
     const id = window.setInterval(() => {
       const stream = pendingStreamRef.current;
@@ -809,7 +893,7 @@ export function ControlScreen({
       if (n >= 8) window.clearInterval(id);
     }, 1500);
     return () => window.clearInterval(id);
-  }, [connected, hasFrame]);
+  }, [connected, hasFrame, wcActive]);
 
   // Track browser Fullscreen API state (web / Quest Browser).
   useEffect(() => {
@@ -956,7 +1040,9 @@ export function ControlScreen({
       requestVideoFrameCallback?: (cb: (now: number, meta?: { presentedFrames?: number }) => void) => number;
       cancelVideoFrameCallback?: (h: number) => void;
     }) | null;
-    if (!v || !hasStream || !v.requestVideoFrameCallback) return;
+    // wc path: display fps is counted at the canvas draw instead — counting both
+    // would double-book frameTimes.
+    if (!v || !hasStream || wcActive || !v.requestVideoFrameCallback) return;
     let handle = 0;
     let lastPresented = 0;
     const onVF = (_ts: number, meta?: { presentedFrames?: number }) => {
@@ -977,7 +1063,7 @@ export function ControlScreen({
     };
     handle = v.requestVideoFrameCallback(onVF);
     return () => v.cancelVideoFrameCallback?.(handle);
-  }, [hasStream]);
+  }, [hasStream, wcActive]);
 
   // Load the monitor list once connected (for the display switcher). The data
   // channel can lag the "connected" signal, so retry until it answers — otherwise
@@ -1016,6 +1102,8 @@ export function ControlScreen({
     if (!showStats) return;
     let alive = true;
     const id = window.setInterval(async () => {
+      // Direct-video path telemetry (independent of the RTP stats below).
+      setWcStats(link.wcStats?.() ?? null);
       const s = await link.netStats().catch(() => null);
       if (!alive || !s) return;
       const prev = netRef.current;
@@ -1241,9 +1329,12 @@ export function ControlScreen({
 
   /** The painted screen surface (video track or LAN canvas) — source of truth for hit-testing. */
   const mediaEl = (): HTMLElement | null => {
+    const c = canvasRef.current;
+    // Direct-video path renders on the canvas — the video element may still hold
+    // a stale (frozen) track frame, so the canvas must win while wc is live.
+    if (wcActiveRef.current && c && c.width > 0) return c;
     const v = videoRef.current;
     if (v && v.srcObject && v.videoWidth > 0) return v;
-    const c = canvasRef.current;
     if (c && c.width > 0) return c;
     return v ?? c;
   };
@@ -1933,7 +2024,7 @@ export function ControlScreen({
   const cursorScreen = useMemo(() => {
     return normToViewport(viewportRef.current, mediaEl(), cursor.x, cursor.y);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor, zoom, pan, hasStream, immersive, topCollapsed, dockCollapsed, browserFs, kbInset, vvPin]);
+  }, [cursor, zoom, pan, hasStream, wcActive, immersive, topCollapsed, dockCollapsed, browserFs, kbInset, vvPin]);
   // Trackpad / Quest: hide the OS pointer and draw RemoteCursor (shape mirrors host).
   // Desktop web mouse/pen: live CSS cursor instead (no double-cursor).
   const showRemoteCursor = mode === "trackpad" || questBrowser;
@@ -1961,7 +2052,7 @@ export function ControlScreen({
       }}
     >
       {/* ==== top toolbar — flex sibling (shrinks video); collapsible like the bottom dock ==== */}
-      {!immersive && !topCollapsed && (
+      {!immersive && !topCollapsed && !pipView && (
         <div
           className="relative z-40 flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-base/95 px-2 py-1.5 backdrop-blur"
           style={{ paddingTop: "max(0.35rem, env(safe-area-inset-top))" }}
@@ -2169,7 +2260,7 @@ export function ControlScreen({
           autoPlay
           muted
           playsInline
-          hidden={!hasStream}
+          hidden={!hasStream || wcActive}
           onLoadedMetadata={onVideoSized}
           onResize={onVideoSized}
           onPlaying={() => setHasFrame(true)}
@@ -2188,7 +2279,7 @@ export function ControlScreen({
         <audio ref={audioRef} autoPlay playsInline className="hidden" />
         <canvas
           ref={canvasRef}
-          hidden={hasStream}
+          hidden={hasStream && !wcActive}
           className="max-h-full max-w-full select-none object-contain will-change-transform"
           style={{
             transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
@@ -2235,7 +2326,7 @@ export function ControlScreen({
       </div>
 
       {/* ---- collapsed top / immersive restore chips (same pattern as bottom Controls) ---- */}
-      {(immersive || topCollapsed) && (
+      {(immersive || topCollapsed) && !pipView && (
         <div
           className="absolute left-2 right-2 z-40 flex items-center justify-between gap-1.5"
           // Edge-flush on purpose: the stream itself paints under the notch, so the
@@ -2298,47 +2389,74 @@ export function ControlScreen({
       )}
 
       {/* ---- performance / debug HUD (dense 2-col — double the telemetry, same footprint) ---- */}
-      {showStats && !immersive && !topCollapsed && (
+      {showStats && !immersive && !topCollapsed && !pipView && (
         <div className="absolute right-2 top-2 z-30 w-[17.5rem] max-w-[92vw] rounded-xl border border-white/[0.1] bg-black/70 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md">
           <div className="mb-1 flex items-center justify-between gap-1.5">
             <span className="flex items-center gap-1 text-[10px] font-800 text-white">
               <Gauge className="h-3 w-3 text-accent-3" /> Stream stats
-            </span>
-            {net && (
-              <span
-                className={`rounded px-1 py-0.5 font-800 tabular-nums ${
-                  Math.round(net.rttMs / 2 + net.bufMs + net.decMs) <= 50
-                    ? "bg-green/20 text-green"
-                    : Math.round(net.rttMs / 2 + net.bufMs + net.decMs) <= 100
-                      ? "bg-amber/20 text-amber"
-                      : "bg-red/20 text-red"
-                }`}
-              >
-                ~{Math.max(1, Math.round(net.rttMs / 2 + net.bufMs + net.decMs))}ms
+              <span className={`rounded px-1 py-0.5 text-[8px] font-800 ${wcStats ? "bg-green/20 text-green" : "bg-white/[0.08] text-ink-soft"}`}>
+                {wcStats ? "DIRECT" : hasStream ? "RTC" : "LAN"}
               </span>
-            )}
+            </span>
+            {(() => {
+              // Glass-to-glass estimate: wc path measures it for real (clock-synced
+              // capture→decode); the RTC path approximates rtt/2 + buffer + decode.
+              const lag = wcStats ? wcStats.e2eMs : net ? Math.round(net.rttMs / 2 + net.bufMs + net.decMs) : null;
+              if (lag == null) return null;
+              return (
+                <span
+                  className={`rounded px-1 py-0.5 font-800 tabular-nums ${
+                    lag <= 50 ? "bg-green/20 text-green" : lag <= 100 ? "bg-amber/20 text-amber" : "bg-red/20 text-red"
+                  }`}
+                >
+                  ~{Math.max(1, lag)}ms
+                </span>
+              );
+            })()}
           </div>
-          <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
-            <StatCell k="Display" v={`${fps} fps`} />
-            <StatCell k="Decode" v={net ? `${net.fps} fps` : "—"} />
-            <StatCell k="Res out" v={net && net.w ? `${net.w}×${net.h}` : res || "—"} />
-            <StatCell
-              k="Bitrate ↓"
-              v={net ? (net.kbps >= 1000 ? `${(net.kbps / 1000).toFixed(1)}M` : `${net.kbps}k`) : "—"}
-            />
-            <StatCell k="RTT" v={net ? `${net.rttMs} ms` : "—"} />
-            <StatCell k="Buffer" v={net ? `${net.bufMs} ms` : "—"} hi={!!net && net.bufMs > 60} />
-            <StatCell k="JB tgt/min" v={net ? `${net.jbTargetMs}·${net.jbMinMs}` : "—"} />
-            <StatCell k="Decode ms" v={net ? `${net.decMs.toFixed(1)}` : "—"} />
-            <StatCell k="Jitter" v={net ? `${net.jitterMs} ms` : "—"} />
-            <StatCell k="Loss" v={net ? `${net.lostPkts} pkt` : "—"} />
-            <StatCell k="Drop / frz" v={net ? `${net.dropped} · ${net.freezes}` : "—"} hi={!!net && net.freezes > 10} />
-            <StatCell k="NACK/PLI" v={net ? `${net.nackCount} · ${net.pliCount}` : "—"} />
-            <StatCell k="FIR / IDR↓" v={net ? `${net.firCount} · ${net.keyFramesDecoded}` : "—"} />
-            <StatCell k="Pkts ↓" v={net ? `${net.packetsReceived}` : "—"} />
-            <StatCell k="Decoded" v={net ? `${net.framesDecoded}` : "—"} />
-            <StatCell k="Rendered" v={net ? `${net.framesRendered || "—"}` : "—"} />
-          </div>
+          {wcStats ? (
+            /* Direct WebCodecs path — per-stage latency is measured, not inferred. */
+            <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+              <StatCell k="Display" v={`${fps} fps`} />
+              <StatCell k="Decode" v={`${wcStats.fps} fps`} />
+              <StatCell k="Res out" v={res || "—"} />
+              <StatCell k="Bitrate ↓" v={wcStats.kbps >= 1000 ? `${(wcStats.kbps / 1000).toFixed(1)}M` : `${wcStats.kbps}k`} />
+              <StatCell k="E2E" v={`${wcStats.e2eMs} ms`} hi={wcStats.e2eMs > 80} />
+              <StatCell k="Net+enc" v={`${wcStats.netMs} ms`} />
+              <StatCell k="Decode ms" v={`${wcStats.decodeMs.toFixed(1)}`} />
+              <StatCell k="Dec queue" v={`${wcStats.queue}`} hi={wcStats.queue > 3} />
+              <StatCell k="Frame KB" v={`${wcStats.avgFrameKB}`} />
+              <StatCell k="Codec" v={wcStats.codec.replace(/^avc1\./, "H264/")} />
+              <StatCell k="Frames" v={`${wcStats.frames}`} />
+              <StatCell k="Keyframes" v={`${wcStats.keyFrames}`} />
+              <StatCell k="Data ↓" v={`${(wcStats.bytes / 1048576).toFixed(1)} MB`} />
+              <StatCell k="Clock ±" v={`${wcStats.clockRttMs} ms`} />
+              <StatCell k="Buffer" v="0 ms" />
+              <StatCell k="JB tgt/min" v="bypassed" />
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+              <StatCell k="Display" v={`${fps} fps`} />
+              <StatCell k="Decode" v={net ? `${net.fps} fps` : "—"} />
+              <StatCell k="Res out" v={net && net.w ? `${net.w}×${net.h}` : res || "—"} />
+              <StatCell
+                k="Bitrate ↓"
+                v={net ? (net.kbps >= 1000 ? `${(net.kbps / 1000).toFixed(1)}M` : `${net.kbps}k`) : "—"}
+              />
+              <StatCell k="RTT" v={net ? `${net.rttMs} ms` : "—"} />
+              <StatCell k="Buffer" v={net ? `${net.bufMs} ms` : "—"} hi={!!net && net.bufMs > 60} />
+              <StatCell k="JB tgt/min" v={net ? `${net.jbTargetMs}·${net.jbMinMs}` : "—"} />
+              <StatCell k="Decode ms" v={net ? `${net.decMs.toFixed(1)}` : "—"} />
+              <StatCell k="Jitter" v={net ? `${net.jitterMs} ms` : "—"} />
+              <StatCell k="Loss" v={net ? `${net.lostPkts} pkt` : "—"} />
+              <StatCell k="Drop / frz" v={net ? `${net.dropped} · ${net.freezes}` : "—"} hi={!!net && net.freezes > 10} />
+              <StatCell k="NACK/PLI" v={net ? `${net.nackCount} · ${net.pliCount}` : "—"} />
+              <StatCell k="FIR / IDR↓" v={net ? `${net.firCount} · ${net.keyFramesDecoded}` : "—"} />
+              <StatCell k="Pkts ↓" v={net ? `${net.packetsReceived}` : "—"} />
+              <StatCell k="Decoded" v={net ? `${net.framesDecoded}` : "—"} />
+              <StatCell k="Rendered" v={net ? `${net.framesRendered || "—"}` : "—"} />
+            </div>
+          )}
           {hostStats && (
             <>
               <div className="my-1 border-t border-white/[0.08]" />
@@ -2368,17 +2486,25 @@ export function ControlScreen({
                 <StatCell k="NACK↑/PLI↑" v={hostStats.rtc ? `${hostStats.rtc.nack}·${hostStats.rtc.pli}` : "—"} />
                 <StatCell k="JPEG q" v={hostStats.rtc ? `${hostStats.rtc.jpegQ}` : "—"} />
                 <StatCell k="Mode" v={hostStats.rtc?.content || "—"} />
+                {hostStats.wc?.on && (
+                  <>
+                    <StatCell k="H264 enc" v={`${hostStats.wc.encMs ?? 0} ms`} hi={(hostStats.wc.encMs ?? 0) > 15} />
+                    <StatCell k="Enc cap" v={`${hostStats.wc.kbpsMax ?? 0}k`} />
+                    <StatCell k="Skipped" v={`${hostStats.wc.skipped ?? 0}`} hi={(hostStats.wc.skipped ?? 0) > 30} />
+                    <StatCell k="Ch buf" v={`${hostStats.wc.bufKB ?? 0} KB`} hi={(hostStats.wc.bufKB ?? 0) > 128} />
+                  </>
+                )}
               </div>
             </>
           )}
           <div className="mt-1 rounded-md bg-white/[0.05] px-1.5 py-0.5 text-[9px] font-700 text-accent-3">
-            {bottleneckHint(hostStats, net, fps)}
+            {bottleneckHint(hostStats, net, fps, wcStats)}
           </div>
         </div>
       )}
 
       {/* ---- pinned quick-button rail (small, semi-transparent, screen edge) ---- */}
-      {pinnedDefs.length > 0 && (
+      {pinnedDefs.length > 0 && !pipView && (
         <div
           className="pointer-events-none absolute right-1.5 top-1/2 z-30 flex max-h-[70%] -translate-y-1/2 flex-col gap-1.5 overflow-y-auto py-1"
           style={{ scrollbarWidth: "none" }}
@@ -2404,7 +2530,7 @@ export function ControlScreen({
       )}
 
       {/* ---- "tap to type" — phone fallback when auto-focus needs a gesture ---- */}
-      {!typing && pcTextField && !questBrowser && (
+      {!typing && pcTextField && !questBrowser && !pipView && (
         <motion.button
           initial={{ y: 20, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
@@ -2417,7 +2543,7 @@ export function ControlScreen({
       )}
 
       {/* ---- collapsed-dock helpers: stay visible while typing (Controls must not vanish) ---- */}
-      {(immersive || dockCollapsed) && (
+      {(immersive || dockCollapsed) && !pipView && (
         <div
           className="absolute bottom-2 left-2 right-2 z-40 flex items-center justify-between"
           style={{ marginBottom: "env(safe-area-inset-bottom)" }}
@@ -2540,7 +2666,7 @@ export function ControlScreen({
       )}
 
       {/* ==== bottom control bar ==== */}
-      {!immersive && !dockCollapsed && (
+      {!immersive && !dockCollapsed && !pipView && (
         <motion.div
           initial={{ y: 32, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
@@ -2897,7 +3023,18 @@ function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {
 }
 
 /** A plain-language guess at where latency / fps is being lost. */
-function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps?: number): string {
+function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps?: number, wc?: WcStats | null): string {
+  // Direct WebCodecs path: E2E is measured (clock-synced), so read it literally.
+  if (wc) {
+    const hostMs = host ? host.captureMs + host.scaleMs + host.encodeMs : 0;
+    if (wc.queue > 3) return `Decoder backlog ${wc.queue} — phone decode too slow; lower res/fps.`;
+    if ((host?.wc?.bufKB ?? 0) > 128) return "Channel backlog — network can't drain the bitrate; lower it.";
+    if (wc.e2eMs > 100) return `E2E ${wc.e2eMs}ms: net+enc ${wc.netMs} · dec ${wc.decodeMs}ms — check link.`;
+    if (displayFps != null && wc.fps > 0 && displayFps < wc.fps * 0.7) {
+      return "Display behind decode — phone UI thread busy.";
+    }
+    return `Direct path: no jitter buffer (~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms).`;
+  }
   if (!host && !net) return "Gathering stats…";
   const phoneLag = net ? Math.round(net.rttMs / 2 + net.bufMs + net.decMs) : 0;
   const hostMs = host ? host.captureMs + host.scaleMs + host.encodeMs : 0;

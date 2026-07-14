@@ -5,7 +5,7 @@
  */
 
 import { remoteWsUrl } from "@/lib/remoteClient";
-import type { CloudConn, ConnectSnapshot, RtcInboundVideoStats } from "./cloud";
+import type { CloudConn, ConnectSnapshot, RtcInboundVideoStats, WcStats } from "./cloud";
 
 export type ControlMsg =
   | { type: "move"; x: number; y: number }
@@ -75,6 +75,15 @@ export interface RemoteLink {
   noteVideoSink?(active: boolean): void;
   /** Decode-side WebRTC video telemetry for the debug HUD (cloud only). */
   netStats(): Promise<RtcInboundVideoStats | null>;
+  /**
+   * Direct-video path (WebCodecs over the data channel): register the render
+   * sink. The sink OWNS each VideoFrame and must close() it after drawing.
+   * When this path is live the host stops feeding the WebRTC track and the
+   * link emits `{event:"wc", active}` so the UI can swap video ↔ canvas.
+   */
+  onWcFrame?(cb: (f: VideoFrame) => void): () => void;
+  /** Live wc-path telemetry (null when inactive). */
+  wcStats?(): WcStats | null;
   close(): void;
 }
 
@@ -229,6 +238,12 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
     },
     netStats() {
       return conn.videoStats();
+    },
+    onWcFrame(cb) {
+      return conn.onWcFrame(cb);
+    },
+    wcStats() {
+      return conn.wcInfo();
     },
     close() {
       // The CloudConn is owned by CompanionApp; closing it happens on disconnect.
