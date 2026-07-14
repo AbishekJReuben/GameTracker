@@ -415,6 +415,40 @@ export function ControlScreen({
       }
     });
   }, []);
+  // Keep the display awake while streaming — Chrome on Android otherwise dims,
+  // throttles rAF/timers, and tanks fps. No-op where Wake Lock isn't available
+  // (older WebViews); APK + discovery web + Quest flat all benefit.
+  useEffect(() => {
+    if (!connected || !hasStream) return;
+    type WakeLockSentinel = { release: () => Promise<void>; addEventListener: (t: string, fn: () => void) => void };
+    type WakeLockNav = Navigator & { wakeLock?: { request: (type: "screen") => Promise<WakeLockSentinel> } };
+    const nav = navigator as WakeLockNav;
+    if (!nav.wakeLock?.request) return;
+    let lock: WakeLockSentinel | null = null;
+    let cancelled = false;
+    const acquire = async () => {
+      if (cancelled || document.visibilityState !== "visible") return;
+      try {
+        lock = await nav.wakeLock!.request("screen");
+        lock.addEventListener("release", () => {
+          lock = null;
+        });
+      } catch {
+        /* permission / power-save policy */
+      }
+    };
+    const onVis = () => {
+      if (document.visibilityState === "visible") void acquire();
+    };
+    void acquire();
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVis);
+      void lock?.release().catch(() => {});
+      lock = null;
+    };
+  }, [connected, hasStream]);
   // Direct-video path (WebCodecs over the data channel): frames render on the
   // canvas — the <video> element (WebRTC track) hides while this is live.
   const [wcActive, setWcActive] = useState(false);

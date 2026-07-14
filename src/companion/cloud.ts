@@ -869,8 +869,23 @@ export class CloudConn {
         if (typeof VideoDecoder === "undefined") {
           this.wcSupported = false;
         } else {
-          const r = await VideoDecoder.isConfigSupported({ codec: "avc1.640034", optimizeForLatency: true });
-          this.wcSupported = !!r.supported;
+          let supported = false;
+          for (const hw of ["prefer-hardware", "no-preference"] as const) {
+            try {
+              const r = await VideoDecoder.isConfigSupported({
+                codec: "avc1.640034",
+                optimizeForLatency: true,
+                hardwareAcceleration: hw,
+              });
+              if (r.supported) {
+                supported = true;
+                break;
+              }
+            } catch {
+              /* try next */
+            }
+          }
+          this.wcSupported = supported;
         }
       } catch {
         this.wcSupported = false;
