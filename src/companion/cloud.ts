@@ -14,7 +14,7 @@
  */
 
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc";
-import { isQuestBrowser } from "./device";
+import { isImmersiveActive, onImmersiveActiveChange } from "./runtime";
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 /** "pending" = link up, awaiting host approval; "denied" = host rejected us. */
@@ -32,6 +32,48 @@ export type ConnectPhase =
   | "reconnecting"
   | "denied";
 
+/** Where the auth handshake actually is (independent of the coarse phase). */
+export type AuthState = "none" | "sent" | "pending" | "ok" | "denied";
+
+/**
+ * Low-level connection diagnostics for the progress UI — the REAL states of the
+ * signaling socket, the peer connection, the data channels, and the auth
+ * handshake, so a stuck stage shows exactly which layer is wedged.
+ */
+export type ConnectDetail = {
+  /** How long the connection has sat in the current phase (ms). */
+  phaseMs: number;
+  /** Signaling WebSocket state. */
+  sig: string;
+  /** RTCPeerConnection connectionState. */
+  pc: string;
+  /** ICE connection state. */
+  ice: string;
+  /** ICE gathering state. */
+  gather: string;
+  /** SDP signaling state (offer/answer machine). */
+  sdp: string;
+  /** Data-channel readyStates: control / data / video. */
+  chCtl: string;
+  chData: string;
+  chVid: string;
+  /** Offers received from the host this session. */
+  offers: number;
+  /** ICE candidates received from the host. */
+  candIn: number;
+  /** Auth handshake state + how many times we've asked + ms since the last ask. */
+  authState: AuthState;
+  authSent: number;
+  authAgeMs: number;
+  /** Whether a permanent key is saved for this PC. */
+  hasSecret: boolean;
+  /** Current host session id (short), if any. */
+  sid?: string;
+  /** Last notable transition (e.g. "offer received", "auth re-sent") + age. */
+  lastEvent: string;
+  lastEventAgoMs: number;
+};
+
 export type ConnectSnapshot = {
   phase: ConnectPhase;
   status: Status;
@@ -39,6 +81,7 @@ export type ConnectSnapshot = {
   backoffMs: number;
   iceState?: RTCIceConnectionState;
   job: string;
+  detail: ConnectDetail;
 };
 
 /** Identity + optional secret key the host uses to authorize this device. */
@@ -118,6 +161,16 @@ const BACKOFF_MIN = 1500;
 const BACKOFF_MAX = 30000;
 const WATCHDOG_MS = 3000; // health-check cadence
 const HARD_RESET_MS = 60000; // transport down this long → full teardown + rebuild
+// First-connection wedges (cold start) get a much shorter fuse: nothing is
+// established yet, so a fast clean rebuild beats waiting out the full backstop.
+const HARD_RESET_FIRST_MS = 25000;
+// Transport connected but the host never answered our auth handshake → rebuild.
+// (Auth is also re-SENT every watchdog tick in that window; see startWatchdog.)
+const AUTH_STALL_MS = 15000;
+// Peer negotiation (offer applied, ICE checking) stuck without ever connecting
+// or failing — Chromium can sit in "connecting" limbo after glare with a zombie
+// session; don't wait the full hard-reset for that on any connection.
+const NEG_STALL_MS = 20000;
 // Receiver jitter buffer (ms). This is the dominant phone-side latency term
 // (stats HUD: "buffer"). Target ~40ms so glass-to-glass stays near one frame
 // of headroom on a LAN/Tailscale link (RTT/2 + buffer + decode ≈ 40–60ms).
@@ -247,6 +300,27 @@ export class CloudConn {
   private reconnectBackoffMs = 0;
   private reconnectAt = 0;
   private iceState?: RTCIceConnectionState;
+  // ---- connection diagnostics (surfaced in ConnectSnapshot.detail) ----
+  private phaseChangedAt = Date.now();
+  private offersReceived = 0;
+  private candidatesIn = 0;
+  private authState: AuthState = "none";
+  private authSentCount = 0;
+  private lastAuthSentAt = 0;
+  /** First watchdog tick that saw "transport up but auth unanswered" (0 = none). */
+  private authStallSince = 0;
+  private lastEvent = "created";
+  private lastEventAt = Date.now();
+  /** 1s UI ticker so phase age / channel states stay live while connecting. */
+  private progressTickTimer: number | null = null;
+  /** Drop WebCodecs while Quest ImmersiveScreen needs the RTC `<video>` track. */
+  private unsubImmersive: (() => void) | null = null;
+
+  /** Record a notable transition for the diagnostics panel. */
+  private noteEvent(what: string) {
+    this.lastEvent = what;
+    this.lastEventAt = Date.now();
+  }
 
   constructor(
     private signalUrl: string,
@@ -259,6 +333,12 @@ export class CloudConn {
     // link dead and force a visible reconnect. Give the link a fresh window and
     // probe it immediately instead.
     document.addEventListener("visibilitychange", this.onVisibility);
+    // Flat Quest Control uses WebCodecs like the phone; ImmersiveScreen textures
+    // the RTC video element, so enter VR must fall back and exit can re-opt-in.
+    this.unsubImmersive = onImmersiveActiveChange((active) => {
+      if (active) this.wcFallback("immersive VR needs the RTC video track");
+      else if (this.authState === "ok") void this.maybeStartWc();
+    });
   }
 
   private onVisibility = () => {
@@ -283,6 +363,10 @@ export class CloudConn {
       this.progressPhase === "reconnecting" && this.reconnectAt > 0
         ? Math.max(0, this.reconnectAt - Date.now())
         : this.reconnectBackoffMs;
+    const now = Date.now();
+    const pc = this.pc;
+    const ch = (c?: RTCDataChannel) => c?.readyState ?? "—";
+    const sigState = this.sig?.state ?? "none";
     return {
       phase: this.progressPhase,
       status: this.lastStatus ?? "new",
@@ -290,10 +374,31 @@ export class CloudConn {
       backoffMs,
       iceState: this.iceState,
       job: this.progressJob,
+      detail: {
+        phaseMs: now - this.phaseChangedAt,
+        sig: sigState,
+        pc: pc?.connectionState ?? "none",
+        ice: pc?.iceConnectionState ?? "—",
+        gather: pc?.iceGatheringState ?? "—",
+        sdp: pc?.signalingState ?? "—",
+        chCtl: ch(this.chControl),
+        chData: ch(this.chData),
+        chVid: ch(this.chVideo),
+        offers: this.offersReceived,
+        candIn: this.candidatesIn,
+        authState: this.authState,
+        authSent: this.authSentCount,
+        authAgeMs: this.lastAuthSentAt ? now - this.lastAuthSentAt : -1,
+        hasSecret: !!this.auth?.secret,
+        sid: this.currentSid ? this.currentSid.slice(0, 6) : undefined,
+        lastEvent: this.lastEvent,
+        lastEventAgoMs: now - this.lastEventAt,
+      },
     };
   }
 
   private setProgress(phase: ConnectPhase, job: string) {
+    if (phase !== this.progressPhase) this.phaseChangedAt = Date.now();
     this.progressPhase = phase;
     this.progressJob = job;
     this.emitProgress();
@@ -323,7 +428,14 @@ export class CloudConn {
       this.reconnectAt = 0;
       this.setProgress("connected", "Connected to your PC");
     } else if (s === "pending") {
-      this.setProgress("pending_approval", "Waiting for approval on your PC…");
+      // Only claim "waiting for approval" once the host actually said so —
+      // before that, "pending" just means the transport connected while the
+      // auth handshake is still in flight (a very different failure mode).
+      if (this.authState === "pending") {
+        this.setProgress("pending_approval", "Waiting for approval on your PC…");
+      } else {
+        this.setProgress("authenticating", "Authorizing this device…");
+      }
     } else if (s === "denied") {
       this.setProgress("denied", "Access declined on your PC");
     } else if (s === "disconnected" || s === "failed" || s === "closed") {
@@ -348,7 +460,25 @@ export class CloudConn {
     this.reconnectAttempt = 0;
     this.setProgress("idle", "Starting connection…");
     this.startWatchdog();
+    this.startProgressTicker();
     await this.openSignaling(true);
+  }
+
+  /** While connecting, refresh subscribers every second so the diagnostics
+   *  (phase age, channel states) tick live instead of only on transitions. */
+  private startProgressTicker() {
+    this.stopProgressTicker();
+    this.progressTickTimer = window.setInterval(() => {
+      if (this.closed || this.progressListeners.size === 0) return;
+      if (this.progressPhase !== "connected") this.emitProgress();
+    }, 1000);
+  }
+
+  private stopProgressTicker() {
+    if (this.progressTickTimer !== null) {
+      window.clearInterval(this.progressTickTimer);
+      this.progressTickTimer = null;
+    }
   }
 
   /**
@@ -372,6 +502,7 @@ export class CloudConn {
       if (this.sig !== sig || this.closed) return; // stale socket from a prior attempt
       if (m.type === "offer") await this.onOffer(m.sdp, (m as { sid?: string }).sid);
       else if (m.type === "candidate" && this.pc) {
+        this.candidatesIn++;
         try {
           await this.pc.addIceCandidate(m.candidate);
         } catch {
@@ -479,6 +610,8 @@ export class CloudConn {
 
   private async onOffer(sdp: string, sid?: string) {
     this.clearOfferTimeout();
+    this.offersReceived++;
+    this.noteEvent(sid && sid === this.currentSid ? "ICE-restart offer" : "offer received");
     // ICE-restart renegotiation of the SAME session: apply the new offer to the
     // existing peer connection instead of rebuilding. Keeps the media track, the
     // hardware decoder, and the host's authorization — the screen just re-routes
@@ -490,6 +623,7 @@ export class CloudConn {
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
         this.sig.send({ type: "answer", sdp: answer.sdp ?? "" });
+        this.noteEvent("answer sent (ICE restart)");
         return;
       } catch {
         /* renegotiation failed — fall through and rebuild the session cleanly */
@@ -503,6 +637,10 @@ export class CloudConn {
     this.stopJitterHold();
     this.videoReceiver = null;
     this.authed = false; // every fresh peer requires re-authorization by the host
+    this.authState = "none";
+    this.authSentCount = 0;
+    this.lastAuthSentAt = 0;
+    this.authStallSince = 0;
     this.videoReceiver = null;
     // A new PC restarts inbound-RTP counters from 0, so the old frame count is
     // meaningless — reset it so the jitter-adaptation baseline is correct.
@@ -602,6 +740,7 @@ export class CloudConn {
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
     this.sig!.send({ type: "answer", sdp: answer.sdp ?? "" });
+    this.noteEvent("answer sent");
     // We have a live PC now; the signaling handshake is done. Further recovery is
     // driven by the PC's own state + the data-channel heartbeat, so drop the
     // serialization guard (leaving it set here would wedge reconnection if the PC
@@ -655,10 +794,15 @@ export class CloudConn {
     }
   }
 
-  /** Send the identity + optional secret so the host can authorize this device. */
+  /**
+   * Send the identity + optional secret so the host can authorize this device.
+   * Idempotent and safe to REPEAT: the host re-acks an already-authorized
+   * session, so the watchdog re-sends this while the handshake is unanswered
+   * (a first ask lost around channel-open used to wedge "authorizing" forever).
+   */
   private sendAuth() {
     if (this.chControl?.readyState !== "open") return;
-    this.setProgress("authenticating", "Authorizing this device…");
+    if (this.authState !== "pending") this.setProgress("authenticating", "Authorizing this device…");
     const a = this.auth;
     try {
       this.chControl.send(
@@ -669,6 +813,10 @@ export class CloudConn {
           secret: a?.secret || undefined,
         }),
       );
+      this.authSentCount++;
+      this.lastAuthSentAt = Date.now();
+      if (this.authState === "none") this.authState = "sent";
+      this.noteEvent(this.authSentCount > 1 ? `auth re-sent (×${this.authSentCount})` : "auth sent");
     } catch {
       /* ignore */
     }
@@ -713,9 +861,9 @@ export class CloudConn {
   /** After auth-ok: probe local decode support and opt in to the wc path. */
   private async maybeStartWc() {
     if (this.closed || this.denied || this.wcActive || this.wcRequestedAt) return;
-    // Quest renders the stream through the <video> element (immersive VR draws it
-    // as a WebGL texture) — the canvas-based wc path would leave VR black.
-    if (isQuestBrowser()) return;
+    // Immersive VR textures the RTC `<video>` element — canvas WebCodecs would
+    // leave the big screen black. Flat Quest / web / APK all opt in.
+    if (isImmersiveActive()) return;
     if (this.wcSupported == null) {
       try {
         if (typeof VideoDecoder === "undefined") {
@@ -1025,6 +1173,24 @@ export class CloudConn {
   }
 
   /**
+   * Force a clean teardown + rebuild NOW (bypasses the `connecting` guard and the
+   * reconnect backoff). Used by the hard-reset backstop and the stage-stall
+   * deadlines — the recoveries that fire when the normal event-driven paths
+   * (ICE failed, heartbeat death) never trigger.
+   */
+  private forceRebuild(reason: string) {
+    this.lastHealthyAt = Date.now();
+    this.connecting = false;
+    this.backoff = BACKOFF_MIN;
+    this.clearReconnect();
+    this.noteEvent(`rebuild: ${reason}`);
+    console.warn("[remote] forcing session rebuild:", reason);
+    this.setProgress("reconnecting", "Connection stalled — rebuilding…");
+    this.emit("disconnected");
+    this.openSignaling(false).catch(() => this.scheduleReconnect());
+  }
+
+  /**
    * Health watchdog: auto-recovers from wedged links the soft reconnect can't (the
    * Wi‑Fi-switch case), and adapts the receiver jitter buffer to the decoder so
    * fewer frames are dropped.
@@ -1046,17 +1212,41 @@ export class CloudConn {
       // Backgrounded: timers throttle and getStats is meaningless — skip checks.
       if (document.hidden) return;
       // Hard reset — the ultimate backstop: if the transport hasn't been "connected"
-      // for HARD_RESET_MS, force a clean rebuild. Bypasses the `connecting` guard so
-      // a PC wedged in "disconnected"/"connecting" (never firing "failed") recovers.
-      if (Date.now() - this.lastHealthyAt > HARD_RESET_MS) {
-        this.lastHealthyAt = Date.now();
-        this.connecting = false;
-        this.backoff = BACKOFF_MIN;
-        this.clearReconnect();
-        this.setProgress("reconnecting", "Connection stalled — rebuilding…");
-        this.emit("disconnected");
-        this.openSignaling(false).catch(() => this.scheduleReconnect());
+      // for the reset window, force a clean rebuild. Bypasses the `connecting` guard
+      // so a PC wedged in "disconnected"/"connecting" (never firing "failed")
+      // recovers. Cold starts (never connected yet) get a much shorter fuse: there's
+      // nothing established to protect, and the old 60s wait read as "app is broken,
+      // restart it".
+      const resetAfter = this.connectedOnce ? HARD_RESET_MS : HARD_RESET_FIRST_MS;
+      if (Date.now() - this.lastHealthyAt > resetAfter) {
+        this.forceRebuild("no transport for too long");
         return;
+      }
+      // Peer negotiation stall: an offer was applied but the pc never reaches
+      // "connected" OR "failed" (ICE limbo after glare with a zombie session from
+      // a killed app — the classic cold-start "Peer connection takes forever").
+      // Event-driven recovery never fires for this state, so deadline it.
+      if (!transportUp && this.progressPhase === "negotiating" && Date.now() - this.phaseChangedAt > NEG_STALL_MS) {
+        this.forceRebuild("peer negotiation stalled");
+        return;
+      }
+      // Auth-handshake stall: transport is up but the host never answered our
+      // auth (the ask or the verdict got lost around channel-open / a superseded
+      // prompt). This used to wedge FOREVER — transportUp keeps the hard-reset
+      // timer fed, and nothing ever re-sent the handshake. Now: re-ask every tick
+      // (the host re-acks idempotently) and rebuild if it stays unanswered.
+      // `authState === "pending"` is excluded — that's a real approval prompt
+      // open on the PC, which legitimately takes as long as the user takes.
+      if (transportUp && !this.authed && !this.denied && this.authState !== "pending") {
+        if (!this.authStallSince) this.authStallSince = Date.now();
+        this.sendAuth();
+        if (Date.now() - this.authStallSince > AUTH_STALL_MS) {
+          this.authStallSince = 0;
+          this.forceRebuild("authorization unanswered");
+          return;
+        }
+      } else if (this.authState !== "pending") {
+        this.authStallSince = 0;
       }
       if (!connected) return;
       // WebCodecs-path health. Opt-in that never produced frames (old host, codec
@@ -1105,12 +1295,11 @@ export class CloudConn {
       // recovery: first ask the host to rebuild its encoder/track in place
       // (fixes a wedged HOST encoder cheaply, ~6s); if frames still don't decode
       // (~12s) rebuild the whole peer session — a new receiver + decoder, which
-      // is exactly what a manual disconnect/reconnect did. Quest is excluded:
-      // its immersive sessions consume the video off-DOM and page visibility
-      // semantics differ, so the gate can't be trusted there.
+      // is exactly what a manual disconnect/reconnect did. Immersive VR is
+      // excluded (off-DOM video + different visibility); flat Quest matches APK.
       const dBytes = st.bytesReceived >= this.winBytes ? st.bytesReceived - this.winBytes : 0;
       this.winBytes = st.bytesReceived;
-      if (this.sinkActive && !isQuestBrowser() && dDecoded === 0 && dBytes > 30_000) {
+      if (this.sinkActive && !isImmersiveActive() && dDecoded === 0 && dBytes > 30_000) {
         this.stallTicks++;
         if (this.stallTicks === 2) {
           this.sendControl({ type: "vreset" });
@@ -1209,6 +1398,9 @@ export class CloudConn {
       if (msg.event === "auth") {
         const state = (msg as { state?: string }).state;
         if (state === "ok") {
+          this.authState = "ok";
+          this.authStallSince = 0;
+          this.noteEvent("auth ok");
           this.authed = true;
           this.emit("connected");
           // Host just started capture on the existing track — nudge subscribers to
@@ -1218,8 +1410,13 @@ export class CloudConn {
           // H.264 itself (bypasses the receiver jitter buffer entirely).
           void this.maybeStartWc();
         } else if (state === "pending") {
+          this.authState = "pending";
+          this.authStallSince = 0;
+          this.noteEvent("host prompt open (approval pending)");
           this.emit("pending");
         } else if (state === "denied") {
+          this.authState = "denied";
+          this.noteEvent("auth denied");
           this.denied = true;
           this.clearReconnect();
           this.emit("denied");
@@ -1441,6 +1638,8 @@ export class CloudConn {
   close() {
     this.closed = true;
     document.removeEventListener("visibilitychange", this.onVisibility);
+    this.unsubImmersive?.();
+    this.unsubImmersive = null;
     // Tell the host we're leaving on purpose so it stops capturing immediately
     // (it no longer tears down on signaling-level "peer-left" alone).
     try {
@@ -1452,6 +1651,7 @@ export class CloudConn {
     this.clearOfferTimeout();
     this.stopHeartbeat();
     this.stopWatchdog();
+    this.stopProgressTicker();
     this.stopJitterHold();
     this.wcReset(false);
     this.wcFrameCb = null;

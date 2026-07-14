@@ -15,10 +15,42 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo = Split-Path -Parent $here
 
-# Build discovery clients (companion + quest into signaling/static) if either is
-# missing, so phone browsers and the Quest headset work over HTTPS.
-$needsBuild = -not (Test-Path (Join-Path $here "static\quest.html")) `
-    -or -not (Test-Path (Join-Path $here "static\companion.html"))
+function Get-NewestWriteTime([string[]]$paths) {
+    $newest = [datetime]::MinValue
+    foreach ($p in $paths) {
+        if (-not (Test-Path $p)) { continue }
+        $item = Get-Item $p
+        if ($item.PSIsContainer) {
+            $child = Get-ChildItem -Path $p -Recurse -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+            if ($child -and $child.LastWriteTime -gt $newest) { $newest = $child.LastWriteTime }
+        } elseif ($item.LastWriteTime -gt $newest) {
+            $newest = $item.LastWriteTime
+        }
+    }
+    return $newest
+}
+
+# Build discovery clients (companion + quest into signaling/static) when missing
+# OR when source is newer than the published static HTML — otherwise browsers /
+# Quest keep running a stale bundle while the APK has the latest Control/cloud.
+$staticCompanion = Join-Path $here "static\companion.html"
+$staticQuest = Join-Path $here "static\quest.html"
+$needsBuild = -not (Test-Path $staticCompanion) -or -not (Test-Path $staticQuest)
+if (-not $needsBuild) {
+    $staticAge = Get-NewestWriteTime @($staticCompanion, $staticQuest)
+    $srcAge = Get-NewestWriteTime @(
+        (Join-Path $repo "src\companion"),
+        (Join-Path $repo "src\quest"),
+        (Join-Path $repo "src\lib"),
+        (Join-Path $repo "companion.html"),
+        (Join-Path $repo "quest.html"),
+        (Join-Path $repo "vite.quest.config.ts"),
+        (Join-Path $repo "package.json")
+    )
+    if ($srcAge -gt $staticAge) { $needsBuild = $true }
+}
 if ($needsBuild) {
     Write-Host "Building discovery clients (npm run discovery:build)..." -ForegroundColor Cyan
     Push-Location $repo

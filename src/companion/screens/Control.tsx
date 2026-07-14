@@ -70,6 +70,7 @@ import type { ConnectSnapshot, WcStats } from "../cloud";
 import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { isQuestBrowser } from "../device";
+import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
 
 type HostRtcStats = {
   sendKbps: number;
@@ -396,6 +397,24 @@ export function ControlScreen({
   useEffect(() => {
     localStorage.setItem("gt.remote.soundOn", soundOn ? "1" : "0");
   }, [soundOn]);
+  // Hand PC sound to ImmersiveScreen while WebXR is live; resume on exit.
+  useEffect(() => {
+    return onImmersiveActiveChange((active) => {
+      const a = audioRef.current;
+      if (!a) return;
+      if (active) {
+        a.muted = true;
+        try {
+          a.pause();
+        } catch {
+          /* ignore */
+        }
+      } else {
+        a.muted = !soundOnRef.current;
+        if (soundOnRef.current) a.play?.().catch(() => {});
+      }
+    });
+  }, []);
   // Direct-video path (WebCodecs over the data channel): frames render on the
   // canvas — the <video> element (WebRTC track) hides while this is live.
   const [wcActive, setWcActive] = useState(false);
@@ -781,11 +800,9 @@ export function ControlScreen({
       const a = audioRef.current;
       if (!a) return;
       a.srcObject = stream;
-      a.muted = !soundOnRef.current;
-      // Remembered "sound on": try to resume unmuted right away. If the platform
-      // still requires a user gesture, flip the toggle back off so the speaker
-      // button shows the true state and one tap restores it.
-      if (soundOnRef.current) a.play?.().catch(() => setSoundOn(false));
+      // ImmersiveScreen owns PC sound while WebXR is up (avoids double audio).
+      a.muted = !soundOnRef.current || isImmersiveActive();
+      if (soundOnRef.current && !isImmersiveActive()) a.play?.().catch(() => setSoundOn(false));
     });
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     const unsubEvent = link.onEvent((e) => {

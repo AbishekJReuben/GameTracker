@@ -4,14 +4,19 @@
  * link. Rendered on top of the flat page while a session is live; the flat DOM
  * stays mounted underneath because the Quest system keyboard requires the focused
  * <input> to be a real, on-screen DOM node.
+ *
+ * PC sound plays here (separate from Control's audio element) so WebXR doesn't
+ * go silent while flat Control mutes to avoid double playback.
  */
 
 import { useEffect, useRef, useState } from "react";
+import { Volume2, VolumeX } from "lucide-react";
 import type { RemoteLink, ControlMsg } from "@/companion/links";
 import { ImmersiveSession, type PointerAction } from "./xr/session";
 import { TextDiffSender } from "./textDiff";
 
-const MOVE_THROTTLE_MS = 14; // ~70 Hz cursor updates to the PC
+/** Match Control's move cadence so VR pointer feels as snappy as flat. */
+const MOVE_THROTTLE_MS = 4;
 
 export function ImmersiveScreen({
   link,
@@ -25,6 +30,7 @@ export function ImmersiveScreen({
   onExit: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const kbdRef = useRef<HTMLInputElement | null>(null);
   const sessionRef = useRef<ImmersiveSession | null>(null);
   const startedRef = useRef(false);
@@ -33,12 +39,36 @@ export function ImmersiveScreen({
 
   const [error, setError] = useState<string | null>(null);
   const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const [soundOn, setSoundOn] = useState(() => localStorage.getItem("gt.remote.soundOn") === "1");
+  const soundOnRef = useRef(soundOn);
+  soundOnRef.current = soundOn;
 
   const diff = useRef(new TextDiffSender((m) => link.send(m)));
   const lastMove = useRef(0);
   const scrollAcc = useRef({ x: 0, y: 0 });
 
   const send = (m: ControlMsg) => link.send(m);
+
+  useEffect(() => {
+    localStorage.setItem("gt.remote.soundOn", soundOn ? "1" : "0");
+    const a = audioRef.current;
+    if (!a) return;
+    a.muted = !soundOn;
+    if (soundOn) a.play?.().catch(() => setSoundOn(false));
+  }, [soundOn]);
+
+  // Separate audio MediaStream (same A/V split as Control) — never merge into video.
+  useEffect(() => {
+    return (
+      link.onAudioStream?.((audioStream) => {
+        const a = audioRef.current;
+        if (!a) return;
+        a.srcObject = audioStream;
+        a.muted = !soundOnRef.current;
+        if (soundOnRef.current) a.play?.().catch(() => setSoundOn(false));
+      }) ?? undefined
+    );
+  }, [link]);
 
   const openKeyboard = () => {
     const el = kbdRef.current;
@@ -150,6 +180,16 @@ export function ImmersiveScreen({
     return () => unsub?.();
   }, [link]);
 
+  const toggleSound = () => {
+    const a = audioRef.current;
+    const next = !soundOn;
+    if (a) {
+      a.muted = !next;
+      if (next) a.play?.().catch(() => {});
+    }
+    setSoundOn(next);
+  };
+
   return (
     <div className="fixed inset-0 z-30 grid place-items-center bg-bg-base/95 text-ink">
       <div className="max-w-md px-8 text-center">
@@ -172,10 +212,23 @@ export function ImmersiveScreen({
         </ul>
         {keyboardOpen && <p className="mt-4 text-sm text-accent-3">Keyboard open — type on the headset keyboard.</p>}
         {error && <p className="mt-4 rounded-xl border border-amber/40 bg-amber/10 px-3 py-2 text-sm text-amber">{error}</p>}
-        <button className="btn btn-subtle mt-6 h-11 px-5" onClick={() => void sessionRef.current?.end()}>
-          Exit VR
-        </button>
+        <div className="mt-6 flex items-center justify-center gap-2">
+          <button
+            type="button"
+            className={`btn h-11 gap-2 px-4 ${soundOn ? "btn-primary" : "btn-subtle"}`}
+            onClick={toggleSound}
+            title={soundOn ? "Mute PC sound" : "Play PC sound"}
+          >
+            {soundOn ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
+            {soundOn ? "PC sound on" : "PC sound off"}
+          </button>
+          <button className="btn btn-subtle h-11 px-5" onClick={() => void sessionRef.current?.end()}>
+            Exit VR
+          </button>
+        </div>
       </div>
+
+      <audio ref={audioRef} autoPlay playsInline className="hidden" />
 
       {/* On-screen DOM input the Quest system keyboard writes into. Must stay in
           the DOM and on-screen (not display:none / off-screen) per Meta's docs. */}

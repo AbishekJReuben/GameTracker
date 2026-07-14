@@ -107,6 +107,22 @@ export class Signaling {
     });
   }
 
+  /** Raw WebSocket state for diagnostics ("open" / "connecting" / "closed" / "none"). */
+  get state(): string {
+    switch (this.ws?.readyState) {
+      case WebSocket.CONNECTING:
+        return "connecting";
+      case WebSocket.OPEN:
+        return "open";
+      case WebSocket.CLOSING:
+        return "closing";
+      case WebSocket.CLOSED:
+        return "closed";
+      default:
+        return "none";
+    }
+  }
+
   onMessage(h: (m: SignalMsg) => void) {
     this.handlers.push(h);
   }

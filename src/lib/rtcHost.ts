@@ -788,6 +788,11 @@ export function startHost(opts: HostOptions): () => void {
     // Access gate: the screen/audio capture and input injection stay off until the
     // guest is authorized (trusted device, correct secret, or user approval).
     let authorized = false;
+    // True while an auth decision is in flight (checkAuth call or approval prompt).
+    // Guests RE-SEND their auth every few seconds until answered (the first ask can
+    // be lost around channel-open) — this guard keeps a retry from stacking a
+    // second checkAuth/prompt on top of the one already running.
+    let authBusy = false;
     let startVideoCapture: (() => Promise<void>) | null = null;
     let startAudioCapture: (() => Promise<void>) | null = null;
     // Capture-stall watchdog bookkeeping (restart capture if it wedges).
@@ -1226,50 +1231,68 @@ export function startHost(opts: HostOptions): () => void {
         }
         // Auth handshake: the guest sends this on connect. Decide access, and (if
         // the device isn't already trusted) ask the desktop UI to approve it.
+        // IDEMPOTENT: guests retry the handshake until they hear a verdict, so an
+        // already-authorized session re-acks "ok" instead of staying silent (a lost
+        // "ok" used to wedge the phone in "authorizing" until an app restart).
         if (msg && msg.type === "auth") {
-          const deviceId = String(msg.deviceId ?? "");
-          const name = String(msg.name ?? "Phone");
-          const secret = typeof msg.secret === "string" ? msg.secret : undefined;
-          let level: string;
-          try {
-            level = await api.remoteCheckAuth(deviceId, name, secret);
-          } catch {
-            level = "none";
-          }
-          if (pc !== myPc) return; // session superseded/torn down while we awaited
-          if (level !== "none") {
-            await authorize();
+          if (authorized) {
+            if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "ok" }));
             return;
           }
-          // Untrusted → prompt the user on the desktop.
-          if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "pending" }));
-          const decision: ApprovalDecision = opts.onApprovalRequest
-            ? await opts.onApprovalRequest({ deviceId, name })
-            : { kind: "deny" };
-          // A superseded prompt (the store auto-dismissed it because a newer request
-          // arrived) is never a refusal — stay completely silent so we don't send a
-          // terminal "denied" to a phone that's still waiting. The newer session runs
-          // its own prompt and decides. This is the primary guard against "access
-          // denied before the PC user chose".
-          if (decision.kind === "superseded") return;
-          // Bail if this session was replaced while the prompt was open — any verdict
-          // now belongs to the OLD session; forwarding it would disturb the new one.
-          if (pc !== myPc) return;
-          if (decision.kind === "deny") {
-            if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "denied" }));
-            teardownPeer();
-          } else {
+          if (authBusy) {
+            // A decision is already in flight — restate "pending" so the retrying
+            // guest knows it was heard, but never stack a second prompt.
+            if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "pending" }));
+            return;
+          }
+          authBusy = true;
+          try {
+            const deviceId = String(msg.deviceId ?? "");
+            const name = String(msg.name ?? "Phone");
+            const secret = typeof msg.secret === "string" ? msg.secret : undefined;
+            let level: string;
             try {
-              await api.remoteGrant(
-                deviceId,
-                name,
-                decision.kind,
-                decision.kind === "temporary" ? decision.durationSecs : undefined,
-              );
+              level = await api.remoteCheckAuth(deviceId, name, secret);
             } catch {
-              /* grant persistence best-effort */
+              level = "none";
             }
-            await authorize();
+            if (pc !== myPc) return; // session superseded/torn down while we awaited
+            if (level !== "none") {
+              await authorize();
+              return;
+            }
+            // Untrusted → prompt the user on the desktop.
+            if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "pending" }));
+            const decision: ApprovalDecision = opts.onApprovalRequest
+              ? await opts.onApprovalRequest({ deviceId, name })
+              : { kind: "deny" };
+            // A superseded prompt (the store auto-dismissed it because a newer request
+            // arrived) is never a refusal — stay completely silent so we don't send a
+            // terminal "denied" to a phone that's still waiting. The newer session runs
+            // its own prompt and decides. This is the primary guard against "access
+            // denied before the PC user chose".
+            if (decision.kind === "superseded") return;
+            // Bail if this session was replaced while the prompt was open — any verdict
+            // now belongs to the OLD session; forwarding it would disturb the new one.
+            if (pc !== myPc) return;
+            if (decision.kind === "deny") {
+              if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "denied" }));
+              teardownPeer();
+            } else {
+              try {
+                await api.remoteGrant(
+                  deviceId,
+                  name,
+                  decision.kind,
+                  decision.kind === "temporary" ? decision.durationSecs : undefined,
+                );
+              } catch {
+                /* grant persistence best-effort */
+              }
+              await authorize();
+            }
+          } finally {
+            authBusy = false;
           }
           return;
         }

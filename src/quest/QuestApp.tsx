@@ -21,12 +21,15 @@ export function QuestApp() {
 
   // Module-level runtime must be set during render (before CompanionApp mounts
   // / auto-connects) so the headset device name and VR hooks are live.
+  // immersiveActive gates WebCodecs off only while ImmersiveScreen is up —
+  // flat Quest Control uses the same DIRECT path as the phone APK / web.
   setCompanionRuntime({
     deviceName: questDeviceName,
     vrSupported,
     onEnterVr: () => setImmersive(true),
     vrMode: mode,
     onVrModeChange: setMode,
+    immersiveActive: immersive,
     onControlReady: (l) => {
       setLink(l);
       if (!l) setStream(null);

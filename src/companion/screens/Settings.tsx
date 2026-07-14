@@ -28,6 +28,7 @@ import { checkForUpdateVerbose, openReleasePage, type UpdateCheck } from "../upd
 import { UpdatePanel } from "../UpdatePanel";
 import { deviceName } from "../device";
 import { getCompanionRuntime } from "../runtime";
+import { APP_VERSION } from "@/lib/version";
 
 interface SettingsProps {
   /** The saved connection code (code 1). */
@@ -49,10 +50,39 @@ export function SettingsScreen({ code, onSaveKey, onDisconnect, onForget }: Sett
     );
   return (
     <div className="mx-auto max-w-xl space-y-4 p-4">
-      {isTauri && <UpdateSection />}
+      {isTauri ? <UpdateSection /> : <WebAboutSection />}
       <ConnectionSection code={code} onSaveKey={onSaveKey} onDisconnect={onDisconnect} onForget={onForget} />
       <div className="pb-2 text-center text-[11px] text-ink-faint">GameTracker Remote · companion</div>
     </div>
+  );
+}
+
+/** Web / Quest: version + releases link (APK install chain stays Tauri-only). */
+function WebAboutSection() {
+  return (
+    <section className="rounded-2xl border border-line bg-bg-900/60 p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <span className="grid h-9 w-9 place-items-center rounded-xl bg-accent-sheen shadow-glow">
+          <Info className="h-4 w-4 text-white" />
+        </span>
+        <div>
+          <div className="font-display text-base font-800">About</div>
+          <div className="text-[11px] text-ink-faint">Version {APP_VERSION}</div>
+        </div>
+      </div>
+      <p className="mb-3 text-[12px] text-ink-faint">
+        Browser and Quest clients update when discovery static is rebuilt. Open the release page for notes and APK
+        downloads.
+      </p>
+      <button
+        type="button"
+        onClick={() => void openReleasePage(APP_VERSION)}
+        className="btn btn-subtle h-11 w-full gap-2"
+        title="Open GitHub release page"
+      >
+        <ExternalLink className="h-4 w-4" /> Open release page
+      </button>
+    </section>
   );
 }
 

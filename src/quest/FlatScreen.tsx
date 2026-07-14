@@ -1,4 +1,8 @@
 /**
+ * DEPRECATED / UNUSED — live Quest path is QuestApp → CompanionApp + ImmersiveScreen.
+ * Kept on disk for reference only; do not import. Feature work belongs in
+ * `src/companion/screens/Control.tsx` and `src/companion/cloud.ts`.
+ *
  * Flat (2D) remote screen for the Quest browser window. The controller acts as a
  * laser pointer that generates ordinary PointerEvents; we map them to absolute
  * cursor moves + clicks/drags on the PC, forward the thumbstick wheel to scroll,

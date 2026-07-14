@@ -1,4 +1,7 @@
 /**
+ * DEPRECATED / UNUSED — live Quest pairing is CompanionApp → Pairing (shared with
+ * APK/web). Kept on disk for reference only; do not import.
+ *
  * Quest-styled first-run pairing. Same WebRTC handshake as the phone companion
  * (reuses CloudConn), but with large, laser-friendly targets and the headset's
  * model name in the PC approval prompt.

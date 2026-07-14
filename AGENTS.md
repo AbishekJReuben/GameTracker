@@ -779,14 +779,22 @@ not regress):**
   `VideoDecoder` (`optimizeForLatency`) and paints straight onto the Control canvas —
   no RTP, no playout delay, no compositor sampling. Measured e2e is clock-synced via the
   heartbeat (`pong` now carries host `performance.now()`; lowest-RTT-of-8 midpoint).
-- **Fallback is automatic and layered:** WebRTC track stays negotiated; guest reverts
+- **  Fallback is automatic and layered:** WebRTC track stays negotiated; guest reverts
   (`vmode rtc`) on probe failure, opt-in timeout (6s), repeated decoder errors, or flow
   stall (watchdog vkf at ~6s, revert at ~12s); host reverts on encoder failure and pushes
-  `{event:"vmode",mode:"rtc"}`. **Quest stays on the RTC track** (immersive VR consumes
-  the `<video>` element as a WebGL texture; the wc canvas path would leave VR black).
-  Host encoder-stall watchdog is gated on `!wcSink` (0 RTP fps is HEALTHY in wc mode).
+  `{event:"vmode",mode:"rtc"}`. **Immersive VR stays on the RTC track** (WebGL textures
+  the `<video>` element; the wc canvas path would leave VR black). Flat Quest Control,
+  discovery web, and the APK all opt into WebCodecs when `VideoDecoder` works —
+  `isImmersiveActive()` (not blanket `isQuestBrowser`) is the only Quest gate. Entering
+  VR forces `wcFallback`; leaving VR re-opts in. Decode-stall self-heal uses the same
+  gate. Host encoder-stall watchdog is gated on `!wcSink` (0 RTP fps is HEALTHY in wc mode).
   Latest-wins everywhere: frames are skipped when `videoCh.bufferedAmount > 256KB` or
   `encodeQueueSize > 2` — a backlog can only become latency.
+- **Client parity (APK ≈ web ≈ Quest flat):** all three mount the same `CompanionApp` /
+  `Control` / `cloud.ts`. `serve.ps1` rebuilds `signaling/static` when companion/quest/
+  lib sources are newer than the published HTML (not only when files are missing).
+  ImmersiveScreen plays PC sound via `onAudioStream` + a Volume toggle (Control mutes
+  while VR is up). Web/Quest Settings show About + Open release page (install stays APK).
 - **HUD:** header shows the transport (`DIRECT`/`RTC`/`LAN`); wc mode swaps the top grid
   for measured stats (E2E, net+enc, decode ms, dec queue, frame KB, clock ±) and the host
   section gains H264 enc ms / skipped / channel buf. The lag pill uses the measured E2E.
@@ -800,6 +808,26 @@ not regress):**
 - **PC sound remembers its state** (`gt.remote.soundOn`): restored on connect by
   attempting an unmuted `play()`; if the platform still demands a gesture the toggle
   falls back to off so one tap restores it.
+- **Auth handshake is IDEMPOTENT + deadlined (cold-start wedge fix).** The guest's
+  single `{type:"auth"}` (or the host's `auth ok`) could be lost around channel-open,
+  and the watchdog counts a connected transport as healthy — so the phone sat in
+  "Device authorization" forever until an app restart. Now: the guest RE-SENDS auth
+  every watchdog tick while `transportUp && !authed && authState !== "pending"` and
+  force-rebuilds after 15s unanswered (`AUTH_STALL_MS`); the host re-acks `ok` for an
+  already-authorized session and guards duplicate asks with `authBusy` (re-states
+  `pending`, never stacks a second approval prompt — the superseded-prompt rules stay
+  intact). A genuine PC-side approval prompt (`authState === "pending"`) is exempt
+  from all deadlines. Also: `negotiating` stuck >20s (ICE limbo after glare with a
+  zombie session) force-rebuilds, and the 60s hard reset drops to **25s before the
+  first-ever connect** (`HARD_RESET_FIRST_MS`). `forceRebuild()` bypasses the
+  `connecting` guard + backoff.
+- **Connection diagnostics:** `ConnectSnapshot.detail` (`ConnectDetail`) carries the
+  real per-layer states — signaling socket, pc/ICE/gathering/SDP, per-channel
+  readyStates, offers/candidates counts, auth state (`none/sent/pending/ok/denied` +
+  ask count + age), permanent-key presence, sid, last event. `ConnectionProgress`
+  shows a live sub-line under the ACTIVE step, plus a collapsible Diagnostics panel
+  that auto-expands when a stage stalls >6s (compact overlay gets a one-liner). A 1s
+  progress ticker in `CloudConn` keeps it live while connecting.
 
 **v3.9.16+ A/V-sync buffer lag (do not regress):**
 - **Symptom:** JB target shows 40ms but measured buffer stays ~200ms; decode fps
