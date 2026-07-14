@@ -25,16 +25,37 @@ import { invoke } from "@tauri-apps/api/core";
 const MANIFEST_URL =
   "https://github.com/AbishekJReuben/GameTracker/releases/latest/download/apk-latest.json";
 
+/** GitHub Releases page (same host as the desktop updater / APK assets). */
+export const RELEASES_URL = "https://github.com/AbishekJReuben/GameTracker/releases";
+
+/** Open the Releases page (or a specific tag) in the system browser. */
+export async function openReleasePage(version?: string | null): Promise<void> {
+  const ver = version?.trim().replace(/^v/i, "");
+  const url = ver ? `${RELEASES_URL}/tag/v${ver}` : RELEASES_URL;
+  try {
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+    await openUrl(url);
+  } catch {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
+
 export interface UpdateInfo {
   version: string;
   url: string;
   notes?: string;
+  /** Hex sha256 of the APK, published by CI — verified natively after download. */
+  sha256?: string;
+  /** Exact APK byte size, published by CI. */
+  size?: number;
 }
 
 interface Manifest {
   version: string;
   url: string;
   notes?: string;
+  sha256?: string;
+  size?: number;
 }
 
 /** True when running inside a real Tauri webview (Android APK / desktop). */
@@ -97,7 +118,7 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
     const m = await loadManifest();
     if (!m?.version || !m?.url) return null;
     if (cmpVersion(m.version, current) <= 0) return null;
-    return { version: m.version, url: m.url, notes: m.notes };
+    return { version: m.version, url: m.url, notes: m.notes, sha256: m.sha256, size: m.size };
   } catch {
     return null;
   }
@@ -129,7 +150,11 @@ export async function checkForUpdateVerbose(): Promise<UpdateCheck> {
     if (cmpVersion(m.version, current) <= 0) {
       return { status: "up-to-date", current };
     }
-    return { status: "update-available", info: { version: m.version, url: m.url, notes: m.notes }, current };
+    return {
+      status: "update-available",
+      info: { version: m.version, url: m.url, notes: m.notes, sha256: m.sha256, size: m.size },
+      current,
+    };
   } catch (e) {
     const message =
       e instanceof Error && e.message ? e.message : "Couldn't reach the update server. Check your connection.";
@@ -160,15 +185,25 @@ export async function openInstallSettings(): Promise<void> {
 /**
  * Download the APK and launch the system installer (PackageInstaller session,
  * then legacy ACTION_VIEW). Resolves once the installer has been handed the
- * file — stock Android still shows its own one-tap confirm dialog.
+ * file — stock Android still shows its own one-tap confirm dialog. The native
+ * side verifies the download against the manifest's sha256/size when present.
  */
-export async function installUpdate(url: string): Promise<void> {
-  await invoke("download_and_install_apk", { url });
+export async function installUpdate(info: UpdateInfo): Promise<void> {
+  await invoke("download_and_install_apk", {
+    url: info.url,
+    sha256: info.sha256 ?? null,
+    size: info.size ?? null,
+  });
 }
 
 /** Copy the APK into public Downloads; returns a display path like `Download/…`. */
-export async function saveApkToDownloads(url: string, version?: string): Promise<string> {
-  return invoke<string>("save_apk_to_downloads", { url, version: version ?? null });
+export async function saveApkToDownloads(info: UpdateInfo): Promise<string> {
+  return invoke<string>("save_apk_to_downloads", {
+    url: info.url,
+    version: info.version ?? null,
+    sha256: info.sha256 ?? null,
+    size: info.size ?? null,
+  });
 }
 
 /** Open the APK previously saved by {@link saveApkToDownloads}. */
@@ -237,7 +272,7 @@ export async function installUpdateWithFallbacks(
 
   progress({ step: "installer", message: "Downloading and opening the system installer…" });
   try {
-    await installUpdate(info.url);
+    await installUpdate(info);
     return { status: "handed-off", method: "installer" };
   } catch (e) {
     const reason = errMessage(
@@ -254,7 +289,7 @@ export async function installUpdateWithFallbacks(
 
   let savedPath: string | undefined;
   try {
-    savedPath = await saveApkToDownloads(info.url, info.version);
+    savedPath = await saveApkToDownloads(info);
     progress({
       step: "open-downloads",
       message: `Saved to ${savedPath}. Opening it with the system installer…`,

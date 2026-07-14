@@ -601,6 +601,8 @@ where
         let mut last_wh = (0u32, 0u32);
         let mut last_color = JpegColor::Bgra;
         let mut last_emit = Instant::now() - Duration::from_secs(2);
+        // Encoded copy of the last emitted static frame, for cheap keep-alives.
+        let mut cached_jpg: Option<Vec<u8>> = None;
 
         while slot.running.load(Ordering::SeqCst) && slot.gen.load(Ordering::SeqCst) == my_gen {
             let t0 = Instant::now();
@@ -619,7 +621,9 @@ where
                 if let Some(d) = dup.as_mut() {
                     match d.grab(budget_ms, max_w) {
                         super::dxdupe::Grab::Frame { w: gw, h: gh, .. } => {
-                            if let Some((px, ow, oh)) = scale_u8x4(d.buffer(), gw, gh, max_w, fast) {
+                            if let Some((mut px, ow, oh)) = scale_u8x4(d.buffer(), gw, gh, max_w, fast) {
+                                // Real system cursor into the frame (remote users need it).
+                                d.draw_cursor(&mut px, ow, oh);
                                 scaled = Some((px, ow, oh, JpegColor::Bgra, true));
                             }
                         }
@@ -651,8 +655,20 @@ where
                         .as_ref()
                         .map_or(true, |prev| last_wh != (w, h) || prev.as_slice() != px.as_slice());
                 let stale = last_emit.elapsed() >= Duration::from_millis(900);
-                if changed || stale {
+                if changed {
                     if let Some(jpg) = encode_frame(&px, w, h, quality, color) {
+                        emit(jpg);
+                        last_emit = Instant::now();
+                        cached_jpg = None; // frame content moved on — drop the stale cache
+                    }
+                } else if stale {
+                    // Keep-alive on a static screen: re-send the SAME pixels. Reuse the
+                    // cached encode (encode once, then clone ~1/s) instead of burning a
+                    // full JPEG encode per keep-alive.
+                    if cached_jpg.is_none() {
+                        cached_jpg = encode_frame(&px, w, h, quality, color);
+                    }
+                    if let Some(jpg) = cached_jpg.clone() {
                         emit(jpg);
                         last_emit = Instant::now();
                     }
@@ -661,10 +677,13 @@ where
                 last_wh = (w, h);
                 last_color = color;
             } else if let Some(prev) = last.as_ref() {
-                // Static screen / cursor-only update: re-send the last frame occasionally
-                // so a freshly-attached decoder still gets a keyframe.
+                // Static screen: re-send the last frame occasionally so a freshly
+                // attached decoder still gets a keyframe (cached — no re-encode).
                 if last_emit.elapsed() >= Duration::from_millis(900) {
-                    if let Some(jpg) = encode_frame(prev, last_wh.0, last_wh.1, quality, last_color) {
+                    if cached_jpg.is_none() {
+                        cached_jpg = encode_frame(prev, last_wh.0, last_wh.1, quality, last_color);
+                    }
+                    if let Some(jpg) = cached_jpg.clone() {
                         emit(jpg);
                         last_emit = Instant::now();
                     }
@@ -778,7 +797,10 @@ where
                             let s0 = Instant::now();
                             // BGRA source (already GPU-downscaled to ~max_w); the CPU
                             // resize just trims to the exact target across all cores.
-                            if let Some((px, ow, oh)) = scale_u8x4(d.buffer(), gw, gh, max_w, fast) {
+                            if let Some((mut px, ow, oh)) = scale_u8x4(d.buffer(), gw, gh, max_w, fast) {
+                                // Composite the real system cursor into the outgoing
+                                // frame (DD frames don't include the pointer).
+                                d.draw_cursor(&mut px, ow, oh);
                                 scaled = Some((px, ow, oh, native_w, native_h, s0.elapsed().as_micros() as u32, JpegColor::Bgra, true));
                             }
                         }
@@ -883,6 +905,10 @@ where
     std::thread::spawn(move || {
         boost_capture_thread();
         let mut last_emit = Instant::now() - Duration::from_secs(2);
+        // Encoded copy of the last emitted frame for keep-alive re-sends: a static
+        // screen then costs one encode + a ~1/s memcpy instead of an encode per
+        // keep-alive. Never touched on the changed-frame hot path.
+        let mut cached: Option<(Vec<u8>, u32, u32, u8)> = None;
         while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
             let frame = {
                 let (lock, cv) = &*enc_mail;
@@ -912,13 +938,27 @@ where
 
             // The capture side already told us whether the pixels changed, so there's
             // no whole-frame diff here (a 4K memcmp per frame was pure overhead).
-            if frame.changed || stale {
+            if frame.changed {
                 let enc0 = Instant::now();
                 if let Some(jpg) = encode_frame(&frame.px, frame.w, frame.h, quality, frame.color) {
                     ST_ENC_US.store(enc0.elapsed().as_micros() as u32, Ordering::Relaxed);
                     ST_BYTES.store(jpg.len() as u32, Ordering::Relaxed);
                     ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
                     emit(jpg);
+                    last_emit = Instant::now();
+                    cached = None; // content moved on — drop the stale keep-alive cache
+                }
+            } else if stale {
+                // Keep-alive: same pixels as last time. Encode once, then serve clones.
+                let usable = matches!(&cached, Some((_, w, h, q)) if *w == frame.w && *h == frame.h && *q == quality);
+                if !usable {
+                    cached = encode_frame(&frame.px, frame.w, frame.h, quality, frame.color)
+                        .map(|j| (j, frame.w, frame.h, quality));
+                }
+                if let Some((jpg, ..)) = &cached {
+                    ST_BYTES.store(jpg.len() as u32, Ordering::Relaxed);
+                    ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
+                    emit(jpg.clone());
                     last_emit = Instant::now();
                 }
             }

@@ -127,7 +127,11 @@ jobs:
         env:
           APK_URL: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/GameTrackerRemote.apk
         run: |
-          node -e "const fs=require('fs'); const v=require('./companion/src-tauri/tauri.conf.json').version; fs.writeFileSync('apk-latest.json', JSON.stringify({ version: v, url: process.env.APK_URL, notes: '', pubDate: new Date().toISOString() }, null, 2))"
+          # sha256 + size let the in-app updater verify the download byte-for-byte
+          # (the definitive fix for "package appears to be invalid" corruption).
+          export APK_SHA256=$(sha256sum GameTrackerRemote.apk | awk '{print $1}')
+          export APK_SIZE=$(stat -c%s GameTrackerRemote.apk)
+          node -e "const fs=require('fs'); const v=require('./companion/src-tauri/tauri.conf.json').version; fs.writeFileSync('apk-latest.json', JSON.stringify({ version: v, url: process.env.APK_URL, sha256: process.env.APK_SHA256, size: Number(process.env.APK_SIZE), notes: '', pubDate: new Date().toISOString() }, null, 2))"
           cat apk-latest.json
 
       - name: Upload APK + manifest to the Release

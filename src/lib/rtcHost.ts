@@ -518,7 +518,9 @@ export function startHost(opts: HostOptions): () => void {
         off += 8;
         const jpg = u8.slice(off, off + len);
         off += len;
-        jobs.push({ y, p: createImageBitmap(new Blob([jpg], { type: "image/jpeg" })) });
+        // Our encoder emits plain sRGB JPEGs with no ICC profile — skip the color
+        // conversion pass for a faster decode.
+        jobs.push({ y, p: createImageBitmap(new Blob([jpg], { type: "image/jpeg" }), { colorSpaceConversion: "none" }) });
       }
       const bmps = await Promise.all(jobs.map((j) => j.p));
       bmps.forEach((bmp, i) => {
@@ -528,7 +530,7 @@ export function startHost(opts: HostOptions): () => void {
     };
 
     const drawFull = async (bytes: ArrayBuffer) => {
-      const bmp = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+      const bmp = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), { colorSpaceConversion: "none" });
       if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
         canvas.width = bmp.width;
         canvas.height = bmp.height;
@@ -684,6 +686,48 @@ export function startHost(opts: HostOptions): () => void {
     // Capture-stall watchdog bookkeeping (restart capture if it wedges).
     let lastProduced = -1;
     let zeroSince = 0;
+    // Encoder-stall watchdog bookkeeping (see below): counts consecutive 500ms
+    // ticks where Rust produces frames but the WebRTC encoder sends none.
+    let encStallTicks = 0;
+    let stallProduced = -1;
+    let stallProducedAt = 0;
+
+    // Self-heal for a wedged WebRTC VIDEO ENCODER. Raising the stream resolution
+    // resizes the canvas, and some hardware H.264 encoders never recover from the
+    // mid-stream size increase: the track keeps accepting frames but the encoder
+    // outputs nothing, so the guest freezes on the last frame — and lowering the
+    // resolution again doesn't help because the encoder itself is dead. Rebuild
+    // the canvas + generator track and swap it in with `replaceTrack` (no
+    // renegotiation, keeps the session/auth), then restart the Rust feed.
+    const rebuildVideoPipeline = async () => {
+      if (pc !== myPc || !videoSender || !authorized) return;
+      console.warn("[remote] video encoder stalled — rebuilding the video track in place");
+      stopCapture();
+      videoWriter?.close().catch(() => {});
+      videoWriter = null;
+      try {
+        videoTrack?.stop();
+      } catch {
+        /* ignore */
+      }
+      const v = await buildVideoTrack();
+      if (!v || pc !== myPc) return;
+      videoTrack = v.track;
+      startVideoCapture = v.start;
+      try {
+        await videoSender.replaceTrack(v.track);
+      } catch (e) {
+        console.warn("[remote] replaceTrack failed:", e);
+        return;
+      }
+      applyContentHint();
+      applyBitrate();
+      try {
+        await v.start();
+      } catch (e) {
+        console.warn("[remote] capture restart after rebuild failed:", e);
+      }
+    };
 
     const authorize = async () => {
       if (authorized) return;
@@ -932,6 +976,7 @@ export function startHost(opts: HostOptions): () => void {
         // The `quality` message re-tunes the capture + encoder; not an input event.
         if (msg && msg.type === "quality") {
           if (opts.fixedMonitor != null) return; // aux quality is fixed at start
+          const prevMaxW = quality.maxW;
           if (typeof msg.maxW === "number") quality.maxW = clamp(msg.maxW, 320, 3840);
           if (typeof msg.quality === "number") quality.jpeg = clamp(msg.quality, 20, 95);
           if (typeof msg.fps === "number") quality.fps = clamp(msg.fps, 1, 120);
@@ -944,6 +989,16 @@ export function startHost(opts: HostOptions): () => void {
           }
           applyContentHint();
           applyBitrate();
+          // Resolution changes resize the canvas mid-stream, which makes some
+          // hardware encoders hiccup. Ask for a fresh keyframe once frames at the
+          // new size start flowing; a still-wedged encoder is then caught by the
+          // encoder-stall watchdog (rebuildVideoPipeline).
+          if (quality.maxW !== prevMaxW) {
+            window.setTimeout(() => {
+              const sender = videoSender as (RTCRtpSender & { generateKeyFrame?: () => Promise<void> }) | null;
+              sender?.generateKeyFrame?.().catch(() => {});
+            }, 700);
+          }
           return;
         }
         // Controller-mode probe: the phone asks whether this PC can create a
@@ -1115,8 +1170,33 @@ export function startHost(opts: HostOptions): () => void {
               zeroSince = 0;
             }
           }
+          // Primary hosts always read the outbound link stats — the encoder-stall
+          // watchdog needs them even when no desktop UI is subscribed.
+          const link = opts.fixedMonitor == null || opts.onStats ? await readSendStats() : { kbps: 0, fps: 0, rtt: 0 };
+          // Encoder-stall watchdog: Rust producing frames at a real rate while the
+          // WebRTC encoder sends 0 fps for ~5s means the encoder wedged (classic
+          // trigger: a mid-stream resolution increase). Rebuild the track in place.
+          if (cs && authorized && opts.fixedMonitor == null && pc?.connectionState === "connected") {
+            const now = Date.now();
+            let producedRate = 0;
+            if (stallProduced >= 0 && now > stallProducedAt) {
+              producedRate = ((cs.producedFrames - stallProduced) * 1000) / (now - stallProducedAt);
+            }
+            stallProduced = cs.producedFrames;
+            stallProducedAt = now;
+            if (producedRate > 3 && link.fps === 0) {
+              encStallTicks++;
+              if (encStallTicks >= 10) {
+                encStallTicks = -30; // ~15s cooldown before it may fire again
+                void rebuildVideoPipeline();
+              }
+            } else if (encStallTicks > 0) {
+              encStallTicks = 0;
+            } else if (encStallTicks < 0) {
+              encStallTicks++; // count the cooldown back up to 0
+            }
+          }
           if (opts.onStats) {
-            const link = await readSendStats();
             opts.onStats({
               capture: cs,
               sendKbps: link.kbps,

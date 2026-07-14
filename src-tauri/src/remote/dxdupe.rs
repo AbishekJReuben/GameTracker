@@ -35,7 +35,14 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
+
+// DXGI_OUTDUPL_POINTER_SHAPE_TYPE values (the windows crate exposes them as consts
+// of a wrapper type; we store the raw u32 for simple matching).
+const PTR_MONOCHROME: u32 = 1;
+const PTR_COLOR: u32 = 2;
+const PTR_MASKED_COLOR: u32 = 4;
 
 /// The result of trying to grab one frame from the duplication session.
 pub enum Grab {
@@ -72,6 +79,22 @@ pub struct Duplicator {
     readback: Vec<u8>,
     /// Virtual-desktop top-left of the output we're duplicating (for re-matching).
     pub origin: (i32, i32),
+    // ---- live hardware-cursor state (mirrored from AcquireNextFrame info) ----
+    // Desktop Duplication frames do NOT include the mouse pointer; it arrives as
+    // separate position + shape metadata. We keep the latest of each so
+    // `draw_cursor` can composite the real system cursor into every outgoing
+    // frame — the remote user then always sees where the PC cursor actually is,
+    // even when the link lags behind their own stylized touch cursor.
+    ptr_visible: bool,
+    ptr_x: i32,
+    ptr_y: i32,
+    ptr_shape: Vec<u8>,
+    ptr_type: u32,
+    ptr_w: u32,
+    ptr_h: u32,
+    ptr_pitch: u32,
+    /// Native dims of the last grabbed frame (scales cursor coords to the stream).
+    last_native: (u32, u32),
 }
 
 impl Duplicator {
@@ -159,6 +182,15 @@ impl Duplicator {
                 gpu_scale,
                 readback: Vec::new(),
                 origin,
+                ptr_visible: false,
+                ptr_x: 0,
+                ptr_y: 0,
+                ptr_shape: Vec::new(),
+                ptr_type: 0,
+                ptr_w: 0,
+                ptr_h: 0,
+                ptr_pitch: 0,
+                last_native: (0, 0),
             })
         }
     }
@@ -269,18 +301,50 @@ impl Duplicator {
                 Err(_) => return Grab::Lost,
             }
 
-            // Cursor-only updates carry no new desktop pixels (LastPresentTime == 0).
+            // Mirror the hardware-cursor metadata (position/visibility valid only on
+            // frames where the mouse updated; shape only when it changed).
+            let mouse_updated = info.LastMouseUpdateTime != 0;
+            if mouse_updated {
+                self.ptr_visible = info.PointerPosition.Visible.as_bool();
+                if self.ptr_visible {
+                    self.ptr_x = info.PointerPosition.Position.x;
+                    self.ptr_y = info.PointerPosition.Position.y;
+                }
+            }
+            if info.PointerShapeBufferSize > 0 {
+                let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
+                let mut required = 0u32;
+                let mut sinfo = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+                if self
+                    .dup
+                    .GetFramePointerShape(buf.len() as u32, buf.as_mut_ptr() as *mut _, &mut required, &mut sinfo)
+                    .is_ok()
+                {
+                    self.ptr_shape = buf;
+                    self.ptr_type = sinfo.Type;
+                    self.ptr_w = sinfo.Width;
+                    self.ptr_h = sinfo.Height;
+                    self.ptr_pitch = sinfo.Pitch;
+                }
+            }
+
+            // New desktop pixels (LastPresentTime != 0) OR a cursor move both produce
+            // a frame: the texture always holds the CURRENT desktop, and cursor moves
+            // must reach the stream now that the real pointer is composited in
+            // (before cursor compositing, cursor-only updates were skipped as a pure
+            // CPU saving — that would freeze the visible pointer on a static screen).
             let has_new = info.LastPresentTime != 0;
             let res = resource;
             let out = (|| {
                 let res = res.as_ref()?;
-                if !has_new {
+                if !has_new && !mouse_updated {
                     return None;
                 }
                 let tex: ID3D11Texture2D = res.cast().ok()?;
                 let mut td = D3D11_TEXTURE2D_DESC::default();
                 tex.GetDesc(&mut td);
                 let (nw, nh) = (td.Width, td.Height);
+                self.last_native = (nw, nh);
                 let src: ID3D11Resource = tex.cast().ok()?;
 
                 // Largest mip level still >= max_w wide, so the CPU only does a small
@@ -318,6 +382,105 @@ impl Duplicator {
 
             let _ = self.dup.ReleaseFrame();
             out.unwrap_or(Grab::Timeout)
+        }
+    }
+
+    /// Composite the current hardware cursor into `buf` — a packed **BGRA** image
+    /// of this monitor at `bw × bh` (the final scaled stream frame). Nearest-scales
+    /// the shape by the same ratio as the frame so the cursor stays proportionate
+    /// at any stream resolution. Handles all three DXGI shape types: color
+    /// (per-pixel alpha), monochrome (AND/XOR bit masks, the classic arrow/I-beam),
+    /// and masked color (alpha byte 0 = opaque, 0xFF = XOR with screen).
+    pub fn draw_cursor(&self, buf: &mut [u8], bw: u32, bh: u32) {
+        if !self.ptr_visible || self.ptr_shape.is_empty() || bw == 0 || bh == 0 {
+            return;
+        }
+        let (nw, nh) = self.last_native;
+        if nw == 0 || nh == 0 {
+            return;
+        }
+        let mono = self.ptr_type == PTR_MONOCHROME;
+        let shape_w = self.ptr_w;
+        let shape_h = if mono { self.ptr_h / 2 } else { self.ptr_h };
+        if shape_w == 0 || shape_h == 0 {
+            return;
+        }
+        let pitch = self.ptr_pitch as usize;
+        // Destination rect: cursor position and size scaled from native to stream.
+        let dx0 = (self.ptr_x as i64 * bw as i64 / nw as i64) as i32;
+        let dy0 = (self.ptr_y as i64 * bh as i64 / nh as i64) as i32;
+        let dw = ((shape_w as u64 * bw as u64).div_ceil(nw as u64)).max(1) as i32;
+        let dh = ((shape_h as u64 * bh as u64).div_ceil(nh as u64)).max(1) as i32;
+
+        for dy in 0..dh {
+            let ty = dy0 + dy;
+            if ty < 0 || ty >= bh as i32 {
+                continue;
+            }
+            let sy = ((dy as u32 * shape_h) / dh as u32).min(shape_h - 1) as usize;
+            for dx in 0..dw {
+                let tx = dx0 + dx;
+                if tx < 0 || tx >= bw as i32 {
+                    continue;
+                }
+                let sx = ((dx as u32 * shape_w) / dw as u32).min(shape_w - 1) as usize;
+                let di = (ty as usize * bw as usize + tx as usize) * 4;
+                if di + 3 >= buf.len() {
+                    continue;
+                }
+                match self.ptr_type {
+                    PTR_COLOR => {
+                        let si = sy * pitch + sx * 4;
+                        let Some(px) = self.ptr_shape.get(si..si + 4) else { continue };
+                        let a = px[3] as u32;
+                        if a == 0 {
+                            continue;
+                        }
+                        for c in 0..3 {
+                            let s = px[c] as u32;
+                            let d = buf[di + c] as u32;
+                            buf[di + c] = ((s * a + d * (255 - a)) / 255) as u8;
+                        }
+                    }
+                    PTR_MONOCHROME => {
+                        // 1bpp, AND mask rows then XOR mask rows (stacked).
+                        let byte = sx / 8;
+                        let bit = 7 - (sx % 8);
+                        let and_i = sy * pitch + byte;
+                        let xor_i = (sy + shape_h as usize) * pitch + byte;
+                        let (Some(&ab), Some(&xb)) = (self.ptr_shape.get(and_i), self.ptr_shape.get(xor_i)) else {
+                            continue;
+                        };
+                        let and = (ab >> bit) & 1;
+                        let xor = (xb >> bit) & 1;
+                        if and == 0 {
+                            let v = if xor == 1 { 0xFF } else { 0x00 };
+                            buf[di] = v;
+                            buf[di + 1] = v;
+                            buf[di + 2] = v;
+                        } else if xor == 1 {
+                            buf[di] = !buf[di];
+                            buf[di + 1] = !buf[di + 1];
+                            buf[di + 2] = !buf[di + 2];
+                        }
+                        // and==1 && xor==0 → transparent.
+                    }
+                    PTR_MASKED_COLOR => {
+                        let si = sy * pitch + sx * 4;
+                        let Some(px) = self.ptr_shape.get(si..si + 4) else { continue };
+                        if px[3] == 0 {
+                            buf[di] = px[0];
+                            buf[di + 1] = px[1];
+                            buf[di + 2] = px[2];
+                        } else {
+                            buf[di] ^= px[0];
+                            buf[di + 1] ^= px[1];
+                            buf[di + 2] ^= px[2];
+                        }
+                    }
+                    _ => return,
+                }
+            }
         }
     }
 }

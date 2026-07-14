@@ -22,8 +22,9 @@ import {
   Plug,
   Trash2,
   Info,
+  ExternalLink,
 } from "lucide-react";
-import { checkForUpdateVerbose, type UpdateCheck } from "../update";
+import { checkForUpdateVerbose, openReleasePage, type UpdateCheck } from "../update";
 import { UpdatePanel } from "../UpdatePanel";
 import { deviceName } from "../device";
 import { getCompanionRuntime } from "../runtime";
@@ -113,9 +114,22 @@ function UpdateSection() {
           )}
         </div>
 
-        <button onClick={runCheck} disabled={checking} className="btn btn-subtle h-11 w-full gap-2">
-          <RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} /> Check for updates
-        </button>
+        <div className="flex gap-2">
+          <button onClick={runCheck} disabled={checking} className="btn btn-subtle h-11 flex-1 gap-2">
+            <RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} /> Check for updates
+          </button>
+          <button
+            onClick={() =>
+              void openReleasePage(
+                check?.status === "update-available" ? check.info.version : current,
+              )
+            }
+            className="btn btn-subtle h-11 gap-2 px-3"
+            title="Open GitHub release page"
+          >
+            <ExternalLink className="h-4 w-4" />
+          </button>
+        </div>
       </div>
 
       {check?.status === "update-available" ? (

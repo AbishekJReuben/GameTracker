@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { motion } from "motion/react";
 import {
   LayoutDashboard,
@@ -78,6 +79,12 @@ export function CompanionApp() {
   const [phase, setPhase] = useState<Phase>("boot");
   const [conn, setConn] = useState<CloudConn | null>(null);
   const [tab, setTab] = useState<Tab>("control");
+  // Android floating mini-window: while a session is live, tell the native shell
+  // that leaving the app (Home/recents) should enter 16:9 picture-in-picture.
+  // Best-effort — rejects harmlessly on the web/discovery build (no Tauri).
+  useEffect(() => {
+    invoke("set_pip_enabled", { enabled: phase === "connected" }).catch(() => {});
+  }, [phase]);
   const [activeCode, setActiveCode] = useState(() => localStorage.getItem(LS_CODE) || "");
   const [pendingConn, setPendingConn] = useState<CloudConn | null>(null);
   const autoConnRef = useRef<CloudConn | null>(null);

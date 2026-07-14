@@ -101,6 +101,20 @@ const save = (path, before, after, msg) => {
     m = m.replace(/([ \t]*<\/application>)/, `${receiver}$1`);
   }
 
+  // Picture-in-picture support on the main activity: leaving the app while a
+  // remote session is live shrinks it into a floating 16:9 mini window (see
+  // MainActivity.onUserLeaveHint below). resizeableActivity default stays on.
+  {
+    const act = m.match(/<activity\b[^>]*?android:name="[^"]*MainActivity"[^>]*?>/);
+    if (act && !act[0].includes("supportsPictureInPicture")) {
+      const patched = act[0].replace(
+        "<activity",
+        `<activity${eol}            android:supportsPictureInPicture="true"`,
+      );
+      m = m.replace(act[0], patched);
+    }
+  }
+
   // <queries> so the legacy ACTION_VIEW fallback can resolve the system package
   // installer on Android 11+ (package-visibility restrictions otherwise hide it).
   if (!m.includes("vnd.android.package-archive")) {
@@ -206,34 +220,67 @@ const save = (path, before, after, msg) => {
     console.warn(`[patch-android] ${mainActivityPath} not found — skipping MainActivity patch.`);
   } else {
     const before = readFileSync(mainActivityPath, "utf8");
-    if (!before.includes("WindowInsetsControllerCompat")) {
-      const content =
-        `package ${pkg}\n\n` +
-        `import android.os.Bundle\n` +
-        `import androidx.activity.enableEdgeToEdge\n` +
-        `import androidx.core.view.WindowInsetsCompat\n` +
-        `import androidx.core.view.WindowInsetsControllerCompat\n\n` +
-        `class MainActivity : TauriActivity() {\n` +
-        `  override fun onCreate(savedInstanceState: Bundle?) {\n` +
-        `    enableEdgeToEdge()\n` +
-        `    super.onCreate(savedInstanceState)\n` +
-        `    hideSystemBars()\n` +
-        `  }\n\n` +
-        `  override fun onWindowFocusChanged(hasFocus: Boolean) {\n` +
-        `    super.onWindowFocusChanged(hasFocus)\n` +
-        `    // Re-hide after the bars are transiently shown (keyboard, app resume).\n` +
-        `    if (hasFocus) hideSystemBars()\n` +
-        `  }\n\n` +
-        `  private fun hideSystemBars() {\n` +
-        `    val controller = WindowInsetsControllerCompat(window, window.decorView)\n` +
-        `    controller.hide(WindowInsetsCompat.Type.systemBars())\n` +
-        `    controller.systemBarsBehavior =\n` +
-        `      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE\n` +
-        `  }\n` +
-        `}\n`;
-      writeFileSync(mainActivityPath, content);
-      note("rewrote MainActivity.kt (immersive full-screen)");
-    }
+    const content =
+      `package ${pkg}\n\n` +
+      `import android.app.PictureInPictureParams\n` +
+      `import android.content.pm.ActivityInfo\n` +
+      `import android.content.res.Configuration\n` +
+      `import android.os.Build\n` +
+      `import android.os.Bundle\n` +
+      `import android.util.Rational\n` +
+      `import androidx.activity.enableEdgeToEdge\n` +
+      `import androidx.core.view.WindowInsetsCompat\n` +
+      `import androidx.core.view.WindowInsetsControllerCompat\n\n` +
+      `class MainActivity : TauriActivity() {\n` +
+      `  companion object {\n` +
+      `    /** Set over JNI by the Rust \`set_pip_enabled\` command: true while the\n` +
+      `     *  webview has a live remote session, so leaving the app shrinks it into\n` +
+      `     *  a floating 16:9 mini window (YouTube/AnyDesk style) instead of plain\n` +
+      `     *  backgrounding. */\n` +
+      `    @JvmField var pipWanted = false\n` +
+      `  }\n\n` +
+      `  override fun onCreate(savedInstanceState: Bundle?) {\n` +
+      `    enableEdgeToEdge()\n` +
+      `    super.onCreate(savedInstanceState)\n` +
+      `    // Follow the physical sensor in all four orientations, IGNORING the\n` +
+      `    // system auto-rotate lock — holding the phone sideways for a moment\n` +
+      `    // rotates the remote screen even with rotation lock on.\n` +
+      `    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR\n` +
+      `    hideSystemBars()\n` +
+      `  }\n\n` +
+      `  override fun onWindowFocusChanged(hasFocus: Boolean) {\n` +
+      `    super.onWindowFocusChanged(hasFocus)\n` +
+      `    // Re-hide after the bars are transiently shown (keyboard, app resume).\n` +
+      `    if (hasFocus) hideSystemBars()\n` +
+      `  }\n\n` +
+      `  // Home / recents while connected → floating 16:9 mini window.\n` +
+      `  override fun onUserLeaveHint() {\n` +
+      `    super.onUserLeaveHint()\n` +
+      `    if (pipWanted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {\n` +
+      `      try {\n` +
+      `        enterPictureInPictureMode(\n` +
+      `          PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()\n` +
+      `        )\n` +
+      `      } catch (_: Exception) {\n` +
+      `        // PiP unavailable (device/settings) — plain backgrounding is fine.\n` +
+      `      }\n` +
+      `    }\n` +
+      `  }\n\n` +
+      `  override fun onPictureInPictureModeChanged(\n` +
+      `    isInPictureInPictureMode: Boolean,\n` +
+      `    newConfig: Configuration\n` +
+      `  ) {\n` +
+      `    super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)\n` +
+      `    if (!isInPictureInPictureMode) hideSystemBars()\n` +
+      `  }\n\n` +
+      `  private fun hideSystemBars() {\n` +
+      `    val controller = WindowInsetsControllerCompat(window, window.decorView)\n` +
+      `    controller.hide(WindowInsetsCompat.Type.systemBars())\n` +
+      `    controller.systemBarsBehavior =\n` +
+      `      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE\n` +
+      `  }\n` +
+      `}\n`;
+    save(mainActivityPath, before, content, "rewrote MainActivity.kt (immersive + sensor rotate + PiP)");
   }
 }
 

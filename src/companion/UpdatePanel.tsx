@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Download,
+  ExternalLink,
   FolderDown,
   Loader2,
   RefreshCw,
@@ -18,6 +19,7 @@ import {
   installUpdateWithFallbacks,
   openDownloadedApk,
   openInstallSettings,
+  openReleasePage,
   saveApkToDownloads,
   type InstallOutcome,
   type InstallProgress,
@@ -94,7 +96,7 @@ export function UpdatePanel({ info, current, sheet, onClose }: UpdatePanelProps)
     setLocalError(null);
     setProgress({ step: "save-downloads", message: "Saving APK to Downloads…" });
     try {
-      const path = await saveApkToDownloads(info.url, info.version);
+      const path = await saveApkToDownloads(info);
       setSavedPath(path);
       setProgress({
         step: "open-downloads",
@@ -242,6 +244,12 @@ export function UpdatePanel({ info, current, sheet, onClose }: UpdatePanelProps)
               <RefreshCw className="h-4 w-4" /> Open saved APK
             </button>
           </div>
+          <button
+            onClick={() => void openReleasePage(info.version)}
+            className="btn btn-ghost h-10 w-full gap-2 text-xs text-ink-dim"
+          >
+            <ExternalLink className="h-4 w-4" /> Open release page
+          </button>
           <p className="text-center text-[11px] text-ink-faint">
             Manual: Files → Downloads → GameTrackerRemote-{info.version}.apk → Install
           </p>

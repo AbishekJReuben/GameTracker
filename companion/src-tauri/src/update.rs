@@ -32,7 +32,12 @@ const FILE_PROVIDER_AUTHORITY: &str = "com.chilloutgames.gametracker.companion.f
 /// package installer for it. Progress is emitted on `apk-update://progress`
 /// (`{ phase, received, total }`) so the UI can show a bar.
 #[tauri::command]
-pub async fn download_and_install_apk(app: AppHandle, url: String) -> Result<(), String> {
+pub async fn download_and_install_apk(
+    app: AppHandle,
+    url: String,
+    sha256: Option<String>,
+    size: Option<u64>,
+) -> Result<(), String> {
     // Resolve the cache dir on the calling thread (AppHandle::path needs the
     // handle), then do the blocking download + install off the main thread.
     let cache_dir = app
@@ -41,7 +46,8 @@ pub async fn download_and_install_apk(app: AppHandle, url: String) -> Result<(),
         .map_err(|e| format!("no cache dir: {e}"))?;
 
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || run_update(&app2, &url, &cache_dir))
+    let expect = Expected { sha256, size };
+    tauri::async_runtime::spawn_blocking(move || run_update(&app2, &url, &cache_dir, &expect))
         .await
         .map_err(|e| format!("update task panicked: {e}"))?
 }
@@ -60,14 +66,17 @@ pub async fn save_apk_to_downloads(
     app: AppHandle,
     url: String,
     version: Option<String>,
+    sha256: Option<String>,
+    size: Option<u64>,
 ) -> Result<String, String> {
     let cache_dir = app
         .path()
         .app_cache_dir()
         .map_err(|e| format!("no cache dir: {e}"))?;
     let app2 = app.clone();
+    let expect = Expected { sha256, size };
     tauri::async_runtime::spawn_blocking(move || {
-        let apk_path = ensure_downloaded(&app2, &url, &cache_dir)?;
+        let apk_path = ensure_downloaded(&app2, &url, &cache_dir, &expect)?;
         emit(&app2, "saving", 0, 0);
         let display_name = version
             .as_deref()
@@ -151,7 +160,7 @@ pub async fn open_install_settings() -> Result<(), String> {
 /// happen before the first activity finishes creating, which can't be the case
 /// while the webview is already invoking commands.
 #[cfg(target_os = "android")]
-fn tao_android_context() -> Result<tao::platform::android::prelude::AndroidContext, String> {
+pub(crate) fn tao_android_context() -> Result<tao::platform::android::prelude::AndroidContext, String> {
     tao::platform::android::prelude::main_android_context().ok_or_else(|| {
         "Android activity context is not available yet — try again in a moment".to_string()
     })
@@ -203,15 +212,73 @@ fn emit(app: &AppHandle, phase: &str, received: u64, total: u64) {
     );
 }
 
+/// Integrity expectations published in `apk-latest.json` (both optional so older
+/// manifests keep working; when present they are enforced).
+pub struct Expected {
+    pub sha256: Option<String>,
+    pub size: Option<u64>,
+}
+
 /// Download (or reuse) the APK in the cache dir, then hand it to the installer.
-fn run_update(app: &AppHandle, url: &str, cache_dir: &std::path::Path) -> Result<(), String> {
-    let apk_path = ensure_downloaded(app, url, cache_dir)?;
+fn run_update(
+    app: &AppHandle,
+    url: &str,
+    cache_dir: &std::path::Path,
+    expect: &Expected,
+) -> Result<(), String> {
+    let apk_path = ensure_downloaded(app, url, cache_dir, expect)?;
     emit(app, "installing", 0, 0);
     launch_installer(apk_path.to_string_lossy().as_ref()).map_err(|e| {
         format!(
             "Install step failed after a successful download: {e}. You can save the APK to Downloads and install it from there."
         )
     })
+}
+
+/// Hex-encoded SHA-256 of a file (streamed — the APK is tens of MB).
+fn sha256_file(path: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
+/// Full integrity gate for a candidate APK file. Structure checks always run;
+/// the size/sha256 comparisons run only when the manifest provided them — and the
+/// sha256 match is definitive (byte-identical to the file CI signed and hashed).
+fn apk_matches(path: &std::path::Path, expect: &Expected) -> bool {
+    if !apk_looks_complete(path) {
+        return false;
+    }
+    if let Some(want) = expect.size {
+        if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) != want {
+            return false;
+        }
+    }
+    if let Some(want) = expect.sha256.as_deref() {
+        let want = want.trim().to_ascii_lowercase();
+        if !want.is_empty() {
+            match sha256_file(path) {
+                Some(got) if got == want => {}
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 /// A complete APK is a ZIP: it starts with the "PK" magic AND ends with an
@@ -258,17 +325,22 @@ fn ensure_downloaded(
     app: &AppHandle,
     url: &str,
     cache_dir: &std::path::Path,
+    expect: &Expected,
 ) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("mkdir cache: {e}"))?;
     let apk_path = cache_dir.join("update.apk");
 
-    // Reuse only a verified-complete cached APK.
-    if apk_looks_complete(&apk_path) {
+    // Reuse the cached APK only when it passes the FULL integrity gate — including
+    // the manifest sha256 when available. The old structure-only check could keep
+    // reusing a cached file that was subtly corrupted (or belonged to a previous
+    // release: the cache filename is version-agnostic), sticking every retry on
+    // "package appears to be invalid" until the user reinstalled by hand.
+    if apk_matches(&apk_path, expect) {
         let len = std::fs::metadata(&apk_path).map(|m| m.len()).unwrap_or(0);
         emit(app, "downloading", len, len);
         return Ok(apk_path);
     }
-    let _ = std::fs::remove_file(&apk_path); // drop any corrupt/partial cache
+    let _ = std::fs::remove_file(&apk_path); // drop any corrupt/partial/stale cache
 
     emit(app, "downloading", 0, 0);
     let tmp_path = cache_dir.join("update.apk.part");
@@ -296,6 +368,13 @@ fn ensure_downloaded(
         .header("Content-Length")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // If some hop compressed the body anyway, ureq (gzip feature) transparently
+    // decompresses it — but then the byte count we receive is the DECOMPRESSED
+    // size and can't be compared against Content-Length (the compressed size).
+    let encoded = resp
+        .header("Content-Encoding")
+        .map(|e| !e.eq_ignore_ascii_case("identity"))
+        .unwrap_or(false);
 
     let mut reader = resp.into_reader();
     let mut file = std::fs::File::create(&tmp_path).map_err(|e| format!("create apk: {e}"))?;
@@ -314,15 +393,31 @@ fn ensure_downloaded(
     let _ = file.sync_all();
     drop(file);
 
-    // Completeness: bytes must match Content-Length (when the server gave one) AND
-    // the file must be a structurally-complete ZIP. Either failing means a truncated
-    // or altered body — delete it and report, so a retry re-downloads cleanly instead
-    // of reusing a broken cache.
-    if total > 0 && received != total {
+    // Completeness: bytes must match Content-Length (when the server gave one and
+    // the body wasn't transparently decompressed) AND the file must be a
+    // structurally-complete ZIP. Either failing means a truncated or altered body —
+    // delete it and report, so a retry re-downloads cleanly instead of reusing a
+    // broken cache.
+    if !encoded && total > 0 && received != total {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(format!(
             "download incomplete ({received} of {total} bytes) — check your connection and try again"
         ));
+    }
+    // A gzip-wrapped body that slipped through anyway (magic 1F 8B) is a proxy /
+    // transfer-encoding problem, not a broken release — name it explicitly.
+    {
+        let mut head = [0u8; 2];
+        let is_gzip = std::fs::File::open(&tmp_path)
+            .and_then(|mut f| f.read_exact(&mut head).map(|_| head == [0x1f, 0x8b]))
+            .unwrap_or(false);
+        if is_gzip {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(
+                "the download arrived compressed by a proxy and couldn't be unpacked — try again on another network"
+                    .into(),
+            );
+        }
     }
     if !apk_looks_complete(&tmp_path) {
         let _ = std::fs::remove_file(&tmp_path);
@@ -330,6 +425,18 @@ fn ensure_downloaded(
             "the downloaded update looks incomplete or corrupted (not a valid APK) — please try again"
                 .into(),
         );
+    }
+    // Definitive integrity gate: the sha256 published by CI next to the APK. Any
+    // mismatch — however the bytes got altered — is caught here instead of by
+    // Android's installer saying "package appears to be invalid".
+    if expect.sha256.is_some() || expect.size.is_some() {
+        if !apk_matches(&tmp_path, expect) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(
+                "the downloaded update failed its integrity check (checksum mismatch) — please try again"
+                    .into(),
+            );
+        }
     }
 
     std::fs::rename(&tmp_path, &apk_path).map_err(|e| format!("finalize apk: {e}"))?;

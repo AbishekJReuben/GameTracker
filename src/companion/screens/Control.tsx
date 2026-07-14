@@ -657,7 +657,7 @@ export function ControlScreen({
       off += 12;
       const jpg = buf.slice(off, off + len); // copy: buf may be reused before decode resolves
       off += len;
-      createImageBitmap(new Blob([jpg], { type: "image/jpeg" }))
+      createImageBitmap(new Blob([jpg], { type: "image/jpeg" }), { colorSpaceConversion: "none" })
         .then((bmp) => {
           ctx.drawImage(bmp, tx, ty);
           bmp.close?.();
@@ -778,7 +778,15 @@ export function ControlScreen({
       doc.webkitExitFullscreen?.();
     }
   };
+  // APK WebView: browser Fullscreen API + multi-tab pop-outs aren't useful — hide both.
+  const isApk =
+    typeof window !== "undefined" &&
+    Boolean(
+      (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ ||
+        (window as unknown as { __TAURI__?: unknown }).__TAURI__,
+    );
   const browserFsSupported =
+    !isApk &&
     typeof document !== "undefined" &&
     !!(
       document.documentElement.requestFullscreen ||
@@ -1891,18 +1899,19 @@ export function ControlScreen({
                   >
                     <Monitor className="h-3.5 w-3.5" /> {monitorIdx + 1}/{monitors.length}
                   </button>
-                  {monitors
-                    .filter((m) => m.index !== monitorIdx)
-                    .map((m) => (
-                      <button
-                        key={m.index}
-                        onClick={() => openMonitorPopout(m.index)}
-                        className="flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1.5 text-xs font-700 text-ink-soft active:scale-95"
-                        title={`Open ${m.name || `Display ${m.index + 1}`} in a new tab (side-by-side)`}
-                      >
-                        <AppWindow className="h-3.5 w-3.5" /> {m.index + 1}
-                      </button>
-                    ))}
+                  {!isApk &&
+                    monitors
+                      .filter((m) => m.index !== monitorIdx)
+                      .map((m) => (
+                        <button
+                          key={m.index}
+                          onClick={() => openMonitorPopout(m.index)}
+                          className="flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1.5 text-xs font-700 text-ink-soft active:scale-95"
+                          title={`Open ${m.name || `Display ${m.index + 1}`} in a new tab (side-by-side)`}
+                        >
+                          <AppWindow className="h-3.5 w-3.5" /> {m.index + 1}
+                        </button>
+                      ))}
                 </>
               )
             )}
@@ -1966,7 +1975,7 @@ export function ControlScreen({
                 </button>
               </>
             )}
-            {browserFsSupported && (
+            {browserFsSupported ? (
               <button
                 onClick={toggleBrowserFullscreen}
                 className={`grid h-8 w-8 place-items-center rounded-lg active:scale-95 ${
@@ -1976,14 +1985,15 @@ export function ControlScreen({
               >
                 {browserFs ? <Shrink className="h-4 w-4" /> : <Expand className="h-4 w-4" />}
               </button>
+            ) : (
+              <button
+                onClick={() => setImmersive(true)}
+                className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.04] text-ink-soft active:scale-95"
+                title="Hide all chrome"
+              >
+                <Maximize2 className="h-4 w-4" />
+              </button>
             )}
-            <button
-              onClick={() => setImmersive(true)}
-              className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.04] text-ink-soft active:scale-95"
-              title="Hide all chrome"
-            >
-              <Maximize2 className="h-4 w-4" />
-            </button>
             <button
               onClick={() => setTopCollapsed(true)}
               className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.04] text-ink-soft active:scale-95"
@@ -2080,7 +2090,9 @@ export function ControlScreen({
       {(immersive || topCollapsed) && (
         <div
           className="absolute left-2 right-2 z-40 flex items-center justify-between gap-1.5"
-          style={{ top: "max(0.5rem, calc(env(safe-area-inset-top) + 0.25rem))" }}
+          // Edge-flush on purpose: the stream itself paints under the notch, so the
+          // floating pills sit at the true top edge (no safe-area offset).
+          style={{ top: "0.375rem" }}
         >
           <div className="flex items-center gap-1.5">
             {connected && (

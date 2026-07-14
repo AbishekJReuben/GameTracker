@@ -1104,11 +1104,12 @@ dependencies = [
 
 [[package]]
 name = "gametracker-companion"
-version = "3.9.12"
+version = "3.9.13"
 dependencies = [
  "jni",
  "serde",
  "serde_json",
+ "sha2",
  "tao",
  "tauri",
  "tauri-build",
