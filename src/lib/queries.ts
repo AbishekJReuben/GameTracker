@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, GameInput, GameStatus, SessionFilter, EntryKind } from "./api";
+import { readRemoteOnly } from "./setupMode";
 
 export const keys = {
   settings: ["settings"] as const,
@@ -37,6 +38,16 @@ export const keys = {
 
 export function useSettings() {
   return useQuery({ queryKey: keys.settings, queryFn: api.getSettings });
+}
+
+/**
+ * Whether the app is in "remote only" setup mode — everything but Remote and
+ * Settings is hidden. Reads false while settings are still loading; the shell
+ * holds a loading overlay until then, so no hidden tab flashes into view.
+ */
+export function useRemoteOnly(): boolean {
+  const { data } = useSettings();
+  return readRemoteOnly(data);
 }
 
 export function useGames() {

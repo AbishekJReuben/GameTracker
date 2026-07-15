@@ -173,45 +173,82 @@ Var TrackerDesktopBox
 Var TrackerDesktopState
 Var TrackerAutoUninstallBox
 Var TrackerAutoUninstallState
+Var TrackerFullRadio
+Var TrackerRemoteRadio
+Var TrackerRemoteOnlyState
 Var AppStartMenuFolder
 
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
 Page custom TrackerSinglePageCreate TrackerSinglePageLeave
 
 Function TrackerSinglePageCreate
+ ; Default the setup type to whatever this PC already has, so an update keeps the
+ ; current mode unless the user deliberately changes it here. Read before the
+ ; dialog exists so $2/$3 are free. Missing marker (first install, or an upgrade
+ ; from before this option) => Full tracker, which is how those installs behave.
+ StrCpy $TrackerRemoteOnlyState ${BST_UNCHECKED}
+ ClearErrors
+ FileOpen $2 "$INSTDIR\install-mode.txt" r
+ ${IfNot} ${Errors}
+  FileRead $2 $3
+  FileClose $2
+  StrCpy $3 $3 6 ; tolerate a trailing newline
+  ${If} $3 == "remote"
+   StrCpy $TrackerRemoteOnlyState ${BST_CHECKED}
+  ${EndIf}
+ ${EndIf}
+
  !insertmacro MUI_HEADER_TEXT "${PRODUCTNAME}" "Local-first play & app analytics for Windows"
  nsDialogs::Create 1018
  Pop $0
  ${IfThen} $(^RTL) = 1 ${|} nsDialogs::SetRTL $(^RTL) ${|}
 
- ${NSD_CreateLabel} 0 0 100% 24u "Install ${PRODUCTNAME} ${VERSION} on this PC."
+ ${NSD_CreateLabel} 0 0 100% 12u "Install ${PRODUCTNAME} ${VERSION} on this PC."
  Pop $1
 
- ${NSD_CreateLabel} 0 28u 100% 72u "What you get:$\r$\n- Automatic game & app session tracking (runtime + focus time)$\r$\n- Live hardware monitor with CPU/GPU temps$\r$\n- Timeline, heatmaps, collection insights & suggestions$\r$\n- 100% local — data stays in %LOCALAPPDATA%$\r$\n- Starts to the system tray; optional autostart at login"
+ ${NSD_CreateLabel} 0 14u 100% 48u "What you get:$\r$\n- Automatic game & app session tracking + live hardware monitor$\r$\n- Timeline, heatmaps, collection insights & suggestions$\r$\n- Remote control this PC from your phone, browser or Quest headset$\r$\n- 100% local — data stays in %LOCALAPPDATA%; starts to the system tray"
  Pop $1
 
- ${NSD_CreateLabel} 0 106u 100% 12u "Install location:"
+ ${NSD_CreateLabel} 0 66u 100% 10u "Setup type:"
  Pop $1
 
- ${NSD_CreateText} 0 120u 72% 12u $INSTDIR
+ ${NSD_CreateRadioButton} 0 78u 100% 12u "Full tracker — tracking, stats, music, system and remote"
+ Pop $TrackerFullRadio
+
+ ${NSD_CreateRadioButton} 0 90u 100% 12u "Remote only — just the remote; every other tab stays hidden"
+ Pop $TrackerRemoteRadio
+
+ ${If} $TrackerRemoteOnlyState == ${BST_CHECKED}
+  ${NSD_Check} $TrackerRemoteRadio
+ ${Else}
+  ${NSD_Check} $TrackerFullRadio
+ ${EndIf}
+
+ ${NSD_CreateLabel} 0 102u 100% 20u "Both install exactly the same files — this only picks what is shown. Remote only keeps tracking in the background and can be switched to the full app any time under Settings > Setup type (and back again)."
+ Pop $1
+
+ ${NSD_CreateLabel} 0 126u 100% 10u "Install location:"
+ Pop $1
+
+ ${NSD_CreateText} 0 138u 72% 12u $INSTDIR
  Pop $TrackerDirField
  ${NSD_SetText} $TrackerDirField $INSTDIR
 
- ${NSD_CreateBrowseButton} 74% 120u 26% 12u "Browse..."
+ ${NSD_CreateBrowseButton} 74% 138u 26% 12u "Browse..."
  Pop $1
  ${NSD_OnClick} $1 TrackerBrowseDir
 
- ${NSD_CreateCheckbox} 0 142u 100% 12u "Create a desktop shortcut"
+ ${NSD_CreateCheckbox} 0 154u 100% 12u "Create a desktop shortcut"
  Pop $TrackerDesktopBox
  ${NSD_Check} $TrackerDesktopBox
  StrCpy $TrackerDesktopState ${BST_CHECKED}
 
- ${NSD_CreateCheckbox} 0 158u 100% 12u "Clean install (fully remove the previous version first — not needed for updates)"
+ ${NSD_CreateCheckbox} 0 168u 100% 12u "Clean install (fully remove the previous version first — not needed for updates)"
  Pop $TrackerAutoUninstallBox
  ${NSD_Uncheck} $TrackerAutoUninstallBox
  StrCpy $TrackerAutoUninstallState ${BST_UNCHECKED}
 
- ${NSD_CreateLabel} 0 178u 100% 24u "Updates install in place over the running app (it closes automatically). WebView2 is installed if needed. Existing Tracker data is always preserved."
+ ${NSD_CreateLabel} 0 182u 100% 20u "Updates install in place over the running app (it closes automatically). WebView2 is installed if needed. Existing Tracker data is always preserved."
  Pop $1
 
  nsDialogs::Show
@@ -239,6 +276,12 @@ Function TrackerSinglePageLeave
   StrCpy $TrackerAutoUninstallState ${BST_CHECKED}
  ${Else}
   StrCpy $TrackerAutoUninstallState ${BST_UNCHECKED}
+ ${EndIf}
+ ${NSD_GetState} $TrackerRemoteRadio $0
+ ${If} $0 == ${BST_CHECKED}
+  StrCpy $TrackerRemoteOnlyState ${BST_CHECKED}
+ ${Else}
+  StrCpy $TrackerRemoteOnlyState ${BST_UNCHECKED}
  ${EndIf}
 FunctionEnd
 

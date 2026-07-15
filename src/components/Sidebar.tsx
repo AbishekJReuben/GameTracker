@@ -2,6 +2,8 @@ import { NavLink, useLocation } from "react-router-dom";
 import { motion } from "motion/react";
 import { LayoutDashboard, Library, CalendarRange, Trophy, Settings, Gamepad2, Tag, Compass, AppWindow, Cpu, Headphones, Smartphone } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { useRemoteOnly } from "@/lib/queries";
+import { routeAllowed } from "@/lib/setupMode";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { dur } from "@/lib/format";
 import { springNav } from "@/lib/motion";
@@ -27,8 +29,12 @@ export function Sidebar() {
   const live = tracking?.isPlaying && !tracking?.paused;
   const motionOn = useMotionEnabled();
   const showSuggested = useApp((s) => s.prefs.showSuggested);
-  // The Suggested tab is opt-in (default off) — hide it from nav unless enabled.
-  const nav = NAV.filter((item) => item.to !== "/suggested" || showSuggested);
+  // Remote-only mode strips nav down to Remote + Settings; otherwise the only
+  // gated item is Suggested, which is opt-in (default off).
+  const remoteOnly = useRemoteOnly();
+  const nav = NAV.filter((item) =>
+    remoteOnly ? routeAllowed(item.to, true) : item.to !== "/suggested" || showSuggested
+  );
 
   return (
     <aside className="z-10 flex w-[244px] shrink-0 flex-col gap-2 border-r border-line bg-bg-900/50 px-3 pb-4 pt-2 backdrop-blur-xl">
@@ -48,7 +54,9 @@ export function Sidebar() {
         </div>
         <div className="leading-tight">
           <div className="font-display text-[18px] font-800 tracking-tight accent-text">Tracker</div>
-          <div className="text-[10px] font-700 uppercase tracking-[0.22em] text-ink-dim">play & app analytics</div>
+          <div className="text-[10px] font-700 uppercase tracking-[0.22em] text-ink-dim">
+            {remoteOnly ? "remote control" : "play & app analytics"}
+          </div>
         </div>
       </div>
 
@@ -114,7 +122,9 @@ export function Sidebar() {
         })}
       </nav>
 
-      <div className="mt-auto">
+      {/* The live-tracking HUD is a tracker surface — remote-only mode hides it
+          along with the tabs it summarizes. */}
+      <div className={cn("mt-auto", remoteOnly && "hidden")}>
         <div className="hud-panel p-3">
           <div className="flex items-center gap-2">
             <span className="relative flex h-2.5 w-2.5">

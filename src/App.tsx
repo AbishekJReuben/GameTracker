@@ -16,7 +16,8 @@ import { SplashScreen } from "./components/SplashScreen";
 import { GameModal } from "./components/GameModal";
 import { DropZone } from "./components/DropZone";
 import { useTauriBridge } from "./lib/bridge";
-import { useSettings } from "./lib/queries";
+import { useSettings, useRemoteOnly } from "./lib/queries";
+import { routeAllowed } from "./lib/setupMode";
 import { useApp } from "./store/app";
 import Dashboard from "./routes/Dashboard";
 import LibraryPage from "./routes/Library";
@@ -39,17 +40,29 @@ function AppShell() {
   const { data: settings } = useSettings();
   const onboarded = settings?.onboarded === "true";
   const landing = useApp((s) => s.prefs.landing);
+  const remoteOnly = useRemoteOnly();
   const onceRef = useRef(false);
 
-  // One-time: honor the "default landing page" pref on launch.
+  // One-time: honor the "default landing page" pref on launch. Remote-only mode
+  // has no landing choice — the guard below parks it on /remote.
   useEffect(() => {
-    if (onceRef.current || didLanding) return;
+    if (onceRef.current || didLanding || !settings) return;
+    if (remoteOnly) return;
     onceRef.current = true;
     didLanding = true;
     if (location.pathname === "/" && landing && landing !== "/") {
       navigate(landing, { replace: true });
     }
-  }, [landing, location.pathname, navigate]);
+  }, [landing, location.pathname, navigate, remoteOnly, settings]);
+
+  // Hiding nav isn't enough on its own: a stale landing pref, an in-app link, or
+  // a route left behind when the mode flips would still render a hidden page.
+  // Bounce anything outside the allowed set back to Remote.
+  useEffect(() => {
+    if (remoteOnly && !routeAllowed(location.pathname, true)) {
+      navigate("/remote", { replace: true });
+    }
+  }, [remoteOnly, location.pathname, navigate]);
 
   return (
     <div className="relative flex h-full flex-col overflow-hidden">

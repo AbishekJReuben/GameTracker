@@ -19,6 +19,28 @@
   ${If} $TrackerDesktopState == ${BST_CHECKED}
     Call CreateOrUpdateDesktopShortcut
   ${EndIf}
+  ; Hand the setup page's "Setup type" choice to the app: it reads this marker on
+  ; launch and seeds the "remote only" setting from it (seed_install_mode in
+  ; src-tauri/src/lib.rs). Both types install the same files — only the flag differs.
+  ;
+  ; A silent/passive auto-update never shows that page, so the state is still
+  ; empty; write nothing in that case, or every background update would reset a
+  ; mode the user had since changed in Settings.
+  ${If} $TrackerRemoteOnlyState == ${BST_CHECKED}
+    StrCpy $2 "remote"
+  ${ElseIf} $TrackerRemoteOnlyState == ${BST_UNCHECKED}
+    StrCpy $2 "full"
+  ${Else}
+    StrCpy $2 ""
+  ${EndIf}
+  ${If} $2 != ""
+    ClearErrors
+    FileOpen $3 "$INSTDIR\install-mode.txt" w
+    ${IfNot} ${Errors}
+      FileWrite $3 $2
+      FileClose $3
+    ${EndIf}
+  ${EndIf}
   ; If the user already had elevated autostart, repoint the scheduled task at this
   ; install folder (reinstall / moved directory — the old path would 404 at logon).
   nsExec::ExecToStack 'schtasks /Query /TN "GameTracker Autostart"'
@@ -32,6 +54,9 @@
 !macro NSIS_HOOK_PREUNINSTALL
   nsExec::Exec 'taskkill /F /IM sensorbridge.exe'
   nsExec::Exec 'taskkill /F /IM sensorbridge-x86_64-pc-windows-msvc.exe'
+  ; Not a bundled resource, so the uninstaller's generated Delete list misses it —
+  ; left behind it would keep $INSTDIR non-empty and block the final RMDir.
+  Delete "$INSTDIR\install-mode.txt"
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL

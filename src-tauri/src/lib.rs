@@ -71,6 +71,107 @@ fn check_for_update_once(handle: &tauri::AppHandle) {
     });
 }
 
+/// Apply the setup type ("Full tracker" vs "Remote only") chosen in the Windows
+/// installer, which writes it to `install-mode.txt` beside the exe.
+///
+/// Every run of the installer rewrites the marker, so adopting it only when it
+/// differs from the last value we saw keeps the two ways of setting the mode from
+/// fighting: a deliberate re-pick in the installer takes effect, while an update
+/// that leaves the radio alone never clobbers a later change made in Settings.
+/// Absent marker (dev build, portable copy, pre-3.9.26 install) → leave as is.
+fn seed_install_mode(pool: &db::DbPool) {
+    let marker = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("install-mode.txt")))
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    if let Some(raw) = marker {
+        apply_install_mode(pool, &raw);
+    }
+}
+
+/// The decision half of [`seed_install_mode`], split out so it can be tested
+/// without an installed exe to sit next to.
+fn apply_install_mode(pool: &db::DbPool, raw: &str) {
+    let mode = raw.trim().to_ascii_lowercase();
+    if mode != "remote" && mode != "full" {
+        return;
+    }
+    let seen = db::settings::get(pool, "install_mode_seen").ok().flatten();
+    if seen.as_deref() == Some(mode.as_str()) {
+        return;
+    }
+    let remote_only = if mode == "remote" { "true" } else { "false" };
+    let _ = db::settings::set(pool, "remote_only", remote_only);
+    let _ = db::settings::set(pool, "install_mode_seen", &mode);
+}
+
+#[cfg(test)]
+mod install_mode_tests {
+    use super::*;
+
+    fn pool() -> db::DbPool {
+        let path = std::env::temp_dir().join(format!(
+            "gt-install-mode-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        db::init_pool(&path).expect("test pool")
+    }
+
+    fn remote_only(pool: &db::DbPool) -> bool {
+        db::settings::get_bool(pool, "remote_only").unwrap()
+    }
+
+    #[test]
+    fn seeds_the_mode_the_installer_wrote() {
+        let p = pool();
+        assert!(!remote_only(&p), "defaults to the full app");
+
+        apply_install_mode(&p, "remote");
+        assert!(remote_only(&p));
+
+        apply_install_mode(&p, "full");
+        assert!(!remote_only(&p));
+    }
+
+    #[test]
+    fn tolerates_a_trailing_newline_and_odd_casing() {
+        let p = pool();
+        apply_install_mode(&p, "Remote\r\n");
+        assert!(remote_only(&p));
+    }
+
+    #[test]
+    fn ignores_a_corrupt_marker() {
+        let p = pool();
+        apply_install_mode(&p, "remote");
+        apply_install_mode(&p, "wat");
+        assert!(remote_only(&p), "garbage must not silently flip the mode");
+    }
+
+    /// The installer rewrites the marker on every run, including updates that just
+    /// keep the pre-selected default. Re-applying an already-seen mode must not
+    /// undo a change the user made in Settings afterwards.
+    #[test]
+    fn an_unchanged_marker_does_not_override_the_settings_toggle() {
+        let p = pool();
+        apply_install_mode(&p, "remote");
+        assert!(remote_only(&p));
+
+        // User switches the full app back on from Settings.
+        db::settings::set(&p, "remote_only", "false").unwrap();
+
+        apply_install_mode(&p, "remote");
+        assert!(!remote_only(&p), "the update must leave their choice alone");
+
+        // ...but deliberately re-picking the other type in the installer applies.
+        apply_install_mode(&p, "full");
+        apply_install_mode(&p, "remote");
+        assert!(remote_only(&p));
+    }
+}
+
 /// If a backup restore was staged, swap it into place before the pool opens.
 fn apply_pending_restore(data_dir: &std::path::Path, db_path: &std::path::Path) {
     let pending = data_dir.join("pending_restore.db");
@@ -107,6 +208,8 @@ pub fn run() {
 
             let pool = db::init_pool(&db_path)
                 .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            seed_install_mode(&pool);
+
             let shared = Arc::new(TrackingShared::new());
             let sys_shared = Arc::new(SystemShared::new());
 

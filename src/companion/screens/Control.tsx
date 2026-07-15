@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { motion, AnimatePresence, useReducedMotion } from "motion/react";
 import {
   MousePointer2,
@@ -73,6 +74,7 @@ import { apiGet } from "../link";
 import type { ConnectSnapshot, WcStats } from "../cloud";
 import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
+import { tabAllowed } from "@/lib/setupMode";
 import { isTauri } from "@/lib/tauri";
 import { isQuestBrowser } from "../device";
 import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
@@ -394,6 +396,7 @@ export function ControlScreen({
   vrMode = "pointer",
   onVrModeChange,
   popoutMonitor = null,
+  remoteOnly = false,
 }: {
   link: RemoteLink;
   onNavigate?: (tab: NavTab) => void;
@@ -406,6 +409,8 @@ export function ControlScreen({
   onVrModeChange?: (mode: "pointer" | "gamepad") => void;
   /** When set, this tab is a multi-monitor pop-out locked to that display index. */
   popoutMonitor?: number | null;
+  /** PC is in remote-only setup mode — the "Go to…" menu drops the hidden tabs. */
+  remoteOnly?: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -2403,6 +2408,9 @@ export function ControlScreen({
               <>
                 <div className="fixed inset-0 z-40" onClick={() => setNavOpen(false)} />
                 <div className="absolute left-0 top-[calc(100%+6px)] z-50 flex flex-col gap-0.5 rounded-2xl glass border border-white/[0.08] p-1.5 shadow-float">
+                  {/* The bottom tab strip is hidden on this screen, so this menu is
+                      the only way off it — it has to keep listing every tab the
+                      current setup mode still allows. */}
                   {([
                     { id: "stats", label: "Home", icon: BarChart3 },
                     { id: "library", label: "Library", icon: LibraryIcon },
@@ -2411,18 +2419,20 @@ export function ControlScreen({
                     { id: "music", label: "Music", icon: Headphones },
                     { id: "system", label: "System", icon: CpuIcon },
                     { id: "settings", label: "Settings", icon: SettingsIcon },
-                  ] as const).map((t) => (
-                    <button
-                      key={t.id}
-                      onClick={() => {
-                        setNavOpen(false);
-                        onNavigate(t.id);
-                      }}
-                      className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-sm font-700 text-ink-soft active:bg-white/[0.08]"
-                    >
-                      <t.icon className="h-4 w-4" /> {t.label}
-                    </button>
-                  ))}
+                  ] as const)
+                    .filter((t) => tabAllowed(t.id, remoteOnly))
+                    .map((t) => (
+                      <button
+                        key={t.id}
+                        onClick={() => {
+                          setNavOpen(false);
+                          onNavigate(t.id);
+                        }}
+                        className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-sm font-700 text-ink-soft active:bg-white/[0.08]"
+                      >
+                        <t.icon className="h-4 w-4" /> {t.label}
+                      </button>
+                    ))}
                 </div>
               </>
             )}
@@ -3400,9 +3410,10 @@ export function ControlScreen({
             // Curved-edge phones bend the leftmost/rightmost controls (Mouse tab,
             // Disconnect) away from the viewer. Android reports 0 inset for a
             // curve — it only reports cutouts — so a bare env() fixes nothing;
-            // the max() floor is what actually does the work here.
-            paddingLeft: "max(0.75rem, env(safe-area-inset-left))",
-            paddingRight: "max(0.75rem, env(safe-area-inset-right))",
+            // the max() floor is what actually does the work here. 1.25rem clears
+            // typical Galaxy/Pixel side curves; 0.75rem was still clipping.
+            paddingLeft: "max(1.25rem, env(safe-area-inset-left))",
+            paddingRight: "max(1.25rem, env(safe-area-inset-right))",
           }}
         >
           {/* expanded control panels — each a single horizontally-scrollable row of icons */}
@@ -4237,9 +4248,10 @@ function Sep() {
  * the width on its own — this sits inside every dock panel's scrollable row, so
  * horizontal space is the scarce one.
  *
- * The popover is `fixed` (the row is `overflow-x-auto`, which would clip an
- * absolute child) and opens UPWARD — unlike ZoomChip, this lives in the bottom
- * dock, so a downward popover would land off-screen.
+ * The popover is portaled to `document.body` and opens UPWARD. The dock is a
+ * Framer `motion.div` (transform containing block) and its rows are
+ * `overflow-x-auto`, so an in-tree `position:fixed` lands off-screen / clipped —
+ * that was why the slider never appeared in the browser companion.
  */
 function ToolbarScaleChip({
   scale,
@@ -4301,46 +4313,50 @@ function ToolbarScaleChip({
       >
         {label}
       </button>
-      <AnimatePresence>
-        {open && pos && (
-          <motion.div
-            initial={{ opacity: 0, y: 6, scale: 0.92 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.92 }}
-            transition={{ type: "spring", stiffness: 480, damping: 28 }}
-            data-scale-chip
-            className="fixed z-[100] flex flex-col items-center gap-1.5 rounded-2xl border border-white/15 bg-black/90 px-2.5 py-2 shadow-float backdrop-blur-md"
-            style={{ bottom: pos.bottom, left: pos.left }}
-          >
-            <span className="text-[9px] font-800 tabular-nums text-white">{label}</span>
-            {/* Rotated horizontal range — writing-mode:vertical is unreliable on
-                Android/WebView (same reason as ZoomChip). */}
-            <div className="relative flex h-32 w-10 items-center justify-center">
-              <input
-                type="range"
-                min={TOOLBAR_SCALE_MIN}
-                max={TOOLBAR_SCALE_MAX}
-                step={0.05}
-                value={scale}
-                onPointerDown={(e) => e.stopPropagation()}
-                onChange={(e) => onScale(parseFloat(e.target.value))}
-                onInput={(e) => onScale(parseFloat((e.target as HTMLInputElement).value))}
-                className="h-2 w-28 cursor-pointer accent-accent-3"
-                style={{ transform: "rotate(-90deg)" }}
-                aria-label="Toolbar scale"
-              />
-            </div>
-            <button
-              type="button"
-              onPointerDown={(e) => e.preventDefault()}
-              onClick={onReset}
-              className="rounded-md bg-white/[0.08] px-2 py-0.5 text-[9px] font-800 text-ink-soft active:bg-white/[0.14]"
-            >
-              Reset
-            </button>
-          </motion.div>
+      {typeof document !== "undefined" &&
+        createPortal(
+          <AnimatePresence>
+            {open && pos && (
+              <motion.div
+                initial={{ opacity: 0, y: 6, scale: 0.92 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 6, scale: 0.92 }}
+                transition={{ type: "spring", stiffness: 480, damping: 28 }}
+                data-scale-chip
+                className="fixed z-[100] flex flex-col items-center gap-1.5 rounded-2xl border border-white/15 bg-black/90 px-2.5 py-2 shadow-float backdrop-blur-md"
+                style={{ bottom: pos.bottom, left: pos.left }}
+              >
+                <span className="text-[9px] font-800 tabular-nums text-white">{label}</span>
+                {/* Rotated horizontal range — writing-mode:vertical is unreliable on
+                    Android/WebView (same reason as ZoomChip). */}
+                <div className="relative flex h-32 w-10 items-center justify-center">
+                  <input
+                    type="range"
+                    min={TOOLBAR_SCALE_MIN}
+                    max={TOOLBAR_SCALE_MAX}
+                    step={0.05}
+                    value={scale}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onChange={(e) => onScale(parseFloat(e.target.value))}
+                    onInput={(e) => onScale(parseFloat((e.target as HTMLInputElement).value))}
+                    className="h-2 w-28 cursor-pointer accent-accent-3"
+                    style={{ transform: "rotate(-90deg)" }}
+                    aria-label="Toolbar scale"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={onReset}
+                  className="rounded-md bg-white/[0.08] px-2 py-0.5 text-[9px] font-800 text-ink-soft active:bg-white/[0.14]"
+                >
+                  Reset
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>,
+          document.body,
         )}
-      </AnimatePresence>
     </div>
   );
 }

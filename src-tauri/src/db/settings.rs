@@ -26,6 +26,12 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("steam_persona_name", ""),
     ("steam_avatar_url", ""),
     ("steam_linked", "false"),
+    // "Remote only" setup mode: hides every surface except Remote and Settings
+    // on the desktop AND on the phone/web/Quest companions. Presentation only —
+    // tracking, media logging and the system monitor keep running, so turning
+    // the full app back on in Settings leaves no gap in history. Seeded from the
+    // installer's setup-type choice (see seed_install_mode in lib.rs).
+    ("remote_only", "false"),
     ("remote_enabled", "false"),
     ("remote_port", "47800"),
     ("remote_cloud_enabled", "false"),

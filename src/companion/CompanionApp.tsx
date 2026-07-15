@@ -21,8 +21,9 @@ import {
   X,
 } from "lucide-react";
 import { DEFAULT_SIGNAL_URL, auxMonitorRoom } from "@/lib/remoteConfig";
+import { readRemoteOnly, tabAllowed } from "@/lib/setupMode";
 import { Pairing, type Connected } from "./Pairing";
-import { setCloudMode } from "./link";
+import { apiGet, setCloudMode } from "./link";
 import { makeRtcLink, type RemoteLink } from "./links";
 import { CloudConn, type ConnectSnapshot } from "./cloud";
 import { deviceId, deviceName } from "./device";
@@ -85,6 +86,11 @@ export function CompanionApp() {
   useEffect(() => {
     invoke("set_pip_enabled", { enabled: phase === "connected" }).catch(() => {});
   }, [phase]);
+  // "Remote only" setup mode belongs to the PC — the companion mirrors it so the
+  // phone, browser and Quest show the same tabs, and can't change it. Polled
+  // rather than pushed: it flips at most a handful of times in a session, and a
+  // late pickup is only ever cosmetic (the data behind a hidden tab still exists).
+  const [remoteOnly, setRemoteOnly] = useState(false);
   const [activeCode, setActiveCode] = useState(() => localStorage.getItem(LS_CODE) || "");
   const [pendingConn, setPendingConn] = useState<CloudConn | null>(null);
   const autoConnRef = useRef<CloudConn | null>(null);
@@ -160,6 +166,33 @@ export function CompanionApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (phase !== "connected") return;
+    let alive = true;
+    const read = async () => {
+      try {
+        const s = await apiGet<Record<string, string>>("/api/settings");
+        if (alive) setRemoteOnly(readRemoteOnly(s));
+      } catch {
+        // Transient link hiccup — keep showing the last known mode.
+      }
+    };
+    void read();
+    const timer = setInterval(read, 15_000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [phase]);
+
+  // Follow the PC if it flips to remote-only while a hidden tab (or a game
+  // detail opened from one) is on screen.
+  useEffect(() => {
+    if (!remoteOnly) return;
+    if (!tabAllowed(tab, true)) setTab("control");
+    if (detailId) closeGame();
+  }, [remoteOnly, tab, detailId]);
+
   // In-app updater: check GitHub for a newer APK on launch (Tauri's updater
   // plugin doesn't support Android, so this is a small custom flow).
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
@@ -230,6 +263,7 @@ export function CompanionApp() {
   if (!conn) return updateBanner; // unreachable (body handles !conn), narrows for TS
 
   const isControlTab = tab === "control";
+  const tabs = TABS.filter((t) => tabAllowed(t.id, remoteOnly));
 
   return (
     <>
@@ -280,6 +314,7 @@ export function CompanionApp() {
               onNavigate={isPopout ? undefined : (t) => setTab(t)}
               onDisconnect={disconnect}
               popoutMonitor={POPOUT_MONITOR}
+              remoteOnly={remoteOnly}
             />
           )}
         </ScreenErrorBoundary>
@@ -287,10 +322,17 @@ export function CompanionApp() {
 
       {!isControlTab && (
         <nav
-          className="grid grid-cols-8 border-t border-line bg-bg-900/70 backdrop-blur"
-          style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          className="grid border-t border-line bg-bg-900/70 backdrop-blur"
+          style={{
+            paddingBottom: "env(safe-area-inset-bottom)",
+            // Same curved-edge floor as the Control dock — Android reports 0 for
+            // side curves, so the max() floor is what keeps the end tabs clear.
+            paddingLeft: "max(1.25rem, env(safe-area-inset-left))",
+            paddingRight: "max(1.25rem, env(safe-area-inset-right))",
+            gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))`,
+          }}
         >
-          {TABS.map((t) => {
+          {tabs.map((t) => {
             const active = tab === t.id;
             return (
               <button
@@ -359,11 +401,13 @@ function ControlTab({
   onNavigate,
   onDisconnect,
   popoutMonitor,
+  remoteOnly,
 }: {
   conn: CloudConn;
   onNavigate?: (t: Tab) => void;
   onDisconnect: () => void;
   popoutMonitor?: number | null;
+  remoteOnly?: boolean;
 }) {
   const link: RemoteLink = useMemo(() => makeRtcLink(conn), [conn]);
   const rt = getCompanionRuntime();
@@ -384,6 +428,7 @@ function ControlTab({
       vrMode={rt.vrMode}
       onVrModeChange={rt.onVrModeChange}
       popoutMonitor={popoutMonitor}
+      remoteOnly={remoteOnly}
     />
   );
 }

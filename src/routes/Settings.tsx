@@ -36,12 +36,14 @@ import {
   Music2,
   Compass,
   Gauge,
+  Smartphone,
 } from "lucide-react";
 import { Page } from "@/components/Page";
 import { SectionTitle, Segmented } from "@/components/ui";
 import { Panel } from "@/components/Panel";
 import { TIMELINE_RANGE_OPTIONS } from "@/lib/timelineZoom";
-import { useSettings, useRefreshAll, useGames } from "@/lib/queries";
+import { useSettings, useRefreshAll, useGames, useRemoteOnly } from "@/lib/queries";
+import { REMOTE_ONLY_KEY } from "@/lib/setupMode";
 import { useApp, useMotionEnabled } from "@/store/app";
 import type { AccentTheme, CustomAccent } from "@/store/app";
 import { api, type Settings } from "@/lib/api";
@@ -63,6 +65,12 @@ const ACCENTS: { id: AccentTheme; label: string; colors: [string, string, string
   { id: "rose", label: "Rosé", colors: ["#fb7185", "#f472b6", "#c084fc"] },
   { id: "mono", label: "Mono", colors: ["#94a3b8", "#64748b", "#cbd5e1"] },
 ];
+
+/**
+ * Settings sections that only configure surfaces remote-only mode hides — they
+ * come back untouched (and still recording) when the full app is switched on.
+ */
+const REMOTE_ONLY_HIDDEN_SECTIONS = ["dashboard", "tracking", "screenshots", "launchers"];
 
 const LANDING_OPTS = [
   { value: "/", label: "Dashboard" },
@@ -176,8 +184,28 @@ export default function SettingsPage() {
   };
 
   const enabled = useMotionEnabled();
+  const remoteOnly = useRemoteOnly();
 
   const sections = [
+    {
+      id: "setup",
+      title: "Setup type",
+      subtitle: "The full tracker, or remote control on its own",
+      content: (
+        <div className="space-y-1">
+          <SettingRow
+            icon={<Smartphone className="h-4 w-4" />}
+            title="Remote only"
+            desc="Hide everything except Remote and Settings — here and in the phone, browser & Quest apps. Tracking, music logging and the hardware monitor keep running in the background, so switching back leaves no gap in your history."
+          >
+            <SpringToggle
+              checked={remoteOnly}
+              onChange={(v) => setVal(REMOTE_ONLY_KEY, v ? "true" : "false")}
+            />
+          </SettingRow>
+        </div>
+      ),
+    },
     {
       id: "appearance",
       title: "Appearance",
@@ -300,18 +328,24 @@ export default function SettingsPage() {
       subtitle: "Defaults and formats",
       content: (
         <div className="space-y-1">
-          <SettingRow icon={<Home className="h-4 w-4" />} title="Open on launch" desc="Which screen Tracker shows first.">
-            <select className="input w-40" value={prefs.landing} onChange={(e) => setPref("landing", e.target.value)}>
-              {LANDING_OPTS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          </SettingRow>
-          <SettingRow icon={<Compass className="h-4 w-4" />} title="Suggested tab" desc="Show the game recommendations tab in the sidebar.">
-            <SpringToggle checked={prefs.showSuggested} onChange={(v) => setPref("showSuggested", v)} />
-          </SettingRow>
+          {/* Both rows choose between tabs that remote-only mode hides — it always
+              opens on Remote, and Suggested isn't reachable either way. */}
+          {!remoteOnly && (
+            <>
+              <SettingRow icon={<Home className="h-4 w-4" />} title="Open on launch" desc="Which screen Tracker shows first.">
+                <select className="input w-40" value={prefs.landing} onChange={(e) => setPref("landing", e.target.value)}>
+                  {LANDING_OPTS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </SettingRow>
+              <SettingRow icon={<Compass className="h-4 w-4" />} title="Suggested tab" desc="Show the game recommendations tab in the sidebar.">
+                <SpringToggle checked={prefs.showSuggested} onChange={(v) => setPref("showSuggested", v)} />
+              </SettingRow>
+            </>
+          )}
           <SettingRow icon={<CalendarRange className="h-4 w-4" />} title="Default timeline range" desc="Starting zoom for timeline views.">
             <Segmented
               value={prefs.timelineRange}
@@ -468,6 +502,10 @@ export default function SettingsPage() {
     },
   ];
 
+  const visibleSections = remoteOnly
+    ? sections.filter((s) => !REMOTE_ONLY_HIDDEN_SECTIONS.includes(s.id))
+    : sections;
+
   const [openSections, setOpenSections] = useState<Set<string>>(() => new Set(sections.map((s) => s.id)));
 
   const toggleSection = (id: string) => {
@@ -482,7 +520,7 @@ export default function SettingsPage() {
   return (
     <Page title="Settings" subtitle="Tune the look, the tracking, and your data">
       <div className="mx-auto max-w-3xl space-y-4">
-        {sections.map((section, i) => (
+        {visibleSections.map((section, i) => (
           <motion.div
             key={section.id}
             initial={enabled ? { opacity: 0, y: 10 } : false}

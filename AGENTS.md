@@ -953,3 +953,25 @@ not regress):**
   Host SDP x-google-min-bitrate + encoding minBitrate floor so GCC cannot
   crush the share to ~200kbps.
 
+**v3.9.26 Remote-only vs Full install mode (do not regress):**
+- **UI-only gating.** Installer always lays down every file; the setup-type choice
+  only seeds `remote_only` in the DB. Tracking, media logging, and the system
+  monitor keep running so flipping back to Full leaves no gap in history.
+- **Single source of truth = PC Settings.** Toggle lives under Settings → Setup
+  type (`remote_only`). Phone / discovery web / Quest only *mirror* it via
+  `/api/settings` (15s poll in `CompanionApp`) — they cannot change it.
+- **Installer → marker → seed.** NSIS page radios write `$INSTDIR\install-mode.txt`
+  (`full` / `remote`) in `NSIS_HOOK_POSTINSTALL`. Silent/passive updates leave the
+  state empty and write nothing (so a Settings flip isn't clobbered by auto-update).
+  `seed_install_mode` / `apply_install_mode` in `lib.rs` adopt the marker only when
+  it differs from `install_mode_seen`. **Do not** re-apply every launch.
+- **Shared policy:** `src/lib/setupMode.ts` (`routeAllowed` / `tabAllowed` /
+  `readRemoteOnly`). Desktop: Sidebar filter + App route guard bounce to `/remote`.
+  Companion: tab strip + Control "Go to…" menu. Settings hides tracker-only sections
+  while remote-only is on (dashboard / tracking / screenshots / launchers).
+- **ToolbarScaleChip portals to `document.body`.** The dock is a Framer
+  `motion.div` (transform containing block); in-tree `position:fixed` made the
+  vertical scale slider invisible on web. Keep the portal.
+- **Curved-edge dock padding** uses `max(1.25rem, env(safe-area-inset-*))` on the
+  Control bottom bar and the companion tab strip — Android reports 0 for curves.
+
