@@ -1067,6 +1067,10 @@ export class CloudConn {
 
   /** Build (or rebuild) the VideoDecoder for the host-announced codec. */
   private wcBuildDecoder(): boolean {
+    // Safety net for hosts that ship NVENC frames without a prior codec JSON
+    // (pre-announce bug): High@5.2 matches what NVENC emits; the in-band SPS
+    // is what the decoder actually keys off of once configured.
+    if (!this.wcCodec) this.wcCodec = WC_CODECS[0];
     if (!this.wcCodec) return false;
     try {
       this.wcDecoder?.close();

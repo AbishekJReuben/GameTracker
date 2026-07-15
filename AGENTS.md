@@ -1033,6 +1033,19 @@ not regress):**
   `zeroCopy`. Hardware tests are `#[ignore]`d (`-- --ignored`) so CI and non-NVIDIA
   machines don't fail: `remote::nvenc::tests::nvenc_smoke`,
   `remote::gpu::tests::composites_scale_and_every_cursor_op`.
+- **One NVENC session only (`ST_ZC_LIVE`).** A `grab_gpu` Timeout must NOT fall through
+  to the CPU mailbox — that started a second NVENC session on the encoder thread whose
+  reference chain is unrelated to the zero-copy one. Interleaving them made the picture
+  glitch with static patches that never refreshed. While zero-copy owns the stream,
+  keep-alives re-encode the last composited texture from the *same* session; the
+  upload-path encoder stands down behind `ST_ZC_LIVE`.
+- **Announce a codec string before the first native frame.** The guest builds its
+  `VideoDecoder` from a JSON `{codec}` on the video channel. The canvas/WebCodecs path
+  announced during configure; the NVENC path never paints the canvas, so without an
+  explicit announce the phone dropped every Annex-B frame and sat on "Waking your
+  screen…" until the 6s opt-in watchdog fell back to RTC. `wcActivate` + the first
+  GN frame both announce; `wcTeardown` must NOT null `nativeSink` (a DIRECT retry
+  only flips `CAP_NATIVE_OK`).
 
 [ExoPlayer#8514]: https://github.com/google/ExoPlayer/issues/8514
 

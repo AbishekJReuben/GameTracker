@@ -415,7 +415,7 @@ export function startHost(opts: HostOptions): () => void {
    * the JPEG decode and the WebCodecs encoder are all bypassed. Null ⇒ Rust must send
    * JPEG (the RTC track needs real pixels to composite).
    */
-  let nativeSink: ((payload: Uint8Array<ArrayBuffer>, key: boolean) => void) | null = null;
+  let nativeSink: ((payload: Uint8Array<ArrayBuffer>, key: boolean, w?: number, h?: number) => void) | null = null;
   /** True once Rust has told us (via the frame container) that it's encoding natively. */
   let nativeActive = false;
 
@@ -611,7 +611,10 @@ export function startHost(opts: HostOptions): () => void {
     const pushFrame = () => {
       // Direct WebCodecs path active: the guest decodes H.264 off the data
       // channel, so feeding the WebRTC track too would double-encode every frame.
+      // Native NVENC owns the channel while `nativeActive` — don't also run the
+      // canvas WebCodecs encoder or two independent H.264 streams interleave.
       if (wcSink) {
+        if (nativeActive) return;
         try {
           wcSink(canvas);
         } catch {
@@ -715,7 +718,13 @@ export function startHost(opts: HostOptions): () => void {
       const u8 = new Uint8Array(bytes);
       if (u8.length > 8 && u8[0] === 0x47 && u8[1] === 0x4e) {
         nativeActive = true;
-        nativeSink?.(u8.subarray(8), (u8[2] & 1) === 1);
+        // Little-endian u16 width/height live in the GN header — pass them so
+        // the first native frame can announce a codec+size to the guest before
+        // any Annex-B lands (without that JSON the guest never builds a
+        // VideoDecoder and sits on "Waking your screen…" forever).
+        const nw = u8[4] | (u8[5] << 8);
+        const nh = u8[6] | (u8[7] << 8);
+        nativeSink?.(u8.subarray(8), (u8[2] & 1) === 1, nw, nh);
         return;
       }
       nativeActive = false;
@@ -1098,8 +1107,29 @@ export function startHost(opts: HostOptions): () => void {
     // ---- native path: Rust already produced the H.264 ------------------------
     // Nothing to encode here — forward the Annex-B frame straight to the guest.
     // Latest-wins still applies: a channel backlog can only ever become latency.
-    nativeSink = (payload, key) => {
+    //
+    // First frame MUST announce a codec string on the video channel. The guest
+    // builds its VideoDecoder from that JSON; without it every Annex-B frame is
+    // dropped and the phone sits on "Waking your screen…" until the 6s opt-in
+    // watchdog falls back to RTC. The canvas/WebCodecs path announces during
+    // configure — the native path never touches the canvas, so we do it here.
+    let nativeAnnounced = false;
+    nativeSink = (payload, key, w = 0, h = 0) => {
       if (videoCh.readyState !== "open") return;
+      if (!nativeAnnounced) {
+        nativeAnnounced = true;
+        const codec = wcCodec || WC_CODECS[0];
+        try {
+          videoCh.send(JSON.stringify({ codec, w, h }));
+        } catch {
+          /* guest resyncs from the next announce / keyframe */
+        }
+        try {
+          void api.remoteRequestKeyframe();
+        } catch {
+          /* not on desktop */
+        }
+      }
       const pace = clamp(quality.pace, 0, 100) / 100;
       const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
       if (videoCh.bufferedAmount > maxBuffered) {
@@ -1121,9 +1151,12 @@ export function startHost(opts: HostOptions): () => void {
     const wcTeardown = (notifyGuest: boolean, permanent = false) => {
       wcSink = null;
       // Rust must go back to JPEG: the RTC track we're falling back to composites a
-      // canvas, and a canvas cannot be fed an H.264 bitstream.
-      nativeSink = null;
+      // canvas, and a canvas cannot be fed an H.264 bitstream. Keep `nativeSink`
+      // installed — a later DIRECT re-opt-in (guest retry after RTC fallback) only
+      // flips CAP_NATIVE_OK; if we null the sink here those GN frames go nowhere
+      // and the phone sits on "Waking your screen…" again.
       nativeActive = false;
+      nativeAnnounced = false;
       try {
         api.remoteSetCaptureNative(false);
       } catch {
@@ -1236,7 +1269,17 @@ export function startHost(opts: HostOptions): () => void {
       if (pc !== myPc || wcSink) return; // superseded while awaiting
       if (typeof VideoEncoder === "undefined") {
         // No WebCodecs encoder here. That's only fatal if Rust can't encode either.
-        if (nativeOk) return; // native carries DIRECT on its own
+        if (nativeOk) {
+          // Announce immediately — native frames may already be in flight, and the
+          // guest refuses to build a decoder until it sees a codec string.
+          try {
+            videoCh.send(JSON.stringify({ codec: WC_CODECS[0] }));
+          } catch {
+            /* guest picks it up from the first-frame announce in nativeSink */
+          }
+          nativeAnnounced = true;
+          return;
+        }
         wcDead = true;
         wcTeardown(true, true);
         return;
@@ -1273,13 +1316,32 @@ export function startHost(opts: HostOptions): () => void {
         // Nothing on the H.264 ladder encodes here. Only fatal if Rust can't encode
         // natively either — with NVENC up, DIRECT is perfectly healthy without a
         // webview encoder (we just have no canvas fallback if NVENC later dies).
-        if (nativeOk) return;
+        if (nativeOk) {
+          try {
+            videoCh.send(JSON.stringify({ codec: WC_CODECS[0] }));
+          } catch {
+            /* first-frame announce in nativeSink covers this */
+          }
+          nativeAnnounced = true;
+          return;
+        }
         wcDead = true;
         wcTeardown(true, true);
         return;
       }
       wcCodec = picked;
       wcHw = pickedHw;
+      // Tell the guest the codec NOW. On the NVENC path the canvas never paints, so
+      // wcEncodeFrame's configure-time announce never runs — without this the phone
+      // drops every frame and shows "Waking your screen…" until the opt-in timeout.
+      if (nativeOk) {
+        try {
+          videoCh.send(JSON.stringify({ codec: picked }));
+          nativeAnnounced = true;
+        } catch {
+          /* nativeSink's first-frame announce is the backup */
+        }
+      }
       wcEncoder = new VideoEncoder({
         output: (chunk) => {
           const ms = performance.now() - chunk.timestamp / 1000;

@@ -499,6 +499,17 @@ static ST_NATIVE: AtomicBool = AtomicBool::new(false);
 /// readback at all. Implies `ST_NATIVE`.
 static ST_ZEROCOPY: AtomicBool = AtomicBool::new(false);
 
+/// Set while the capture thread owns a live zero-copy NVENC session.
+///
+/// **This is a correctness interlock, not telemetry.** Exactly one NVENC session may
+/// ever feed the stream: two sessions produce two independent reference chains, and
+/// interleaving them on one channel makes the guest decode P-frames against the wrong
+/// references — static areas survive (skip macroblocks) while everything that moves
+/// turns to garbage. That was the "sometimes great, sometimes choppy with patches that
+/// never refresh" bug. The encoder thread's upload-path encoder must stand down while
+/// this is set.
+static ST_ZC_LIVE: AtomicBool = AtomicBool::new(false);
+
 /// The stream size for a given native resolution and width cap: never upscale, keep
 /// the aspect, and round to even (NVENC requires even dimensions). Mirrors what
 /// `scale_u8x4` lands on for the CPU path so both routes stream the same shape.
@@ -558,6 +569,10 @@ pub fn set_capture_native(on: bool) {
     CAP_NATIVE_OK.store(on, Ordering::Relaxed);
     if on {
         request_keyframe();
+    } else {
+        // Drop the zero-copy claim so a later re-enable (or the JPEG fallback)
+        // isn't blocked by a stale interlock from the previous DIRECT session.
+        ST_ZC_LIVE.store(false, Ordering::Relaxed);
     }
 }
 
@@ -853,6 +868,7 @@ where
     CAP_NATIVE_OK.store(false, Ordering::Relaxed);
     ST_NATIVE.store(false, Ordering::Relaxed);
     ST_ZEROCOPY.store(false, Ordering::Relaxed);
+    ST_ZC_LIVE.store(false, Ordering::Relaxed);
 
     // Single-slot mailbox: (latest frame, condvar to wake the encoder).
     let mailbox: Arc<(PlMutex<Option<RawFrame>>, Condvar)> =
@@ -876,6 +892,10 @@ where
         let mut zc_off = false;
         #[cfg(windows)]
         let zc_started = Instant::now();
+        // Last zero-copy emit — used to pace keep-alives on a static desktop
+        // (`Grab::Timeout`) without spinning the encoder every tick.
+        #[cfg(windows)]
+        let mut zc_last_emit = Instant::now() - Duration::from_secs(2);
         let mut cur_mon = usize::MAX;
         // Last successfully scaled frame (shared), re-sent on idle so the encoder's
         // ~1s keep-alive still fires for a freshly attached decoder.
@@ -913,6 +933,7 @@ where
                     dup = super::dxdupe::Duplicator::new_for(tx, ty);
                     cur_mon = sel;
                     zc = None; // new device ⇒ the old compositor/encoder are dead
+                    ST_ZC_LIVE.store(false, Ordering::Relaxed);
                 }
 
                 // ---- zero-copy: grab → GPU scale+cursor → NVENC, no readback -------
@@ -939,9 +960,15 @@ where
                                 });
                                 if zc.is_none() {
                                     zc_off = true;
+                                    ST_ZC_LIVE.store(false, Ordering::Relaxed);
                                     eprintln!(
                                         "[capture] zero-copy GPU path unavailable at {ow}x{oh} — using the readback path"
                                     );
+                                } else {
+                                    // Claim the stream BEFORE the first encode so the
+                                    // encoder thread can't race a second NVENC session
+                                    // onto the same channel.
+                                    ST_ZC_LIVE.store(true, Ordering::Relaxed);
                                 }
                                 NATIVE_FORCE_KEY.store(true, Ordering::Relaxed);
                             }
@@ -973,24 +1000,56 @@ where
                                         ST_ZEROCOPY.store(true, Ordering::Relaxed);
                                         ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
                                         cap_emit(pkt);
-                                        let elapsed = cap0.elapsed();
-                                        let target = Duration::from_millis(budget_ms as u64);
-                                        if elapsed < target {
-                                            std::thread::sleep(target - elapsed);
-                                        }
-                                        continue;
+                                        zc_last_emit = Instant::now();
+                                    } else {
+                                        // Encode faulted: drop the session (stays
+                                        // retryable — the next frame rebuilds it).
+                                        zc = None;
+                                        ST_ZC_LIVE.store(false, Ordering::Relaxed);
                                     }
-                                    // Encode faulted: drop the session but stay
-                                    // retryable, and let this frame go the CPU route.
-                                    zc = None;
                                 }
                             }
                         }
-                        // Nothing new on screen: the encoder thread's keep-alive still
-                        // needs to fire, so fall through to the CPU path rather than
-                        // spinning here.
-                        super::dxdupe::Grab::Timeout => {}
-                        super::dxdupe::Grab::Lost => dup = None,
+                        super::dxdupe::Grab::Timeout => {
+                            // Nothing new on screen. Re-encode the last composited
+                            // frame occasionally so a freshly-attached decoder still
+                            // gets something on a static desktop (H.264 makes this
+                            // nearly free — an unchanged P-frame is a few hundred
+                            // bytes of skip macroblocks).
+                            if let Some((comp, enc)) = zc.as_mut() {
+                                let want_key = NATIVE_FORCE_KEY.load(Ordering::Relaxed);
+                                if want_key || zc_last_emit.elapsed() >= Duration::from_millis(700) {
+                                    let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                    let ts_us = zc_started.elapsed().as_micros() as u64;
+                                    if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
+                                        ST_BYTES.store(pkt.len() as u32, Ordering::Relaxed);
+                                        ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
+                                        cap_emit(pkt);
+                                        zc_last_emit = Instant::now();
+                                    }
+                                }
+                            }
+                        }
+                        super::dxdupe::Grab::Lost => {
+                            dup = None;
+                            zc = None;
+                            ST_ZC_LIVE.store(false, Ordering::Relaxed);
+                        }
+                    }
+                    // **Never fall through to the CPU path while we own a zero-copy
+                    // session.** Doing so pushes a frame to the mailbox, and the
+                    // encoder thread would encode it with a SECOND NVENC session whose
+                    // reference chain is unrelated to ours. Interleaving two chains on
+                    // one channel is what made the picture glitch and leave patches
+                    // stale — the screen only had to go briefly static (a grab_gpu
+                    // timeout) for the second encoder to cut in.
+                    if zc.is_some() {
+                        let elapsed = cap0.elapsed();
+                        let target = Duration::from_millis(budget_ms as u64);
+                        if elapsed < target {
+                            std::thread::sleep(target - elapsed);
+                        }
+                        continue;
                     }
                 }
 
@@ -1157,9 +1216,14 @@ where
             // Only the BGRA (Desktop Duplication) source qualifies: the xcap fallback
             // hands us RGBA, and swizzling a whole frame on the CPU would give back
             // exactly the kind of per-pixel pass this path exists to remove.
+            //
+            // Stand down while the capture thread owns a zero-copy session
+            // (`ST_ZC_LIVE`): two NVENC reference chains on one channel is what made
+            // the picture glitch with patches that never refreshed.
             #[cfg(windows)]
             if !native_off
                 && CAP_NATIVE_OK.load(Ordering::Relaxed)
+                && !ST_ZC_LIVE.load(Ordering::Relaxed)
                 && matches!(frame.color, JpegColor::Bgra)
                 && (frame.changed || stale)
             {
