@@ -1203,8 +1203,8 @@ export function startHost(opts: HostOptions): () => void {
      *  a view (not a copy) so the native path can forward Rust's bytes as-is. */
     // `Uint8Array<ArrayBuffer>` (not the default `ArrayBufferLike`): RTCDataChannel.send
     // won't take a possibly-SharedArrayBuffer-backed view.
-    const wcSendBytes = (payload: Uint8Array<ArrayBuffer>, key: boolean, tsMs: number) => {
-      if (videoCh.readyState !== "open") return;
+    const wcSendBytes = (payload: Uint8Array<ArrayBuffer>, key: boolean, tsMs: number): boolean => {
+      if (videoCh.readyState !== "open") return false;
       const head = new ArrayBuffer(20);
       const dv = new DataView(head);
       dv.setUint8(0, 0x47); // 'G'
@@ -1220,7 +1220,10 @@ export function startHost(opts: HostOptions): () => void {
           videoCh.send(payload.subarray(off, Math.min(off + WC_FRAG, payload.byteLength)));
         }
       } catch {
-        return; // channel died mid-frame; the guest resyncs off the next header
+        // A partial frame is as harmful as a dropped one for an H.264 P-frame
+        // chain. The native caller holds deltas and requests an IDR before it
+        // resumes delivery.
+        return false;
       }
       wcFrames++;
       wcBytes += payload.byteLength;
@@ -1228,6 +1231,7 @@ export function startHost(opts: HostOptions): () => void {
         wcKeys++;
         wcLastKeyAt = performance.now();
       }
+      return true;
     };
 
     const wcSend = (chunk: EncodedVideoChunk) => {
@@ -1246,27 +1250,56 @@ export function startHost(opts: HostOptions): () => void {
     // watchdog falls back to RTC. The canvas/WebCodecs path announces during
     // configure — the native path never touches the canvas, so we do it here.
     let nativeAnnounced = false;
+    let nativeConfigW = 0;
+    let nativeConfigH = 0;
+    // NVENC uses an infinite GOP here. Once a P-frame is dropped, every later P-frame
+    // can reference an image the guest never received, so never forward deltas until
+    // a fresh IDR re-establishes a clean reference chain.
+    let nativeAwaitKey = false;
+    let nativeKeyRequestAt = 0;
+    const requestNativeKeyframe = () => {
+      const now = performance.now();
+      // Coalesce capture-rate calls while Rust's atomic request is still pending.
+      if (now - nativeKeyRequestAt < 250) return;
+      nativeKeyRequestAt = now;
+      try {
+        void api.remoteRequestKeyframe();
+      } catch {
+        /* not on desktop / no native encoder */
+      }
+    };
     nativeSink = (payload, key, w = 0, h = 0) => {
       if (videoCh.readyState !== "open") return;
-      if (!nativeAnnounced) {
+      if (!nativeAnnounced || w !== nativeConfigW || h !== nativeConfigH) {
         nativeAnnounced = true;
+        nativeConfigW = w;
+        nativeConfigH = h;
         const codec = "avc1.42C028"; // Constrained Baseline — matches NVENC output
         try {
           videoCh.send(JSON.stringify({ codec, w, h }));
         } catch {
           /* guest resyncs from the next announce / keyframe */
         }
-        try {
-          void api.remoteRequestKeyframe();
-        } catch {
-          /* not on desktop */
-        }
+        // A decoder configuration/resize must be followed by a complete access unit.
+        if (!key) nativeAwaitKey = true;
+        requestNativeKeyframe();
       }
+      // The native path previously ignored `wcKeyMs`, so a decoder fault could live
+      // forever. Its periodic IDR is also the final safety net for corruption the
+      // guest cannot report explicitly.
+      if (!key && performance.now() - wcLastKeyAt >= quality.wcKeyMs) {
+        nativeAwaitKey = true;
+        requestNativeKeyframe();
+      }
+      if (nativeAwaitKey && !key) return;
+      if (key) nativeAwaitKey = false;
       const pace = clamp(quality.pace, 0, 100) / 100;
       const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
       const buffered = videoCh.bufferedAmount;
       if (buffered > maxBuffered) {
         wcSkipped++;
+        nativeAwaitKey = true;
+        requestNativeKeyframe();
         adaptFromBuffer(buffered, maxBuffered, true);
         return;
       }
@@ -1274,7 +1307,10 @@ export function startHost(opts: HostOptions): () => void {
       // Stamped on arrival rather than at capture: the host and Rust don't share a
       // clock, and now that a frame is ~30KB instead of 334KB the IPC hop it folds
       // into the measurement is small (it lands in `net+enc`, never unaccounted).
-      wcSendBytes(payload, key, performance.now());
+      if (!wcSendBytes(payload, key, performance.now())) {
+        nativeAwaitKey = true;
+        requestNativeKeyframe();
+      }
     };
 
     /**
@@ -1292,6 +1328,9 @@ export function startHost(opts: HostOptions): () => void {
       // and the phone sits on "Waking your screen…" again.
       nativeActive = false;
       nativeAnnounced = false;
+      nativeConfigW = 0;
+      nativeConfigH = 0;
+      nativeAwaitKey = true;
       try {
         api.remoteSetCaptureNative(false);
       } catch {
@@ -1630,6 +1669,7 @@ export function startHost(opts: HostOptions): () => void {
           const now = Date.now();
           if (authorized && now - lastVresetAt > 4000) {
             lastVresetAt = now;
+            nativeAwaitKey = true;
             // On the native path the canvas/generator track isn't in the picture at
             // all — the equivalent un-wedge is a fresh IDR + SPS from Rust.
             try {
@@ -1688,6 +1728,7 @@ export function startHost(opts: HostOptions): () => void {
         // the whole keyframe interval staring at nothing.
         if (msg && msg.type === "vkf") {
           wcForceKey = true;
+          nativeAwaitKey = true;
           try {
             void api.remoteRequestKeyframe();
           } catch {
