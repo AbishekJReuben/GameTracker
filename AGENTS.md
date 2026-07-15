@@ -1046,6 +1046,15 @@ not regress):**
   screen…" until the 6s opt-in watchdog fell back to RTC. `wcActivate` + the first
   GN frame both announce; `wcTeardown` must NOT null `nativeSink` (a DIRECT retry
   only flips `CAP_NATIVE_OK`).
+- **Decode latency: Constrained Baseline + CAVLC + multi-slice.** High+CABAC left
+  some Android HW decoders out of low-latency mode (Moonlight errata #8 — "B-frames
+  might be present"). NVENC now ships Constrained Baseline / CAVLC, forces
+  `constraint_set1` in the SPS rewriter, and uses `sliceMode=3` (~1 slice / 540 px)
+  so the phone can parallelise decode. Guest `VideoDecoder.configure` sets
+  `optimizeForLatency`, `avc: { format: "annexb" }`, and `codedWidth/Height` from
+  the host announce. WebCodecs still cannot pick MediaCodec's
+  `FEATURE_LowLatency` decoder variant or vendor keys (Parsec/Moonlight native
+  path) — that needs a native Android bridge if Baseline+slices aren't enough.
 
 [ExoPlayer#8514]: https://github.com/google/ExoPlayer/issues/8514
 

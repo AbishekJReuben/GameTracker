@@ -211,7 +211,16 @@ fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
 
     let profile_idc = r.u(8)?;
     w.u(profile_idc, 8);
-    w.u(r.u(8)?, 8); // constraint flags + reserved
+    let constraints = r.u(8)?;
+    // Constrained Baseline (profile 66 + constraint_set1): Moonlight errata #8 —
+    // some Android HW decoders only enter low-latency mode when the SPS forbids
+    // B-frames at the profile level. NVENC's Baseline GUID usually sets this
+    // already; force it so a driver quirk can't leave us on plain Baseline.
+    if profile_idc == 66 {
+        w.u(constraints | 0x40, 8); // constraint_set1_flag
+    } else {
+        w.u(constraints, 8);
+    }
     w.u(r.u(8)?, 8); // level_idc
     w.ue(r.ue()?); // seq_parameter_set_id
 
@@ -820,5 +829,30 @@ mod tests {
         let rewrote = fixup_into(&stream, &mut out);
         assert!(!rewrote, "must not claim a rewrite it couldn't do");
         assert_eq!(out, stream, "original bytes must be preserved verbatim");
+    }
+
+    #[test]
+    fn forces_constrained_baseline_flag() {
+        // Minimal Baseline SPS (profile 66) with constraint_set1 clear — rewriter
+        // must set it so Android HW sees Constrained Baseline (Moonlight errata #8).
+        let mut w = BitWriter::default();
+        w.u(66, 8); // Baseline
+        w.u(0x00, 8); // no constraint flags
+        w.u(40, 8); // level 4.0
+        w.ue(0); // sps id
+        w.ue(0); // log2_max_frame_num
+        w.ue(2); // poc_type 2
+        w.ue(16); // refs (forced to 1)
+        w.u1(0); // gaps
+        w.ue(119); // width mbs
+        w.ue(67); // height map units
+        w.u1(1); // frame_mbs_only
+        w.u1(1); // direct_8x8
+        w.u1(0); // no crop
+        w.u1(0); // no vui (rewriter synthesises one)
+        w.trailing();
+        let out = rewrite_rbsp(&w.d).expect("rewrite");
+        assert_eq!(out[0], 66);
+        assert_ne!(out[1] & 0x40, 0, "constraint_set1_flag must be set");
     }
 }

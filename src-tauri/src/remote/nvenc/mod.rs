@@ -17,6 +17,12 @@
 //! `zeroReorderDelay`, no lookahead, infinite GOP with IDRs only on demand, and
 //! `maxNumRefFrames = 1`. The last one matters off-host: NVENC defaults the DPB to 16,
 //! which makes some Android decoders allocate 16+ buffers (Moonlight decoder-errata #1).
+//!
+//! Profile is **Constrained Baseline + CAVLC** (not High+CABAC): Moonlight errata #8 —
+//! some Android HW decoders refuse to enter low-latency mode when the SPS says High,
+//! because B-frames *could* be present. Baseline forbids them at the profile level.
+//! Multi-slice encode (`sliceMode=3`) lets the phone's decoder parallelise across
+//! cores and cuts wall-clock decode ms on mid-range SoCs.
 //! Output still goes through [`sps`] to fix the two VUI fields NVENC won't expose.
 //!
 //! Absent DLL / non-NVIDIA GPU / any init failure ⇒ [`Encoder::new`] returns `None` and
@@ -34,6 +40,73 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 
 use ffi::*;
+
+/// How many slices to put in a frame of the given height.
+///
+/// Sunshine/Moonlight use `sliceMode=3` (N slices/picture) so the phone's HW decoder
+/// can parallelise. Too few and a mid-range SoC sits on one core for ~16–25 ms; too
+/// many wastes bits. ~1 slice per 540 px → 1080p gets 2, 1440p gets 3, 4K gets 4–8.
+fn slices_for_height(h: u32) -> u32 {
+    ((h + 539) / 540).clamp(1, 8)
+}
+
+/// Apply the phone-friendly H.264 knobs onto a fresh preset config. Shared by
+/// `open_session` and `reconfigure` so they can never drift apart.
+///
+/// # Safety
+/// `cfg.encodeCodecConfig` is a C union; the caller must have just filled it from
+/// an H.264 preset so the `h264Config` arm is the live one.
+unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
+    cfg.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+    // Infinite GOP: keyframes cost bandwidth and the transport is reliable, so we
+    // only emit them on demand (guest `vkf`, resolution change, first frame).
+    cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
+    // 1 == "IDR, P, P, P…" — no B-frames, so nothing is ever reordered.
+    cfg.frameIntervalP = 1;
+    cfg.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
+    cfg.mvPrecision = NV_ENC_MV_PRECISION_QUARTER_PEL;
+
+    let rc = &mut cfg.rcParams;
+    rc.version = NV_ENC_RC_PARAMS_VER;
+    rc.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    rc.averageBitRate = p.bitrate_bps;
+    rc.maxBitRate = p.bitrate_bps;
+    // One frame of VBV = the encoder must fit every frame in its own budget rather
+    // than spending a burst it pays back later. This is the classic low-latency CBR
+    // setup (Sunshine does the same); it's what stops IDR spikes from queueing.
+    rc.vbvBufferSize = p.bitrate_bps / p.fps.max(1);
+    rc.vbvInitialDelay = rc.vbvBufferSize;
+    rc.set_zero_reorder_delay(true);
+    rc.set_enable_lookahead(false);
+    rc.set_enable_aq(false);
+    rc.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+    rc.lookaheadDepth = 0;
+
+    let h264 = &mut cfg.encodeCodecConfig.h264Config;
+    h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+    h264.chromaFormatIDC = 1; // yuv420
+    // Baseline forbids CABAC and the 8×8 adaptive transform — CAVLC is also a few
+    // ms cheaper to decode on software paths (Sunshine's `nvenc_h264_cavlc` knob).
+    h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
+    h264.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE;
+    // DPB of 1: the phone only ever needs the previous frame. Moonlight errata #1 —
+    // NVENC's default of 16 makes some Android decoders allocate 16+ buffers.
+    h264.maxNumRefFrames = 1;
+    h264.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
+    // Multi-slice: wall-clock decode on the phone scales with cores, not with
+    // frame size. Same knob Sunshine sets from the client's `slicesPerFrame`.
+    h264.sliceMode = NV_ENC_H264_SLICE_MODE_NUM_SLICES;
+    h264.sliceModeData = slices_for_height(p.height);
+    // Re-send SPS/PPS with every IDR so a guest that joins (or rebuilds its decoder)
+    // can start from the next keyframe without a side-channel config message.
+    h264.set_repeat_sps_pps(true);
+    h264.set_output_aud(false);
+    // Ask for the VUI bitstream-restriction block; `sps::fixup` then corrects the
+    // reorder/buffering values inside it (NVENC exposes no field for them).
+    h264.h264VUIParameters.bitstreamRestrictionFlag = 1;
+    h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
+    h264.h264VUIParameters.videoFullRangeFlag = 0;
+}
 
 /// `NvEncodeAPICreateInstance` / `NvEncodeAPIGetMaxSupportedVersion` from the driver DLL.
 struct Api {
@@ -207,49 +280,8 @@ impl Encoder {
 
         let mut cfg = preset.presetCfg;
         cfg.version = NV_ENC_CONFIG_VER;
-        cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-        // Infinite GOP: keyframes cost bandwidth and the transport is reliable, so we
-        // only emit them on demand (guest `vkf`, resolution change, first frame).
-        cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
-        // 1 == "IDR, P, P, P…" — no B-frames, so nothing is ever reordered.
-        cfg.frameIntervalP = 1;
-        cfg.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
-        cfg.mvPrecision = NV_ENC_MV_PRECISION_QUARTER_PEL;
-
-        let rc = &mut cfg.rcParams;
-        rc.version = NV_ENC_RC_PARAMS_VER;
-        rc.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-        rc.averageBitRate = p.bitrate_bps;
-        rc.maxBitRate = p.bitrate_bps;
-        // One frame of VBV = the encoder must fit every frame in its own budget rather
-        // than spending a burst it pays back later. This is the classic low-latency CBR
-        // setup (Sunshine does the same); it's what stops IDR spikes from queueing.
-        rc.vbvBufferSize = p.bitrate_bps / p.fps.max(1);
-        rc.vbvInitialDelay = rc.vbvBufferSize;
-        rc.set_zero_reorder_delay(true);
-        rc.set_enable_lookahead(false);
-        rc.set_enable_aq(false);
-        rc.multiPass = NV_ENC_MULTI_PASS_DISABLED;
-        rc.lookaheadDepth = 0;
-
-        let h264 = &mut cfg.encodeCodecConfig.h264Config;
-        h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-        h264.chromaFormatIDC = 1; // yuv420
-        h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
-        h264.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
-        // DPB of 1: the phone only ever needs the previous frame. Moonlight errata #1 —
-        // NVENC's default of 16 makes some Android decoders allocate 16+ buffers.
-        h264.maxNumRefFrames = 1;
-        h264.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
-        // Re-send SPS/PPS with every IDR so a guest that joins (or rebuilds its decoder)
-        // can start from the next keyframe without a side-channel config message.
-        h264.set_repeat_sps_pps(true);
-        h264.set_output_aud(false);
-        // Ask for the VUI bitstream-restriction block; `sps::fixup` then corrects the
-        // reorder/buffering values inside it (NVENC exposes no field for them).
-        h264.h264VUIParameters.bitstreamRestrictionFlag = 1;
-        h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
-        h264.h264VUIParameters.videoFullRangeFlag = 0;
+        // SAFETY: presetCfg was filled by GetEncodePresetConfigEx for H.264.
+        unsafe { apply_h264_guest_friendly(&mut cfg, &p) };
 
         let mut init = NV_ENC_INITIALIZE_PARAMS {
             version: NV_ENC_INITIALIZE_PARAMS_VER,
@@ -332,27 +364,8 @@ impl Encoder {
             }
             let mut cfg = preset.presetCfg;
             cfg.version = NV_ENC_CONFIG_VER;
-            cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-            cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
-            cfg.frameIntervalP = 1;
-            let rc = &mut cfg.rcParams;
-            rc.version = NV_ENC_RC_PARAMS_VER;
-            rc.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-            rc.averageBitRate = p.bitrate_bps;
-            rc.maxBitRate = p.bitrate_bps;
-            rc.vbvBufferSize = p.bitrate_bps / p.fps.max(1);
-            rc.vbvInitialDelay = rc.vbvBufferSize;
-            rc.set_zero_reorder_delay(true);
-            rc.set_enable_lookahead(false);
-            rc.set_enable_aq(false);
-            let h264 = &mut cfg.encodeCodecConfig.h264Config;
-            h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-            h264.chromaFormatIDC = 1;
-            h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
-            h264.maxNumRefFrames = 1;
-            h264.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
-            h264.set_repeat_sps_pps(true);
-            h264.h264VUIParameters.bitstreamRestrictionFlag = 1;
+            // SAFETY: presetCfg was filled by GetEncodePresetConfigEx for H.264.
+            unsafe { apply_h264_guest_friendly(&mut cfg, &p) };
 
             let mut re = NV_ENC_RECONFIGURE_PARAMS {
                 version: NV_ENC_RECONFIGURE_PARAMS_VER,

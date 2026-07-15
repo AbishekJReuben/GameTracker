@@ -189,10 +189,9 @@ const JITTER_MAX_DEFAULT = 120;
 const JITTER_MIN_DEFAULT = 40;
 /** Consecutive clean watchdog ticks (3s each) before easing from a raised target. */
 const JITTER_CLEAN_TICKS = 2;
-// H.264 decode candidates for the DIRECT path, most capable first — MUST mirror
-// the host's WC_CODECS ladder (rtcHost.ts). Probing only High@5.2 made any device
-// that tops out at Main/Baseline fall back to RTC forever.
-const WC_CODECS = ["avc1.640034", "avc1.4d0034", "avc1.42e034"];
+// H.264 decode candidates — MUST mirror rtcHost.ts. Baseline first so Android HW
+// can enter low-latency mode (Moonlight errata #8); High stays for JPEG→WC fallback.
+const WC_CODECS = ["avc1.42C028", "avc1.42E028", "avc1.4d0028", "avc1.640028", "avc1.640034"];
 // A soft DIRECT failure (opt-in timeout, flow stall, host encoder hiccup) used to
 // latch the path OFF for the whole session — only a page refresh or an app restart
 // brought it back. Retry on a backoff instead: DIRECT is where the latency budget
@@ -309,6 +308,11 @@ export class CloudConn {
   private wcHostRefused = false;
   private wcDecoder: VideoDecoder | null = null;
   private wcCodec = "";
+  /** Coded frame size from the host's codec announce — fed into VideoDecoderConfig
+   *  so Android MediaCodec allocates the right buffers up front (avoids a mid-stream
+   *  reconfigure that costs a keyframe + several frames of black). */
+  private wcCodedW = 0;
+  private wcCodedH = 0;
   private wcAwaitKey = true;
   private wcKfReqAt = 0;
   private wcErrors = 0;
@@ -1068,8 +1072,8 @@ export class CloudConn {
   /** Build (or rebuild) the VideoDecoder for the host-announced codec. */
   private wcBuildDecoder(): boolean {
     // Safety net for hosts that ship NVENC frames without a prior codec JSON
-    // (pre-announce bug): High@5.2 matches what NVENC emits; the in-band SPS
-    // is what the decoder actually keys off of once configured.
+    // (pre-announce bug): Constrained Baseline matches what NVENC emits; the
+    // in-band SPS is what the decoder actually keys off of once configured.
     if (!this.wcCodec) this.wcCodec = WC_CODECS[0];
     if (!this.wcCodec) return false;
     try {
@@ -1093,11 +1097,31 @@ export class CloudConn {
         else this.wcRequestKeyframe();
       },
     });
+    // Annex-B + coded size + optimizeForLatency: Chrome maps the latency hint
+    // into MediaCodec's low-delay path when the bitstream allows it. Explicit
+    // `avc.format` stops the UA from guessing avcC vs annexb from the first
+    // chunk (a mis-guess forces an extra reconfigure / keyframe wait).
+    const cfg: VideoDecoderConfig = {
+      codec: this.wcCodec,
+      optimizeForLatency: true,
+      hardwareAcceleration: "prefer-hardware",
+      ...(this.wcCodedW > 0 && this.wcCodedH > 0
+        ? { codedWidth: this.wcCodedW, codedHeight: this.wcCodedH }
+        : {}),
+    };
+    // `avc` is in the AVC codec registration but missing from some TS libs.
+    (cfg as VideoDecoderConfig & { avc?: { format: string } }).avc = { format: "annexb" };
     try {
-      dec.configure({ codec: this.wcCodec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+      dec.configure(cfg);
     } catch {
       try {
-        dec.configure({ codec: this.wcCodec, optimizeForLatency: true });
+        dec.configure({
+          codec: this.wcCodec,
+          optimizeForLatency: true,
+          ...(this.wcCodedW > 0 && this.wcCodedH > 0
+            ? { codedWidth: this.wcCodedW, codedHeight: this.wcCodedH }
+            : {}),
+        });
       } catch (e2) {
         console.warn("[remote] wc decoder configure failed:", e2);
         try {
@@ -1126,10 +1150,15 @@ export class CloudConn {
     // Config (string JSON): sent on activation and every encoder reconfigure.
     if (typeof data === "string") {
       try {
-        const cfg = JSON.parse(data) as { codec?: string };
+        const cfg = JSON.parse(data) as { codec?: string; w?: number; h?: number };
         if (cfg && typeof cfg.codec === "string" && cfg.codec) {
-          if (cfg.codec !== this.wcCodec || !this.wcDecoder) {
+          const w = typeof cfg.w === "number" && cfg.w > 0 ? Math.round(cfg.w) : this.wcCodedW;
+          const h = typeof cfg.h === "number" && cfg.h > 0 ? Math.round(cfg.h) : this.wcCodedH;
+          const sizeChanged = w !== this.wcCodedW || h !== this.wcCodedH;
+          if (cfg.codec !== this.wcCodec || !this.wcDecoder || sizeChanged) {
             this.wcCodec = cfg.codec;
+            this.wcCodedW = w;
+            this.wcCodedH = h;
             this.wcBuildDecoder();
           }
         }

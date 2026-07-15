@@ -73,9 +73,10 @@ interface HostOptions {
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 // ---- WebCodecs direct-video path ("wc") ------------------------------------
-// H.264 candidates for the data-channel video path, most capable first
-// (High → Main → Constrained-Baseline, all level 5.2 so 4K60 fits).
-const WC_CODECS = ["avc1.640034", "avc1.4d0034", "avc1.42e034"];
+// H.264 candidates for the data-channel video path. Baseline first: NVENC now
+// ships Constrained Baseline so Android HW can enter low-latency mode (Moonlight
+// errata #8). High stays on the ladder for the JPEG→WebCodecs fallback encoder.
+const WC_CODECS = ["avc1.42C028", "avc1.42E028", "avc1.4d0028", "avc1.640028", "avc1.640034"];
 /** Fragment size for encoded frames on the SCTP channel (< 64KB interop limit). */
 const WC_FRAG = 61440;
 /** Skip encoding new frames while this many bytes sit unsent in the channel —

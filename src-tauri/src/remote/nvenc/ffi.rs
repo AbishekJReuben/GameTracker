@@ -117,7 +117,11 @@ pub const NV_ENC_PIC_FLAG_OUTPUT_SPSPPS: u32 = 4;
 
 pub const NV_ENC_H264_ENTROPY_CODING_MODE_CABAC: u32 = 1;
 pub const NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC: u32 = 2;
+pub const NV_ENC_H264_ADAPTIVE_TRANSFORM_AUTOSELECT: u32 = 0;
+pub const NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE: u32 = 1;
 pub const NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE: u32 = 2;
+/// `sliceMode = 3` ⇒ `sliceModeData` is the number of slices in the picture.
+pub const NV_ENC_H264_SLICE_MODE_NUM_SLICES: u32 = 3;
 
 pub const NV_ENC_TUNING_INFO_LOW_LATENCY: u32 = 2;
 pub const NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY: u32 = 3;
