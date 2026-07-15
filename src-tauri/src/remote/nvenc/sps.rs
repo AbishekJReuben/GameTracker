@@ -215,12 +215,11 @@ fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
     w.u(r.u(8)?, 8); // level_idc
     w.ue(r.ue()?); // seq_parameter_set_id
 
-    let mut chroma_format_idc = 1;
     if matches!(
         profile_idc,
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
     ) {
-        chroma_format_idc = r.ue()?;
+        let chroma_format_idc = r.ue()?;
         w.ue(chroma_format_idc);
         if chroma_format_idc == 3 {
             w.u1(r.u1()?); // separate_colour_plane_flag
@@ -288,8 +287,6 @@ fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
     // the bitstream restriction, and an all-absent VUI is legal (every flag is 0).
     w.u1(1);
 
-    let mut nal_hrd = 0;
-    let mut vcl_hrd = 0;
     if vui_present == 1 {
         let aspect = r.u1()?;
         w.u1(aspect);
@@ -332,12 +329,12 @@ fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
             w.u(r.u(32)?, 32); // time_scale
             w.u1(r.u1()?); // fixed_frame_rate_flag
         }
-        nal_hrd = r.u1()?;
+        let nal_hrd = r.u1()?;
         w.u1(nal_hrd);
         if nal_hrd == 1 {
             copy_hrd(&mut r, &mut w)?;
         }
-        vcl_hrd = r.u1()?;
+        let vcl_hrd = r.u1()?;
         w.u1(vcl_hrd);
         if vcl_hrd == 1 {
             copy_hrd(&mut r, &mut w)?;

@@ -19,6 +19,9 @@ pub(crate) mod capture;
 #[cfg(windows)]
 pub(crate) mod dxdupe;
 pub(crate) mod focus;
+/// GPU scale + cursor compositing for the zero-copy capture path.
+#[cfg(windows)]
+pub(crate) mod gpu;
 /// Native H.264 encode path for the screen stream: D3D11 plumbing + the wire
 /// container (Windows + NVIDIA only; JPEG→WebCodecs stays as the fallback).
 #[cfg(windows)]

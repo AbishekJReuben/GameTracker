@@ -44,6 +44,25 @@ const PTR_MONOCHROME: u32 = 1;
 const PTR_COLOR: u32 = 2;
 const PTR_MASKED_COLOR: u32 = 4;
 
+/// Normalized cursor shape for the GPU compositor: one RGBA8 image plus how to apply
+/// it. DXGI's three shape types collapse to two ops, because **monochrome maps exactly
+/// onto masked-colour**: `and=1,xor=0` (transparent) is XOR-with-black, i.e. a no-op,
+/// and `and=1,xor=1` (invert) is XOR-with-white. So the shader only needs two branches
+/// instead of three, and the fiddly 1bpp AND/XOR unpacking stays on the CPU where it
+/// runs once per *shape change* rather than once per frame.
+pub struct CursorImage {
+    /// Packed BGRA, `w * h * 4`.
+    pub px: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    /// Top-left in NATIVE desktop pixels.
+    pub x: i32,
+    pub y: i32,
+    /// false ⇒ per-pixel alpha blend (`PTR_COLOR`).
+    /// true  ⇒ masked: alpha 0 = replace with rgb, alpha 255 = XOR rgb into the screen.
+    pub masked: bool,
+}
+
 /// The result of trying to grab one frame from the duplication session.
 pub enum Grab {
     /// A fresh frame is ready in the duplicator's reusable readback buffer (read via
@@ -93,6 +112,9 @@ pub struct Duplicator {
     ptr_w: u32,
     ptr_h: u32,
     ptr_pitch: u32,
+    /// Bumped whenever DXGI hands us a NEW shape. The GPU compositor keys its cursor
+    /// texture upload off this, so a cursor that only moves costs nothing.
+    ptr_seq: u64,
     /// Native dims of the last grabbed frame (scales cursor coords to the stream).
     last_native: (u32, u32),
 }
@@ -190,6 +212,7 @@ impl Duplicator {
                 ptr_w: 0,
                 ptr_h: 0,
                 ptr_pitch: 0,
+                ptr_seq: 0,
                 last_native: (0, 0),
             })
         }
@@ -304,29 +327,7 @@ impl Duplicator {
             // Mirror the hardware-cursor metadata (position/visibility valid only on
             // frames where the mouse updated; shape only when it changed).
             let mouse_updated = info.LastMouseUpdateTime != 0;
-            if mouse_updated {
-                self.ptr_visible = info.PointerPosition.Visible.as_bool();
-                if self.ptr_visible {
-                    self.ptr_x = info.PointerPosition.Position.x;
-                    self.ptr_y = info.PointerPosition.Position.y;
-                }
-            }
-            if info.PointerShapeBufferSize > 0 {
-                let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
-                let mut required = 0u32;
-                let mut sinfo = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
-                if self
-                    .dup
-                    .GetFramePointerShape(buf.len() as u32, buf.as_mut_ptr() as *mut _, &mut required, &mut sinfo)
-                    .is_ok()
-                {
-                    self.ptr_shape = buf;
-                    self.ptr_type = sinfo.Type;
-                    self.ptr_w = sinfo.Width;
-                    self.ptr_h = sinfo.Height;
-                    self.ptr_pitch = sinfo.Pitch;
-                }
-            }
+            self.absorb_pointer(&info);
 
             // New desktop pixels (LastPresentTime != 0) OR a cursor move both produce
             // a frame: the texture always holds the CURRENT desktop, and cursor moves
@@ -382,6 +383,190 @@ impl Duplicator {
 
             let _ = self.dup.ReleaseFrame();
             out.unwrap_or(Grab::Timeout)
+        }
+    }
+
+    /// The D3D11 device backing this duplication session. NVENC must open its session
+    /// on **this** device to register the frame textures without a copy.
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
+    /// Grab a frame and leave it **on the GPU** — the zero-copy path.
+    ///
+    /// Same acquisition and cursor bookkeeping as [`Duplicator::grab`], but instead of
+    /// staging + `Map`ping the pixels back to system RAM it copies the frame into the
+    /// mip texture and generates the chain, so a downscaling sampler gets a properly
+    /// filtered read. Use [`Duplicator::frame_srv`] to sample the result.
+    ///
+    /// Returns `Grab::Frame` with the NATIVE dimensions (there's no readback size —
+    /// the consumer picks the output size when it samples).
+    pub fn grab_gpu(&mut self, timeout_ms: u32) -> Grab {
+        unsafe {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            match self.dup.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
+                Ok(()) => {}
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Grab::Timeout,
+                Err(_) => return Grab::Lost,
+            }
+            self.absorb_pointer(&info);
+            let has_new = info.LastPresentTime != 0;
+            let mouse_updated = info.LastMouseUpdateTime != 0;
+            let res = resource;
+            let out = (|| {
+                let res = res.as_ref()?;
+                if !has_new && !mouse_updated {
+                    return None;
+                }
+                let tex: ID3D11Texture2D = res.cast().ok()?;
+                let mut td = D3D11_TEXTURE2D_DESC::default();
+                tex.GetDesc(&mut td);
+                let (nw, nh) = (td.Width, td.Height);
+                self.last_native = (nw, nh);
+                let src: ID3D11Resource = tex.cast().ok()?;
+                // Without mip support we still hand back a sampleable copy; the
+                // compositor's bilinear sampler just does a plain downscale.
+                self.ensure_mip(nw, nh)?;
+                let mip = self.mip_tex.clone()?;
+                let mip_res: ID3D11Resource = mip.cast().ok()?;
+                self.context.CopySubresourceRegion(&mip_res, 0, 0, 0, 0, &src, 0, None);
+                if self.gpu_scale {
+                    if let Some(srv) = self.mip_srv.clone() {
+                        self.context.GenerateMips(&srv);
+                    }
+                }
+                Some(Grab::Frame { w: nw, h: nh, native_w: nw, native_h: nh })
+            })();
+            // Must release before returning: DXGI allows one outstanding frame, and the
+            // copy above already took what we need.
+            let _ = self.dup.ReleaseFrame();
+            out.unwrap_or(Grab::Timeout)
+        }
+    }
+
+    /// SRV over the last [`Duplicator::grab_gpu`] frame (full native resolution, mipped).
+    pub fn frame_srv(&self) -> Option<ID3D11ShaderResourceView> {
+        self.mip_srv.clone()
+    }
+
+    /// Mirror the hardware-cursor metadata from an acquired frame. Position/visibility
+    /// are only valid on frames where the mouse updated; the shape only when it changed.
+    unsafe fn absorb_pointer(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO) {
+        if info.LastMouseUpdateTime != 0 {
+            self.ptr_visible = info.PointerPosition.Visible.as_bool();
+            if self.ptr_visible {
+                self.ptr_x = info.PointerPosition.Position.x;
+                self.ptr_y = info.PointerPosition.Position.y;
+            }
+        }
+        if info.PointerShapeBufferSize > 0 {
+            let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
+            let mut required = 0u32;
+            let mut sinfo = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            if self
+                .dup
+                .GetFramePointerShape(buf.len() as u32, buf.as_mut_ptr() as *mut _, &mut required, &mut sinfo)
+                .is_ok()
+            {
+                self.ptr_shape = buf;
+                self.ptr_type = sinfo.Type;
+                self.ptr_w = sinfo.Width;
+                self.ptr_h = sinfo.Height;
+                self.ptr_pitch = sinfo.Pitch;
+                self.ptr_seq = self.ptr_seq.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Monotonic id of the current cursor shape; bumped only when DXGI hands us a new
+    /// one. The GPU compositor keys its texture upload off this so a moving (but
+    /// unchanged) cursor costs nothing.
+    pub fn cursor_seq(&self) -> u64 {
+        self.ptr_seq
+    }
+
+    pub fn cursor_visible(&self) -> bool {
+        self.ptr_visible && !self.ptr_shape.is_empty()
+    }
+
+    pub fn native_size(&self) -> (u32, u32) {
+        self.last_native
+    }
+
+    /// Decode the current shape into a normalized BGRA image + op for the GPU
+    /// compositor. Mirrors [`Duplicator::draw_cursor`]'s per-type semantics exactly —
+    /// keep the two in step. `None` when there's nothing to draw.
+    pub fn cursor_image(&self) -> Option<CursorImage> {
+        if !self.cursor_visible() {
+            return None;
+        }
+        let mono = self.ptr_type == PTR_MONOCHROME;
+        let w = self.ptr_w;
+        // Monochrome packs the AND mask then the XOR mask, stacked — so the real
+        // height is half of what DXGI reports.
+        let h = if mono { self.ptr_h / 2 } else { self.ptr_h };
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let pitch = self.ptr_pitch as usize;
+        let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
+        match self.ptr_type {
+            PTR_COLOR => {
+                for y in 0..h as usize {
+                    for x in 0..w as usize {
+                        let si = y * pitch + x * 4;
+                        let Some(s) = self.ptr_shape.get(si..si + 4) else { continue };
+                        let di = (y * w as usize + x) * 4;
+                        px[di..di + 4].copy_from_slice(s);
+                    }
+                }
+                Some(CursorImage { px, w, h, x: self.ptr_x, y: self.ptr_y, masked: false })
+            }
+            PTR_MASKED_COLOR => {
+                for y in 0..h as usize {
+                    for x in 0..w as usize {
+                        let si = y * pitch + x * 4;
+                        let Some(s) = self.ptr_shape.get(si..si + 4) else { continue };
+                        let di = (y * w as usize + x) * 4;
+                        px[di..di + 4].copy_from_slice(s);
+                    }
+                }
+                Some(CursorImage { px, w, h, x: self.ptr_x, y: self.ptr_y, masked: true })
+            }
+            PTR_MONOCHROME => {
+                // Re-express the 1bpp AND/XOR pair as masked-colour, which is exactly
+                // equivalent (see CursorImage):
+                //   and=0,xor=0 -> opaque black      (alpha 0,   rgb 0x00)
+                //   and=0,xor=1 -> opaque white      (alpha 0,   rgb 0xFF)
+                //   and=1,xor=0 -> transparent       (alpha 255, rgb 0x00 -> XOR 0 = no-op)
+                //   and=1,xor=1 -> invert the screen (alpha 255, rgb 0xFF -> XOR 0xFF)
+                for y in 0..h as usize {
+                    for x in 0..w as usize {
+                        let byte = x / 8;
+                        let bit = 7 - (x % 8);
+                        let and_i = y * pitch + byte;
+                        let xor_i = (y + h as usize) * pitch + byte;
+                        let (Some(&ab), Some(&xb)) = (self.ptr_shape.get(and_i), self.ptr_shape.get(xor_i)) else {
+                            continue;
+                        };
+                        let and = (ab >> bit) & 1;
+                        let xor = (xb >> bit) & 1;
+                        let di = (y * w as usize + x) * 4;
+                        let v = if xor == 1 { 0xFFu8 } else { 0x00 };
+                        px[di] = v;
+                        px[di + 1] = v;
+                        px[di + 2] = v;
+                        px[di + 3] = if and == 1 { 0xFF } else { 0x00 };
+                    }
+                }
+                Some(CursorImage { px, w, h, x: self.ptr_x, y: self.ptr_y, masked: true })
+            }
+            _ => None,
         }
     }
 

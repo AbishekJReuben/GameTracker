@@ -953,6 +953,71 @@ not regress):**
   Host SDP x-google-min-bitrate + encoding minBitrate floor so GCC cannot
   crush the share to ~200kbps.
 
+**v3.9.27 native NVENC encode — the host stops shipping JPEG (do not regress):**
+- **What the numbers actually said.** The DIRECT path measured ~35ms "H264 enc" and
+  ~30ms phone decode. But at **2×2 pixels / 1kbit/s they were still 27.5ms and
+  30.2ms** — four pixels cannot cost 27ms to encode, so neither number was ever
+  *work*. ~55ms of the 93ms E2E was **fixed pipeline overhead**, which is why no
+  quality/bitrate/fps knob ever moved it. Don't tune this; the dials aren't connected
+  to it.
+- **Host encode: the round trip was the cost.** The old path was DXGI texture → GPU
+  downscale → **CPU readback** → JPEG (334KB) → **IPC** → `createImageBitmap` →
+  canvas → `VideoFrame(canvas)` → **back into the GPU process** → MediaFoundation
+  H.264. Pixels crossed the GPU/CPU boundary four times and were compressed twice.
+  Now: duplication texture → NVENC on the same D3D11 device → ~30KB Annex-B → IPC →
+  data channel. Measured **1.2ms median at 1080p** on an RTX 4070 Ti (`nvenc_smoke`).
+- **Phone decode: we never controlled the SPS.** Chromium's WebCodecs encoder emitted
+  a stock SPS; Android decoders read `pic_order_cnt_type=0` as "reordering is
+  *possible*" and buffer a frame ahead ([ExoPlayer#8514]), and NVENC's default
+  `max_num_ref_frames=16` makes some allocate 16+ buffers (Moonlight
+  decoder-errata #1/#2). Our NVENC config (`frameIntervalP=1`, no B-frames,
+  `zeroReorderDelay`) makes it emit **`poc_type=2`** — reordering *impossible*, so
+  that slow path is never armed — plus refs=1/reorder=0/dpb=1. `nvenc/sps.rs` rewrites
+  the SPS to force those three regardless; it's a **guarantee, not the mechanism**, and
+  a parse failure ships the encoder's SPS untouched.
+- **`nvenc/ffi.rs` is hand-written and ABI-asserted.** The crates (`nvidia-video-codec-sdk`,
+  `nvenc`) need the SDK installed + cudarc; we load `nvEncodeAPI64.dll` (ships with the
+  driver) so the build stays turnkey. **Targets API 12.0 on purpose:** NVENC is
+  *backward* compatible, so an older API reaches more drivers — and this dev box caps
+  at 13.0, so binding 13.1 disabled NVENC on the machine it was written for. Layouts
+  differ between versions (`NV_ENC_INITIALIZE_PARAMS` 1808 @12.0 vs 1800 @13.1), so
+  **version and layouts move together, never one alone.** Every size/offset is asserted
+  against machine-generated ground truth from `scripts/nvenc-abi-probe.c` — re-run it
+  if you touch a struct. This is not ceremony: it already caught `Option<*mut c_void>`
+  having no null-pointer optimisation (every function-table slot 16 bytes → silently
+  misaligned → corruption *inside the display driver*), and `FORCEIDR` being 2, not 1.
+- **Zero-copy (`gpu.rs`) removes the readback too.** One full-screen pass samples the
+  duplication texture (sampler does the downscale, trilinear off `grab_gpu`'s mip
+  chain) **and composites the cursor in the same fetch**. Cursor compositing has to be
+  in-shader because Desktop Duplication delivers the pointer as metadata, and because
+  masked/monochrome cursors **XOR the screen** — blend state cannot express that, the
+  shader must read the screen value. **Monochrome maps exactly onto masked-colour**
+  (`and=1,xor=0` → XOR black = no-op; `and=1,xor=1` → XOR white = invert), so the 1bpp
+  AND/XOR unpack stays on the CPU, runs once per *shape change*, and the shader has two
+  branches instead of three. Shaders compile at runtime via `D3DCompile`
+  (`d3dcompiler_47.dll` ships with Windows — no build dep). `dxdupe::draw_cursor` and
+  `dxdupe::cursor_image` must stay in step.
+- **Layered fallback, all deliberate — do not collapse it.** zero-copy → readback+upload
+  (`native.rs::encode_pixels`) → JPEG+WebCodecs. Any failure at any layer drops one
+  level and **stays retryable**; nothing latches off for the session (same rule as
+  v3.9.24's "DIRECT is sticky").
+- **`CAP_NATIVE_OK` defaults OFF and resets in `start_capture`.** Only a DIRECT guest
+  can take pre-encoded H.264 — **the RTC track composites a canvas and would go black**.
+  The host enables it on wc opt-in and disables it on every fallback to RTC. The webview
+  still builds its WebCodecs encoder underneath as a live net for a mid-session NVENC
+  fault. Missing WebCodecs is no longer fatal to DIRECT when NVENC is up.
+- **Only the BGRA (Desktop Duplication) source qualifies.** The xcap fallback is RGBA;
+  swizzling per-pixel would reintroduce exactly the cost this removes.
+- **Infinite GOP ⇒ a fresh decoder needs an IDR.** `vkf`/`vreset`/DIRECT opt-in all call
+  `remote_request_keyframe`. Without it the guest stares at nothing until the interval.
+- **HUD:** NVENC badge beside the DIRECT pill; "H264 enc" reports real NVENC time and
+  flags >5ms native (vs >15ms on the JPEG path); capture stats carry `native` +
+  `zeroCopy`. Hardware tests are `#[ignore]`d (`-- --ignored`) so CI and non-NVIDIA
+  machines don't fail: `remote::nvenc::tests::nvenc_smoke`,
+  `remote::gpu::tests::composites_scale_and_every_cursor_op`.
+
+[ExoPlayer#8514]: https://github.com/google/ExoPlayer/issues/8514
+
 **v3.9.26 Remote-only vs Full install mode (do not regress):**
 - **UI-only gating.** Installer always lays down every file; the setup-type choice
   only seeds `remote_only` in the DB. Tracking, media logging, and the system

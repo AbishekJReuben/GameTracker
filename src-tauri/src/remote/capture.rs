@@ -495,6 +495,20 @@ static ST_PRODUCED: AtomicU32 = AtomicU32::new(0);
 /// Surfaced to the HUD so "why is this slow" is answerable at a glance.
 static ST_NATIVE: AtomicBool = AtomicBool::new(false);
 
+/// True while frames go GPU→GPU (duplication texture → composite → NVENC) with no
+/// readback at all. Implies `ST_NATIVE`.
+static ST_ZEROCOPY: AtomicBool = AtomicBool::new(false);
+
+/// The stream size for a given native resolution and width cap: never upscale, keep
+/// the aspect, and round to even (NVENC requires even dimensions). Mirrors what
+/// `scale_u8x4` lands on for the CPU path so both routes stream the same shape.
+#[cfg(windows)]
+fn native_out_size(native_w: u32, native_h: u32, max_w: u32) -> (u32, u32) {
+    let w = max_w.min(native_w).max(32);
+    let h = ((native_h as u64 * w as u64) / native_w.max(1) as u64).max(32) as u32;
+    (w & !1, h & !1)
+}
+
 /// Set by [`request_keyframe`] when the guest asks for an IDR (`vkf`/`vreset`, a fresh
 /// decoder, a resolution change). Consumed by the encoder thread on the next frame.
 static NATIVE_FORCE_KEY: AtomicBool = AtomicBool::new(false);
@@ -568,6 +582,10 @@ pub struct CaptureStats {
     /// True when frames are leaving as NVENC H.264 rather than JPEG. When true,
     /// `encode_ms` is real NVENC time and `frame_bytes` is the H.264 frame.
     pub native: bool,
+    /// True when the frame never touches system RAM (duplication texture → GPU
+    /// composite → NVENC). Implies `native`; `capture_ms` then excludes the readback
+    /// and `scale_ms` is 0 because the composite does the scaling.
+    pub zero_copy: bool,
 }
 
 /// Read the latest host-side capture telemetry.
@@ -588,6 +606,7 @@ pub fn capture_stats() -> CaptureStats {
         content: CAP_CONTENT.load(Ordering::Relaxed),
         running: CAP_RUNNING.load(Ordering::Relaxed),
         native: ST_NATIVE.load(Ordering::Relaxed),
+        zero_copy: ST_ZEROCOPY.load(Ordering::Relaxed),
     }
 }
 
@@ -817,8 +836,13 @@ struct RawFrame {
 /// any existing pipeline is superseded (generation bump), so it's safe to re-call.
 pub fn start_capture<F>(max_w: u32, fps: u32, quality: u32, emit: F)
 where
-    F: Fn(Vec<u8>) + Send + 'static,
+    F: Fn(Vec<u8>) + Send + Sync + 'static,
 {
+    // Shared because BOTH threads can emit: the zero-copy path finishes a frame on the
+    // capture thread (grab → GPU composite → NVENC, never touching system RAM), while
+    // the CPU/JPEG path still hands off to the encoder thread through the mailbox.
+    let emit = Arc::new(emit);
+    let cap_emit = emit.clone();
     set_capture_quality(max_w, fps, quality);
     let my_gen = CAP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     CAP_RUNNING.store(true, Ordering::SeqCst);
@@ -828,6 +852,7 @@ where
     // brand-new RTC guest, which paints its canvas from pixels and would show black.
     CAP_NATIVE_OK.store(false, Ordering::Relaxed);
     ST_NATIVE.store(false, Ordering::Relaxed);
+    ST_ZEROCOPY.store(false, Ordering::Relaxed);
 
     // Single-slot mailbox: (latest frame, condvar to wake the encoder).
     let mailbox: Arc<(PlMutex<Option<RawFrame>>, Condvar)> =
@@ -841,6 +866,16 @@ where
         let _timer = TimerBoost::new(); // 1ms sleep precision for fps pacing
         #[cfg(windows)]
         let mut dup: Option<super::dxdupe::Duplicator> = None;
+        // ---- zero-copy state (Windows + NVIDIA + Desktop Duplication) ----
+        // When all three line up the frame never leaves the GPU: duplication texture →
+        // compositor (scale + cursor) → NVENC → data channel. `zc_off` latches after a
+        // failure so we stop retrying every frame and let the CPU path carry the stream.
+        #[cfg(windows)]
+        let mut zc: Option<(super::gpu::Compositor, super::native::NativeEncoder)> = None;
+        #[cfg(windows)]
+        let mut zc_off = false;
+        #[cfg(windows)]
+        let zc_started = Instant::now();
         let mut cur_mon = usize::MAX;
         // Last successfully scaled frame (shared), re-sent on idle so the encoder's
         // ~1s keep-alive still fires for a freshly attached decoder.
@@ -877,7 +912,88 @@ where
                     let (tx, ty) = monitor_bounds(sel).map(|(x, y, _, _)| (x, y)).unwrap_or((0, 0));
                     dup = super::dxdupe::Duplicator::new_for(tx, ty);
                     cur_mon = sel;
+                    zc = None; // new device ⇒ the old compositor/encoder are dead
                 }
+
+                // ---- zero-copy: grab → GPU scale+cursor → NVENC, no readback -------
+                // Skips the staging Map that costs ~7ms/frame ("capture" in the HUD)
+                // and the CPU downscale + cursor paint that follow it.
+                if !zc_off && CAP_NATIVE_OK.load(Ordering::Relaxed) && dup.is_some() {
+                    let d = dup.as_mut().unwrap();
+                    let g0 = Instant::now();
+                    match d.grab_gpu(budget_ms) {
+                        super::dxdupe::Grab::Frame { native_w, native_h, .. } => {
+                            let cap_us = g0.elapsed().as_micros() as u32;
+                            let (ow, oh) = native_out_size(native_w, native_h, max_w);
+                            // (Re)build on first use or a resolution change. NVENC must
+                            // sit on the DUPLICATOR's device to register its textures.
+                            let fresh = match &zc {
+                                Some((c, _)) => c.size() != (ow, oh),
+                                None => true,
+                            };
+                            if fresh {
+                                zc = super::gpu::Compositor::new(d.device(), d.context(), ow, oh).and_then(|c| {
+                                    let bps = native_bitrate_bps(ow, oh, fps, quality);
+                                    super::native::NativeEncoder::new(Some(d.device()), ow, oh, fps, bps)
+                                        .map(|e| (c, e))
+                                });
+                                if zc.is_none() {
+                                    zc_off = true;
+                                    eprintln!(
+                                        "[capture] zero-copy GPU path unavailable at {ow}x{oh} — using the readback path"
+                                    );
+                                }
+                                NATIVE_FORCE_KEY.store(true, Ordering::Relaxed);
+                            }
+                            if let Some((comp, enc)) = zc.as_mut() {
+                                let bps = native_bitrate_bps(ow, oh, fps, quality);
+                                enc.accepts(ow, oh, fps, bps);
+                                let srv = d.frame_srv();
+                                let img = d.cursor_image();
+                                let ok = match &srv {
+                                    Some(s) => comp.render(s, native_w, native_h, img.as_ref().map(|i| (i, d.cursor_seq()))),
+                                    None => false,
+                                };
+                                if ok {
+                                    let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                    let ts_us = zc_started.elapsed().as_micros() as u64;
+                                    let e0 = Instant::now();
+                                    if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
+                                        ST_CAP_US.store(cap_us, Ordering::Relaxed);
+                                        // The composite IS the scale; there is no
+                                        // separate CPU resize pass to report.
+                                        ST_SCALE_US.store(0, Ordering::Relaxed);
+                                        ST_ENC_US.store(e0.elapsed().as_micros() as u32, Ordering::Relaxed);
+                                        ST_NAT_W.store(native_w, Ordering::Relaxed);
+                                        ST_NAT_H.store(native_h, Ordering::Relaxed);
+                                        ST_OUT_W.store(ow, Ordering::Relaxed);
+                                        ST_OUT_H.store(oh, Ordering::Relaxed);
+                                        ST_BYTES.store(pkt.len() as u32, Ordering::Relaxed);
+                                        ST_NATIVE.store(true, Ordering::Relaxed);
+                                        ST_ZEROCOPY.store(true, Ordering::Relaxed);
+                                        ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
+                                        cap_emit(pkt);
+                                        let elapsed = cap0.elapsed();
+                                        let target = Duration::from_millis(budget_ms as u64);
+                                        if elapsed < target {
+                                            std::thread::sleep(target - elapsed);
+                                        }
+                                        continue;
+                                    }
+                                    // Encode faulted: drop the session but stay
+                                    // retryable, and let this frame go the CPU route.
+                                    zc = None;
+                                }
+                            }
+                        }
+                        // Nothing new on screen: the encoder thread's keep-alive still
+                        // needs to fire, so fall through to the CPU path rather than
+                        // spinning here.
+                        super::dxdupe::Grab::Timeout => {}
+                        super::dxdupe::Grab::Lost => dup = None,
+                    }
+                }
+
                 if let Some(d) = dup.as_mut() {
                     // Grab downscales on the GPU toward max_w; time it on its own so
                     // capture vs scale telemetry stays honest.
@@ -1079,6 +1195,9 @@ where
                         ST_OUT_W.store(nw, Ordering::Relaxed);
                         ST_OUT_H.store(nh, Ordering::Relaxed);
                         ST_NATIVE.store(true, Ordering::Relaxed);
+                        // We're here via the readback path, so whatever the capture
+                        // thread last claimed, this frame is not zero-copy.
+                        ST_ZEROCOPY.store(false, Ordering::Relaxed);
                         ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
                         emit(pkt);
                         last_emit = Instant::now();
@@ -1092,7 +1211,10 @@ where
                 }
             }
             #[cfg(windows)]
-            ST_NATIVE.store(false, Ordering::Relaxed);
+            {
+                ST_NATIVE.store(false, Ordering::Relaxed);
+                ST_ZEROCOPY.store(false, Ordering::Relaxed);
+            }
 
             // ---- JPEG fallback ---------------------------------------------------
             // The capture side already told us whether the pixels changed, so there's
