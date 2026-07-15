@@ -180,6 +180,17 @@ export type WcStats = {
   clockRttMs: number;
   /** True when Annex-B is decoded by native MediaCodec → Surface (APK only). */
   native?: boolean;
+  /** Cumulative artifact events the host reported this session (backpressure skips
+   *  + soft-recovery armings). Lets the HUD show "artifacts: N" without parsing
+   *  encoder internals. */
+  artifacts?: number;
+  /** Cumulative clean recoveries (IDRs that closed a soft-recovery window). */
+  recovered?: number;
+  /** True when the host has an outstanding recovery IDR but is still forwarding
+   *  P-frames — the picture may show transient artifacting until the IDR lands. */
+  recovering?: boolean;
+  /** Cumulative guest-side decode errors that armed a keyframe request. */
+  guestErrors?: number;
 };
 
 const HEARTBEAT_MS = 5000; // ping cadence
@@ -354,6 +365,11 @@ export class CloudConn {
   private wcAwaitKey = true;
   private wcKfReqAt = 0;
   private wcErrors = 0;
+  /** Host-reported artifact/recovery counters (capstats → HUD). `-1` means "not
+   *  reported yet" so the first real sample doesn't read as a regression. */
+  private wcHostArtifacts = -1;
+  private wcHostRecovered = -1;
+  private wcHostRecovering = false;
   private wcFrameCb: ((f: VideoFrame) => void) | null = null;
   private wcHead: { key: boolean; seq: number; tsMs: number; len: number } | null = null;
   private wcBuf: Uint8Array | null = null;
@@ -1137,9 +1153,11 @@ export class CloudConn {
             this.audioUnderruns = s.underruns ?? 0;
           }
         };
-        // Lean envelope — matches near-instant DIRECT video.
+        // Lean envelope — matches near-instant DIRECT video. Lowered from
+        // 20/35/100 to 12/18/90 to shave ~17ms of phone-side audio latency
+        // (worklet grows adaptively if underruns appear, so the floor is safe).
         node.port.postMessage({
-          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 20, targetMs: 35, maxMs: 100 },
+          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 12, targetMs: 18, maxMs: 90 },
         });
         this.audioNode = node;
         this.startAudioStatsPoll();
@@ -1189,9 +1207,9 @@ export class CloudConn {
             cfg: {
               channels: msg.cfg.channels ?? 2,
               captureRate: msg.cfg.sampleRate ?? 48000,
-              primeMs: 20,
-              targetMs: 35,
-              maxMs: 100,
+              primeMs: 12,
+              targetMs: 18,
+              maxMs: 90,
             },
           });
         }
@@ -1477,6 +1495,11 @@ export class CloudConn {
     }
   }
 
+  /** Last native-decoder error string we surfaced as a toast — used to dedupe
+   *  the poll so a sticky `lastError` from a recovered configure attempt can't
+   *  spam the "decoder error" message every tick. */
+  private wcLastNativeError = "";
+
   /** Pull decode-ms / frame count from Kotlin (Surface path has no VideoFrame). */
   private async wcPollNativeStats() {
     if (!this.wcNative || !this.wcActive) return;
@@ -1497,9 +1520,22 @@ export class CloudConn {
         this.wcE2eMs = this.wcE2eMs === 0 ? e2e : this.wcE2eMs * 0.85 + e2e * 0.15;
       }
     }
-    if (st.error) {
-      console.warn("[remote] native decoder:", st.error);
-      this.emitEvent({ event: "decoder", state: "error", reason: st.error });
+    // Only surface a decoder error when the codec is NOT producing frames. The
+    // Java bridge's `lastError` is sticky across the progressive-configure
+    // ladder: attempt 0 may log a configure failure that attempt 1 recovered
+    // from, and that stale string would otherwise re-toast every poll tick
+    // even though frames are decoding fine on the Surface. Dedupe by string so
+    // a genuine persistent fault is announced once, not every 500ms.
+    if (st.error && st.error !== this.wcLastNativeError) {
+      this.wcLastNativeError = st.error;
+      if (st.frames === 0) {
+        console.warn("[remote] native decoder:", st.error);
+        this.emitEvent({ event: "decoder", state: "error", reason: st.error });
+      }
+    } else if (!st.error) {
+      // Codec cleared its error (healthy) — allow a future different error to
+      // re-announce.
+      this.wcLastNativeError = "";
     }
   }
 
@@ -1781,6 +1817,10 @@ export class CloudConn {
       codec: this.wcCodec,
       clockRttMs: clk ? Math.round(clk.rtt) : 0,
       native: this.wcNative,
+      artifacts: this.wcHostArtifacts >= 0 ? this.wcHostArtifacts : undefined,
+      recovered: this.wcHostRecovered >= 0 ? this.wcHostRecovered : undefined,
+      recovering: this.wcHostRecovering,
+      guestErrors: this.wcErrors,
     };
   }
 

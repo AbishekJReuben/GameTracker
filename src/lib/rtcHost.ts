@@ -889,10 +889,12 @@ export function startHost(opts: HostOptions): () => void {
     });
     node.connect(dest);
     audioNode = node;
-    // RTC path: slightly wider than the phone DIRECT defaults — absorbs IPC
-    // jitter from the Tauri channel under game load without the old 90ms sit.
+    // RTC path: moderately wider than the phone DIRECT defaults — absorbs IPC
+    // jitter from the Tauri channel under game load. Lowered from 40/55/150 to
+    // 30/40/120 to claw back ~15ms of desktop-side audio latency; underruns
+    // still grow it adaptively toward maxMs.
     try {
-      node.port.postMessage({ cfg: { channels: 2, captureRate: ctx.sampleRate, primeMs: 40, targetMs: 55, maxMs: 150 } });
+      node.port.postMessage({ cfg: { channels: 2, captureRate: ctx.sampleRate, primeMs: 30, targetMs: 40, maxMs: 120 } });
     } catch {
       /* ignore */
     }
@@ -933,7 +935,7 @@ export function startHost(opts: HostOptions): () => void {
       liveFmt = { sampleRate: captureRate, channels };
       try {
         node.port.postMessage({
-          cfg: { channels, captureRate, primeMs: 40, targetMs: 55, maxMs: 150 },
+          cfg: { channels, captureRate, primeMs: 30, targetMs: 40, maxMs: 120 },
         });
       } catch {
         /* node torn down */
@@ -1252,11 +1254,19 @@ export function startHost(opts: HostOptions): () => void {
     let nativeAnnounced = false;
     let nativeConfigW = 0;
     let nativeConfigH = 0;
-    // NVENC uses an infinite GOP here. Once a P-frame is dropped, every later P-frame
-    // can reference an image the guest never received, so never forward deltas until
-    // a fresh IDR re-establishes a clean reference chain.
+    // HARD gate — set ONLY when the decoder truly cannot make progress on a P-frame:
+    // a config/announce change, a channel that dropped mid-frame (partial access unit),
+    // or a guest-reported decode stall. While set, P-frames are dropped until the next
+    // IDR re-establishes a clean reference chain. NEVER set this for backpressure or
+    // the periodic safety-net IDR — those request a recovery keyframe but keep frames
+    // flowing (transient artifacts beat a frozen stream under high motion).
     let nativeAwaitKey = false;
+    // SOFT recovery — an IDR has been requested but P-frames are still being forwarded.
+    // Used by the HUD to surface "artifacting, recovering" without freezing the picture.
+    let nativeRecovering = false;
     let nativeKeyRequestAt = 0;
+    let nativeArtifactEvents = 0; // count of soft-recovery armings (HUD "artifacts")
+    let nativeRecoveredEvents = 0; // count of clean IDR arrivals that closed a recovery
     const requestNativeKeyframe = () => {
       const now = performance.now();
       // Coalesce capture-rate calls while Rust's atomic request is still pending.
@@ -1267,6 +1277,15 @@ export function startHost(opts: HostOptions): () => void {
       } catch {
         /* not on desktop / no native encoder */
       }
+    };
+    /** Arm soft recovery: request an IDR but keep P-frames flowing so the stream
+     *  never freezes. Transient artifacting is expected until the IDR lands. */
+    const armNativeRecovery = () => {
+      if (!nativeRecovering) {
+        nativeRecovering = true;
+        nativeArtifactEvents++;
+      }
+      requestNativeKeyframe();
     };
     nativeSink = (payload, key, w = 0, h = 0) => {
       if (videoCh.readyState !== "open") return;
@@ -1280,26 +1299,37 @@ export function startHost(opts: HostOptions): () => void {
         } catch {
           /* guest resyncs from the next announce / keyframe */
         }
-        // A decoder configuration/resize must be followed by a complete access unit.
+        // A decoder configuration/resize genuinely cannot decode a P-frame sent under
+        // the old SPS — HARD-gate until the IDR arrives.
         if (!key) nativeAwaitKey = true;
         requestNativeKeyframe();
       }
       // The native path previously ignored `wcKeyMs`, so a decoder fault could live
-      // forever. Its periodic IDR is also the final safety net for corruption the
-      // guest cannot report explicitly.
+      // forever. Its periodic IDR is the final safety net for corruption the guest
+      // cannot report explicitly. This is a SOFT recovery — keep forwarding so motion
+      // scenes don't stall waiting for the IDR to land.
       if (!key && performance.now() - wcLastKeyAt >= quality.wcKeyMs) {
-        nativeAwaitKey = true;
-        requestNativeKeyframe();
+        armNativeRecovery();
       }
+      // HARD gate: only set on a true reference-chain break (config/resize/partial AU).
       if (nativeAwaitKey && !key) return;
-      if (key) nativeAwaitKey = false;
+      if (key) {
+        // A clean IDR closes any open soft-recovery window AND the hard gate.
+        if (nativeRecovering) {
+          nativeRecoveredEvents++;
+          nativeRecovering = false;
+        }
+        nativeAwaitKey = false;
+      }
       const pace = clamp(quality.pace, 0, 100) / 100;
       const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
       const buffered = videoCh.bufferedAmount;
       if (buffered > maxBuffered) {
+        // Backpressure: skip THIS frame (latest-wins) but do NOT gate subsequent
+        // P-frames — that was the high-motion freeze. The dropped P-frame may cause
+        // a brief artifact on the guest; arm a soft recovery IDR to clean it up.
         wcSkipped++;
-        nativeAwaitKey = true;
-        requestNativeKeyframe();
+        armNativeRecovery();
         adaptFromBuffer(buffered, maxBuffered, true);
         return;
       }
@@ -1308,8 +1338,10 @@ export function startHost(opts: HostOptions): () => void {
       // clock, and now that a frame is ~30KB instead of 334KB the IPC hop it folds
       // into the measurement is small (it lands in `net+enc`, never unaccounted).
       if (!wcSendBytes(payload, key, performance.now())) {
+        // Channel threw mid-frame — the guest received a partial access unit, which
+        // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
         nativeAwaitKey = true;
-        requestNativeKeyframe();
+        armNativeRecovery();
       }
     };
 
@@ -1331,6 +1363,7 @@ export function startHost(opts: HostOptions): () => void {
       nativeConfigW = 0;
       nativeConfigH = 0;
       nativeAwaitKey = true;
+      nativeRecovering = false;
       try {
         api.remoteSetCaptureNative(false);
       } catch {
@@ -2081,6 +2114,15 @@ export function startHost(opts: HostOptions): () => void {
                           kbpsMax: Math.round((adaptKbps > 0 ? adaptKbps : wcTargetBps() / 1000)),
                           adaptKbps: Math.round(adaptKbps),
                           targetKbps: targetKbps(),
+                          // Artifact / recovery telemetry for the HUD. The host is the
+                          // single source of truth: it knows every backpressure skip,
+                          // every soft-recovery arming, and every clean IDR that closed
+                          // one. `recovering` flips true the moment a soft recovery is
+                          // armed and false when the IDR lands — the phone shows
+                          // "artifacting, recovering" while this is true.
+                          artifacts: nativeArtifactEvents,
+                          recovered: nativeRecoveredEvents,
+                          recovering: nativeRecovering,
                         }
                       : { on: false },
                   // Audio path telemetry for the phone HUD.

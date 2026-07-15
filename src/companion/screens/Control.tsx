@@ -139,6 +139,10 @@ type HostWcStats = {
   adaptKbps?: number;
   /** Tune-panel target the adaptive layer eases back toward. */
   targetKbps?: number;
+  /** Host-side artifact/recovery counters (see rtcHost.ts nativeSink). */
+  artifacts?: number;
+  recovered?: number;
+  recovering?: boolean;
 };
 type HostAudioStats = {
   mode: "pcm" | "rtc";
@@ -2889,19 +2893,17 @@ export function ControlScreen({
         </div>
       )}
 
-      {/* ---- performance / debug HUD (dense 2-col — double the telemetry, same footprint) ---- */}
+      {/* ---- performance / debug HUD — full-width bottom strip, shorter + closable ---- */}
       {showStats && !immersive && !topCollapsed && !pipView && (
         <StatVerboseCtx.Provider value={statsVerbose}>
         <div
-          className={`absolute right-2 top-2 z-30 ${
-            // Expanded cells span both columns and carry a description line, so the
-            // panel needs the room — and a scroll cap, since it gets tall.
-            statsVerbose ? "max-h-[86vh] w-[23rem] overflow-y-auto" : "w-[18.5rem]"
-          } max-w-[94vw] rounded-xl border border-white/[0.1] bg-black/70 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md`}
+          className={`absolute bottom-2 left-2 right-2 z-30 mx-auto max-w-[110rem] rounded-xl border border-white/[0.1] bg-black/75 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md ${
+            statsVerbose ? "max-h-[60vh] overflow-y-auto" : ""
+          }`}
           style={statsVerbose ? { scrollbarWidth: "thin" } : undefined}
         >
-          <div className="mb-1 flex items-center justify-between gap-1.5">
-            <span className="flex items-center gap-1 text-[10px] font-800 text-white">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-1.5">
+            <span className="flex flex-wrap items-center gap-1 text-[10px] font-800 text-white">
               <Gauge className="h-3 w-3 text-accent-3" /> Stream stats
               <span className={`rounded px-1 py-0.5 text-[8px] font-800 ${wcStats ? "bg-green/20 text-green" : "bg-white/[0.08] text-ink-soft"}`}>
                 {wcStats ? "DIRECT" : hasStream ? "RTC" : "LAN"}
@@ -2924,6 +2926,19 @@ export function ControlScreen({
                   {audioStats.mode === "pcm" ? "AUD·DIRECT" : "AUD·RTC"}
                 </span>
               ) : null}
+              {/* Live recovery indicator — pulses while the host has an outstanding
+                  recovery IDR but is still forwarding P-frames (transient artifacting).
+                  Shown only when actively recovering so a clean stream stays clean. */}
+              {(wcStats?.recovering || hostStats?.wc?.recovering) && (
+                <motion.span
+                  animate={{ opacity: [1, 0.4, 1] }}
+                  transition={{ duration: 1, repeat: Infinity, ease: "easeInOut" }}
+                  className="rounded bg-amber/25 px-1 py-0.5 text-[8px] font-800 text-amber"
+                  title="Stream had a transient artifact; a clean keyframe is on the way"
+                >
+                  RECOVERING
+                </motion.span>
+              )}
             </span>
             <span className="flex items-center gap-1">
               {(() => {
@@ -2953,11 +2968,64 @@ export function ControlScreen({
               >
                 <Info className="h-2.5 w-2.5" />
               </button>
+              {/* Close button — the panel is full-width so a corner tap to dismiss
+                  isn't obvious. Explicit X keeps the escape hatch visible. */}
+              <button
+                type="button"
+                onClick={() => setShowStats(false)}
+                title="Close stats"
+                className="grid h-4 w-4 shrink-0 place-items-center rounded bg-white/[0.08] text-ink-dim hover:bg-red/30 hover:text-white"
+              >
+                <X className="h-2.5 w-2.5" />
+              </button>
             </span>
           </div>
+          {/* Artifact / recovery summary row — always visible so the user can see
+              when the stream had to recover (and that it did). Prominent because
+              "is the stream healthy?" is the question the HUD exists to answer. */}
+          {(() => {
+            const artifacts = hostStats?.wc?.artifacts ?? wcStats?.artifacts ?? 0;
+            const recovered = hostStats?.wc?.recovered ?? wcStats?.recovered ?? 0;
+            const guestErr = wcStats?.guestErrors ?? 0;
+            const skipped = hostStats?.wc?.skipped ?? 0;
+            if (!artifacts && !recovered && !guestErr && !skipped) return null;
+            const recovering = wcStats?.recovering || hostStats?.wc?.recovering;
+            return (
+              <div className="mb-1 flex flex-wrap items-center gap-1 rounded-md bg-white/[0.04] px-1.5 py-0.5 text-[9px]">
+                <span className={`font-800 ${recovering ? "text-amber" : "text-ink-dim"}`}>
+                  {recovering ? "Artifacting — recovering" : "Recovered"}
+                </span>
+                <span className="text-ink-faint">·</span>
+                <span className="tabular-nums text-ink-soft">
+                  events <span className="font-700 text-white">{artifacts}</span>
+                </span>
+                <span className="text-ink-faint">·</span>
+                <span className="tabular-nums text-green">
+                  cleaned <span className="font-700">{recovered}</span>
+                </span>
+                {guestErr > 0 && (
+                  <>
+                    <span className="text-ink-faint">·</span>
+                    <span className="tabular-nums text-amber">
+                      phone err <span className="font-700">{guestErr}</span>
+                    </span>
+                  </>
+                )}
+                {skipped > 0 && (
+                  <>
+                    <span className="text-ink-faint">·</span>
+                    <span className="tabular-nums text-ink-soft">
+                      skipped <span className="font-700">{skipped}</span>
+                    </span>
+                  </>
+                )}
+              </div>
+            );
+          })()}
           {wcStats ? (
-            /* Direct WebCodecs path — per-stage latency is measured, not inferred. */
-            <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+            /* Direct WebCodecs path — per-stage latency is measured, not inferred.
+             * Wide grid (4 cols on roomy screens) keeps the strip short. */
+            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 sm:grid-cols-3 lg:grid-cols-4">
               <StatCell k="Display" v={`${fps} fps`} />
               <StatCell k="Decode" v={`${wcStats.fps} fps`} />
               <StatCell k="Res out" v={res || "—"} />
@@ -2976,7 +3044,7 @@ export function ControlScreen({
               <StatCell k="JB tgt/min" v="bypassed" />
             </div>
           ) : (
-            <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 sm:grid-cols-3 lg:grid-cols-4">
               <StatCell k="Display" v={`${fps} fps`} />
               <StatCell k="Decode" v={net ? `${net.fps} fps` : "—"} />
               <StatCell k="Res out" v={net && net.w ? `${net.w}×${net.h}` : res || "—"} />
@@ -3001,7 +3069,7 @@ export function ControlScreen({
           {hostStats && (
             <>
               <div className="my-1 border-t border-white/[0.08]" />
-              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 sm:grid-cols-3 lg:grid-cols-4">
                 <StatCell k="Host prod" v={`${hostStats.producedFps ?? "–"}/${hostStats.fps}`} />
                 <StatCell k="Send fps" v={hostStats.rtc ? `${hostStats.rtc.sendFps}` : "—"} />
                 <StatCell k="Cap/scl" v={`${hostStats.captureMs.toFixed(0)}·${hostStats.scaleMs.toFixed(0)}`} />
@@ -3047,6 +3115,15 @@ export function ControlScreen({
                         hi={(hostStats.wc.adaptKbps ?? 0) < (hostStats.wc.targetKbps ?? 0) * 0.7}
                       />
                     )}
+                    {/* Per-session artifact/recovery counters. Pulses red while a
+                        recovery is in flight so a healthy stream stays green. */}
+                    <StatCell
+                      k="Artifacts"
+                      v={`${hostStats.wc.artifacts ?? 0}`}
+                      hi={(hostStats.wc.artifacts ?? 0) > 0 && !!hostStats.wc.recovering}
+                    />
+                    <StatCell k="Recovered" v={`${hostStats.wc.recovered ?? 0}`} />
+                    <StatCell k="Guest err" v={`${wcStats?.guestErrors ?? 0}`} hi={(wcStats?.guestErrors ?? 0) > 4} />
                   </>
                 )}
               </div>
@@ -3056,7 +3133,7 @@ export function ControlScreen({
           {(audioStats || hostStats?.audio) && (
             <>
               <div className="my-1 border-t border-white/[0.08]" />
-              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 sm:grid-cols-3 lg:grid-cols-4">
                 <StatCell k="Audio" v={(audioStats?.mode ?? hostStats?.audio?.mode ?? "rtc").toUpperCase()} />
                 <StatCell
                   k="A-buf"
@@ -4352,7 +4429,19 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
     long: "Adaptive bitrate",
     info: "Live encode bitrate the PC shed down to when your phone's network couldn't drain the channel, easing back toward the Tune target when it clears. Stops a Wi-Fi dip from turning into a 14fps slideshow of skipped frames.",
   },
-  Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound (lean ~35ms). RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
+  Artifacts: {
+    long: "Artifact events",
+    info: "Cumulative times the PC armed a soft recovery (backpressure skip or the periodic safety-net IDR) this session. Each one may cause a brief burst of macroblocking until the recovery IDR lands. A slow, steady climb during high-motion scenes is normal; a fast spike with no recovery means the link is undersized.",
+  },
+  Recovered: {
+    long: "Clean recoveries",
+    info: "How many of the artifact events were closed out by a clean IDR arriving. Should track Artifacts over time — a widening gap means the recovery IDRs themselves are being lost (the link is shedding keyframes too).",
+  },
+  "Guest err": {
+    long: "Phone decode errors",
+    info: "Times the phone's decoder reported an error and asked the PC for a keyframe. A climbing count on the WebCodecs path usually means the H.264 stream hit a reference the decoder couldn't reconcile; on the native path it's the bridge's own fault count.",
+  },
+  Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound (lean ~18ms). RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
   "A-buf": { long: "Audio playout buffer", info: "How much sound is sitting on the phone before it plays. DIRECT only — RTC uses the browser's NetEQ instead." },
   "A-tgt": { long: "Audio buffer target", info: "What the DIRECT worklet steers toward. Grows briefly after an underrun, then eases back." },
   "A ↓": { long: "Audio download rate", info: "PCM bytes arriving per second on DIRECT. Opus on the RTC path isn't counted here." },

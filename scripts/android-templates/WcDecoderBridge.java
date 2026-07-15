@@ -127,19 +127,30 @@ public final class WcDecoderBridge {
   public static boolean probeLowLatency() {
     String name = pickDecoderName();
     if (name == null) return false;
+    // IMPORTANT: probe must NOT instantiate a real MediaCodec. The previous
+    // implementation called supportsKnownVendorParameter(name), which does
+    // MediaCodec.createByCodecName + getSupportedVendorParameters — on some
+    // Qualcomm/MTK drivers that leaves the codec in a state that breaks the
+    // LATER real init(), producing "MediaCodec unavailable" fallbacks on
+    // devices that have a perfectly good hardware decoder. The name-based
+    // heuristic (low_latency / low-latency in the decoder name) and the
+    // FEATURE_LowLatency capability check are both pure introspection and
+    // sufficient for the boolean probe.
     try {
       MediaCodecInfo info = findInfo(name);
-      if (info == null) return false;
+      if (info == null) {
+        // No capability introspection possible — fall back to the name heuristic.
+        String lower = name.toLowerCase();
+        return lower.contains("low_latency") || lower.contains("low-latency");
+      }
       MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(MIME);
       if (Build.VERSION.SDK_INT >= 30) {
         return caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
             || name.toLowerCase().contains("low_latency")
-            || name.toLowerCase().contains("low-latency")
-            || supportsKnownVendorParameter(name);
+            || name.toLowerCase().contains("low-latency");
       }
       return name.toLowerCase().contains("low_latency")
-          || name.toLowerCase().contains("low-latency")
-          || supportsKnownVendorParameter(name);
+          || name.toLowerCase().contains("low-latency");
     } catch (Exception e) {
       return false;
     }
@@ -618,6 +629,12 @@ public final class WcDecoderBridge {
         started.set(true);
         awaitKey.set(true);
         csdQueued.set(false);
+        // Successful start clears any prior error: the progressive ladder may
+        // have logged a configure/start failure on an earlier attempt, and that
+        // stale string would otherwise be reported forever by statsError() —
+        // which the JS poll surfaces as a "decoder error" toast even though the
+        // codec is now running fine.
+        lastError.set("");
         Log.i(
             TAG,
             "MediaCodec started name="
@@ -713,6 +730,11 @@ public final class WcDecoderBridge {
             // Render immediately to the Surface (Moonlight/deskstream path).
             codec.releaseOutputBuffer(index, true);
             frames.incrementAndGet();
+            // Codec is producing frames → any prior error is stale. Clear it so
+            // statsError() stops reporting a configure-time failure that the
+            // progressive ladder already recovered from.
+            String le = lastError.get();
+            if (le != null && !le.isEmpty()) lastError.set("");
           } catch (Exception e) {
             lastError.set(String.valueOf(e.getMessage()));
           }

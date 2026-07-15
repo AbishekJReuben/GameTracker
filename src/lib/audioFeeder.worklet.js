@@ -37,10 +37,14 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     this.avail = 0; // interleaved samples currently buffered
     // Envelope (ms): prime, steer toward target, trim runaway latency.
     // Defaults = lean DIRECT profile; the host RTC path widens these via cfg.
-    this.primeMs = 25;
-    this.targetMs = 40;
-    this.maxMs = 120;
-    this.baseTargetMs = 40;
+    // Latency floor (12ms prime / 18ms target) is tuned for the DIRECT path:
+    // the data channel delivers PCM in bursts but the AudioWorklet runs at
+    // audio-thread priority, so a small buffer clears faster after a stall
+    // and keeps total audio latency within one frame of the video path.
+    this.primeMs = 12;
+    this.targetMs = 18;
+    this.maxMs = 90;
+    this.baseTargetMs = 18;
     this.priming = true;
     this.gain = 0;
     // Resampler state: interpolating between input frames f0 and f1, phase∈[0,1).
@@ -187,14 +191,17 @@ class GtPcmFeeder extends AudioWorkletProcessor {
       this.underruns++;
       // Bursty delivery (game hogging the CPU delays chunk forwarding): hold
       // more audio before resuming so the next gap fits inside the buffer.
-      this.targetMs = Math.min(this.maxMs, this.targetMs + 25);
+      // Step is +12ms (was 25) so a single underrun can't blow past the video
+      // path's latency budget; repeated underruns still climb toward maxMs.
+      this.targetMs = Math.min(this.maxMs, this.targetMs + 12);
       // Ran fully dry → refill to PRIME before resuming (prevents machine-gun
       // clicking when the stream is briefly starved).
       if (this.avail < this.channels) this.priming = true;
-    } else if (++this.cleanQuanta * frames > sampleRate * 10 && this.targetMs > this.baseTargetMs) {
-      // ~10s clean → ease latency back down one step.
+    } else if (++this.cleanQuanta * frames > sampleRate * 6 && this.targetMs > this.baseTargetMs) {
+      // ~6s clean (was 10) → ease latency back down one step. Faster ease-back
+      // keeps the post-underrun dwell short so total audio lag tracks the video.
       this.cleanQuanta = 0;
-      this.targetMs = Math.max(this.baseTargetMs, this.targetMs - 10);
+      this.targetMs = Math.max(this.baseTargetMs, this.targetMs - 6);
     }
     return true;
   }
