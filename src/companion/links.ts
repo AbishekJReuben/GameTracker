@@ -68,6 +68,8 @@ export type QualitySettings = {
   wcBufKB?: number;
   /** Host/DIRECT: latest-wins encoder-queue ceiling, before `pace` widens it. */
   wcQueueMax?: number;
+  /** Host: allow native NVENC encode (false = force the JPEG→WebCodecs path). */
+  hostNvenc?: boolean;
 };
 
 export interface RemoteLink {

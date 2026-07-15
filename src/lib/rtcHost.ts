@@ -398,6 +398,9 @@ export function startHost(opts: HostOptions): () => void {
     wcKeyMs: WC_KEY_INTERVAL_MS,
     wcBufKB: WC_MAX_BUFFERED / 1024,
     wcQueueMax: 2,
+    // Let Rust encode natively (NVENC). The phone can turn this off to fall back to
+    // the long-standing JPEG→canvas→WebCodecs path.
+    hostNvenc: true,
   };
 
   // When set, composited frames are diverted from the WebRTC generator track into
@@ -1226,7 +1229,7 @@ export function startHost(opts: HostOptions): () => void {
       // the canvas path has to be ready to carry the stream.
       let nativeOk = false;
       try {
-        nativeOk = await api.remoteSetCaptureNative(true);
+        nativeOk = quality.hostNvenc && (await api.remoteSetCaptureNative(true));
       } catch {
         /* not on desktop */
       }
@@ -1492,6 +1495,30 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.wcKeyMs === "number") quality.wcKeyMs = clamp(msg.wcKeyMs, 1000, 30000);
           if (typeof msg.wcBufKB === "number") quality.wcBufKB = clamp(msg.wcBufKB, 64, 1024);
           if (typeof msg.wcQueueMax === "number") quality.wcQueueMax = clamp(msg.wcQueueMax, 1, 6);
+          // Native encode on/off takes effect live — the whole point is to A/B it (or
+          // escape a bad picture) without reconnecting. Only meaningful while DIRECT
+          // is up; wcActivate reads `quality.hostNvenc` when it isn't.
+          if (typeof msg.hostNvenc === "boolean" && msg.hostNvenc !== quality.hostNvenc) {
+            quality.hostNvenc = msg.hostNvenc;
+            if (wcSink || nativeActive) {
+              try {
+                void api.remoteSetCaptureNative(quality.hostNvenc);
+              } catch {
+                /* not on desktop */
+              }
+              // Turning it OFF hands the stream to a different encoder mid-GOP, so the
+              // guest's decoder needs a fresh keyframe from whoever takes over.
+              wcForceKey = true;
+              if (!quality.hostNvenc) {
+                nativeActive = false;
+                // No webview encoder to hand off to (a host with NVENC but no
+                // WebCodecs): DIRECT has nothing left to produce frames, so drop to
+                // the RTC track now rather than let the guest stare at a dead channel
+                // until its stall watchdog fires ~12s later.
+                if (!wcSink) wcTeardown(true);
+              }
+            }
+          }
           try {
             api.remoteSetCaptureQuality(
               quality.maxW,

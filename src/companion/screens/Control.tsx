@@ -994,6 +994,7 @@ export function ControlScreen({
       wcKeyMs: tune.wcKeyMs,
       wcBufKB: tune.wcBufKB,
       wcQueueMax: tune.wcQueueMax,
+      hostNvenc: tune.hostNvenc,
     }),
     [tune],
   );
@@ -3181,6 +3182,29 @@ export function ControlScreen({
                     Decode H.264 straight off the data channel instead of using the browser's video pipeline — skips the
                     jitter buffer entirely, which is the single biggest chunk of lag. Leave ON; turn it off only to
                     A/B against the RTC path. The header badge shows which one is actually live right now.
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    PC encoder (NVENC) <ScopeTag scope="host" />
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => patchTune({ hostNvenc: !tune.hostNvenc })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
+                      tune.hostNvenc ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tune.hostNvenc ? "ON" : "OFF"}
+                  </button>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    <b className="text-ink-dim">ON</b>: the PC encodes the screen itself on the GPU (~1ms/frame) and
+                    sends finished H.264. <b className="text-ink-dim">OFF</b>: the older path — the PC sends JPEGs and
+                    the browser re-encodes them (~35ms/frame, but long-proven). Flip to OFF if the picture goes choppy
+                    or patches stop refreshing. No effect on a PC without an NVIDIA encoder. The header shows an
+                    <b className="text-ink-dim"> NVENC</b> badge whenever it's actually live.
                   </p>
                 )}
                 <button

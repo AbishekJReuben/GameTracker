@@ -53,6 +53,13 @@ export type StreamTune = {
   jbGrowAt: number;
   /** Guest/DIRECT: backoff floor before re-attempting DIRECT after a soft failure (s). */
   directRetrySec: number;
+  /**
+   * Host: let the PC encode H.264 itself (NVENC on the GPU) instead of shipping JPEGs
+   * for the browser to re-encode. ON is ~1ms host encode vs ~35ms, but it's the newer
+   * path — turn it OFF to fall back to the long-standing JPEG pipeline if the picture
+   * misbehaves. No-op on a PC without NVENC (it's already on the JPEG path).
+   */
+  hostNvenc: boolean;
 };
 
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
@@ -75,6 +82,7 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   wcQueueMax: 2,
   jbGrowAt: 15,
   directRetrySec: 15,
+  hostNvenc: true,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -115,6 +123,9 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     wcQueueMax: clamp(Number(r.wcQueueMax) || d.wcQueueMax, 1, 6),
     jbGrowAt: clamp(Number(r.jbGrowAt) || d.jbGrowAt, 5, 40),
     directRetrySec: clamp(Number(r.directRetrySec) || d.directRetrySec, 5, 120),
+    // Same `!== false` shape as preferDirect: absent (an older saved tune) means the
+    // default, and only an explicit false turns it off.
+    hostNvenc: r.hostNvenc !== false,
   };
 }
 
