@@ -224,11 +224,14 @@ const save = (path, before, after, msg) => {
       `package ${pkg}\n\n` +
       `import android.app.PictureInPictureParams\n` +
       `import android.content.pm.ActivityInfo\n` +
+      `import android.content.pm.PackageManager\n` +
       `import android.content.res.Configuration\n` +
+      `import android.graphics.Rect\n` +
       `import android.os.Build\n` +
       `import android.os.Bundle\n` +
       `import android.util.Rational\n` +
       `import androidx.activity.enableEdgeToEdge\n` +
+      `import androidx.annotation.RequiresApi\n` +
       `import androidx.core.view.WindowInsetsCompat\n` +
       `import androidx.core.view.WindowInsetsControllerCompat\n` +
       `import java.lang.ref.WeakReference\n\n` +
@@ -266,40 +269,71 @@ const save = (path, before, after, msg) => {
       `    // Re-hide after the bars are transiently shown (keyboard, app resume).\n` +
       `    if (hasFocus) hideSystemBars()\n` +
       `  }\n\n` +
-      `  /** Android 12+: auto-enter PiP is armed via params (the OS runs the smooth\n` +
-      `   *  shrink animation itself when the user swipes home — no flicker, exactly\n` +
-      `   *  like YouTube). Re-applied whenever the session-live gate flips. */\n` +
+      `  /** Does this device actually have PiP? (Go/TV/OEM builds may not.) NOTE: no\n` +
+      `   *  SDK_INT check in here — lint can't see version guards through a helper,\n` +
+      `   *  so every caller does its own inline check and minSdk 24 stays buildable. */\n` +
+      `  private fun hasPipFeature(): Boolean =\n` +
+      `    packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)\n\n` +
+      `  /** Shared 16:9 params. \`sourceRectHint\` tells the OS which on-screen rect\n` +
+      `   *  morphs into the mini window — without it the system falls back to a\n` +
+      `   *  content overlay and the shrink looks like a cross-fade rather than the\n` +
+      `   *  seamless YouTube move. */\n` +
+      `  @RequiresApi(Build.VERSION_CODES.O)\n` +
+      `  private fun pipParams(autoEnter: Boolean): PictureInPictureParams {\n` +
+      `    val b = PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9))\n` +
+      `    try {\n` +
+      `      val rect = Rect()\n` +
+      `      window.decorView.getGlobalVisibleRect(rect)\n` +
+      `      if (!rect.isEmpty) b.setSourceRectHint(rect)\n` +
+      `    } catch (_: Exception) {\n` +
+      `      // No layout yet — the OS just uses its default animation.\n` +
+      `    }\n` +
+      `    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {\n` +
+      `      b.setAutoEnterEnabled(autoEnter)\n` +
+      `      b.setSeamlessResizeEnabled(false)\n` +
+      `    }\n` +
+      `    return b.build()\n` +
+      `  }\n\n` +
+      `  /** Android 12+: arm auto-enter so the OS runs the shrink itself on the home\n` +
+      `   *  gesture. Params must be FRESH when the user leaves (the OS reads the last\n` +
+      `   *  snapshot), so this is re-applied when the gate flips and on resume. */\n` +
       `  fun updatePipParams() {\n` +
       `    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return\n` +
+      `    if (!hasPipFeature()) return\n` +
       `    try {\n` +
-      `      setPictureInPictureParams(\n` +
-      `        PictureInPictureParams.Builder()\n` +
-      `          .setAspectRatio(Rational(16, 9))\n` +
-      `          .setAutoEnterEnabled(pipWanted)\n` +
-      `          .setSeamlessResizeEnabled(false)\n` +
-      `          .build()\n` +
-      `      )\n` +
+      `      setPictureInPictureParams(pipParams(pipWanted))\n` +
       `    } catch (_: Exception) {\n` +
-      `      // PiP unavailable (device/settings) — plain backgrounding is fine.\n` +
+      `      // PiP unavailable (device/settings) — the leave-hint path below still tries.\n` +
       `    }\n` +
       `  }\n\n` +
-      `  // Home / recents while connected → floating 16:9 mini window. Legacy path\n` +
-      `  // for Android 8–11 (S+ uses the auto-enter params above; entering again\n` +
-      `  // here would double-trigger, so it's gated to pre-S).\n` +
+      `  override fun onResume() {\n` +
+      `    super.onResume()\n` +
+      `    // Re-arm on every resume: auto-enter reads the most recent params, and a\n` +
+      `    // stale snapshot (set once at onCreate, before the session went live) is a\n` +
+      `    // documented way for auto-enter to quietly do nothing.\n` +
+      `    updatePipParams()\n` +
+      `  }\n\n` +
+      `  // Home / recents while connected → floating 16:9 mini window.\n` +
+      `  //\n` +
+      `  // This runs on ALL API >= O, including 12+ where setAutoEnterEnabled is\n` +
+      `  // supposed to make it unnecessary. That is deliberate: auto-enter silently\n` +
+      `  // no-ops on a number of OEM builds (b/245392106 \"Inconsistent\n` +
+      `  // setAutoEnterEnabled behavior\"), and gating this to pre-S left those devices\n` +
+      `  // with NO picture-in-picture at all and no fallback. Google's wording is that\n` +
+      `  // with auto-enter you \"don't need to\" call this — not that you must not.\n` +
+      `  // The isInPictureInPictureMode guard makes the redundant call a no-op when\n` +
+      `  // auto-enter did fire first.\n` +
       `  override fun onUserLeaveHint() {\n` +
       `    super.onUserLeaveHint()\n` +
-      `    if (\n` +
-      `      pipWanted &&\n` +
-      `      Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&\n` +
-      `      Build.VERSION.SDK_INT < Build.VERSION_CODES.S\n` +
-      `    ) {\n` +
-      `      try {\n` +
-      `        enterPictureInPictureMode(\n` +
-      `          PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()\n` +
-      `        )\n` +
-      `      } catch (_: Exception) {\n` +
-      `        // PiP unavailable (device/settings) — plain backgrounding is fine.\n` +
-      `      }\n` +
+      `    // Inline SDK check (not folded into hasPipFeature) so lint's NewApi can\n` +
+      `    // see it — minSdk is 24 and the PiP APIs below are 26.\n` +
+      `    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return\n` +
+      `    if (!pipWanted || !hasPipFeature()) return\n` +
+      `    if (isInPictureInPictureMode) return\n` +
+      `    try {\n` +
+      `      enterPictureInPictureMode(pipParams(pipWanted))\n` +
+      `    } catch (_: Exception) {\n` +
+      `      // PiP unavailable (device/settings) — plain backgrounding is fine.\n` +
       `    }\n` +
       `  }\n\n` +
       `  override fun onPictureInPictureModeChanged(\n` +

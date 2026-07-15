@@ -391,6 +391,13 @@ export function startHost(opts: HostOptions): () => void {
     bitrateHeadroom: 1.4,
     minBitrateKbps: 1500,
     startBitrateKbps: 8000,
+    // "Feel" slider (0 = responsiveness, 100 = smoothness). Host-side it only
+    // widens the latest-wins skip thresholds — the guest does the actual pacing.
+    pace: 0,
+    // DIRECT-path knobs from the Tune panel; `pace` scales the last two on top.
+    wcKeyMs: WC_KEY_INTERVAL_MS,
+    wcBufKB: WC_MAX_BUFFERED / 1024,
+    wcQueueMax: 2,
   };
 
   // When set, composited frames are diverted from the WebRTC generator track into
@@ -1023,6 +1030,7 @@ export function startHost(opts: HostOptions): () => void {
     let wcBytes = 0;
     let wcKeys = 0;
     let wcSkipped = 0;
+    let wcErrors = 0; // transient encoder faults; enough of them → wcDead
     let wcDead = false; // hard failure this session — don't retry until a new peer
 
     const wcTargetBps = () => (quality.bitrate > 0 ? quality.bitrate * 1000 : bitrateFor(quality));
@@ -1057,8 +1065,13 @@ export function startHost(opts: HostOptions): () => void {
       }
     };
 
-    /** Stop the wc path. `notifyGuest` asks the phone to fall back to the track. */
-    const wcTeardown = (notifyGuest: boolean) => {
+    /**
+     * Stop the wc path. `notifyGuest` asks the phone to fall back to the track.
+     * `permanent` tells it not to bother asking again this session (no encoder at
+     * all) — omit it for transient faults so the guest's retry can bring DIRECT
+     * back instead of stranding the session on RTC's jitter buffer.
+     */
+    const wcTeardown = (notifyGuest: boolean, permanent = false) => {
       wcSink = null;
       try {
         wcEncoder?.close();
@@ -1070,7 +1083,7 @@ export function startHost(opts: HostOptions): () => void {
       wcH = 0;
       if (notifyGuest && dataCh?.readyState === "open") {
         try {
-          dataCh.send(JSON.stringify({ event: "vmode", mode: "rtc" }));
+          dataCh.send(JSON.stringify({ event: "vmode", mode: "rtc", permanent }));
         } catch {
           /* ignore */
         }
@@ -1101,9 +1114,17 @@ export function startHost(opts: HostOptions): () => void {
             avc: { format: "annexb" },
           });
         } catch (e) {
-          console.warn("[remote] wc encoder configure failed — falling back to the RTC track:", e);
-          wcDead = true;
-          wcTeardown(true);
+          // Configure is per size/bitrate/fps, so a rejection here is about THIS
+          // shape, not the encoder as a whole — dropping the Res slider can make
+          // the very next attempt succeed. Stay retryable.
+          wcErrors++;
+          const permanent = wcErrors > 3;
+          if (permanent) wcDead = true;
+          console.warn(
+            `[remote] wc encoder configure failed at ${w}×${h} (${wcErrors})${permanent ? " — DIRECT off for this session" : " — will retry"}:`,
+            e,
+          );
+          wcTeardown(true, permanent);
           return;
         }
         wcW = w;
@@ -1119,11 +1140,18 @@ export function startHost(opts: HostOptions): () => void {
       }
       // Latest-wins: a backlog in the channel or the encoder can only ever AGE the
       // stream — skip this frame and let the next one carry the fresher pixels.
-      if (videoCh.bufferedAmount > WC_MAX_BUFFERED || enc.encodeQueueSize > 2) {
+      // The "Feel" slider widens how much backlog is tolerated before skipping:
+      // dropped frames are what make motion look choppy, so smoothness buys
+      // evenness by accepting staleness the responsive end refuses. The Tune
+      // panel sets the base ceilings; pace scales them from there.
+      const pace = clamp(quality.pace, 0, 100) / 100;
+      const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
+      const maxQueue = quality.wcQueueMax + Math.round(pace * 2);
+      if (videoCh.bufferedAmount > maxBuffered || enc.encodeQueueSize > maxQueue) {
         wcSkipped++;
         return;
       }
-      const key = wcForceKey || performance.now() - wcLastKeyAt > WC_KEY_INTERVAL_MS;
+      const key = wcForceKey || performance.now() - wcLastKeyAt > quality.wcKeyMs;
       wcForceKey = false;
       const vf = new VideoFrame(canvas, { timestamp: Math.round(performance.now() * 1000) });
       try {
@@ -1139,8 +1167,10 @@ export function startHost(opts: HostOptions): () => void {
     const wcActivate = async () => {
       if (wcSink || wcDead || pc !== myPc) return;
       if (typeof VideoEncoder === "undefined") {
+        // No WebCodecs at all in this webview — genuinely hopeless, tell the
+        // guest to stop asking.
         wcDead = true;
-        wcTeardown(true);
+        wcTeardown(true, true);
         return;
       }
       // Probe at 4K60 so a codec accepted here always covers the live resolution.
@@ -1172,8 +1202,9 @@ export function startHost(opts: HostOptions): () => void {
       }
       if (pc !== myPc || wcSink) return; // superseded while probing
       if (!picked) {
+        // Nothing on the H.264 ladder encodes here — no amount of retrying helps.
         wcDead = true;
-        wcTeardown(true);
+        wcTeardown(true, true);
         return;
       }
       wcCodec = picked;
@@ -1185,9 +1216,18 @@ export function startHost(opts: HostOptions): () => void {
           wcSend(chunk);
         },
         error: (e) => {
-          console.warn("[remote] wc encoder error — falling back to the RTC track:", e);
-          wcDead = true;
-          wcTeardown(true);
+          // A single encoder fault used to kill DIRECT for the whole session.
+          // Drop to RTC so the screen keeps moving, but stay retryable — the
+          // guest re-asks on its backoff and we rebuild. Only give up for good
+          // once the encoder proves it's reliably broken.
+          wcErrors++;
+          const permanent = wcErrors > 3;
+          if (permanent) wcDead = true;
+          console.warn(
+            `[remote] wc encoder error (${wcErrors}) — falling back to the RTC track${permanent ? " for this session" : ", will retry"}:`,
+            e,
+          );
+          wcTeardown(true, permanent);
         },
       });
       wcW = 0; // force configure on the first frame
@@ -1366,6 +1406,10 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.bitrateHeadroom === "number") quality.bitrateHeadroom = clamp(msg.bitrateHeadroom, 1.0, 2.5);
           if (typeof msg.minBitrateKbps === "number") quality.minBitrateKbps = clamp(msg.minBitrateKbps, 500, 8000);
           if (typeof msg.startBitrateKbps === "number") quality.startBitrateKbps = clamp(msg.startBitrateKbps, 1000, 20000);
+          if (typeof msg.pace === "number") quality.pace = clamp(msg.pace, 0, 100);
+          if (typeof msg.wcKeyMs === "number") quality.wcKeyMs = clamp(msg.wcKeyMs, 1000, 30000);
+          if (typeof msg.wcBufKB === "number") quality.wcBufKB = clamp(msg.wcBufKB, 64, 1024);
+          if (typeof msg.wcQueueMax === "number") quality.wcQueueMax = clamp(msg.wcQueueMax, 1, 6);
           try {
             api.remoteSetCaptureQuality(
               quality.maxW,

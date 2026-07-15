@@ -798,6 +798,92 @@ not regress):**
   gate. Host encoder-stall watchdog is gated on `!wcSink` (0 RTP fps is HEALTHY in wc mode).
   Latest-wins everywhere: frames are skipped when `videoCh.bufferedAmount > 256KB` or
   `encodeQueueSize > 2` — a backlog can only become latency.
+
+**v3.9.24 DIRECT is sticky, RTC is a waiting room (do not regress):**
+- **No fallback may latch DIRECT off for the session.** Every revert used to set
+  `wcSupported = false` / host `wcDead = true`, so ONE transient stall stranded the
+  session on RTC's jitter buffer — the whole thing the path exists to avoid — until
+  the user refreshed the page or restarted the app. Now `wcSupported` means **device
+  capability only** (no usable `VideoDecoder`; never set it for a runtime fault), and
+  soft failures arm `wcRetryAt` with a 15s→120s backoff that the watchdog re-attempts
+  via `wcEligible()`. A clean stretch on DIRECT resets the backoff.
+- **`{event:"vmode",mode:"rtc"}` now carries `permanent`.** True only when the host has
+  no `VideoEncoder` / no codec on the ladder → guest sets `wcHostRefused` (cleared on
+  the next peer session). Transient host faults (encoder error, configure rejected at
+  a given size) send `permanent:false`, count toward `wcErrors`, and only go `wcDead`
+  after >3 — so lowering Res can revive DIRECT. Pre-3.9.24 hosts send no flag; the
+  guest treats that as retryable (backoff caps the cost of asking a hopeless host).
+- **Guest probes the SAME codec ladder as the host** (`WC_CODECS`, High→Main→Baseline).
+  It used to probe only `avc1.640034`, so any device topping out at Main/Baseline fell
+  back to RTC permanently.
+- **Leaving VR re-opts in.** `wcFallback(reason, hard=true)` blocks retries while
+  immersive; the exit path must clear `wcRetryAt` or flat Quest stays on RTC.
+- **"Feel" slider (Quality dock, `tune.pace` 0–100, default 0 = responsiveness).**
+  VIDEO ONLY — input latency must never key off it. 0 is byte-for-byte the shipped
+  behavior (paint on decode, JB base 40). Above 0 it buys even cadence with delay:
+  guest holds each decoded frame to `capturedAtGuest + EWMA(e2e) + pace*0.6ms` (a
+  CONSTANT offset off the clock-synced host capture time — pacing off *arrival* time
+  just re-prints the jitter), capped at 150ms wait / 6 queued frames; `pace*0.6` also
+  lifts the RTC jitter-buffer floor, and the host widens its latest-wins thresholds
+  (`bufferedAmount` ×(1+pace), `encodeQueueSize` 2→4). `wcE2eMs` is measured BEFORE
+  pacing — folding our own delay back in would ratchet the target upward.
+- **Tune panel is self-documenting.** Every row carries a `hint` (what it does + which
+  way to drag) and a `ScopeTag` (`host`/`direct`/`rtc`/`both`) — several knobs are
+  no-ops on the live path (JB rows do nothing on DIRECT; Send/Enc-max do nothing when
+  DIRECT is up), which was invisible before. `TuneSection` groups them. The "Info"
+  toggle folds hints away; new rows MUST ship a hint + scope.
+- **Formerly-hardcoded knobs now in Tune:** `wcKeyMs` (host DIRECT keyframe cadence,
+  was `WC_KEY_INTERVAL_MS`), `wcBufKB` + `wcQueueMax` (host latest-wins bases, which
+  `pace` then scales), `jbGrowAt` (guest RTC drop ratio that grows the JB, was a bare
+  `0.15`), `directRetrySec` (DIRECT retry backoff floor). Host knobs ride the existing
+  `quality` message; guest knobs go through `applyStreamTune`.
+- **Dock clears curved screen edges.** The bottom bar carries
+  `paddingLeft/Right: max(0.75rem, env(safe-area-inset-left/right))` — Android reports
+  a **0 inset for a curved edge** (only cutouts are reported), so a bare `env()` fixes
+  nothing and the `max()` floor does the real work. Tab strip trimmed to match
+  (`h-9`→`h-8`, icons `h-5`→`h-4`, `py-1.5`→`py-1`, own `px-1.5` dropped since the
+  container now owns edge spacing) so Mouse and Disconnect stay off the bend.
+- **Auto-PiP: `onUserLeaveHint` is NO LONGER gated to pre-S** (`patch-android.mjs`).
+  Relying on `setAutoEnterEnabled` alone on Android 12+ left devices where auto-enter
+  silently no-ops (b/245392106) with **no PiP at all and no fallback** — the reported
+  "auto pip is not working". The leave-hint path now runs on every API ≥ O, guarded by
+  `isInPictureInPictureMode` so it's a no-op when auto-enter did fire. Google's wording
+  is you "don't need to" call it under auto-enter, not that you must not. Also added:
+  `setSourceRectHint` (without it the shrink is a cross-fade, not the seamless
+  YouTube move), a `FEATURE_PICTURE_IN_PICTURE` check, and an `onResume` re-arm (the
+  OS reads the LAST params snapshot when the user leaves — a stale one set at
+  `onCreate`, before the session went live, is a documented way to get a silent no-op).
+- **minSdk is 24, so every PiP call site needs an INLINE `SDK_INT` guard.** PiP APIs
+  are 26. Do NOT fold the version check into a helper like `hasPipFeature()` — lint's
+  `NewApi` can't see through a function boundary and `lintVitalRelease` fails the APK
+  build. `pipParams()` carries `@RequiresApi(O)`; each caller checks `SDK_INT` itself.
+- **Web PiP: what is and isn't possible on Chrome Android** (researched — don't
+  re-litigate from memory, the folklore here is wrong in both directions):
+  - **MediaStream-backed video CAN be PiP'd** — `getUserMedia`/`getDisplayMedia`/
+    **`canvas.captureStream()`** have been supported since **Chrome 71**, and the
+    `<video>` need not be in the DOM. Verified locally: `captureStream(0)` → `<video>`
+    → `requestPictureInPicture()` resolves and `pictureInPictureElement` is set. Any
+    claim that "PiP only works for plain `<video src>`, not WebRTC" is FALSE.
+  - **Site-initiated auto-PiP does NOT exist on Android.** The Media Session
+    `enterpictureinpicture` action is **desktop-Chrome only** (Chrome 134+), and even
+    there needs audible-within-2s + audio focus + an MEI threshold — and Chrome 142's
+    *browser*-initiated Auto PiP explicitly excludes players "using `MediaStream`",
+    which is exactly us. Chrome-for-Android's automatic PiP (flag, late 2025) is an
+    **in-browser mini-player on tab switch**, not system PiP on app-switch.
+  - **What Android Chrome does do:** caniuse note #8 — "Automatically plays fullscreen
+    videos in Picture-in-Picture mode after user hits Home Screen button." That's the
+    behaviour people see on other sites; it needs the `<video>` **fullscreen**.
+  - **So:** web gets a **tap-to-PiP** button (`pipSupported` = `pictureInPictureEnabled`
+    && !isTauri). Once the mini window is open it survives leaving the browser, which
+    gets the same end result as auto-PiP for one tap. DIRECT paints a canvas so it has
+    no `<video>`; `pipSourceVideo()` mints one from `canvas.captureStream(0)` on first
+    use (RTC just reuses `videoRef`). Fully automatic PiP on app-switch stays
+    **APK-only** via the Android shell.
+- **Stats HUD has a verbose mode** (Info button in its header, off by default).
+  `STAT_INFO` maps every short label → `{ long, info }`, delivered via
+  `StatVerboseCtx` so the ~44 `StatCell` call sites stay untouched; verbose cells
+  `col-span-2` and the panel widens + scrolls. **A key missing from `STAT_INFO`
+  silently falls back to the terse cell** — keep it 1:1 with the rendered labels.
 - **Client parity (APK ≈ web ≈ Quest flat):** all three mount the same `CompanionApp` /
   `Control` / `cloud.ts`. `serve.ps1` rebuilds `signaling/static` when companion/quest/
   lib sources are newer than the published HTML (not only when files are missing).

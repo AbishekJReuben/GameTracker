@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence, useReducedMotion } from "motion/react";
 import {
   MousePointer2,
@@ -18,6 +18,8 @@ import {
   RotateCcw,
   LogOut,
   Gauge,
+  Info,
+  PictureInPicture2,
   Command,
   Maximize2,
   Minimize2,
@@ -46,6 +48,7 @@ import {
   Type as TypeIcon,
   Film,
   Sparkles,
+  Waves,
   Pin,
   PinOff,
   TextCursor,
@@ -70,6 +73,7 @@ import { apiGet } from "../link";
 import type { ConnectSnapshot, WcStats } from "../cloud";
 import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
+import { isTauri } from "@/lib/tauri";
 import { isQuestBrowser } from "../device";
 import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
 import {
@@ -91,8 +95,10 @@ import {
   shapeClass,
   chromeClass,
   PIN_STYLE_DEFAULTS,
-  nextToolbarScale,
+  clampToolbarScale,
   toolbarScaleOf,
+  TOOLBAR_SCALE_MIN,
+  TOOLBAR_SCALE_MAX,
   type ControlChrome,
   type PinStyle,
   type ToolbarId,
@@ -484,6 +490,85 @@ export function ControlScreen({
   const [wcActive, setWcActive] = useState(false);
   const wcActiveRef = useRef(false);
   wcActiveRef.current = wcActive;
+
+  // ---- web picture-in-picture (browser only — the APK has native Android PiP) ----
+  // Chrome Android does NOT expose the Media Session "enterpictureinpicture" action
+  // (that's desktop-only), so a site cannot auto-PiP itself on app-switch. What it
+  // DOES do — caniuse note #8 — is auto-shrink a *fullscreen, playing* <video> when
+  // the user hits Home. And MediaStream-backed video has been PiP-able since Chrome
+  // 71, including `canvas.captureStream()`, so the DIRECT path (canvas, no <video>
+  // at all) can mint one on demand. Hence: a real PiP element, entered by tap.
+  const pipVideoRef = useRef<HTMLVideoElement | null>(null);
+  const pipStreamRef = useRef<MediaStream | null>(null);
+  const [pipOn, setPipOn] = useState(false);
+  const pipSupported = useMemo(
+    () => typeof document !== "undefined" && !!document.pictureInPictureEnabled && !isTauri(),
+    [],
+  );
+
+  /** The <video> to hand the OS: RTC already has one; DIRECT needs a canvas tap. */
+  const pipSourceVideo = async (): Promise<HTMLVideoElement | null> => {
+    if (!wcActiveRef.current) return videoRef.current;
+    const canvas = canvasRef.current;
+    const v = pipVideoRef.current;
+    if (!canvas || !v) return null;
+    if (!pipStreamRef.current) {
+      // 0 = capture on every canvas commit, so the mini window tracks the real
+      // frame cadence instead of resampling on a fixed timer.
+      const cs = (canvas as HTMLCanvasElement & { captureStream?: (fps?: number) => MediaStream }).captureStream?.(0);
+      if (!cs) return null;
+      pipStreamRef.current = cs;
+      v.srcObject = cs;
+    }
+    try {
+      await v.play();
+    } catch {
+      // Muted + playsInline, so autoplay policy shouldn't block it — but if it
+      // does, requestPictureInPicture below will reject and we surface nothing.
+    }
+    return v;
+  };
+
+  const togglePip = async () => {
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        return;
+      }
+      const v = await pipSourceVideo();
+      if (!v) return;
+      await v.requestPictureInPicture();
+    } catch (e) {
+      console.warn("[remote] picture-in-picture request failed:", e);
+    }
+  };
+
+  // Track PiP from the element itself: the user can dismiss the mini window from
+  // the OS, which never routes back through our button.
+  useEffect(() => {
+    const vids = [videoRef.current, pipVideoRef.current].filter(Boolean) as HTMLVideoElement[];
+    const on = () => setPipOn(true);
+    const off = () => setPipOn(false);
+    for (const v of vids) {
+      v.addEventListener("enterpictureinpicture", on);
+      v.addEventListener("leavepictureinpicture", off);
+    }
+    return () => {
+      for (const v of vids) {
+        v.removeEventListener("enterpictureinpicture", on);
+        v.removeEventListener("leavepictureinpicture", off);
+      }
+    };
+  }, [pipSupported]);
+
+  // Drop the canvas capture when the stream goes away, so a reconnect re-taps the
+  // (new) canvas instead of feeding the mini window a dead track.
+  useEffect(() => {
+    if (connected) return;
+    pipStreamRef.current?.getTracks().forEach((t) => t.stop());
+    pipStreamRef.current = null;
+    if (pipVideoRef.current) pipVideoRef.current.srcObject = null;
+  }, [connected]);
   // Android PiP: the OS shrinks the whole webview into a mini floating window.
   // There is no direct signal inside the webview, but the PiP window is far
   // smaller than any phone layout — hide ALL chrome and show pure video there.
@@ -678,9 +763,9 @@ export function ControlScreen({
       return next;
     });
   };
-  const bumpToolbarScale = (id: ToolbarId) => {
+  /** Write an absolute toolbar scale (the slider); `bump` still cycles on tap. */
+  const setToolbarScale = (id: ToolbarId, scale: number) => {
     updateChrome((prev) => {
-      const cur = toolbarScaleOf(prev, id);
       const prevTb = prev.toolbars[id];
       return {
         ...prev,
@@ -690,12 +775,24 @@ export function ControlScreen({
             order: prevTb?.order ?? [],
             hidden: prevTb?.hidden ?? [],
             density: prevTb?.density ?? "comfy",
-            scale: nextToolbarScale(cur),
+            scale: clampToolbarScale(scale),
           },
         },
       };
     });
   };
+  /** Which toolbar's scale popover is open (only one at a time). */
+  const [scaleChipOpen, setScaleChipOpen] = useState<ToolbarId | null>(null);
+  // Outside tap closes it — mirrors the top-bar zoom chip's behaviour.
+  useEffect(() => {
+    if (!scaleChipOpen) return;
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t?.closest("[data-scale-chip]")) setScaleChipOpen(null);
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    return () => window.removeEventListener("pointerdown", onDown, true);
+  }, [scaleChipOpen]);
   const setPinLayoutPos = (id: string, x: number, y: number) => {
     updateChrome((prev) => ({ ...prev, layout: { ...prev.layout, [id]: { x, y } } }));
   };
@@ -822,6 +919,8 @@ export function ControlScreen({
   // host pipeline + guest JB stay in sync with localStorage.
   const [tune, setTune] = useState<StreamTune>(() => loadStreamTune());
   const [tuneOpen, setTuneOpen] = useState(false);
+  /** Per-knob explanations in the Tune panel — on by default; power users can fold them away. */
+  const [tuneHints, setTuneHints] = useState(true);
   const patchTune = (partial: Partial<StreamTune>) => {
     setTune((prev) => {
       const next = { ...prev, ...partial };
@@ -848,6 +947,9 @@ export function ControlScreen({
   const contentMode = tune.contentMode;
   const setContentMode = (m: ContentMode) => patchTune({ contentMode: m });
   const [showStats, setShowStats] = useState(false);
+  /** Long labels + a plain-language line per stat. Off by default — the dense grid
+   *  is the at-a-glance view; this is the "what does JB tgt/min even mean" view. */
+  const [statsVerbose, setStatsVerbose] = useState(false);
   const [fps, setFps] = useState(0);
   const [res, setRes] = useState("");
   const frameTimes = useRef<number[]>([]);
@@ -881,6 +983,10 @@ export function ControlScreen({
       bitrateHeadroom: tune.bitrateHeadroom,
       minBitrateKbps: tune.minBitrateKbps,
       startBitrateKbps: tune.startBitrateKbps,
+      pace: tune.pace,
+      wcKeyMs: tune.wcKeyMs,
+      wcBufKB: tune.wcBufKB,
+      wcQueueMax: tune.wcQueueMax,
     }),
     [tune],
   );
@@ -2504,6 +2610,19 @@ export function ControlScreen({
         />
         {/* Desktop audio — MUST stay off the video MediaStream (A/V sync). */}
         <audio ref={audioRef} autoPlay playsInline className="hidden" />
+        {/* PiP carrier for the DIRECT path: the OS can only shrink a <video>, and
+            DIRECT paints a canvas, so this holds canvas.captureStream(). Kept out
+            of layout (not `hidden` — a hidden element won't play) and only wired up
+            on the first PiP tap. */}
+        {pipSupported && (
+          <video
+            ref={pipVideoRef}
+            muted
+            playsInline
+            className="pointer-events-none absolute h-px w-px opacity-0"
+            aria-hidden
+          />
+        )}
         <canvas
           ref={canvasRef}
           hidden={hasStream && !wcActive}
@@ -2630,7 +2749,15 @@ export function ControlScreen({
 
       {/* ---- performance / debug HUD (dense 2-col — double the telemetry, same footprint) ---- */}
       {showStats && !immersive && !topCollapsed && !pipView && (
-        <div className="absolute right-2 top-2 z-30 w-[18.5rem] max-w-[94vw] rounded-xl border border-white/[0.1] bg-black/70 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md">
+        <StatVerboseCtx.Provider value={statsVerbose}>
+        <div
+          className={`absolute right-2 top-2 z-30 ${
+            // Expanded cells span both columns and carry a description line, so the
+            // panel needs the room — and a scroll cap, since it gets tall.
+            statsVerbose ? "max-h-[86vh] w-[23rem] overflow-y-auto" : "w-[18.5rem]"
+          } max-w-[94vw] rounded-xl border border-white/[0.1] bg-black/70 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md`}
+          style={statsVerbose ? { scrollbarWidth: "thin" } : undefined}
+        >
           <div className="mb-1 flex items-center justify-between gap-1.5">
             <span className="flex items-center gap-1 text-[10px] font-800 text-white">
               <Gauge className="h-3 w-3 text-accent-3" /> Stream stats
@@ -2638,21 +2765,35 @@ export function ControlScreen({
                 {wcStats ? "DIRECT" : hasStream ? "RTC" : "LAN"}
               </span>
             </span>
-            {(() => {
-              // Glass-to-glass estimate: wc path measures it for real (clock-synced
-              // capture→decode); the RTC path approximates rtt/2 + buffer + decode.
-              const lag = wcStats ? wcStats.e2eMs : net ? Math.round(net.rttMs / 2 + net.bufMs + net.decMs) : null;
-              if (lag == null) return null;
-              return (
-                <span
-                  className={`rounded px-1 py-0.5 font-800 tabular-nums ${
-                    lag <= 50 ? "bg-green/20 text-green" : lag <= 100 ? "bg-amber/20 text-amber" : "bg-red/20 text-red"
-                  }`}
-                >
-                  ~{Math.max(1, lag)}ms
-                </span>
-              );
-            })()}
+            <span className="flex items-center gap-1">
+              {(() => {
+                // Glass-to-glass estimate: wc path measures it for real (clock-synced
+                // capture→decode); the RTC path approximates rtt/2 + buffer + decode.
+                const lag = wcStats ? wcStats.e2eMs : net ? Math.round(net.rttMs / 2 + net.bufMs + net.decMs) : null;
+                if (lag == null) return null;
+                return (
+                  <span
+                    className={`rounded px-1 py-0.5 font-800 tabular-nums ${
+                      lag <= 50 ? "bg-green/20 text-green" : lag <= 100 ? "bg-amber/20 text-amber" : "bg-red/20 text-red"
+                    }`}
+                  >
+                    ~{Math.max(1, lag)}ms
+                  </span>
+                );
+              })()}
+              {/* Expand every cell to a full label + what it means. Off by default so
+                  the dense grid stays the at-a-glance view it was designed to be. */}
+              <button
+                type="button"
+                onClick={() => setStatsVerbose((s) => !s)}
+                title={statsVerbose ? "Compact stats" : "Explain each stat"}
+                className={`grid h-4 w-4 shrink-0 place-items-center rounded ${
+                  statsVerbose ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.08] text-ink-dim"
+                }`}
+              >
+                <Info className="h-2.5 w-2.5" />
+              </button>
+            </span>
           </div>
           {wcStats ? (
             /* Direct WebCodecs path — per-stage latency is measured, not inferred. */
@@ -2758,11 +2899,27 @@ export function ControlScreen({
             </button>
             {tuneOpen && (
               <div className="mt-1 max-h-[42vh] space-y-1.5 overflow-y-auto pr-0.5" style={{ scrollbarWidth: "thin" }}>
-                <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                  Drag to hunt the soft spot. Changes apply live. Reset restores shipped defaults.
-                </p>
+                <div className="flex items-start justify-between gap-1.5 px-0.5">
+                  <p className="text-[8px] leading-snug text-ink-faint">
+                    Drag to hunt the soft spot. Changes apply live. Reset restores shipped defaults.
+                    Tags show which leg each knob acts on.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setTuneHints((h) => !h)}
+                    className={`shrink-0 rounded px-1.5 py-0.5 text-[8px] font-800 ${
+                      tuneHints ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tuneHints ? "Hide info" : "Info"}
+                  </button>
+                </div>
+                <TuneSection label="Capture — what the PC grabs and ships" />
                 <TuneRow
                   label="Res"
+                  scope="host"
+                  showHint={tuneHints}
+                  hint="Capture width before encode. The single biggest cost lever: everything downstream scales with pixel count. Right = sharper + heavier."
                   value={tune.maxW}
                   min={480}
                   max={3840}
@@ -2772,6 +2929,9 @@ export function ControlScreen({
                 />
                 <TuneRow
                   label="JPEG q"
+                  scope="host"
+                  showHint={tuneHints}
+                  hint="Quality of the intermediate JPEG the PC sends its own webview (both paths re-encode it to H.264 after). Raising it burns host CPU/IPC for a win H.264 mostly discards."
                   value={tune.jpeg}
                   min={20}
                   max={95}
@@ -2781,6 +2941,9 @@ export function ControlScreen({
                 />
                 <TuneRow
                   label="JPEG cap"
+                  scope="host"
+                  showHint={tuneHints}
+                  hint="Hard ceiling on the above, applied even if JPEG q is dragged higher. Exists because ~400KB frames were burning host IPC for no visible gain."
                   value={tune.jpegCap}
                   min={40}
                   max={95}
@@ -2790,6 +2953,9 @@ export function ControlScreen({
                 />
                 <TuneRow
                   label="FPS"
+                  scope="host"
+                  showHint={tuneHints}
+                  hint="Capture target. The PC only produces frames when the screen changes, so a static desktop reads far below this in the stats — that's normal, not a fault."
                   value={tune.fps}
                   min={10}
                   max={60}
@@ -2797,8 +2963,12 @@ export function ControlScreen({
                   fmt={(v) => `${v}`}
                   onChange={(v) => patchTune({ fps: v })}
                 />
+                <TuneSection label="Bitrate" />
                 <TuneRow
                   label="Bitrate"
+                  scope="both"
+                  showHint={tuneHints}
+                  hint="Steady-state encoder target. Both paths use it: RTC as the sender cap, DIRECT as the WebCodecs bitrate."
                   value={tune.bitrateKbps}
                   min={1000}
                   max={40000}
@@ -2808,6 +2978,9 @@ export function ControlScreen({
                 />
                 <TuneRow
                   label="Headroom"
+                  scope="rtc"
+                  showHint={tuneHints}
+                  hint="Sender cap = bitrate × this. Slack for keyframe spikes to clear the pacer instead of queueing a ~1s hitch. Below ~1.2× that hitch comes back."
                   value={Math.round(tune.bitrateHeadroom * 100)}
                   min={100}
                   max={250}
@@ -2817,6 +2990,9 @@ export function ControlScreen({
                 />
                 <TuneRow
                   label="Min bitrate"
+                  scope="rtc"
+                  showHint={tuneHints}
+                  hint="Floor for the bandwidth estimator, so screen share can't collapse to a blurry ~200kbps and stay there."
                   value={tune.minBitrateKbps}
                   min={500}
                   max={8000}
@@ -2826,6 +3002,9 @@ export function ControlScreen({
                 />
                 <TuneRow
                   label="Start bitrate"
+                  scope="rtc"
+                  showHint={tuneHints}
+                  hint="Opening bandwidth guess, so the first seconds aren't a blurry ramp-up. Applied to the SDP at connect — takes effect on the NEXT connection, not now."
                   value={tune.startBitrateKbps}
                   min={1000}
                   max={20000}
@@ -2833,8 +3012,61 @@ export function ControlScreen({
                   fmt={(v) => `${(v / 1000).toFixed(1)}M`}
                   onChange={(v) => patchTune({ startBitrateKbps: v })}
                 />
+                <TuneSection label="DIRECT path — H.264 over the data channel" />
+                <TuneRow
+                  label="Keyframe every"
+                  scope="direct"
+                  showHint={tuneHints}
+                  hint="Recovery keyframe cadence. The channel is reliable, so keyframes are only for decoder recovery — long is good and dodges the ~1s IDR hitch. Short costs bandwidth for faster recovery from a glitch."
+                  value={tune.wcKeyMs}
+                  min={1000}
+                  max={30000}
+                  step={1000}
+                  fmt={(v) => `${(v / 1000).toFixed(0)}s`}
+                  onChange={(v) => patchTune({ wcKeyMs: v })}
+                />
+                <TuneRow
+                  label="Channel buf cap"
+                  scope="direct"
+                  showHint={tuneHints}
+                  hint="The PC skips encoding while this much data is still unsent. Low = drop stale frames to stay fresh; high = send everything and fall behind. The Feel slider widens this."
+                  value={tune.wcBufKB}
+                  min={64}
+                  max={1024}
+                  step={32}
+                  fmt={(v) => `${v}KB`}
+                  onChange={(v) => patchTune({ wcBufKB: v })}
+                />
+                <TuneRow
+                  label="Enc queue cap"
+                  scope="direct"
+                  showHint={tuneHints}
+                  hint="Frames allowed to pile up inside the PC's encoder before it starts skipping. Same trade as above, one stage earlier."
+                  value={tune.wcQueueMax}
+                  min={1}
+                  max={6}
+                  step={1}
+                  fmt={(v) => `${v}`}
+                  onChange={(v) => patchTune({ wcQueueMax: v })}
+                />
+                <TuneRow
+                  label="Direct retry"
+                  scope="direct"
+                  showHint={tuneHints}
+                  hint="How soon to re-attempt DIRECT after it drops to RTC. Doubles on repeat failures up to 2min; a clean spell resets it. Lower = recover faster, more retry chatter."
+                  value={tune.directRetrySec}
+                  min={5}
+                  max={120}
+                  step={5}
+                  fmt={(v) => `${v}s`}
+                  onChange={(v) => patchTune({ directRetrySec: v })}
+                />
+                <TuneSection label="RTC path — jitter buffer (bypassed on DIRECT)" />
                 <TuneRow
                   label="JB base"
+                  scope="rtc"
+                  showHint={tuneHints}
+                  hint="Resting playout delay the phone asks for. Note it's a MINIMUM — the browser pads above it on its own and often ignores a low ask. This is the delay DIRECT exists to skip."
                   value={tune.jbBase}
                   min={20}
                   max={200}
@@ -2844,6 +3076,9 @@ export function ControlScreen({
                 />
                 <TuneRow
                   label="JB min"
+                  scope="rtc"
+                  showHint={tuneHints}
+                  hint="Floor the buffer eases back down to on a clean link. Never force 0 — that trades this delay for stutter."
                   value={tune.jbMin}
                   min={20}
                   max={200}
@@ -2853,6 +3088,9 @@ export function ControlScreen({
                 />
                 <TuneRow
                   label="JB max"
+                  scope="rtc"
+                  showHint={tuneHints}
+                  hint="Ceiling the buffer may grow to when frames are genuinely arriving late."
                   value={tune.jbMax}
                   min={40}
                   max={400}
@@ -2860,8 +3098,23 @@ export function ControlScreen({
                   fmt={(v) => `${v}ms`}
                   onChange={(v) => patchTune({ jbMax: Math.max(v, tune.jbBase) })}
                 />
+                <TuneRow
+                  label="JB grow at"
+                  scope="rtc"
+                  showHint={tuneHints}
+                  hint="Dropped-frame share that makes the buffer grow. Low = react early and add delay; high = tolerate drops to stay responsive."
+                  value={tune.jbGrowAt}
+                  min={5}
+                  max={40}
+                  step={1}
+                  fmt={(v) => `${v}%`}
+                  onChange={(v) => patchTune({ jbGrowAt: v })}
+                />
+                <TuneSection label="Modes" />
                 <div className="flex items-center justify-between gap-2 px-0.5 pt-0.5">
-                  <span className="text-[9px] text-ink-faint">Content</span>
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    Content <ScopeTag scope="both" />
+                  </span>
                   <div className="flex rounded-md bg-white/[0.06] p-0.5">
                     {(["text", "auto", "video"] as ContentMode[]).map((m) => (
                       <button
@@ -2877,8 +3130,17 @@ export function ControlScreen({
                     ))}
                   </div>
                 </div>
-                <div className="flex items-center justify-between gap-2 px-0.5">
-                  <span className="text-[9px] text-ink-faint">Direct (WebCodecs)</span>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    What the picture mostly is. <b className="text-ink-dim">Text</b> keeps glyph edges crisp and sacrifices
+                    frame rate under pressure; <b className="text-ink-dim">Video</b> keeps motion smooth and lets detail go
+                    soft; <b className="text-ink-dim">Auto</b> sits between.
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    Direct (WebCodecs) <ScopeTag scope="direct" />
+                  </span>
                   <button
                     type="button"
                     onClick={() => patchTune({ preferDirect: !tune.preferDirect })}
@@ -2889,6 +3151,13 @@ export function ControlScreen({
                     {tune.preferDirect ? "ON" : "OFF"}
                   </button>
                 </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    Decode H.264 straight off the data channel instead of using the browser's video pipeline — skips the
+                    jitter buffer entirely, which is the single biggest chunk of lag. Leave ON; turn it off only to
+                    A/B against the RTC path. The header badge shows which one is actually live right now.
+                  </p>
+                )}
                 <button
                   type="button"
                   onClick={resetTuneToDefaults}
@@ -2903,6 +3172,7 @@ export function ControlScreen({
             )}
           </div>
         </div>
+        </StatVerboseCtx.Provider>
       )}
 
       {/* ---- free-place pinned quick buttons (drag in Pin mode; positions + styles saved) ---- */}
@@ -3125,13 +3395,27 @@ export function ControlScreen({
           animate={{ y: 0, opacity: 1 }}
           transition={{ type: "spring", stiffness: 380, damping: 32 }}
           className="shrink-0 border-t border-white/10 bg-base/95 backdrop-blur"
-          style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          style={{
+            paddingBottom: "env(safe-area-inset-bottom)",
+            // Curved-edge phones bend the leftmost/rightmost controls (Mouse tab,
+            // Disconnect) away from the viewer. Android reports 0 inset for a
+            // curve — it only reports cutouts — so a bare env() fixes nothing;
+            // the max() floor is what actually does the work here.
+            paddingLeft: "max(0.75rem, env(safe-area-inset-left))",
+            paddingRight: "max(0.75rem, env(safe-area-inset-right))",
+          }}
         >
           {/* expanded control panels — each a single horizontally-scrollable row of icons */}
           {panel === "mouse" && (
             <div className="flex items-end gap-1 border-b border-white/5">
               <div className="shrink-0 self-center py-2 pl-2">
-                <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "mouse")} onCycle={() => bumpToolbarScale("mouse")} />
+                <ToolbarScaleChip
+                  scale={toolbarScaleOf(chrome, "mouse")}
+                  open={scaleChipOpen === "mouse"}
+                  onToggle={() => setScaleChipOpen((o) => (o === "mouse" ? null : "mouse"))}
+                  onScale={(v) => setToolbarScale("mouse", v)}
+                  onReset={() => setToolbarScale("mouse", 1)}
+                />
               </div>
               <div
                 className="flex min-w-0 flex-1 items-end gap-1.5 overflow-x-auto py-2 pr-2"
@@ -3227,7 +3511,13 @@ export function ControlScreen({
               )}
               <div className="flex items-center gap-1">
                 <div className="shrink-0 self-center py-2 pl-2">
-                  <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "keys")} onCycle={() => bumpToolbarScale("keys")} />
+                  <ToolbarScaleChip
+                  scale={toolbarScaleOf(chrome, "keys")}
+                  open={scaleChipOpen === "keys"}
+                  onToggle={() => setScaleChipOpen((o) => (o === "keys" ? null : "keys"))}
+                  onScale={(v) => setToolbarScale("keys", v)}
+                  onReset={() => setToolbarScale("keys", 1)}
+                />
                 </div>
                 <div
                   className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
@@ -3257,7 +3547,13 @@ export function ControlScreen({
           {panel === "shortcuts" && (
             <div className="flex items-center gap-1 border-b border-white/5">
               <div className="shrink-0 self-center py-2 pl-2">
-                <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "shortcuts")} onCycle={() => bumpToolbarScale("shortcuts")} />
+                <ToolbarScaleChip
+                  scale={toolbarScaleOf(chrome, "shortcuts")}
+                  open={scaleChipOpen === "shortcuts"}
+                  onToggle={() => setScaleChipOpen((o) => (o === "shortcuts" ? null : "shortcuts"))}
+                  onScale={(v) => setToolbarScale("shortcuts", v)}
+                  onReset={() => setToolbarScale("shortcuts", 1)}
+                />
               </div>
               <div
                 className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
@@ -3361,7 +3657,13 @@ export function ControlScreen({
           {panel === "quality" && (
             <div className="flex items-center gap-1 border-b border-white/5">
               <div className="shrink-0 self-center py-2 pl-2">
-                <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "quality")} onCycle={() => bumpToolbarScale("quality")} />
+                <ToolbarScaleChip
+                  scale={toolbarScaleOf(chrome, "quality")}
+                  open={scaleChipOpen === "quality"}
+                  onToggle={() => setScaleChipOpen((o) => (o === "quality" ? null : "quality"))}
+                  onScale={(v) => setToolbarScale("quality", v)}
+                  onReset={() => setToolbarScale("quality", 1)}
+                />
               </div>
               <div
                 className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto py-2 pr-2"
@@ -3379,8 +3681,29 @@ export function ControlScreen({
               <QSlider icon={<Sparkles className="h-3.5 w-3.5" />} label="Sharp" min={20} max={95} step={1} value={streamQ.quality} fmt={(v) => `${v}`} onChange={(v) => setStreamQ((p) => ({ ...p, quality: v }))} />
               <QSlider icon={<Film className="h-3.5 w-3.5" />} label="FPS" min={10} max={60} step={2} value={streamQ.fps} fmt={(v) => `${v}`} onChange={(v) => setStreamQ((p) => ({ ...p, fps: v }))} />
               <QSlider icon={<Wifi className="h-3.5 w-3.5" />} label="Mbps" min={1000} max={40000} step={500} value={streamQ.bitrate} fmt={(v) => (v / 1000).toFixed(1)} onChange={(v) => setStreamQ((p) => ({ ...p, bitrate: v }))} />
+              {/* Video pacing only — input latency is untouched by this slider. */}
+              <QSlider
+                icon={<Waves className="h-3.5 w-3.5" />}
+                label="Feel"
+                min={0}
+                max={100}
+                step={5}
+                value={tune.pace}
+                fmt={(v) => (v === 0 ? "Resp" : v === 100 ? "Smth" : `${v}`)}
+                onChange={(v) => patchTune({ pace: v })}
+              />
               <Sep />
               <IcoBtn active={showStats} title="Performance stats" onClick={() => setShowStats((s) => !s)}><Gauge className="h-4 w-4" /></IcoBtn>
+              {/* Browser-only: the APK gets native auto-PiP from the Android shell. */}
+              {pipSupported && (
+                <IcoBtn
+                  active={pipOn}
+                  title={pipOn ? "Exit floating window" : "Floating window (picture-in-picture)"}
+                  onClick={() => void togglePip()}
+                >
+                  <PictureInPicture2 className="h-4 w-4" />
+                </IcoBtn>
+              )}
               </div>
             </div>
           )}
@@ -3394,7 +3717,13 @@ export function ControlScreen({
               )}
               <div className="flex items-center gap-1">
                 <div className="shrink-0 self-center py-2 pl-2">
-                  <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "game")} onCycle={() => bumpToolbarScale("game")} />
+                  <ToolbarScaleChip
+                  scale={toolbarScaleOf(chrome, "game")}
+                  open={scaleChipOpen === "game"}
+                  onToggle={() => setScaleChipOpen((o) => (o === "game" ? null : "game"))}
+                  onScale={(v) => setToolbarScale("game", v)}
+                  onReset={() => setToolbarScale("game", 1)}
+                />
                 </div>
                 <div
                   className="flex min-w-0 flex-1 origin-left items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
@@ -3497,7 +3826,13 @@ export function ControlScreen({
           {panel === "gamepad" && (
             <div className="flex gap-1 border-b border-white/5">
               <div className="shrink-0 self-start py-2.5 pl-2">
-                <ToolbarScaleBtn scale={toolbarScaleOf(chrome, "gamepad")} onCycle={() => bumpToolbarScale("gamepad")} />
+                <ToolbarScaleChip
+                  scale={toolbarScaleOf(chrome, "gamepad")}
+                  open={scaleChipOpen === "gamepad"}
+                  onToggle={() => setScaleChipOpen((o) => (o === "gamepad" ? null : "gamepad"))}
+                  onScale={(v) => setToolbarScale("gamepad", v)}
+                  onReset={() => setToolbarScale("gamepad", 1)}
+                />
               </div>
               <div
                 className="flex min-w-0 flex-1 flex-col gap-2 py-2.5 pr-3"
@@ -3534,28 +3869,29 @@ export function ControlScreen({
             </div>
           )}
 
-          {/* always-visible icon tab strip */}
-          <div className="flex items-center gap-1 px-1.5 py-1.5">
-            <Tab active={panel === "mouse"} onClick={() => openPanel("mouse")} title="Mouse"><MousePointer2 className="h-5 w-5" /></Tab>
-            <Tab active={panel === "keys"} onClick={() => openPanel("keys")} title="Special keys"><Command className="h-5 w-5" /></Tab>
-            <Tab active={panel === "game"} onClick={() => openPanel("game")} title="Game keys"><Crosshair className="h-5 w-5" /></Tab>
-            <Tab active={panel === "shortcuts"} onClick={() => openPanel("shortcuts")} title="Shortcuts"><Grip className="h-5 w-5" /></Tab>
-            <Tab active={typing} onClick={() => (typing ? stopTyping() : startTyping())} title="Keyboard"><Keyboard className="h-5 w-5" /></Tab>
-            <Tab active={panel === "gamepad" || controllerOn} onClick={() => openPanel("gamepad")} title="Controller"><Gamepad2 className="h-5 w-5" /></Tab>
-            <Tab active={panel === "quality"} onClick={() => openPanel("quality")} title="Quality"><Gauge className="h-5 w-5" /></Tab>
+          {/* always-visible icon tab strip — kept compact so the row still clears
+              the curve after the container's edge padding eats into the width. */}
+          <div className="flex items-center gap-0.5 py-1">
+            <Tab active={panel === "mouse"} onClick={() => openPanel("mouse")} title="Mouse"><MousePointer2 className="h-4 w-4" /></Tab>
+            <Tab active={panel === "keys"} onClick={() => openPanel("keys")} title="Special keys"><Command className="h-4 w-4" /></Tab>
+            <Tab active={panel === "game"} onClick={() => openPanel("game")} title="Game keys"><Crosshair className="h-4 w-4" /></Tab>
+            <Tab active={panel === "shortcuts"} onClick={() => openPanel("shortcuts")} title="Shortcuts"><Grip className="h-4 w-4" /></Tab>
+            <Tab active={typing} onClick={() => (typing ? stopTyping() : startTyping())} title="Keyboard"><Keyboard className="h-4 w-4" /></Tab>
+            <Tab active={panel === "gamepad" || controllerOn} onClick={() => openPanel("gamepad")} title="Controller"><Gamepad2 className="h-4 w-4" /></Tab>
+            <Tab active={panel === "quality"} onClick={() => openPanel("quality")} title="Quality"><Gauge className="h-4 w-4" /></Tab>
             <button
               onClick={() => {
                 setPanel(null);
                 setDockCollapsed(true);
               }}
               title="Hide controls (full-screen viewport)"
-              className="ml-auto grid h-9 w-9 shrink-0 place-items-center rounded-lg text-ink-soft active:bg-white/[0.08]"
+              className="ml-auto grid h-8 w-8 shrink-0 place-items-center rounded-lg text-ink-soft active:bg-white/[0.08]"
             >
-              <ChevronDown className="h-5 w-5" />
+              <ChevronDown className="h-4 w-4" />
             </button>
             {onDisconnect && (
-              <button onClick={onDisconnect} title="Disconnect" className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-red/20 bg-red/5 text-red active:scale-95">
-                <LogOut className="h-4 w-4" />
+              <button onClick={onDisconnect} title="Disconnect" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-red/20 bg-red/5 text-red active:scale-95">
+                <LogOut className="h-3.5 w-3.5" />
               </button>
             )}
           </div>
@@ -3676,7 +4012,82 @@ function CursorFx({ kind, dir }: { kind: "left" | "right" | "scroll"; dir?: numb
 }
 
 // ---------- small UI pieces ----------
+/**
+ * Expanded mode for the stats HUD. A context (rather than a prop on all ~40 call
+ * sites) so the terse grid stays untouched and cells opt into the long form.
+ */
+const StatVerboseCtx = createContext(false);
+
+/**
+ * Plain-language glossary for the HUD. The abbreviations are unreadable without
+ * the source — and several of them mean very different things depending on which
+ * path is live, which is exactly when you're squinting at them.
+ */
+const STAT_INFO: Record<string, { long: string; info: string }> = {
+  // ---- shared / decode side
+  Display: { long: "Display rate", info: "Frames actually painted on this phone each second. A static PC screen legitimately sits near 0." },
+  Decode: { long: "Decode rate", info: "Frames this phone's decoder finished each second. Well under Display means the decoder is the bottleneck." },
+  "Res out": { long: "Resolution received", info: "Size of the frames arriving. Below the PC's 'Out' means the encoder scaled down to fit the bitrate." },
+  "Bitrate ↓": { long: "Download bitrate", info: "Video data arriving per second, measured over the last second." },
+  Buffer: { long: "Playout buffer", info: "Delay frames wait in the jitter buffer before being shown. The big lag term on RTC; always 0 on DIRECT, which skips it." },
+  "JB tgt/min": { long: "Jitter buffer target / floor", info: "What we ask for vs the minimum the browser insists on. When the floor is far above the target, the browser is overriding you — that's the wall DIRECT exists to get around." },
+  "Decode ms": { long: "Decode time", info: "How long one frame takes to decode here, including queueing. Above ~20ms suggests a software decoder." },
+  Codec: { long: "Video codec", info: "H.264 profile in use. 640034 = High, 4d0034 = Main, 42e034 = Baseline." },
+  // ---- DIRECT-only
+  E2E: { long: "End-to-end lag (measured)", info: "PC screen capture → decoded here, using the clock sync from the heartbeat. This is a REAL measurement, not the RTC path's estimate — the two aren't comparable." },
+  "Net+enc": { long: "Network + encode", info: "Capture → arrival: the PC's encode plus flight time, excluding decode. E2E minus this is roughly your decode cost." },
+  "Dec queue": { long: "Decoder queue", info: "Frames waiting inside the decoder right now. Persistently above ~3 means decoding is falling behind arrival." },
+  "Frame KB": { long: "Average frame size", info: "Mean encoded frame size over the last second." },
+  Frames: { long: "Frames decoded", info: "Running total this session." },
+  Keyframes: { long: "Keyframes decoded", info: "Full self-contained frames. DIRECT sends these rarely on purpose — long gaps here are correct, not a fault." },
+  "Data ↓": { long: "Total downloaded", info: "Video bytes received this session." },
+  "Clock ±": { long: "Clock sync quality", info: "Round-trip of the best sync sample. The E2E figure is only as trustworthy as this is small." },
+  // ---- RTC-only
+  RTT: { long: "Round-trip time", info: "Network round trip to the PC. Roughly half of it lands in one-way video lag." },
+  Jitter: { long: "Arrival jitter", info: "How irregularly packets arrive. High jitter is what forces the buffer — and the lag — up." },
+  Loss: { long: "Packets lost", info: "Packets that never arrived. Sustained loss forces retransmits and keyframe requests." },
+  "Drop / frz": { long: "Dropped / freezes", info: "Frames binned as too late, and freeze events. Freezes climb from the browser's ~1s keyframe hitch even on a healthy link — don't chase them." },
+  "NACK/PLI": { long: "Retransmit / keyframe asks (sent)", info: "How often this phone had to ask the PC to resend data or send a fresh keyframe." },
+  "FIR / IDR↓": { long: "Full-frame asks / keyframes in", info: "Full-refresh requests sent, and keyframes received." },
+  "Pkts ↓": { long: "Packets received", info: "Running total this session." },
+  Decoded: { long: "Frames decoded", info: "Running total. Stuck at 0 while bytes flow means the decoder is wedged." },
+  Rendered: { long: "Frames rendered", info: "Frames the browser reports actually painting, when it reports it at all." },
+  // ---- host side
+  "Host prod": { long: "PC frames produced / target", info: "Frames the PC actually captured vs the FPS you asked for. The PC only captures on change, so an idle desktop reads near 0 — that's normal." },
+  "Send fps": { long: "PC send rate", info: "Frames the PC pushed into the WebRTC track. Always 0 on DIRECT, which bypasses that track — healthy, not broken." },
+  "Cap/scl": { long: "Capture / scale time", info: "PC milliseconds spent grabbing the screen and resizing it." },
+  "JPEG ms": { long: "PC JPEG encode time", info: "Time to compress the intermediate JPEG. Both paths pay this before H.264 even starts." },
+  "Host Σ": { long: "PC pipeline total", info: "Capture + scale + JPEG per frame. The PC's whole cost before anything is sent." },
+  "JPEG KB": { long: "Intermediate JPEG size", info: "Size of that intermediate frame. Large ones burn PC CPU and IPC for detail H.264 then discards." },
+  Native: { long: "PC screen resolution", info: "The monitor's real size before any downscale." },
+  Out: { long: "PC output resolution", info: "Size the PC encodes at, after your Res slider." },
+  "Send ↑": { long: "PC upload bitrate", info: "What the PC is actually sending on the WebRTC track. 0 on DIRECT by design." },
+  "Enc max": { long: "RTC encoder ceiling", info: "Cap applied to the WebRTC sender: your bitrate × headroom." },
+  "Enc cap": { long: "DIRECT encoder ceiling", info: "Bitrate ceiling for the WebCodecs encoder on the DIRECT path." },
+  "QP avg": { long: "Quantiser (compression)", info: "How hard the encoder is compressing. Higher = blurrier; a climbing QP means bitrate is the constraint." },
+  "IDR ↑": { long: "Keyframes sent", info: "Keyframes the PC emitted this session." },
+  "NACK↑/PLI↑": { long: "Retransmit / keyframe asks (received)", info: "How often the PC was asked to resend or refresh — the mirror of the phone's counter." },
+  "JPEG q": { long: "Intermediate JPEG quality", info: "Quality of the pre-H.264 JPEG, after the Tune panel's cap is applied." },
+  Mode: { long: "Content mode", info: "Text favours crisp edges, Video favours smooth motion, Auto sits between." },
+  "H264 enc": { long: "PC H.264 encode time", info: "Time to encode one frame on the DIRECT path. Above ~20ms at 1080p suggests the PC fell back to a software encoder." },
+  Skipped: { long: "Frames skipped (PC)", info: "Frames the PC dropped rather than send stale — deliberate. Climbing fast means it can't keep up; the Feel slider changes how eagerly it does this." },
+  "Ch buf": { long: "Channel backlog", info: "Data queued and unsent on the video channel. A backlog can only ever become lag." },
+};
+
 function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {
+  const verbose = useContext(StatVerboseCtx);
+  const meta = STAT_INFO[k];
+  if (verbose && meta) {
+    return (
+      <div className="col-span-2 border-b border-white/[0.04] pb-1 last:border-0">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="min-w-0 font-700 text-ink-dim">{meta.long}</span>
+          <span className={`shrink-0 font-800 tabular-nums ${hi ? "text-amber" : "text-white"}`}>{v}</span>
+        </div>
+        <p className="mt-px text-[8px] leading-snug text-ink-faint">{meta.info}</p>
+      </div>
+    );
+  }
   return (
     <div className="flex min-w-0 items-baseline justify-between gap-1">
       <span className="shrink-0 text-ink-faint">{k}</span>
@@ -3685,7 +4096,40 @@ function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {
   );
 }
 
-/** Full-width labelled slider for the stats Tune panel. */
+/** Group divider inside the Tune panel — 15 bare sliders in one list is unreadable. */
+function TuneSection({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-1.5 px-0.5 pt-1.5">
+      <span className="shrink-0 text-[8px] font-800 uppercase tracking-wide text-ink-dim">{label}</span>
+      <span className="h-px flex-1 bg-white/[0.08]" />
+    </div>
+  );
+}
+
+/** Which leg of the pipeline a Tune knob acts on — colour-coded to match the HUD badge. */
+type TuneScope = "host" | "direct" | "rtc" | "both";
+
+const TUNE_SCOPE_STYLE: Record<TuneScope, string> = {
+  host: "bg-white/[0.08] text-ink-dim",
+  direct: "bg-green/20 text-green",
+  rtc: "bg-accent-3/20 text-accent-3",
+  both: "bg-amber/20 text-amber",
+};
+
+/** Small badge naming the path a knob affects, so a no-op knob is obvious. */
+function ScopeTag({ scope }: { scope: TuneScope }) {
+  return (
+    <span className={`rounded px-1 py-px text-[7px] font-800 uppercase leading-tight ${TUNE_SCOPE_STYLE[scope]}`}>
+      {scope}
+    </span>
+  );
+}
+
+/**
+ * Full-width labelled slider for the stats Tune panel. `hint` explains what the
+ * knob does and which way to drag it — these are A/B experiment controls, and a
+ * bare number with no units or direction is unusable without reading the source.
+ */
 function TuneRow({
   label,
   min,
@@ -3694,6 +4138,9 @@ function TuneRow({
   value,
   fmt,
   onChange,
+  hint,
+  scope,
+  showHint = true,
 }: {
   label: string;
   min: number;
@@ -3702,13 +4149,20 @@ function TuneRow({
   value: number;
   fmt: (v: number) => string;
   onChange: (v: number) => void;
+  hint?: string;
+  scope?: TuneScope;
+  showHint?: boolean;
 }) {
   return (
     <div className="px-0.5">
-      <div className="mb-0.5 flex items-center justify-between text-[9px] font-700">
-        <span className="text-ink-faint">{label}</span>
-        <span className="tabular-nums text-white">{fmt(value)}</span>
+      <div className="mb-0.5 flex items-center justify-between gap-1 text-[9px] font-700">
+        <span className="flex min-w-0 items-center gap-1">
+          <span className="truncate text-ink-faint">{label}</span>
+          {scope && <ScopeTag scope={scope} />}
+        </span>
+        <span className="shrink-0 tabular-nums text-white">{fmt(value)}</span>
       </div>
+      {showHint && hint && <p className="mb-0.5 text-[8px] leading-snug text-ink-faint">{hint}</p>}
       <input
         type="range"
         min={min}
@@ -3777,26 +4231,117 @@ function Sep() {
 }
 
 /** Compact 25%–1000% toolbar scale cycle — sits outside the zoomed row so it stays small. */
-function ToolbarScaleBtn({ scale, onCycle }: { scale: number; onCycle: () => void }) {
+/**
+ * Bottom-toolbar scale control: a narrow chip that expands into a vertical slider,
+ * mirroring the top bar's {@link ZoomChip}. The icon is gone and the label carries
+ * the width on its own — this sits inside every dock panel's scrollable row, so
+ * horizontal space is the scarce one.
+ *
+ * The popover is `fixed` (the row is `overflow-x-auto`, which would clip an
+ * absolute child) and opens UPWARD — unlike ZoomChip, this lives in the bottom
+ * dock, so a downward popover would land off-screen.
+ */
+function ToolbarScaleChip({
+  scale,
+  open,
+  onToggle,
+  onScale,
+  onReset,
+}: {
+  scale: number;
+  open: boolean;
+  onToggle: () => void;
+  onScale: (v: number) => void;
+  onReset: () => void;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState<{ bottom: number; left: number } | null>(null);
   const pct = Math.round(scale * 100);
+  const label = pct < 1000 ? `${pct}%` : "10×";
+  const custom = Math.abs(scale - 1) > 0.02;
+
+  useEffect(() => {
+    if (!open) {
+      setPos(null);
+      return;
+    }
+    const place = () => {
+      const el = rootRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setPos({
+        bottom: Math.max(8, window.innerHeight - r.top + 6),
+        left: Math.min(Math.max(8, r.left - 8), Math.max(8, window.innerWidth - 60)),
+      });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
+
   return (
-    <button
-      type="button"
-      title={`Toolbar ${pct}% — tap to cycle 25%–1000%`}
-      onPointerDown={(e) => e.preventDefault()}
-      onClick={() => {
-        navigator.vibrate?.(5);
-        onCycle();
-      }}
-      className={`flex h-6 shrink-0 items-center gap-0.5 rounded-md border px-1 text-[9px] font-800 tabular-nums leading-none active:scale-95 ${
-        Math.abs(scale - 1) > 0.02
-          ? "border-accent-3/40 bg-accent-3/15 text-accent-3"
-          : "border-white/[0.08] bg-white/[0.04] text-ink-dim"
-      }`}
-    >
-      <SlidersHorizontal className="h-2.5 w-2.5 opacity-80" />
-      {pct < 1000 ? `${pct}%` : "10×"}
-    </button>
+    <div data-scale-chip ref={rootRef} className="relative shrink-0">
+      <button
+        type="button"
+        title={`Toolbar scale ${label} (25%–1000%)`}
+        onPointerDown={(e) => e.preventDefault()}
+        onClick={() => {
+          navigator.vibrate?.(5);
+          onToggle();
+        }}
+        className={`grid h-6 w-8 shrink-0 place-items-center rounded-md border text-[9px] font-800 tabular-nums leading-none active:scale-95 ${
+          custom || open
+            ? "border-accent-3/40 bg-accent-3/15 text-accent-3"
+            : "border-white/[0.08] bg-white/[0.04] text-ink-dim"
+        }`}
+      >
+        {label}
+      </button>
+      <AnimatePresence>
+        {open && pos && (
+          <motion.div
+            initial={{ opacity: 0, y: 6, scale: 0.92 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 6, scale: 0.92 }}
+            transition={{ type: "spring", stiffness: 480, damping: 28 }}
+            data-scale-chip
+            className="fixed z-[100] flex flex-col items-center gap-1.5 rounded-2xl border border-white/15 bg-black/90 px-2.5 py-2 shadow-float backdrop-blur-md"
+            style={{ bottom: pos.bottom, left: pos.left }}
+          >
+            <span className="text-[9px] font-800 tabular-nums text-white">{label}</span>
+            {/* Rotated horizontal range — writing-mode:vertical is unreliable on
+                Android/WebView (same reason as ZoomChip). */}
+            <div className="relative flex h-32 w-10 items-center justify-center">
+              <input
+                type="range"
+                min={TOOLBAR_SCALE_MIN}
+                max={TOOLBAR_SCALE_MAX}
+                step={0.05}
+                value={scale}
+                onPointerDown={(e) => e.stopPropagation()}
+                onChange={(e) => onScale(parseFloat(e.target.value))}
+                onInput={(e) => onScale(parseFloat((e.target as HTMLInputElement).value))}
+                className="h-2 w-28 cursor-pointer accent-accent-3"
+                style={{ transform: "rotate(-90deg)" }}
+                aria-label="Toolbar scale"
+              />
+            </div>
+            <button
+              type="button"
+              onPointerDown={(e) => e.preventDefault()}
+              onClick={onReset}
+              className="rounded-md bg-white/[0.08] px-2 py-0.5 text-[9px] font-800 text-ink-soft active:bg-white/[0.14]"
+            >
+              Reset
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   );
 }
 
@@ -4423,7 +4968,7 @@ function Tab({ onClick, active, title, children }: { onClick: () => void; active
       onPointerDown={(e) => e.preventDefault()}
       onClick={onClick}
       title={title}
-      className={`relative grid h-9 flex-1 place-items-center rounded-lg transition ${active ? "text-white" : "text-ink-dim active:bg-white/[0.06]"}`}
+      className={`relative grid h-8 min-w-0 flex-1 place-items-center rounded-lg transition ${active ? "text-white" : "text-ink-dim active:bg-white/[0.06]"}`}
     >
       {active && (
         <motion.span

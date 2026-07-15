@@ -50,17 +50,9 @@ export type ToolbarPrefs = {
 
 export const TOOLBAR_SCALE_MIN = 0.25;
 export const TOOLBAR_SCALE_MAX = 10;
-/** Tap-cycle steps for the compact toolbar scale chip. */
-export const TOOLBAR_SCALE_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10] as const;
 
 export function clampToolbarScale(n: number): number {
   return clamp(Number.isFinite(n) ? n : 1, TOOLBAR_SCALE_MIN, TOOLBAR_SCALE_MAX);
-}
-
-export function nextToolbarScale(cur: number): number {
-  const c = clampToolbarScale(cur);
-  const next = TOOLBAR_SCALE_STEPS.find((s) => s > c + 0.001);
-  return next ?? TOOLBAR_SCALE_STEPS[0];
 }
 
 export function toolbarScaleOf(c: ControlChrome, id: ToolbarId): number {

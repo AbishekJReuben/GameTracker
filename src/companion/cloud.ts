@@ -189,6 +189,23 @@ const JITTER_MAX_DEFAULT = 120;
 const JITTER_MIN_DEFAULT = 40;
 /** Consecutive clean watchdog ticks (3s each) before easing from a raised target. */
 const JITTER_CLEAN_TICKS = 2;
+// H.264 decode candidates for the DIRECT path, most capable first — MUST mirror
+// the host's WC_CODECS ladder (rtcHost.ts). Probing only High@5.2 made any device
+// that tops out at Main/Baseline fall back to RTC forever.
+const WC_CODECS = ["avc1.640034", "avc1.4d0034", "avc1.42e034"];
+// A soft DIRECT failure (opt-in timeout, flow stall, host encoder hiccup) used to
+// latch the path OFF for the whole session — only a page refresh or an app restart
+// brought it back. Retry on a backoff instead: DIRECT is where the latency budget
+// lives, so RTC is a waiting room, never a destination.
+/** Default backoff floor; the Tune panel's "Direct retry" overrides it per device. */
+const WC_RETRY_MIN_MS = 15000;
+const WC_RETRY_MAX_MS = 120000;
+/** Never hold a decoded frame longer than this while pacing (stale > uneven). */
+const WC_PACE_MAX_WAIT_MS = 150;
+/** Paced frames waiting on the playout clock; beyond this, pacing is losing. */
+const WC_PACE_MAX_QUEUE = 6;
+
+const clampNum = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Number(v) || 0));
 
 export class CloudConn {
   private sig: Signaling | null = null;
@@ -240,6 +257,8 @@ export class CloudConn {
   private jbBase = JITTER_BASE_DEFAULT;
   private jbMax = JITTER_MAX_DEFAULT;
   private jbMin = JITTER_MIN_DEFAULT;
+  /** Windowed drop RATIO (0–1) above which the jitter buffer grows (Tune: "JB grow at"). */
+  private jbGrowAt = 0.15;
   private preferDirect = true;
   private jitterTarget = JITTER_BASE_DEFAULT;
   /** Current lower bound for jitterTarget; eases toward jbMin on clean links. */
@@ -271,10 +290,23 @@ export class CloudConn {
   // host ships H.264 over the "video" data channel; we decode with VideoDecoder
   // and hand frames straight to the Control screen's canvas — no playout delay.
   private chVideo?: RTCDataChannel;
-  /** null = not probed yet; false latches OFF for this connection after failure. */
+  /**
+   * DEVICE capability only: null = not probed yet, false = this device has no
+   * usable H.264 `VideoDecoder` at all. Never set false for a transient failure —
+   * that's what `wcRetryAt` is for, and conflating the two is what pinned sessions
+   * on RTC until the user restarted the app.
+   */
   private wcSupported: boolean | null = null;
   private wcActive = false;
   private wcRequestedAt = 0; // vmode "wc" sent; frames must arrive or we revert
+  /** Earliest time we may re-attempt DIRECT after a soft failure (0 = now). */
+  private wcRetryAt = 0;
+  /** Backoff floor for DIRECT re-attempts (Tune: "Direct retry"). */
+  private wcRetryMin = WC_RETRY_MIN_MS;
+  /** Backoff for repeated soft failures, so a hopeless link stops thrashing. */
+  private wcRetryBackoff = WC_RETRY_MIN_MS;
+  /** Host said "my encoder is gone" — respect it until the next peer session. */
+  private wcHostRefused = false;
   private wcDecoder: VideoDecoder | null = null;
   private wcCodec = "";
   private wcAwaitKey = true;
@@ -296,6 +328,10 @@ export class CloudConn {
   private wcByteWin: { at: number; bytes: number }[] = []; // arrival bytes (kbps window)
   private wcLastFrameAt = 0;
   private wcStallTicks = 0;
+  /** Playout pacing (Quality dock "Feel"): 0 = paint on decode, >0 = clock-paced. */
+  private wcPaceMs = 0;
+  private wcPlayQ: { frame: VideoFrame; showAt: number }[] = [];
+  private wcPlayTimer: number | null = null;
   /** NTP-style clock samples from the data-channel heartbeat (host perf clock). */
   private clockSamples: { rtt: number; off: number }[] = [];
 
@@ -342,8 +378,16 @@ export class CloudConn {
     // Flat Quest Control uses WebCodecs like the phone; ImmersiveScreen textures
     // the RTC video element, so enter VR must fall back and exit can re-opt-in.
     this.unsubImmersive = onImmersiveActiveChange((active) => {
-      if (active) this.wcFallback("immersive VR needs the RTC video track");
-      else if (this.authState === "ok") void this.maybeStartWc();
+      if (active) {
+        // Hard: VR owns the <video> element for as long as it's up.
+        this.wcFallback("immersive VR needs the RTC video track", true);
+      } else {
+        // ...but leaving VR must lift that block, or flat Quest Control would
+        // stay on RTC for the rest of the session.
+        this.wcRetryAt = 0;
+        this.wcRetryBackoff = this.wcRetryMin;
+        if (this.authState === "ok") void this.maybeStartWc();
+      }
     });
     // Apply persisted Tune-panel soft spot (JB + preferDirect) before first connect.
     this.applyStreamTune(loadStreamTune(), false);
@@ -354,21 +398,44 @@ export class CloudConn {
    * capture/bitrate fields travel via the quality message from Control.
    */
   applyStreamTune(tune: StreamTune, reassert = true) {
-    this.jbBase = tune.jbBase;
-    this.jbMax = tune.jbMax;
-    this.jbMin = tune.jbMin;
+    // "Feel" slider → one budget spent on both paths: extra jitter-buffer floor on
+    // RTC, extra playout slack on DIRECT. 0 leaves both exactly as they shipped.
+    const paceMs = Math.round(clampNum(tune.pace, 0, 100) * 0.6);
+    this.wcPaceMs = paceMs;
+    this.jbGrowAt = clampNum(tune.jbGrowAt, 5, 40) / 100;
+    const retryMin = clampNum(tune.directRetrySec, 5, 120) * 1000;
+    if (retryMin !== this.wcRetryMin) {
+      this.wcRetryMin = retryMin;
+      // Moving this slider is an explicit ask, so reset the backoff to the new
+      // floor and pull in any wait already in flight — otherwise lowering it
+      // wouldn't take effect until the OLD (longer) timer expired.
+      this.wcRetryBackoff = retryMin;
+      // ...but never pull in a HARD block (VR / Direct off), which parks wcRetryAt
+      // at MAX_SAFE_INTEGER and is not a backoff at all.
+      if (this.wcRetryAt && this.wcRetryAt !== Number.MAX_SAFE_INTEGER) {
+        this.wcRetryAt = Math.min(this.wcRetryAt, Date.now() + retryMin);
+      }
+    }
+    // Fold pace into the effective JB so the adaptation logic below needs no
+    // knowledge of it — the Tune panel's own JB knobs still compose on top.
+    this.jbBase = tune.jbBase + paceMs;
+    this.jbMax = Math.max(tune.jbMax, this.jbBase);
+    this.jbMin = tune.jbMin + paceMs;
     const wantDirect = tune.preferDirect;
     if (!wantDirect && this.preferDirect && (this.wcActive || this.wcRequestedAt)) {
-      this.wcFallback("Tune: direct path off");
+      this.wcFallback("Tune: direct path off", true);
     }
     this.preferDirect = wantDirect;
     this.jitterTarget = Math.min(this.jbMax, Math.max(this.jbMin, this.jitterTarget || this.jbBase));
     this.jitterFloor = this.jbBase;
+    if (paceMs === 0) this.wcFlushPaceQueue();
     if (reassert) {
       this.applyJitter();
       if (wantDirect) {
-        // Re-probe after a prior "preferDirect off" fallback permanently cleared support.
-        this.wcSupported = null;
+        // Turning Direct back on is an explicit ask — clear the backoff so it
+        // re-attempts now instead of waiting out a previous failure's timer.
+        this.wcRetryAt = 0;
+        this.wcRetryBackoff = this.wcRetryMin;
         if (this.authState === "ok" && !this.wcActive) void this.maybeStartWc();
       }
     }
@@ -894,70 +961,106 @@ export class CloudConn {
     this.wcStallTicks = 0;
     this.wcErrors = 0;
     this.chVideo = undefined;
+    this.wcFlushPaceQueue();
     try {
       this.wcDecoder?.close();
     } catch {
       /* already closed */
     }
     this.wcDecoder = null;
-    if (reprobe) this.wcSupported = null;
+    if (reprobe) {
+      // A fresh peer session earns a clean slate: new host encoder, new channels,
+      // so nothing learned from the last session's failures still applies.
+      this.wcRetryAt = 0;
+      this.wcRetryBackoff = this.wcRetryMin;
+      this.wcHostRefused = false;
+      // NOTE: wcSupported is a DEVICE fact — deliberately NOT cleared here. The
+      // probe is expensive and its answer can't change within a page load.
+    }
     if (wasActive) this.emitEvent({ event: "wc", active: false });
   }
 
-  /** After auth-ok: probe local decode support and opt in to the wc path. */
-  private async maybeStartWc() {
-    if (this.closed || this.denied || this.wcActive || this.wcRequestedAt) return;
+  /** True when DIRECT is worth attempting right now (capability + policy + backoff). */
+  private wcEligible(): boolean {
+    if (this.closed || this.denied || this.wcActive || this.wcRequestedAt) return false;
     // Immersive VR textures the RTC `<video>` element — canvas WebCodecs would
     // leave the big screen black. Flat Quest / web / APK all opt in.
-    if (isImmersiveActive()) return;
-    if (!this.preferDirect) return;
+    if (isImmersiveActive()) return false;
+    if (!this.preferDirect) return false;
+    if (this.wcSupported === false) return false; // device genuinely can't decode
+    if (this.wcHostRefused) return false; // host has no encoder this session
+    if (this.wcRetryAt && Date.now() < this.wcRetryAt) return false;
+    return true;
+  }
+
+  /** After auth-ok (and on watchdog retries): probe decode support, opt in. */
+  private async maybeStartWc() {
+    if (!this.wcEligible()) return;
     if (this.wcSupported == null) {
-      try {
-        if (typeof VideoDecoder === "undefined") {
-          this.wcSupported = false;
-        } else {
-          let supported = false;
-          for (const hw of ["prefer-hardware", "no-preference"] as const) {
-            try {
-              const r = await VideoDecoder.isConfigSupported({
-                codec: "avc1.640034",
-                optimizeForLatency: true,
-                hardwareAcceleration: hw,
-              });
-              if (r.supported) {
-                supported = true;
-                break;
-              }
-            } catch {
-              /* try next */
-            }
-          }
-          this.wcSupported = supported;
-        }
-      } catch {
-        this.wcSupported = false;
+      this.wcSupported = await this.wcProbeDecoder();
+      if (!this.wcSupported) {
+        console.warn("[remote] no usable H.264 VideoDecoder — DIRECT unavailable on this device");
+        return;
       }
     }
-    if (!this.wcSupported || this.closed || this.denied) return;
+    if (this.closed || this.denied) return;
     this.wcRequestedAt = Date.now();
     this.sendControl({ type: "vmode", mode: "wc" });
   }
 
-  /** Give up on the wc path for this session and resume the WebRTC track. */
-  private wcFallback(reason: string) {
+  /** Can this device decode ANY codec on the host's ladder? (device fact, cached) */
+  private async wcProbeDecoder(): Promise<boolean> {
+    try {
+      if (typeof VideoDecoder === "undefined") return false;
+      for (const hw of ["prefer-hardware", "no-preference"] as const) {
+        for (const codec of WC_CODECS) {
+          try {
+            const r = await VideoDecoder.isConfigSupported({
+              codec,
+              optimizeForLatency: true,
+              hardwareAcceleration: hw,
+            });
+            if (r.supported) return true;
+          } catch {
+            /* try next */
+          }
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Drop back to the WebRTC track. `hard` means "don't come back on your own"
+   * (the user switched Direct off, or VR needs the video element) — everything
+   * else is a SOFT failure that re-arms on a backoff, because a transient stall
+   * used to cost the whole session its latency budget until an app restart.
+   */
+  private wcFallback(reason: string, hard = false) {
     if (!this.wcActive && !this.wcRequestedAt) return;
-    console.warn("[remote] direct-video path off — using the WebRTC track:", reason);
-    this.wcSupported = false; // don't retry until a fresh peer session
     const wasActive = this.wcActive;
     this.wcActive = false;
     this.wcRequestedAt = 0;
     this.wcAwaitKey = true;
+    this.wcFlushPaceQueue();
     try {
       this.wcDecoder?.close();
     } catch {
       /* ignore */
     }
     this.wcDecoder = null;
+    if (hard) {
+      this.wcRetryAt = Number.MAX_SAFE_INTEGER;
+      console.warn("[remote] DIRECT off — using the WebRTC track:", reason);
+    } else {
+      this.wcRetryAt = Date.now() + this.wcRetryBackoff;
+      console.warn(
+        `[remote] DIRECT off — using the WebRTC track: ${reason} (retrying in ${Math.round(this.wcRetryBackoff / 1000)}s)`,
+      );
+      this.wcRetryBackoff = Math.min(this.wcRetryBackoff * 2, WC_RETRY_MAX_MS);
+    }
     this.sendControl({ type: "vmode", mode: "rtc" });
     if (wasActive) this.emitEvent({ event: "wc", active: false });
   }
@@ -1110,6 +1213,7 @@ export class CloudConn {
   private onWcFrameOut(frame: VideoFrame) {
     const now = Date.now();
     const meta = this.wcMeta.get(frame.timestamp);
+    let capturedAtGuest = 0;
     if (meta) {
       this.wcMeta.delete(frame.timestamp);
       const dec = now - meta.arrivedAt;
@@ -1117,9 +1221,11 @@ export class CloudConn {
       const clk = this.bestClock();
       if (clk) {
         // Host perf clock ≈ guest Date clock + off  ⇒  host ts in guest time.
-        const capturedAtGuest = meta.tsMs - clk.off;
+        capturedAtGuest = meta.tsMs - clk.off;
         const e2e = now - capturedAtGuest;
         const net = meta.arrivedAt - capturedAtGuest;
+        // Measured BEFORE pacing on purpose: these feed the playout target below,
+        // and folding our own added delay back in would ratchet it upward.
         if (e2e > -50 && e2e < 5000) this.wcE2eMs = this.wcE2eMs === 0 ? e2e : this.wcE2eMs * 0.85 + e2e * 0.15;
         if (net > -50 && net < 5000) this.wcNetMs = this.wcNetMs === 0 ? net : this.wcNetMs * 0.85 + net * 0.15;
       }
@@ -1127,15 +1233,68 @@ export class CloudConn {
     const perfNow = performance.now();
     this.wcTimes.push(perfNow);
     while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
+    // Responsiveness (pace 0): paint the instant it decodes — the shipped path.
+    if (this.wcPaceMs <= 0 || !capturedAtGuest) {
+      this.wcDeliver(frame);
+      return;
+    }
+    // Smoothness: rebuild the HOST's capture cadence on the guest. Every frame is
+    // shown at capture-time + a constant budget, so an irregular arrival pattern
+    // (bursty JPEG→canvas→encode) stops translating into an irregular display.
+    // Only a CONSTANT offset can do this — pacing off arrival time just re-prints
+    // the jitter one step later.
+    const showAt = capturedAtGuest + this.wcE2eMs + this.wcPaceMs;
+    const wait = showAt - now;
+    if (wait <= 1 || wait > WC_PACE_MAX_WAIT_MS) {
+      // Already late, or the estimate drifted absurdly far — show it now.
+      this.wcDeliver(frame);
+      return;
+    }
+    this.wcPlayQ.push({ frame, showAt });
+    if (this.wcPlayQ.length > WC_PACE_MAX_QUEUE) {
+      // Backlog means the budget is too small for this link; draining beats
+      // accumulating delay we can never pay back.
+      this.wcFlushPaceQueue();
+      return;
+    }
+    this.wcPlayDrain();
+  }
+
+  /** Hand a frame to the render sink (sink owns it and must close() it). */
+  private wcDeliver(frame: VideoFrame) {
     if (this.wcFrameCb) {
       try {
-        this.wcFrameCb(frame); // sink owns the frame (draws + closes it)
+        this.wcFrameCb(frame);
         return;
       } catch {
         /* fall through to close */
       }
     }
     frame.close();
+  }
+
+  /** Release paced frames whose playout time has come, in capture order. */
+  private wcPlayDrain = () => {
+    if (this.wcPlayTimer !== null) {
+      window.clearTimeout(this.wcPlayTimer);
+      this.wcPlayTimer = null;
+    }
+    const now = Date.now();
+    while (this.wcPlayQ.length && this.wcPlayQ[0].showAt <= now) {
+      this.wcDeliver(this.wcPlayQ.shift()!.frame);
+    }
+    if (this.wcPlayQ.length) {
+      this.wcPlayTimer = window.setTimeout(this.wcPlayDrain, Math.max(1, this.wcPlayQ[0].showAt - Date.now()));
+    }
+  };
+
+  /** Paint everything queued right now (pace off / teardown / backlog). */
+  private wcFlushPaceQueue() {
+    if (this.wcPlayTimer !== null) {
+      window.clearTimeout(this.wcPlayTimer);
+      this.wcPlayTimer = null;
+    }
+    while (this.wcPlayQ.length) this.wcDeliver(this.wcPlayQ.shift()!.frame);
   }
 
   /** Best (lowest-RTT) clock-offset sample from the recent heartbeat window. */
@@ -1330,6 +1489,10 @@ export class CloudConn {
       // WebCodecs-path health. Opt-in that never produced frames (old host, codec
       // mismatch) reverts to the track; a live path that stops flowing while a
       // screen is actually watching first asks for a keyframe, then reverts.
+      // Sitting on RTC while DIRECT is possible → re-attempt. RTC is a waiting
+      // room, not a destination: every tick we're on it, we're paying the jitter
+      // buffer this whole path exists to avoid.
+      if (this.wcEligible()) void this.maybeStartWc();
       if (this.wcRequestedAt && !this.wcActive && Date.now() - this.wcRequestedAt > 6000) {
         this.wcFallback("no direct-video frames after opt-in");
       }
@@ -1343,6 +1506,9 @@ export class CloudConn {
           }
         } else {
           this.wcStallTicks = 0;
+          // A clean stretch on DIRECT clears the debt from earlier wobbles, so a
+          // link that settles down doesn't inherit a 2-minute backoff.
+          this.wcRetryBackoff = this.wcRetryMin;
         }
       }
       // Adaptive jitter buffer only. There is deliberately NO decode-stall reconnect:
@@ -1407,7 +1573,7 @@ export class CloudConn {
 
       const ratio = dDropped / total;
       const prev = this.jitterTarget;
-      if (ratio > 0.15) {
+      if (ratio > this.jbGrowAt) {
         // Real late-frame drops: nudge up a little (capped lean).
         this.jitterCleanTicks = 0;
         this.jitterTarget = Math.min(this.jbMax, this.jitterTarget + 20);
@@ -1502,10 +1668,20 @@ export class CloudConn {
           this.deniedCb?.();
         }
       }
-      // Host revoked the wc path (its encoder failed) — resume the WebRTC track.
+      // Host revoked the wc path — resume the WebRTC track. `permanent` means the
+      // host has no usable encoder at all; anything else is a fault it expects to
+      // recover from, so we re-ask on the backoff rather than stranding the whole
+      // session on RTC. Hosts before v3.9.24 send no flag — treat those as
+      // retryable too; the backoff caps the cost of asking a hopeless host.
       if (msg.event === "vmode" && (msg as { mode?: string }).mode === "rtc") {
-        this.wcSupported = false;
-        this.wcReset(false);
+        const permanent = (msg as { permanent?: boolean }).permanent === true;
+        if (permanent) {
+          this.wcHostRefused = true;
+          this.wcReset(false);
+        } else {
+          // Route through wcFallback so the retry timer + backoff get armed.
+          this.wcFallback("host encoder fault", false);
+        }
       }
       this.emitEvent(msg as HostEvent);
       return;
@@ -1731,8 +1907,10 @@ export class CloudConn {
     this.stopWatchdog();
     this.stopProgressTicker();
     this.stopJitterHold();
-    this.wcReset(false);
+    // Drop the sink FIRST: wcReset flushes the pace queue, and on teardown those
+    // frames should just be closed, not painted into a dying canvas.
     this.wcFrameCb = null;
+    this.wcReset(false);
     this.clockSamples = [];
     this.pc?.close();
     this.pc = null;

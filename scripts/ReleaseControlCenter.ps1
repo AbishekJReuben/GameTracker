@@ -1,14 +1,14 @@
-<#
+﻿<#
 .SYNOPSIS
-  GameTracker Release Control Center — bump, tag, and push to personal for CI.
+  GameTracker Release Control Center - bump, tag, and push to personal for CI.
 
 .DESCRIPTION
   Small WPF dashboard (ChilloutDashboardKit) for the release loop:
 
-    bump version → commit → tag vX.Y.Z → push personal → GitHub Actions
+    bump version -> commit -> tag vX.Y.Z -> push personal -> GitHub Actions
 
   Personal remote = AbishekJReuben/GameTracker (where CI + Releases live).
-  Origin = ChilloutGameStudio/GameTracker (studio mirror — do NOT use -Push on
+  Origin = ChilloutGameStudio/GameTracker (studio mirror - do NOT use -Push on
   bump-version.ps1; that still targets origin).
 
 .NOTES
@@ -57,10 +57,13 @@ function Get-NextPatch([string]$ver) {
   return ('{0}.{1}.{2}' -f $parts[0], $parts[1], ($patch + 1))
 }
 
-function Get-GitLine([string]$args) {
+# Do NOT name the param $args — that is PowerShell's automatic variable and
+# silently stays empty, so `git` runs with no argv and dumps the help page
+# into Status / Remotes (burying the Ship button below the fold).
+function Get-GitLine([string]$GitArgs) {
   Push-Location $script:RepoRoot
   try {
-    $out = & git @($args.Split(' ')) 2>&1 | Out-String
+    $out = & git @($GitArgs.Split(' ')) 2>&1 | Out-String
     return ($out.Trim())
   } finally { Pop-Location }
 }
@@ -89,7 +92,7 @@ $(Get-CgResourceXaml)
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
           <Ellipse Width="9" Height="9" Fill="$($t.Accent2)" Margin="0,0,9,0"/>
           <TextBlock Text="RELEASE" Foreground="$($t.Text)" FontFamily="Cascadia Mono, Consolas" FontWeight="Bold" FontSize="12.5"/>
-          <TextBlock Text=" // bump · tag · personal CI" Foreground="$($t.Dim)" FontFamily="Cascadia Mono, Consolas" FontSize="12.5"/>
+          <TextBlock Text=" // bump . tag . personal CI" Foreground="$($t.Dim)" FontFamily="Cascadia Mono, Consolas" FontSize="12.5"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" shell:WindowChrome.IsHitTestVisibleInChrome="True">
           <Button x:Name="BtnWinMin" Content="&#x2013;" Style="{StaticResource Caption}"/>
@@ -118,15 +121,15 @@ $(Get-CgResourceXaml)
             <StackPanel>
               <TextBlock Text="// EACH STEP" Foreground="$($t.Accent)" FontFamily="Cascadia Mono, Consolas" FontSize="11" Margin="0,0,0,10"/>
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19" Margin="0,0,0,6"
-                Text="1. Bump — rewrite the version in package.json, both tauri.conf.json files, and both Cargo.toml/lock files (desktop + companion must match)."/>
+                Text="1. Bump - rewrite the version in package.json, both tauri.conf.json files, and both Cargo.toml/lock files (desktop + companion must match)."/>
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19" Margin="0,0,0,6"
-                Text="2. Commit — record those file edits on main so the tag points at a real snapshot."/>
+                Text="2. Commit - record those file edits on main so the tag points at a real snapshot."/>
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19" Margin="0,0,0,6"
-                Text="3. Tag vX.Y.Z — annotated git tag. The Release workflow only starts on v* tags."/>
+                Text="3. Tag vX.Y.Z - annotated git tag. The Release workflow only starts on v* tags."/>
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19" Margin="0,0,0,6"
-                Text="4. Push personal — send commit + tag to AbishekJReuben/GameTracker (CI secrets + Releases live here)."/>
+                Text="4. Push personal - send commit + tag to AbishekJReuben/GameTracker (CI secrets + Releases live here)."/>
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19"
-                Text="5. CI order — create-release → android APK → desktop NSIS. APK finishes first so you can test the phone build quickly."/>
+                Text="5. CI order - create-release -> android APK -> desktop NSIS. APK finishes first so you can test the phone build quickly."/>
             </StackPanel>
           </Border>
 
@@ -145,9 +148,9 @@ $(Get-CgResourceXaml)
           <StackPanel>
             <TextBlock Text="// STATUS" Foreground="$($t.Accent)" FontFamily="Cascadia Mono, Consolas" FontSize="11" Margin="0,0,0,10"/>
             <TextBlock Text="Current version" Foreground="$($t.Dim)" FontSize="11"/>
-            <TextBlock x:Name="TxtCurrent" Text="…" Foreground="$($t.Accent2)" FontFamily="Cascadia Mono, Consolas" FontSize="28" FontWeight="Bold" Margin="0,2,0,12"/>
+            <TextBlock x:Name="TxtCurrent" Text="..." Foreground="$($t.Accent2)" FontFamily="Cascadia Mono, Consolas" FontSize="28" FontWeight="Bold" Margin="0,2,0,12"/>
             <TextBlock Text="Branch / HEAD" Foreground="$($t.Dim)" FontSize="11"/>
-            <TextBlock x:Name="TxtBranch" Text="…" Foreground="$($t.Text)" FontFamily="Cascadia Mono, Consolas" FontSize="12" TextWrapping="Wrap" Margin="0,2,0,0"/>
+            <TextBlock x:Name="TxtBranch" Text="..." Foreground="$($t.Text)" FontFamily="Cascadia Mono, Consolas" FontSize="12" TextWrapping="Wrap" Margin="0,2,0,0"/>
           </StackPanel>
         </Border>
 
@@ -157,7 +160,7 @@ $(Get-CgResourceXaml)
             <TextBlock Text="New version" Foreground="$($t.Dim)" FontSize="11" Margin="0,0,0,4"/>
             <TextBox x:Name="TxtVersion" Height="34" Padding="8,6" FontFamily="Cascadia Mono, Consolas" FontSize="14"
                      Background="$($t.LogBg)" Foreground="$($t.Text)" BorderBrush="$($t.Edge)" CaretBrush="$($t.Accent)"/>
-            <Button x:Name="BtnShip" Content="Ship to personal (bump · tag · push)" Margin="0,12,0,0" Height="40" Style="{StaticResource Primary}"/>
+            <Button x:Name="BtnShip" Content="Ship to personal (bump . tag . push)" Margin="0,12,0,0" Height="40" Style="{StaticResource Primary}"/>
             <Button x:Name="BtnDry" Content="Dry-run (print steps only)" Margin="0,8,0,0" Height="34" Style="{StaticResource Ghost}"/>
             <Button x:Name="BtnCi" Content="Open GitHub Actions" Margin="0,8,0,0" Height="34" Style="{StaticResource Ghost}"/>
             <Button x:Name="BtnRefresh" Content="Refresh status" Margin="0,8,0,0" Height="34" Style="{StaticResource Ghost}"/>
@@ -229,7 +232,7 @@ function Invoke-Ship([switch]$DryRun) {
   $script:Busy = $true
   $BtnShip.IsEnabled = $false
   $BtnDry.IsEnabled = $false
-  Write-GuiLog $(if ($DryRun) { "Dry-run v$ver…" } else { "Shipping v$ver…" })
+  Write-GuiLog $(if ($DryRun) { "Dry-run v$ver..." } else { "Shipping v$ver..." })
 
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = 'powershell.exe'
@@ -254,11 +257,11 @@ function Invoke-Ship([switch]$DryRun) {
   }
 
   if ($p.ExitCode -eq 0) {
-    Write-GuiLog "Done. Open Actions to watch APK → desktop."
+    Write-GuiLog "Done. Open Actions to watch APK -> desktop."
     if (-not $DryRun) { Start-Process $script:CiUrl }
   } else {
     Write-GuiLog "FAILED (exit $($p.ExitCode))"
-    [System.Windows.MessageBox]::Show("Ship failed — see log.", 'Release', 'OK', 'Error') | Out-Null
+    [System.Windows.MessageBox]::Show("Ship failed - see log.", 'Release', 'OK', 'Error') | Out-Null
   }
 
   Update-Status

@@ -36,6 +36,23 @@ export type StreamTune = {
   jbMin: number;
   /** Guest: try WebCodecs DIRECT path after auth. */
   preferDirect: boolean;
+  /**
+   * Video pacing: 0 = responsiveness (paint every frame the instant it decodes —
+   * lowest latency, uneven cadence when arrival is bursty), 100 = smoothness
+   * (hold frames to a clock-synced playout schedule for even cadence, at the cost
+   * of that much added delay). Video only — input never rides this.
+   */
+  pace: number;
+  /** Host/DIRECT: recovery keyframe cadence (ms). Long GOP dodges the ~1Hz IDR hitch. */
+  wcKeyMs: number;
+  /** Host/DIRECT: skip encoding while this many KB sit unsent on the video channel. */
+  wcBufKB: number;
+  /** Host/DIRECT: skip encoding while more than this many frames are in the encoder. */
+  wcQueueMax: number;
+  /** Guest/RTC: windowed drop % above which the jitter buffer grows. */
+  jbGrowAt: number;
+  /** Guest/DIRECT: backoff floor before re-attempting DIRECT after a soft failure (s). */
+  directRetrySec: number;
 };
 
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
@@ -52,6 +69,12 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   jbMax: 120,
   jbMin: 40,
   preferDirect: true,
+  pace: 0,
+  wcKeyMs: 10000,
+  wcBufKB: 256,
+  wcQueueMax: 2,
+  jbGrowAt: 15,
+  directRetrySec: 15,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -85,6 +108,13 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     jbMax,
     jbMin,
     preferDirect: r.preferDirect !== false,
+    // 0 is a meaningful value (the default), so `||` would swallow it — test finite.
+    pace: clamp(Number.isFinite(Number(r.pace)) ? Number(r.pace) : d.pace, 0, 100),
+    wcKeyMs: clamp(Number(r.wcKeyMs) || d.wcKeyMs, 1000, 30000),
+    wcBufKB: clamp(Number(r.wcBufKB) || d.wcBufKB, 64, 1024),
+    wcQueueMax: clamp(Number(r.wcQueueMax) || d.wcQueueMax, 1, 6),
+    jbGrowAt: clamp(Number(r.jbGrowAt) || d.jbGrowAt, 5, 40),
+    directRetrySec: clamp(Number(r.directRetrySec) || d.directRetrySec, 5, 120),
   };
 }
 
@@ -162,6 +192,12 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.jbBase !== d.jbBase ||
     t.jbMax !== d.jbMax ||
     t.jbMin !== d.jbMin ||
-    t.preferDirect !== d.preferDirect
+    t.preferDirect !== d.preferDirect ||
+    t.pace !== d.pace ||
+    t.wcKeyMs !== d.wcKeyMs ||
+    t.wcBufKB !== d.wcBufKB ||
+    t.wcQueueMax !== d.wcQueueMax ||
+    t.jbGrowAt !== d.jbGrowAt ||
+    t.directRetrySec !== d.directRetrySec
   );
 }

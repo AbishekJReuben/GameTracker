@@ -59,6 +59,15 @@ export type QualitySettings = {
   minBitrateKbps?: number;
   /** Host: SDP x-google-start-bitrate (kbps) on next answer. */
   startBitrateKbps?: number;
+  /** Video pacing 0–100 (0 = responsiveness, 100 = smoothness). Host widens its
+   *  latest-wins skip thresholds; the guest does the actual playout pacing. */
+  pace?: number;
+  /** Host/DIRECT: recovery keyframe cadence (ms). */
+  wcKeyMs?: number;
+  /** Host/DIRECT: latest-wins channel-buffer ceiling (KB), before `pace` widens it. */
+  wcBufKB?: number;
+  /** Host/DIRECT: latest-wins encoder-queue ceiling, before `pace` widens it. */
+  wcQueueMax?: number;
 };
 
 export interface RemoteLink {
