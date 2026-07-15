@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "gametracker"
-version = "3.9.33"
+version = "3.9.34"
 dependencies = [
  "anyhow",
  "axum",
