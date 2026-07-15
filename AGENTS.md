@@ -45,15 +45,18 @@ Takeaways folded in: automatic background tracking, local/privacy-first storage,
 aggregation with day/week/month rollups, and a "your library + your stats" mental model.
 
 Stack decision — **Tauri 2 (Rust) + React/TS web frontend**, chosen over Electron and WinUI:
-- **Tauri** builds stay tiny (our installer is **2.7 MB**; Electron would be ~100 MB), launch fast,
-  and have first-class **tray + autostart + single-instance** plugins — ideal for a background
-  utility. Rust gives us direct Win32 access for process/idle tracking.
+- **Tauri** builds stay small (the installer started at **2.7 MB** and is now ~27 MB as bundled
+  assets and the hardware-monitor sidecar landed; Electron would still be far larger before any of
+  that), launch fast, and have first-class **tray + autostart + single-instance** plugins — ideal
+  for a background utility. Rust gives us direct Win32 access for process/idle tracking.
 - **Web frontend** unlocks the best modern UI/animation ecosystem (the reason we can hit "premium").
 
-Frontend libraries chosen (and why):
-- **React 18 + TypeScript + Vite** — fast, familiar, great DX.
-- **Tailwind CSS** — design-token-driven styling; our tokens live in `tailwind.config.js`.
-- **Framer Motion** — route transitions, `AnimatePresence`, layout animations, micro-interactions.
+Frontend libraries chosen (and why) — versions are what's actually in `package.json` today:
+- **React 19 + TypeScript 5 + Vite 7** — fast, familiar, great DX. Vite is held at 7 on purpose: the
+  dev machine runs Node 21, and newer Vite requires Node 22+ (see §11 Quick reference).
+- **Tailwind CSS 4** — design-token-driven styling; our tokens live in `tailwind.config.js`.
+- **Motion 12** (the `motion` package — the successor to `framer-motion`; import from `motion/react`,
+  not `framer-motion`) — route transitions, `AnimatePresence`, layout animations, micro-interactions.
 - **Recharts** — bar/scatter charts (Collection page); **custom SVG** for the heatmap, sparkline,
   and the horizontal timeline (more control than a chart lib gives).
 - **TanStack Query** — all backend reads/mutations; **Zustand** — UI/live state; **lucide-react** — icons.
@@ -422,7 +425,11 @@ A **Remote** feature lets an Android phone view live stats and control this PC's
 transports share one UI; the whole feature is gated behind the **`remote_enabled`** setting
 (default off), same "one toggle" convention as other network features.
 
-**Desktop remote server** — `src-tauri/src/remote/` (`mod.rs`, `capture.rs`, `input.rs`). An
+**Desktop remote server** — `src-tauri/src/remote/`: `mod.rs` (the axum server), `capture.rs` (the
+capture/encode pipeline), `dxdupe.rs` (DXGI Desktop Duplication + cursor), `gpu.rs` (the scale +
+cursor-composite shader), `native.rs` (D3D11 plumbing + the Rust→webview frame container),
+`nvenc/` (`ffi.rs` bindings, `mod.rs` encoder session, `sps.rs` bitstream fixup), `input.rs`
+(injection), `audio.rs`, `gamepad.rs`, `focus.rs`, `adb.rs`, `uac.rs`. An
 embedded **axum** HTTP+WS server on **port 47800** (`remote_port`), bound `0.0.0.0`, permissive
 CORS. Pairing: a 6-digit **PIN** (shown on `/remote`) → `POST /pair` returns a bearer token; every
 `/api/*` needs it. WS channels carry the token as a `?token=` query (browsers can't set WS headers).
@@ -431,11 +438,22 @@ Endpoints reuse the exact `db::*` functions via `spawn_blocking`. `/screen` stre
 isn't `Send`); `/media?path=<abs>` serves artwork (path-checked under `media_dir`). `best_host_ip()`
 prefers a Tailscale 100.64/10 address, else LAN.
 
-**Screen-capture pipeline (`capture.rs` + `dxdupe.rs`) — the fps-critical path.** The companion always
-uses the WebRTC video-track path (below), so the host frame rate is capped by how fast Rust can
-produce JPEGs to feed `canvas.captureStream()`. `start_capture` runs a **two-thread pipeline**: a
-capture thread hands frames to an encoder thread through a single-slot latest-wins mailbox, so
-capture(N+1) overlaps encode(N).
+**Screen-capture pipeline (`capture.rs` + `dxdupe.rs`) — the fps-critical path.**
+
+> **Read v3.9.27 (native NVENC) at the end of this section first.** On an NVIDIA host the
+> stream no longer goes through JPEG at all: it's duplication texture → `gpu.rs` (scale +
+> cursor in one shader pass) → `nvenc` → data channel, all on the capture thread, and the
+> mailbox/encoder-thread/JPEG machinery described below is the **fallback**. Everything
+> here is still live and still correct for that fallback — and much of it (Desktop
+> Duplication, MMCSS, TimerBoost, latest-wins) is shared by both paths — but "the host
+> produces JPEGs" is no longer the default story.
+
+Historically the companion always used the WebRTC video-track path (below), so the host frame
+rate was capped by how fast Rust could produce JPEGs to feed `canvas.captureStream()`.
+`start_capture` runs a **two-thread pipeline**: a capture thread hands frames to an encoder
+thread through a single-slot latest-wins mailbox, so capture(N+1) overlaps encode(N). (The
+zero-copy path finishes a frame entirely on the capture thread and never uses the mailbox —
+NVENC at ~1.2ms doesn't need the overlap that a 3.5ms+ JPEG encode did.)
 - **Capture = persistent DXGI Desktop Duplication (`dxdupe.rs`, Windows).** The old `xcap` path used
   GDI `BitBlt`+`GetDIBits`, which copies the **whole native framebuffer every frame** (fixed,
   single-threaded, memory-bandwidth-bound → capture was the flat bottleneck at every resolution with

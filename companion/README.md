@@ -18,15 +18,18 @@ just the native shell.
 
 The **Control** tab is a full remote-desktop surface (see `src/companion/screens/Control.tsx`):
 
-- **Hardware-video screen stream** over a **WebRTC media track** (like Chrome Remote Desktop):
-  the desktop capture thread streams frames to its webview over a binary Tauri channel, which
-  feeds `canvas.captureStream()` into the peer connection, so the browser hardware-encodes
-  H.264/VP9 with inter-frame compression + adaptive bitrate; the phone renders a plain,
-  hardware-decoded `<video>`. Pinch-to-zoom and pan (edge-clamped so no empty space shows).
-  The desktop side captures via **persistent DXGI Desktop Duplication** (GPU, only delivers changed
-  frames) and runs a **two-thread SIMD pipeline** (fast downscale + AVX2 JPEG, high-res frames split
-  into strips encoded across all cores, capture overlapping encode) so it feeds the video track at a
-  high frame rate instead of the old ~6 fps GDI-grab-every-frame loop.
+- **Hardware-video screen stream**, cloud-gaming style. On an NVIDIA PC the frame never leaves
+  the GPU: **persistent DXGI Desktop Duplication** (only delivers changed frames) → a single
+  shader pass that downscales *and* composites the mouse cursor → **NVENC H.264** → the phone's
+  hardware decoder. No JPEG, no canvas, no re-encode — the PC encodes a 1080p frame in **~1.2 ms**.
+  The bitstream is shaped for latency (no B-frames, no reordering, 1-frame DPB) so the phone's
+  decoder emits each frame immediately instead of buffering ahead. Pinch-to-zoom and pan
+  (edge-clamped so no empty space shows).
+  Two transports, negotiated automatically: **DIRECT** ships H.264 over a data channel and the
+  phone decodes it with `VideoDecoder` (no WebRTC jitter buffer — that buffer was an unfixable
+  ~200 ms); **RTC** is the fallback WebRTC media track, rendered as a plain `<video>`.
+  Non-NVIDIA PCs fall back to the older SIMD pipeline (AVX2 JPEG, parallel strips) feeding the
+  browser's own encoder. See AGENTS.md §13 for the whole ladder.
 - **Desktop audio**: the PC's sound is captured (WASAPI loopback) and sent as a WebRTC audio track in
   sync with the screen. It starts **muted** (phones only start audio on a tap) — hit the speaker
   button in the top bar to hear your PC.
@@ -61,11 +64,13 @@ The **Control** tab is a full remote-desktop surface (see `src/companion/screens
   · *HD* · *Ultra* · *Max 4K*, or custom resolution / sharpness / frame-rate; the desktop capture
   retunes and the encoder bitrate/framerate ceiling is set on the fly. A one-tap frame screenshot,
   and a **debug stats HUD** (enable in the Quality tab) that shows phone display fps, decode fps +
-  bitrate + jitter + loss + dropped/frozen frames (WebRTC `getStats`), and host produce fps +
-  capture/scale/encode ms + frame size + resolution — with a plain-language bottleneck guess
-  (host CPU vs network/decoder). Collapsible **Tune** panel soft-spots every streaming knob
+  bitrate + jitter + loss + dropped/frozen frames, and host produce fps + capture/encode ms +
+  frame size + resolution — with a plain-language bottleneck guess (host CPU vs network/decoder).
+  The header shows the live transport (**DIRECT** / RTC / LAN) plus an **NVENC** badge when the PC
+  is encoding the screen itself; without that badge the PC is on the JPEG fallback and "H264 enc"
+  will read ~35 ms instead of ~1 ms. Collapsible **Tune** panel soft-spots every streaming knob
   (`gt.remote.streamTune`). (Lower-sharpness presets use a fast nearest-neighbour downscale —
-  the main fps lever on high-res/4K monitors.)
+  the main fps lever on high-res/4K monitors, and only on the JPEG fallback.)
 
 ## Prerequisites (one-time, on your PC)
 
@@ -211,10 +216,11 @@ mouse/keyboard (see *Remote control features* above).
   games, UAC prompts) requires the desktop GameTracker to run **as administrator**.
 - Everything stays on your own devices — the phone talks only to your PC; nothing goes to a
   third-party server.
-- The screen stream is a **WebRTC video track** (hardware H.264/VP9, adaptive bitrate), fed from
-  the desktop capture thread. The phone picks quality live (resolution up to 4K, 10–60 fps) via
-  the **Quality** tab. For it to always be reachable after a reboot, install the signaling server
-  as a logon task: `npm run signal:install-startup` (see `../signaling/README.md`).
+- The screen stream is **hardware H.264** end to end: NVENC on the PC (or the browser's encoder
+  as a fallback), the phone's hardware decoder on the other side. The phone picks quality live
+  (resolution up to 4K, 10–60 fps) via the **Quality** tab. For it to always be reachable after a
+  reboot, install the signaling server as a logon task: `npm run signal:install-startup` (see
+  `../signaling/README.md`).
 - **Keyboard text goes to the PC's focused window** — click into the target field on the streamed
   screen first (the keyboard also auto-opens when the PC reports a focused text field). Injecting
   into elevated/game windows still needs the desktop app run as administrator.
