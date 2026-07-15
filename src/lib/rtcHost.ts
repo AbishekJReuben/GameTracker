@@ -406,6 +406,15 @@ export function startHost(opts: HostOptions): () => void {
   let wcSink: ((canvas: HTMLCanvasElement) => void) | null = null;
   /** Tear down the current session's WebCodecs encoder (set by startPeer). */
   let wcStop: (() => void) | null = null;
+  /**
+   * Set by startPeer while the guest is on DIRECT. When Rust is encoding natively
+   * (NVENC), frames arrive already H.264 and go straight out this sink — the canvas,
+   * the JPEG decode and the WebCodecs encoder are all bypassed. Null ⇒ Rust must send
+   * JPEG (the RTC track needs real pixels to composite).
+   */
+  let nativeSink: ((payload: Uint8Array<ArrayBuffer>, key: boolean) => void) | null = null;
+  /** True once Rust has told us (via the frame container) that it's encoding natively. */
+  let nativeActive = false;
 
   const stopCapture = () => {
     try {
@@ -696,6 +705,17 @@ export function startHost(opts: HostOptions): () => void {
     const ch = new Channel<ArrayBuffer>();
     ch.onmessage = (buf) => {
       const bytes = buf as unknown as ArrayBuffer;
+      // Native container ('G' 'N' | flags | rsv | w u16 | h u16 | Annex-B): Rust
+      // encoded this with NVENC, so there is nothing to do but forward it. This is
+      // the whole point of the native path — no JPEG decode, no canvas, no
+      // re-encode, none of the ~27ms round trip those cost.
+      const u8 = new Uint8Array(bytes);
+      if (u8.length > 8 && u8[0] === 0x47 && u8[1] === 0x4e) {
+        nativeActive = true;
+        nativeSink?.(u8.subarray(8), (u8[2] & 1) === 1);
+        return;
+      }
+      nativeActive = false;
       if (decoding) {
         newestPending = bytes;
         return;
@@ -1035,34 +1055,58 @@ export function startHost(opts: HostOptions): () => void {
 
     const wcTargetBps = () => (quality.bitrate > 0 ? quality.bitrate * 1000 : bitrateFor(quality));
 
-    /** Ship one encoded chunk: 20-byte header, then ≤WC_FRAG fragments. */
-    const wcSend = (chunk: EncodedVideoChunk) => {
+    /** Ship one encoded frame: 20-byte header, then ≤WC_FRAG fragments. The payload is
+     *  a view (not a copy) so the native path can forward Rust's bytes as-is. */
+    // `Uint8Array<ArrayBuffer>` (not the default `ArrayBufferLike`): RTCDataChannel.send
+    // won't take a possibly-SharedArrayBuffer-backed view.
+    const wcSendBytes = (payload: Uint8Array<ArrayBuffer>, key: boolean, tsMs: number) => {
       if (videoCh.readyState !== "open") return;
-      const payload = new ArrayBuffer(chunk.byteLength);
-      chunk.copyTo(payload);
       const head = new ArrayBuffer(20);
       const dv = new DataView(head);
       dv.setUint8(0, 0x47); // 'G'
       dv.setUint8(1, 0x56); // 'V'
-      dv.setUint8(2, chunk.type === "key" ? 1 : 0);
+      dv.setUint8(2, key ? 1 : 0);
       dv.setUint8(3, 0);
       dv.setUint32(4, wcSeq++ >>> 0, true);
-      dv.setFloat64(8, chunk.timestamp / 1000, true); // host perf.now() ms at capture
+      dv.setFloat64(8, tsMs, true); // host perf.now() ms at capture
       dv.setUint32(16, payload.byteLength, true);
       try {
         videoCh.send(head);
         for (let off = 0; off < payload.byteLength; off += WC_FRAG) {
-          videoCh.send(new Uint8Array(payload, off, Math.min(WC_FRAG, payload.byteLength - off)));
+          videoCh.send(payload.subarray(off, Math.min(off + WC_FRAG, payload.byteLength)));
         }
       } catch {
         return; // channel died mid-frame; the guest resyncs off the next header
       }
       wcFrames++;
       wcBytes += payload.byteLength;
-      if (chunk.type === "key") {
+      if (key) {
         wcKeys++;
         wcLastKeyAt = performance.now();
       }
+    };
+
+    const wcSend = (chunk: EncodedVideoChunk) => {
+      const payload = new ArrayBuffer(chunk.byteLength);
+      chunk.copyTo(payload);
+      wcSendBytes(new Uint8Array(payload), chunk.type === "key", chunk.timestamp / 1000);
+    };
+
+    // ---- native path: Rust already produced the H.264 ------------------------
+    // Nothing to encode here — forward the Annex-B frame straight to the guest.
+    // Latest-wins still applies: a channel backlog can only ever become latency.
+    nativeSink = (payload, key) => {
+      if (videoCh.readyState !== "open") return;
+      const pace = clamp(quality.pace, 0, 100) / 100;
+      const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
+      if (videoCh.bufferedAmount > maxBuffered) {
+        wcSkipped++;
+        return;
+      }
+      // Stamped on arrival rather than at capture: the host and Rust don't share a
+      // clock, and now that a frame is ~30KB instead of 334KB the IPC hop it folds
+      // into the measurement is small (it lands in `net+enc`, never unaccounted).
+      wcSendBytes(payload, key, performance.now());
     };
 
     /**
@@ -1073,6 +1117,15 @@ export function startHost(opts: HostOptions): () => void {
      */
     const wcTeardown = (notifyGuest: boolean, permanent = false) => {
       wcSink = null;
+      // Rust must go back to JPEG: the RTC track we're falling back to composites a
+      // canvas, and a canvas cannot be fed an H.264 bitstream.
+      nativeSink = null;
+      nativeActive = false;
+      try {
+        api.remoteSetCaptureNative(false);
+      } catch {
+        /* not on desktop */
+      }
       try {
         wcEncoder?.close();
       } catch {
@@ -1166,9 +1219,21 @@ export function startHost(opts: HostOptions): () => void {
     /** Guest opted in: pick a codec, build the encoder, divert the frame feed. */
     const wcActivate = async () => {
       if (wcSink || wcDead || pc !== myPc) return;
+      // Let Rust encode with NVENC if it can. When it does, frames arrive already
+      // H.264 and `nativeSink` ships them — the canvas/JPEG/WebCodecs chain below is
+      // never touched. We still build the WebCodecs encoder underneath as a live
+      // safety net: if NVENC faults mid-session Rust silently reverts to JPEG, and
+      // the canvas path has to be ready to carry the stream.
+      let nativeOk = false;
+      try {
+        nativeOk = await api.remoteSetCaptureNative(true);
+      } catch {
+        /* not on desktop */
+      }
+      if (pc !== myPc || wcSink) return; // superseded while awaiting
       if (typeof VideoEncoder === "undefined") {
-        // No WebCodecs at all in this webview — genuinely hopeless, tell the
-        // guest to stop asking.
+        // No WebCodecs encoder here. That's only fatal if Rust can't encode either.
+        if (nativeOk) return; // native carries DIRECT on its own
         wcDead = true;
         wcTeardown(true, true);
         return;
@@ -1202,7 +1267,10 @@ export function startHost(opts: HostOptions): () => void {
       }
       if (pc !== myPc || wcSink) return; // superseded while probing
       if (!picked) {
-        // Nothing on the H.264 ladder encodes here — no amount of retrying helps.
+        // Nothing on the H.264 ladder encodes here. Only fatal if Rust can't encode
+        // natively either — with NVENC up, DIRECT is perfectly healthy without a
+        // webview encoder (we just have no canvas fallback if NVENC later dies).
+        if (nativeOk) return;
         wcDead = true;
         wcTeardown(true, true);
         return;
@@ -1360,6 +1428,13 @@ export function startHost(opts: HostOptions): () => void {
           const now = Date.now();
           if (authorized && now - lastVresetAt > 4000) {
             lastVresetAt = now;
+            // On the native path the canvas/generator track isn't in the picture at
+            // all — the equivalent un-wedge is a fresh IDR + SPS from Rust.
+            try {
+              void api.remoteRequestKeyframe();
+            } catch {
+              /* not on desktop / no native encoder */
+            }
             void rebuildVideoPipeline();
           }
           return;
@@ -1379,8 +1454,15 @@ export function startHost(opts: HostOptions): () => void {
           return;
         }
         // Guest lost decode sync (error/reconfigure) — resync with a keyframe.
+        // Both encoders run an infinite GOP, so without this the guest would wait out
+        // the whole keyframe interval staring at nothing.
         if (msg && msg.type === "vkf") {
           wcForceKey = true;
+          try {
+            void api.remoteRequestKeyframe();
+          } catch {
+            /* not on desktop / no native encoder */
+          }
           return;
         }
         // Multi-monitor pop-out: spin up (or keep) an aux host for that display.
@@ -1416,6 +1498,10 @@ export function startHost(opts: HostOptions): () => void {
               quality.fps,
               jpegForRtc(quality.jpeg, quality.jpegCap),
               CONTENT_NUM[quality.mode] ?? 0,
+              // The native encoder needs a real bitrate, not a JPEG quality. 0 = let
+              // Rust derive it from resolution × fps × quality (same curve as
+              // `bitrateFor` below), so the phone's Bitrate knob drives both paths.
+              quality.bitrate,
             );
           } catch {
             /* ignore */
@@ -1665,20 +1751,30 @@ export function startHost(opts: HostOptions): () => void {
                     jpegQ: jpegForRtc(quality.jpeg, quality.jpegCap),
                     content: quality.mode,
                   },
-                  // WebCodecs direct-path telemetry (all cumulative except encMs/buf).
-                  wc: wcSink
-                    ? {
-                        on: true,
-                        codec: wcCodec,
-                        encMs: Math.round(wcEncMs * 10) / 10,
-                        frames: wcFrames,
-                        bytes: wcBytes,
-                        keys: wcKeys,
-                        skipped: wcSkipped,
-                        bufKB: Math.round(videoCh.bufferedAmount / 1024),
-                        kbpsMax: Math.round(wcBps / 1000),
-                      }
-                    : { on: false },
+                  // DIRECT-path telemetry (all cumulative except encMs/buf). Live
+                  // whenever EITHER encoder is feeding the video channel: `nativeSink`
+                  // (Rust/NVENC) or `wcSink` (webview WebCodecs).
+                  wc:
+                    wcSink || nativeActive
+                      ? {
+                          on: true,
+                          // `native` tells the HUD which encoder produced these
+                          // numbers — "H264 enc 1.2ms" is only believable with it.
+                          native: nativeActive,
+                          codec: nativeActive ? "NVENC/H264" : wcCodec,
+                          // On the native path the webview never encodes, so wcEncMs
+                          // would sit at 0 forever; report Rust's real NVENC time.
+                          encMs: nativeActive
+                            ? Math.round((cs?.encodeMs ?? 0) * 10) / 10
+                            : Math.round(wcEncMs * 10) / 10,
+                          frames: wcFrames,
+                          bytes: wcBytes,
+                          keys: wcKeys,
+                          skipped: wcSkipped,
+                          bufKB: Math.round(videoCh.bufferedAmount / 1024),
+                          kbpsMax: Math.round(wcBps / 1000),
+                        }
+                      : { on: false },
                   at: Date.now(),
                 }),
               );

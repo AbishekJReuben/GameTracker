@@ -2200,11 +2200,53 @@ pub fn remote_start_capture(
 
 /// Live-retune the streaming capture (resolution / fps / JPEG quality, and the
 /// optional content-optimization mode: 0 auto / 1 text / 2 video).
+///
+/// `bitrate_kbps` targets the **native** H.264 encoder (0/omitted = derive it from
+/// resolution × fps × quality); it has no effect on the JPEG fallback, where `quality`
+/// is the only lever.
 #[tauri::command]
-pub fn remote_set_capture_quality(max_w: u32, fps: u32, quality: u32, content: Option<u32>) {
+pub fn remote_set_capture_quality(
+    max_w: u32,
+    fps: u32,
+    quality: u32,
+    content: Option<u32>,
+    bitrate_kbps: Option<u32>,
+) {
     crate::remote::capture::set_capture_quality(max_w, fps, quality);
     if let Some(c) = content {
         crate::remote::capture::set_capture_content(c);
+    }
+    crate::remote::capture::set_capture_bitrate(bitrate_kbps.unwrap_or(0));
+}
+
+/// Ask the native encoder to emit a keyframe on the next frame.
+///
+/// The native path runs an infinite GOP, so a guest that just built a decoder (fresh
+/// session, `vkf`, `vreset`, decode stall) has nothing decodable until one arrives.
+/// A no-op on the JPEG fallback, where every frame is self-contained.
+#[tauri::command]
+pub fn remote_request_keyframe() {
+    crate::remote::capture::request_keyframe();
+}
+
+/// Allow (or forbid) native H.264 frames from the capture pipeline.
+///
+/// Only the DIRECT guest can consume pre-encoded H.264 — the WebRTC track path needs
+/// pixels for its canvas. The host enables this when the guest opts into DIRECT and
+/// disables it on every fallback to RTC.
+///
+/// Returns whether this machine actually *has* a native encoder, so the host knows
+/// whether to expect native frames (and whether a missing WebCodecs encoder is fatal).
+#[tauri::command]
+pub fn remote_set_capture_native(on: bool) -> bool {
+    crate::remote::capture::set_capture_native(on);
+    #[cfg(windows)]
+    {
+        crate::remote::nvenc::available()
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 

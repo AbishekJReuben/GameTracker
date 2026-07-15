@@ -491,6 +491,62 @@ static ST_OUT_H: AtomicU32 = AtomicU32::new(0);
 /// time to derive the true produced fps (independent of the target fps).
 static ST_PRODUCED: AtomicU32 = AtomicU32::new(0);
 
+/// True while the stream is being encoded natively (NVENC H.264) rather than as JPEG.
+/// Surfaced to the HUD so "why is this slow" is answerable at a glance.
+static ST_NATIVE: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`request_keyframe`] when the guest asks for an IDR (`vkf`/`vreset`, a fresh
+/// decoder, a resolution change). Consumed by the encoder thread on the next frame.
+static NATIVE_FORCE_KEY: AtomicBool = AtomicBool::new(false);
+
+/// Ask the native encoder for a self-contained keyframe on the next frame.
+///
+/// The native path runs an effectively infinite GOP (keyframes cost bandwidth and the
+/// data channel is reliable), so a guest whose decoder just started has nothing to
+/// decode until one of these lands.
+pub fn request_keyframe() {
+    NATIVE_FORCE_KEY.store(true, Ordering::Relaxed);
+}
+
+/// Bitrate the native encoder should target for this shape. Mirrors `bitrateFor()` in
+/// `rtcHost.ts`; an explicit override from the phone's Tune panel wins.
+#[cfg(windows)]
+fn native_bitrate_bps(w: u32, h: u32, fps: u32, quality: u32) -> u32 {
+    let override_kbps = CAP_BITRATE_KBPS.load(Ordering::Relaxed);
+    if override_kbps > 0 {
+        return (override_kbps.saturating_mul(1000)).clamp(500_000, 40_000_000);
+    }
+    super::native::auto_bitrate_bps(w, h, fps, quality)
+}
+
+/// Explicit bitrate ceiling in kbps from the phone's Tune panel (0 = derive from
+/// resolution/fps/quality).
+static CAP_BITRATE_KBPS: AtomicU32 = AtomicU32::new(0);
+
+/// Live-set the native encoder's bitrate (kbps; 0 = auto).
+pub fn set_capture_bitrate(kbps: u32) {
+    CAP_BITRATE_KBPS.store(kbps.min(40_000), Ordering::Relaxed);
+}
+
+/// Whether the consumer can accept native H.264 frames.
+///
+/// **Off by default and it must stay that way.** Only the DIRECT (WebCodecs-over-data-
+/// channel) guest can take pre-encoded H.264; the WebRTC track path needs real *pixels*
+/// to composite onto its canvas, and would show a black screen if we handed it a
+/// bitstream. The host flips this on when the guest opts into DIRECT and off on every
+/// fallback to RTC.
+static CAP_NATIVE_OK: AtomicBool = AtomicBool::new(false);
+
+/// Allow/forbid the native H.264 path (host calls this as the guest enters/leaves
+/// DIRECT). Enabling also forces a keyframe so the guest's fresh decoder has a start
+/// point instead of waiting out the infinite GOP.
+pub fn set_capture_native(on: bool) {
+    CAP_NATIVE_OK.store(on, Ordering::Relaxed);
+    if on {
+        request_keyframe();
+    }
+}
+
 /// A snapshot of the host capture pipeline, surfaced to the companion's debug HUD.
 #[derive(Serialize, Clone, Copy, Default)]
 #[serde(rename_all = "camelCase")]
@@ -509,6 +565,9 @@ pub struct CaptureStats {
     pub quality: u32,
     pub content: u32,
     pub running: bool,
+    /// True when frames are leaving as NVENC H.264 rather than JPEG. When true,
+    /// `encode_ms` is real NVENC time and `frame_bytes` is the H.264 frame.
+    pub native: bool,
 }
 
 /// Read the latest host-side capture telemetry.
@@ -528,6 +587,7 @@ pub fn capture_stats() -> CaptureStats {
         quality: CAP_QUALITY.load(Ordering::Relaxed),
         content: CAP_CONTENT.load(Ordering::Relaxed),
         running: CAP_RUNNING.load(Ordering::Relaxed),
+        native: ST_NATIVE.load(Ordering::Relaxed),
     }
 }
 
@@ -763,6 +823,11 @@ where
     let my_gen = CAP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     CAP_RUNNING.store(true, Ordering::SeqCst);
     ST_PRODUCED.store(0, Ordering::Relaxed);
+    // Every session starts on JPEG and is upgraded only once THIS guest opts into
+    // DIRECT. Leaving the previous session's flag set would hand native H.264 to a
+    // brand-new RTC guest, which paints its canvas from pixels and would show black.
+    CAP_NATIVE_OK.store(false, Ordering::Relaxed);
+    ST_NATIVE.store(false, Ordering::Relaxed);
 
     // Single-slot mailbox: (latest frame, condvar to wake the encoder).
     let mailbox: Arc<(PlMutex<Option<RawFrame>>, Condvar)> =
@@ -927,7 +992,7 @@ where
         mailbox_wake(&cap_mail);
     });
 
-    // ---- encoder thread: change-detect + SIMD JPEG + emit ----
+    // ---- encoder thread: change-detect + (native H.264 | SIMD JPEG) + emit ----
     let enc_mail = mailbox;
     std::thread::spawn(move || {
         boost_capture_thread();
@@ -936,6 +1001,15 @@ where
         // screen then costs one encode + a ~1/s memcpy instead of an encode per
         // keep-alive. Never touched on the changed-frame hot path.
         let mut cached: Option<(Vec<u8>, u32, u32, u8)> = None;
+        // Native NVENC session, built lazily on the first frame (we need its real
+        // dimensions) and rebuilt whenever the stream resolution changes. `None` means
+        // this machine has no NVENC and the JPEG path below carries the stream.
+        #[cfg(windows)]
+        let mut native: Option<super::native::NativeEncoder> = None;
+        #[cfg(windows)]
+        let mut native_off = false;
+        #[cfg(windows)]
+        let started = Instant::now();
         while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
             let frame = {
                 let (lock, cv) = &*enc_mail;
@@ -963,6 +1037,64 @@ where
             ST_OUT_W.store(frame.w, Ordering::Relaxed);
             ST_OUT_H.store(frame.h, Ordering::Relaxed);
 
+            // ---- native H.264 (NVENC) fast path ----------------------------------
+            // Only the BGRA (Desktop Duplication) source qualifies: the xcap fallback
+            // hands us RGBA, and swizzling a whole frame on the CPU would give back
+            // exactly the kind of per-pixel pass this path exists to remove.
+            #[cfg(windows)]
+            if !native_off
+                && CAP_NATIVE_OK.load(Ordering::Relaxed)
+                && matches!(frame.color, JpegColor::Bgra)
+                && (frame.changed || stale)
+            {
+                let fps = CAP_FPS.load(Ordering::Relaxed).max(1);
+                let want_bps = native_bitrate_bps(frame.w, frame.h, fps, quality as u32);
+                // (Re)build on first use or a resolution change. NVENC rounds to even
+                // dimensions, so ask the session what it settled on.
+                let usable = match native.as_mut() {
+                    Some(n) => n.accepts(frame.w, frame.h, fps, want_bps),
+                    None => false,
+                };
+                if !usable {
+                    native = super::native::NativeEncoder::new(None, frame.w, frame.h, fps, want_bps);
+                    if native.is_none() {
+                        // No NVENC on this machine (or it refused this shape). Say so
+                        // once, then stop paying for the attempt every frame.
+                        native_off = true;
+                        eprintln!(
+                            "[capture] native H.264 unavailable — streaming via the JPEG path ({}x{})",
+                            frame.w, frame.h
+                        );
+                    }
+                }
+                if let Some(n) = native.as_mut() {
+                    let (nw, nh) = n.size();
+                    // First frame of a session, a guest keyframe request, or the ~1s
+                    // keep-alive on a static screen all need a self-contained IDR.
+                    let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed) || stale;
+                    let ts_us = started.elapsed().as_micros() as u64;
+                    if let Some(pkt) = n.encode_pixels(&frame.px, frame.w, frame.h, force_key, ts_us) {
+                        ST_ENC_US.store(n.last_encode_us, Ordering::Relaxed);
+                        ST_BYTES.store(pkt.len() as u32, Ordering::Relaxed);
+                        ST_OUT_W.store(nw, Ordering::Relaxed);
+                        ST_OUT_H.store(nh, Ordering::Relaxed);
+                        ST_NATIVE.store(true, Ordering::Relaxed);
+                        ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
+                        emit(pkt);
+                        last_emit = Instant::now();
+                        cached = None;
+                        continue;
+                    }
+                    // Encode failed — drop the session and let JPEG carry this frame.
+                    // Staying retryable matters: a transient fault must not strand the
+                    // stream on JPEG for the rest of the session.
+                    native = None;
+                }
+            }
+            #[cfg(windows)]
+            ST_NATIVE.store(false, Ordering::Relaxed);
+
+            // ---- JPEG fallback ---------------------------------------------------
             // The capture side already told us whether the pixels changed, so there's
             // no whole-frame diff here (a 4K memcmp per frame was pure overhead).
             if frame.changed {

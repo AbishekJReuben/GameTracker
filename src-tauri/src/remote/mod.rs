@@ -19,8 +19,11 @@ pub(crate) mod capture;
 #[cfg(windows)]
 pub(crate) mod dxdupe;
 pub(crate) mod focus;
-/// Native NVENC H.264 encode for the screen stream (Windows + NVIDIA only; the
-/// JPEG→WebCodecs path stays as the fallback everywhere else).
+/// Native H.264 encode path for the screen stream: D3D11 plumbing + the wire
+/// container (Windows + NVIDIA only; JPEG→WebCodecs stays as the fallback).
+#[cfg(windows)]
+pub(crate) mod native;
+/// Low-level NVENC bindings + the low-latency encoder session and SPS fixup.
 #[cfg(windows)]
 pub(crate) mod nvenc;
 pub(crate) mod gamepad;

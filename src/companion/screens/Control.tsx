@@ -124,6 +124,8 @@ type HostRtcStats = {
 };
 type HostWcStats = {
   on: boolean;
+  /** PC encoded this itself with NVENC (no JPEG/canvas/WebCodecs round trip). */
+  native?: boolean;
   codec?: string;
   encMs?: number;
   frames?: number;
@@ -2774,6 +2776,12 @@ export function ControlScreen({
               <span className={`rounded px-1 py-0.5 text-[8px] font-800 ${wcStats ? "bg-green/20 text-green" : "bg-white/[0.08] text-ink-soft"}`}>
                 {wcStats ? "DIRECT" : hasStream ? "RTC" : "LAN"}
               </span>
+              {/* The PC is encoding H.264 itself (NVENC) instead of shipping JPEGs for
+                  the webview to re-encode — worth surfacing, it's the difference
+                  between ~1ms and ~35ms of host encode. */}
+              {hostStats?.wc?.native ? (
+                <span className="rounded bg-accent-3/20 px-1 py-0.5 text-[8px] font-800 text-accent-3">NVENC</span>
+              ) : null}
             </span>
             <span className="flex items-center gap-1">
               {(() => {
@@ -2879,7 +2887,14 @@ export function ControlScreen({
                 <StatCell k="Mode" v={hostStats.rtc?.content || "—"} />
                 {hostStats.wc?.on && (
                   <>
-                    <StatCell k="H264 enc" v={`${hostStats.wc.encMs ?? 0} ms`} hi={(hostStats.wc.encMs ?? 0) > 15} />
+                    {/* NVENC on the duplication texture is ~1-2ms at 1080p; the old
+                        canvas→WebCodecs path was ~35ms. Flag against the path in use
+                        so a healthy NVENC number isn't judged by JPEG-path standards. */}
+                    <StatCell
+                      k="H264 enc"
+                      v={`${hostStats.wc.encMs ?? 0} ms`}
+                      hi={(hostStats.wc.encMs ?? 0) > (hostStats.wc.native ? 5 : 15)}
+                    />
                     <StatCell k="Enc cap" v={`${hostStats.wc.kbpsMax ?? 0}k`} />
                     <StatCell k="Skipped" v={`${hostStats.wc.skipped ?? 0}`} hi={(hostStats.wc.skipped ?? 0) > 30} />
                     <StatCell k="Ch buf" v={`${hostStats.wc.bufKB ?? 0} KB`} hi={(hostStats.wc.bufKB ?? 0) > 128} />
@@ -4080,7 +4095,10 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   "NACK↑/PLI↑": { long: "Retransmit / keyframe asks (received)", info: "How often the PC was asked to resend or refresh — the mirror of the phone's counter." },
   "JPEG q": { long: "Intermediate JPEG quality", info: "Quality of the pre-H.264 JPEG, after the Tune panel's cap is applied." },
   Mode: { long: "Content mode", info: "Text favours crisp edges, Video favours smooth motion, Auto sits between." },
-  "H264 enc": { long: "PC H.264 encode time", info: "Time to encode one frame on the DIRECT path. Above ~20ms at 1080p suggests the PC fell back to a software encoder." },
+  "H264 enc": {
+    long: "PC H.264 encode time",
+    info: "Time to encode one frame on the DIRECT path. With the NVENC badge showing, the PC encodes the screen texture directly and this should be ~1-2ms at 1080p; without it the PC is going through JPEG + the browser's encoder, which costs ~35ms.",
+  },
   Skipped: { long: "Frames skipped (PC)", info: "Frames the PC dropped rather than send stale — deliberate. Climbing fast means it can't keep up; the Feel slider changes how eagerly it does this." },
   "Ch buf": { long: "Channel backlog", info: "Data queued and unsent on the video channel. A backlog can only ever become lag." },
 };

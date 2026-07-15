@@ -451,6 +451,8 @@ pub fn run() {
             commands::remote_grab_delta,
             commands::remote_start_capture,
             commands::remote_set_capture_quality,
+            commands::remote_request_keyframe,
+            commands::remote_set_capture_native,
             commands::remote_stop_capture,
             commands::remote_start_aux_capture,
             commands::remote_stop_aux_capture,

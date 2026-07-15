@@ -1217,8 +1217,21 @@ export const api = {
     fps: number,
     quality: number,
   ) => call<void>("remote_start_aux_capture", { monitor, onFrame, maxW, fps, quality }),
-  remoteSetCaptureQuality: (maxW: number, fps: number, quality: number, content?: number) =>
-    call<void>("remote_set_capture_quality", { maxW, fps, quality, content }),
+  // `bitrateKbps` drives the NATIVE H.264 encoder (0/omitted = derive from
+  // resolution × fps × quality). It does nothing on the JPEG fallback.
+  remoteSetCaptureQuality: (
+    maxW: number,
+    fps: number,
+    quality: number,
+    content?: number,
+    bitrateKbps?: number,
+  ) => call<void>("remote_set_capture_quality", { maxW, fps, quality, content, bitrateKbps }),
+  /// Ask the native encoder for a keyframe (infinite GOP, so a fresh decoder needs one).
+  remoteRequestKeyframe: () => call<void>("remote_request_keyframe"),
+  /// Allow native H.264 frames. Only DIRECT guests can take them — the RTC track path
+  /// needs pixels for its canvas, so this must be false whenever DIRECT isn't up.
+  /// Resolves true when this host actually has a native (NVENC) encoder.
+  remoteSetCaptureNative: (on: boolean) => call<boolean>("remote_set_capture_native", { on }),
   remoteStopCapture: () => call<void>("remote_stop_capture"),
   remoteStopAuxCapture: (monitor?: number) => call<void>("remote_stop_aux_capture", { monitor }),
   // Desktop-audio (WASAPI loopback) for the WebRTC audio track. PCM float32 frames
@@ -1270,6 +1283,12 @@ export interface RemoteCaptureStats {
   /** Content-optimization mode: 0 auto / 1 text / 2 video. */
   content: number;
   running: boolean;
+  /**
+   * True when frames are leaving as NVENC H.264 rather than JPEG. When set,
+   * `encodeMs` is real NVENC time and `frameBytes` is the H.264 frame (~30KB) rather
+   * than a JPEG (~334KB).
+   */
+  native: boolean;
 }
 
 export interface RemoteStatus {
