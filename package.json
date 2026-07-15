@@ -1,7 +1,7 @@
 {
   "name": "gametracker",
   "private": true,
-  "version": "3.9.26",
+  "version": "3.9.27",
   "type": "module",
   "scripts": {
     "dev": "vite",

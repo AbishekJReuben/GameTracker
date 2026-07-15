@@ -7,6 +7,7 @@
     the auto-updater, and the version shown inside the app all agree:
 
         package.json                          "version"
+        package-lock.json                     root "version" + packages."".version
         src-tauri/tauri.conf.json             "version"   (embedded at compile time -> package_info)
         src-tauri/Cargo.toml                  [package] version
         src-tauri/Cargo.lock                  gametracker package entry
@@ -60,6 +61,7 @@ $root = Split-Path -Parent $PSScriptRoot
 function P([string]$rel) { Join-Path $root $rel }
 
 $pkgJson  = P "package.json"
+$pkgLock  = P "package-lock.json"
 $confJson = P "src-tauri/tauri.conf.json"
 $cargo    = P "src-tauri/Cargo.toml"
 $cargoLk  = P "src-tauri/Cargo.lock"
@@ -145,6 +147,24 @@ function Set-Version([string]$path, [string]$pattern, [string]$label) {
 # package.json:        "version": "x.y.z"
 Edit-File $pkgJson  "(`"version`"\s*:\s*`")$esc(`")" "`${1}$new`${2}" "package.json version"
 
+# package-lock.json:   npm stores the app's own version in exactly TWO places — the root
+#                      "version" and packages."".version — and they are always the first
+#                      two "version" fields in the file. Every OTHER "version" belongs to
+#                      a dependency and must not be touched, which is why this uses the
+#                      instance Replace overload with a real count of 2 rather than
+#                      Edit-File (whose trailing `1` is a RegexOptions, not a count, so it
+#                      rewrites every match — fine for the files above, wrong here).
+#                      npm rewrites these on `npm install`, but the lock is committed, so
+#                      a bump that skips it leaves the tree inconsistent.
+$lockRaw = Read-Text $pkgLock
+$lockRe  = [regex]"(`"version`"\s*:\s*`")$esc(`")"
+$lockNew = $lockRe.Replace($lockRaw, "`${1}$new`${2}", 2)
+if ($lockNew -eq $lockRaw) {
+    throw "Did not find version $current to replace in $pkgLock. File left unchanged."
+}
+Write-Text $pkgLock $lockNew
+Write-Host "  updated $(Resolve-Path $pkgLock -Relative)" -ForegroundColor DarkGray
+
 # tauri.conf.json:     "version": "x.y.z"
 Edit-File $confJson "(`"version`"\s*:\s*`")$esc(`")" "`${1}$new`${2}" "tauri.conf.json version"
 
@@ -163,13 +183,13 @@ Set-Version $cCompCargo "(?m)^(version\s*=\s*`")([0-9]+\.[0-9]+\.[0-9]+[^`"]*)(`
 # companion Cargo.lock:       the version line directly under  name = "gametracker-companion"
 Set-Version $cCompLock  "(name = `"gametracker-companion`"\r?\nversion = `")([0-9]+\.[0-9]+\.[0-9]+[^`"]*)(`")" "companion Cargo.lock entry"
 
-Write-Host "Version bumped to $new in 7 files (desktop + Android companion)." -ForegroundColor Green
+Write-Host "Version bumped to $new in 8 files (desktop + Android companion)." -ForegroundColor Green
 
 # --- Optional git tag / push --------------------------------------------------
 if ($Tag -or $Push) {
     Push-Location $root
     try {
-        git add $pkgJson $confJson $cargo $cargoLk $cCompConf $cCompCargo $cCompLock | Out-Null
+        git add $pkgJson $pkgLock $confJson $cargo $cargoLk $cCompConf $cCompCargo $cCompLock | Out-Null
         git commit -m "Bump version to $new" | Out-Null
         git tag -a "v$new" -m "Tracker v$new" | Out-Null
         Write-Host "Committed and tagged v$new." -ForegroundColor Green
