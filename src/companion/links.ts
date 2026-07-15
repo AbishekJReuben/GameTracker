@@ -110,6 +110,10 @@ export interface RemoteLink {
   onWcFrame?(cb: (f: VideoFrame) => void): () => void;
   /** Live wc-path telemetry (null when inactive). */
   wcStats?(): WcStats | null;
+  /** Live audio-path telemetry (DIRECT PCM vs RTC Opus). */
+  audioStats?(): import("./cloud").AudioStats | null;
+  /** Mute DIRECT audio playback (RTC still uses the <audio> element). */
+  setAudioMuted?(muted: boolean): void;
   /** Apply guest-side Tune panel knobs (JB + WebCodecs preference). */
   applyStreamTune?(tune: import("./streamTune").StreamTune): void;
   /** Wipe Tune prefs to shipped defaults (also used when connect is stuck). */
@@ -276,6 +280,12 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
     },
     wcStats() {
       return conn.wcInfo();
+    },
+    audioStats() {
+      return conn.audioInfo();
+    },
+    setAudioMuted(muted) {
+      conn.setAudioMuted(muted);
     },
     applyStreamTune(tune) {
       conn.applyStreamTune(tune);

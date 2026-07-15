@@ -149,8 +149,10 @@ function boostStartBitrate(sdp: string, startKbps: number, minKbps = 2500): stri
 function bitrateFor(q: { maxW: number; jpeg: number; fps: number }): number {
   const h = Math.round((q.maxW * 9) / 16);
   const px = q.maxW * h;
-  const bpp = 0.06 * (q.jpeg / 70); // ~0.06 bits/pixel at "quality 70"
-  return Math.round(clamp(px * q.fps * bpp, 500_000, 40_000_000));
+  // 0.10 bpp @ quality 70 — matched to native.rs. Baseline+CAVLC + desktop/webcam
+  // need more than the old 0.06 (talking-head) figure or the picture macroblocks.
+  const bpp = 0.1 * (q.jpeg / 70);
+  return Math.round(clamp(px * q.fps * bpp, 2_000_000, 40_000_000));
 }
 
 /** Route a stats or action request path to the matching backend call. */
@@ -410,6 +412,70 @@ export function startHost(opts: HostOptions): () => void {
     // Let Rust encode natively (NVENC). The phone can turn this off to fall back to
     // the long-standing JPEG→canvas→WebCodecs path.
     hostNvenc: true,
+  };
+
+  // Adaptive bitrate for the DIRECT path. Phone Wi-Fi can jump; when the video
+  // channel backs up we shed bitrate so frames keep flowing (FPS stays up, blocks
+  // stay mild) instead of skipping half the frames into a 14-fps slideshow. Eases
+  // back toward the Tune target when the channel drains. VIDEO ONLY — never touches
+  // input. `adaptKbps` is what Rust actually encodes at; `quality.bitrate` is the cap.
+  let adaptKbps = 0;
+  let adaptCleanTicks = 0;
+  let lastAdaptPush = 0;
+
+  /** Target ceiling from the Tune panel (or auto curve). */
+  const targetKbps = () =>
+    quality.bitrate > 0 ? quality.bitrate : Math.round(bitrateFor(quality) / 1000);
+
+  /** Push the live encode bitrate to Rust (+ WebCodecs) when adapt moved enough. */
+  const pushAdaptBitrate = (force = false) => {
+    const tgt = targetKbps();
+    if (adaptKbps <= 0) adaptKbps = tgt;
+    const now = Date.now();
+    if (!force && now - lastAdaptPush < 400) return;
+    lastAdaptPush = now;
+    const kbps = Math.round(clamp(adaptKbps, Math.max(1500, quality.minBitrateKbps), tgt));
+    adaptKbps = kbps;
+    try {
+      api.remoteSetCaptureQuality(
+        quality.maxW,
+        quality.fps,
+        jpegForRtc(quality.jpeg, quality.jpegCap),
+        CONTENT_NUM[quality.mode] ?? 0,
+        kbps,
+      );
+    } catch {
+      /* not on desktop */
+    }
+    // Keep the canvas/WebCodecs encoder (fallback path) on the same budget.
+    applyBitrate();
+  };
+
+  /**
+   * Shed or restore bitrate from the video-channel backlog. Called from the
+   * send path (on skip) and the capstats tick (periodic).
+   */
+  const adaptFromBuffer = (buffered: number, maxBuffered: number, skippedThisFrame: boolean) => {
+    const tgt = targetKbps();
+    if (adaptKbps <= 0) adaptKbps = tgt;
+    const fill = maxBuffered > 0 ? buffered / maxBuffered : 0;
+    if (skippedThisFrame || fill > 0.55) {
+      // Network can't drain — cut ~12% so the next frames fit. Floor at 1.5 Mbps /
+      // Tune min so we don't spiral into unreadable mush.
+      adaptKbps = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * 0.88));
+      adaptCleanTicks = 0;
+      pushAdaptBitrate();
+    } else if (fill < 0.12) {
+      adaptCleanTicks++;
+      // ~1.2s of a drained channel → ease 5% back toward the Tune target.
+      if (adaptCleanTicks >= 3 && adaptKbps < tgt) {
+        adaptKbps = Math.min(tgt, Math.round(adaptKbps * 1.05 + 50));
+        adaptCleanTicks = 0;
+        pushAdaptBitrate();
+      }
+    } else {
+      adaptCleanTicks = 0;
+    }
   };
 
   // When set, composited frames are diverted from the WebRTC generator track into
@@ -788,8 +854,18 @@ export function startHost(opts: HostOptions): () => void {
    * rendering thread, which page/game load can't jank. The buffering/resampling
    * logic lives in `audioFeeder.worklet.js`; the main thread's only remaining
    * job is forwarding chunks. **Do not move this back to ScriptProcessor.**
+   *
+   * DIRECT audio (phone `{type:"amode",mode:"pcm"}`) bypasses the worklet + WebRTC
+   * track: PCM rides the "audio" data channel to a lean worklet on the phone —
+   * closes the lag gap after NVENC made video near-instant while Opus+NetEQ stayed
+   * ~150–250ms behind.
    */
-  const buildAudioTrack = async (): Promise<{ track: MediaStreamTrack; start: () => Promise<void> } | null> => {
+  const buildAudioTrack = async (): Promise<{
+    track: MediaStreamTrack;
+    start: () => Promise<void>;
+    setDirectSink: (ch: RTCDataChannel | null) => void;
+    format: () => { sampleRate: number; channels: number } | null;
+  } | null> => {
     try {
       audioCtx = new AudioContext({ sampleRate: 48000 });
     } catch {
@@ -813,12 +889,29 @@ export function startHost(opts: HostOptions): () => void {
     });
     node.connect(dest);
     audioNode = node;
+    // RTC path: slightly wider than the phone DIRECT defaults — absorbs IPC
+    // jitter from the Tauri channel under game load without the old 90ms sit.
+    try {
+      node.port.postMessage({ cfg: { channels: 2, captureRate: ctx.sampleRate, primeMs: 40, targetMs: 55, maxMs: 150 } });
+    } catch {
+      /* ignore */
+    }
 
-    // Forward each PCM chunk into the worklet, TRANSFERRING the buffer so the
-    // main thread does no audio work beyond handing the bytes over.
+    let directSink: RTCDataChannel | null = null;
+    let liveFmt: { sampleRate: number; channels: number } | null = null;
+
+    // DIRECT → data channel (copy); RTC → worklet (transfer).
     const ch = new Channel<ArrayBuffer>();
     ch.onmessage = (buf) => {
       const ab = buf as unknown as ArrayBuffer;
+      if (directSink && directSink.readyState === "open") {
+        try {
+          directSink.send(ab.slice(0));
+        } catch {
+          /* channel torn down */
+        }
+        return;
+      }
       try {
         node.port.postMessage(ab, [ab]);
       } catch {
@@ -837,13 +930,37 @@ export function startHost(opts: HostOptions): () => void {
       const channels = fmt ? Math.max(1, Math.min(2, fmt.channels)) : 2;
       const captureRate =
         fmt && fmt.sampleRate > 8000 && fmt.sampleRate <= 384000 ? fmt.sampleRate : ctx.sampleRate;
+      liveFmt = { sampleRate: captureRate, channels };
       try {
-        node.port.postMessage({ cfg: { channels, captureRate } });
+        node.port.postMessage({
+          cfg: { channels, captureRate, primeMs: 40, targetMs: 55, maxMs: 150 },
+        });
       } catch {
         /* node torn down */
       }
+      if (directSink && directSink.readyState === "open") {
+        try {
+          directSink.send(JSON.stringify({ cfg: { sampleRate: captureRate, channels } }));
+        } catch {
+          /* ignore */
+        }
+      }
     };
-    return { track, start };
+    return {
+      track,
+      start,
+      setDirectSink: (sink) => {
+        directSink = sink;
+        if (sink && sink.readyState === "open" && liveFmt) {
+          try {
+            sink.send(JSON.stringify({ cfg: { sampleRate: liveFmt.sampleRate, channels: liveFmt.channels } }));
+          } catch {
+            /* ignore */
+          }
+        }
+      },
+      format: () => liveFmt,
+    };
   };
 
   const startPeer = async () => {
@@ -859,6 +976,8 @@ export function startHost(opts: HostOptions): () => void {
     let authBusy = false;
     let startVideoCapture: (() => Promise<void>) | null = null;
     let startAudioCapture: (() => Promise<void>) | null = null;
+    let setAudioDirectSink: ((ch: RTCDataChannel | null) => void) | null = null;
+    let audioDirect = false;
     // Capture-stall watchdog bookkeeping (restart capture if it wedges).
     let lastProduced = -1;
     let zeroSince = 0;
@@ -1048,6 +1167,10 @@ export function startHost(opts: HostOptions): () => void {
     // front (no renegotiation); carries nothing until the guest opts in.
     const videoCh = pc.createDataChannel("video");
     videoCh.binaryType = "arraybuffer";
+    // DIRECT audio: raw float32 PCM. Created up front (no renegotiation); idle
+    // until the guest opts in with `{type:"amode",mode:"pcm"}`.
+    const audioCh = pc.createDataChannel("audio");
+    audioCh.binaryType = "arraybuffer";
 
     // ---- WebCodecs direct-video encoder (bypasses the receiver jitter buffer).
     // The phone's dominant latency term was Chromium's video jitter buffer:
@@ -1141,10 +1264,13 @@ export function startHost(opts: HostOptions): () => void {
       }
       const pace = clamp(quality.pace, 0, 100) / 100;
       const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
-      if (videoCh.bufferedAmount > maxBuffered) {
+      const buffered = videoCh.bufferedAmount;
+      if (buffered > maxBuffered) {
         wcSkipped++;
+        adaptFromBuffer(buffered, maxBuffered, true);
         return;
       }
+      adaptFromBuffer(buffered, maxBuffered, false);
       // Stamped on arrival rather than at capture: the host and Rust don't share a
       // clock, and now that a frame is ~30KB instead of 334KB the IPC hop it folds
       // into the measurement is small (it lands in `net+enc`, never unaccounted).
@@ -1395,6 +1521,7 @@ export function startHost(opts: HostOptions): () => void {
         audioTrack = a.track;
         pc.addTrack(audioTrack, new MediaStream([audioTrack]));
         startAudioCapture = a.start;
+        setAudioDirectSink = a.setDirectSink;
       }
     }
 
@@ -1528,6 +1655,34 @@ export function startHost(opts: HostOptions): () => void {
           }
           return;
         }
+        // Audio-mode: "pcm" = DIRECT float32 over the data channel (lean phone
+        // worklet); "rtc" = classic Opus track. Mirrors vmode for the sound path.
+        if (msg && msg.type === "amode") {
+          if (msg.mode === "pcm" && authorized) {
+            audioDirect = true;
+            setAudioDirectSink?.(audioCh);
+            if (audioTrack) audioTrack.enabled = false;
+            if (dataCh?.readyState === "open") {
+              try {
+                dataCh.send(JSON.stringify({ event: "amode", mode: "pcm" }));
+              } catch {
+                /* ignore */
+              }
+            }
+          } else {
+            audioDirect = false;
+            setAudioDirectSink?.(null);
+            if (audioTrack) audioTrack.enabled = true;
+            if (dataCh?.readyState === "open") {
+              try {
+                dataCh.send(JSON.stringify({ event: "amode", mode: "rtc" }));
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+          return;
+        }
         // Guest lost decode sync (error/reconfigure) — resync with a keyframe.
         // Both encoders run an infinite GOP, so without this the guest would wait out
         // the whole keyframe interval staring at nothing.
@@ -1567,6 +1722,10 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.wcKeyMs === "number") quality.wcKeyMs = clamp(msg.wcKeyMs, 1000, 30000);
           if (typeof msg.wcBufKB === "number") quality.wcBufKB = clamp(msg.wcBufKB, 64, 1024);
           if (typeof msg.wcQueueMax === "number") quality.wcQueueMax = clamp(msg.wcQueueMax, 1, 6);
+          // Explicit Tune bitrate change resets the adaptive ceiling so a raise
+          // isn't stuck under a previous network-shed floor.
+          adaptKbps = targetKbps();
+          adaptCleanTicks = 0;
           // Native encode on/off takes effect live — the whole point is to A/B it (or
           // escape a bad picture) without reconnecting. Only meaningful while DIRECT
           // is up; wcActivate reads `quality.hostNvenc` when it isn't.
@@ -1597,10 +1756,10 @@ export function startHost(opts: HostOptions): () => void {
               quality.fps,
               jpegForRtc(quality.jpeg, quality.jpegCap),
               CONTENT_NUM[quality.mode] ?? 0,
-              // The native encoder needs a real bitrate, not a JPEG quality. 0 = let
-              // Rust derive it from resolution × fps × quality (same curve as
-              // `bitrateFor` below), so the phone's Bitrate knob drives both paths.
-              quality.bitrate,
+              // The native encoder needs a real bitrate, not a JPEG quality. Prefer
+              // the adaptive value (phone-network shed) when it's running; else the
+              // Tune target / auto curve.
+              adaptKbps > 0 ? adaptKbps : quality.bitrate,
             );
           } catch {
             /* ignore */
@@ -1830,6 +1989,13 @@ export function startHost(opts: HostOptions): () => void {
                   bytesSent: 0,
                 };
           if (cs && opts.fixedMonitor == null && data.readyState === "open") {
+            // Periodic adapt even when no frames were skipped this tick — a slow
+            // drain (fill 0.2–0.5) still wants a gentle shed before it hits the wall.
+            if (nativeActive || wcSink) {
+              const pace = clamp(quality.pace, 0, 100) / 100;
+              const maxBuf = quality.wcBufKB * 1024 * (1 + pace);
+              adaptFromBuffer(videoCh.bufferedAmount, maxBuf, false);
+            }
             try {
               data.send(
                 JSON.stringify({
@@ -1871,9 +2037,16 @@ export function startHost(opts: HostOptions): () => void {
                           keys: wcKeys,
                           skipped: wcSkipped,
                           bufKB: Math.round(videoCh.bufferedAmount / 1024),
-                          kbpsMax: Math.round(wcBps / 1000),
+                          kbpsMax: Math.round((adaptKbps > 0 ? adaptKbps : wcTargetBps() / 1000)),
+                          adaptKbps: Math.round(adaptKbps),
+                          targetKbps: targetKbps(),
                         }
                       : { on: false },
+                  // Audio path telemetry for the phone HUD.
+                  audio: {
+                    mode: audioDirect ? "pcm" : "rtc",
+                    chBufKB: Math.round((audioCh.bufferedAmount || 0) / 1024),
+                  },
                   at: Date.now(),
                 }),
               );

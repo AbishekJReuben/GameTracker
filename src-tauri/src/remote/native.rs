@@ -53,11 +53,17 @@ fn wrap(annexb: &[u8], key: bool, w: u32, h: u32) -> Vec<u8> {
 /// Bitrate for a given stream shape, mirroring `bitrateFor()` in `rtcHost.ts` so the
 /// native path lands on the same bitrate the WebRTC path would have negotiated.
 /// `quality` is the existing 20..95 sharpness knob.
+///
+/// Bits-per-pixel is **0.10** at quality 70 (was 0.06). Constrained Baseline + CAVLC
+/// needs ~10% more than High+CABAC for the same look (Sunshine's `nvenc_h264_cavlc`
+/// note), and a desktop with a live webcam is far denser than a talking-head stream
+/// the old 0.06 figure was tuned for — that starved the encoder into macroblocks.
 pub fn auto_bitrate_bps(w: u32, h: u32, fps: u32, quality: u32) -> u32 {
     let px = (w as u64) * (h as u64);
-    let bpp = 0.06_f64 * (quality as f64 / 70.0);
+    let bpp = 0.10_f64 * (quality as f64 / 70.0);
     let bps = (px as f64) * (fps.max(1) as f64) * bpp;
-    bps.clamp(500_000.0, 40_000_000.0) as u32
+    // Floor 2 Mbps: below that even 720p desktop+webcam turns to blocks.
+    bps.clamp(2_000_000.0, 40_000_000.0) as u32
 }
 
 /// A live native encoder: D3D11 device + upload texture + NVENC session.
@@ -256,10 +262,10 @@ mod tests {
         let a = auto_bitrate_bps(1920, 1080, 60, 70);
         let b = auto_bitrate_bps(1920, 1080, 30, 70);
         assert!(a > b, "more fps must ask for more bitrate");
-        // 1080p60 at quality 70 ~= 0.06 bpp -> ~7.5 Mbps.
-        assert!((6_000_000..=9_000_000).contains(&a), "unexpected 1080p60 bitrate: {a}");
+        // 1080p60 at quality 70 ~= 0.10 bpp -> ~12.4 Mbps.
+        assert!((10_000_000..=15_000_000).contains(&a), "unexpected 1080p60 bitrate: {a}");
         // Clamps hold at the extremes.
-        assert_eq!(auto_bitrate_bps(320, 180, 1, 20), 500_000);
+        assert_eq!(auto_bitrate_bps(320, 180, 1, 20), 2_000_000);
         assert_eq!(auto_bitrate_bps(7680, 4320, 240, 95), 40_000_000);
     }
 }

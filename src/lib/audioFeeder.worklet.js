@@ -15,8 +15,11 @@
  *    nudged ±0.4% (inaudible) to steer the buffer toward TARGET, so clock skew
  *    never forces a trim or an underrun in steady state.
  *  - A slew-limited gain ramp (~6ms) makes every silence↔audio edge click-free.
- *  - TARGET grows +40ms on each underrun (bursty chunk delivery while a game
- *    hogs the CPU) up to 250ms, and eases back down after ~10s of clean play.
+ *  - TARGET grows on each underrun up to `maxMs`, and eases back after ~10s clean.
+ *
+ * Buffer envelope is configurable via `{cfg:{primeMs,targetMs,maxMs}}` so the
+ * host's RTC feeder (wider, absorbs IPC jitter) and the phone's DIRECT feeder
+ * (lean, matches the near-instant video path) can share one processor.
  *
  * No per-frame allocations in `process()` — GC pauses on the audio thread are
  * themselves a crackle source.
@@ -33,8 +36,11 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     this.head = 0;
     this.avail = 0; // interleaved samples currently buffered
     // Envelope (ms): prime, steer toward target, trim runaway latency.
-    this.primeMs = 70;
-    this.targetMs = 90;
+    // Defaults = lean DIRECT profile; the host RTC path widens these via cfg.
+    this.primeMs = 25;
+    this.targetMs = 40;
+    this.maxMs = 120;
+    this.baseTargetMs = 40;
     this.priming = true;
     this.gain = 0;
     // Resampler state: interpolating between input frames f0 and f1, phase∈[0,1).
@@ -42,21 +48,28 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     this.f0 = new Float32Array(2);
     this.f1 = new Float32Array(2);
     this.cleanQuanta = 0;
+    this.underruns = 0;
     this.port.onmessage = (e) => {
       const d = e.data;
       if (d instanceof ArrayBuffer) {
         const f32 = new Float32Array(d);
         this.chunks.push(f32);
         this.avail += f32.length;
-        // Runaway-latency guard: past target+130ms, trim back to target in one
+        // Runaway-latency guard: past target+headroom, trim back to target in one
         // splice (rare — steady-state drift is handled by the resampler).
-        const max = this.ms(this.targetMs + 130);
+        const max = this.ms(Math.min(this.maxMs, this.targetMs + 80));
         if (this.avail > max) this.drop(this.avail - this.ms(this.targetMs));
         return;
       }
       if (d && d.cfg) {
         const ch = Math.max(1, Math.min(2, d.cfg.channels | 0));
         const rate = d.cfg.captureRate > 8000 ? d.cfg.captureRate : sampleRate;
+        if (typeof d.cfg.primeMs === "number") this.primeMs = Math.max(10, Math.min(120, d.cfg.primeMs));
+        if (typeof d.cfg.targetMs === "number") {
+          this.baseTargetMs = Math.max(15, Math.min(200, d.cfg.targetMs));
+          this.targetMs = this.baseTargetMs;
+        }
+        if (typeof d.cfg.maxMs === "number") this.maxMs = Math.max(this.baseTargetMs, Math.min(300, d.cfg.maxMs));
         if (ch !== this.channels || rate !== this.captureRate) {
           // Framing changed: buffered bytes were queued under the old
           // assumption — drop them and re-prime.
@@ -67,6 +80,17 @@ class GtPcmFeeder extends AudioWorkletProcessor {
           this.avail = 0;
           this.priming = true;
           this.phase = 0;
+        }
+        // Stats poll from the main thread.
+        if (d.cfg.stats) {
+          this.port.postMessage({
+            stats: {
+              bufMs: this.channels ? (this.avail / this.channels / sampleRate) * 1000 : 0,
+              targetMs: this.targetMs,
+              priming: this.priming,
+              underruns: this.underruns,
+            },
+          });
         }
       }
     };
@@ -160,16 +184,17 @@ class GtPcmFeeder extends AudioWorkletProcessor {
 
     if (underran) {
       this.cleanQuanta = 0;
+      this.underruns++;
       // Bursty delivery (game hogging the CPU delays chunk forwarding): hold
       // more audio before resuming so the next gap fits inside the buffer.
-      this.targetMs = Math.min(250, this.targetMs + 40);
+      this.targetMs = Math.min(this.maxMs, this.targetMs + 25);
       // Ran fully dry → refill to PRIME before resuming (prevents machine-gun
       // clicking when the stream is briefly starved).
       if (this.avail < this.channels) this.priming = true;
-    } else if (++this.cleanQuanta * frames > sampleRate * 10 && this.targetMs > 90) {
+    } else if (++this.cleanQuanta * frames > sampleRate * 10 && this.targetMs > this.baseTargetMs) {
       // ~10s clean → ease latency back down one step.
       this.cleanQuanta = 0;
-      this.targetMs -= 10;
+      this.targetMs = Math.max(this.baseTargetMs, this.targetMs - 10);
     }
     return true;
   }

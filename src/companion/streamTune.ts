@@ -67,13 +67,21 @@ export type StreamTune = {
    * particular SoC. No-op on web / Quest (they only have WebCodecs).
    */
   preferNativeDecode: boolean;
+  /**
+   * PC sound path. ON = DIRECT: raw float32 PCM over the data channel, lean
+   * worklet on the phone (~40ms) — matches near-instant DIRECT video. OFF = RTC:
+   * the classic WebRTC Opus audio track (NetEQ + host worklet, ~150–250ms behind
+   * video after NVENC made the picture instant). Flip OFF if DIRECT audio
+   * crackles on a bad link.
+   */
+  preferDirectAudio: boolean;
 };
 
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
   maxW: 1920,
   jpeg: 72,
   fps: 40,
-  bitrateKbps: 12000,
+  bitrateKbps: 16000,
   contentMode: "text",
   jpegCap: 72,
   bitrateHeadroom: 1.4,
@@ -91,6 +99,7 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   directRetrySec: 15,
   hostNvenc: true,
   preferNativeDecode: true,
+  preferDirectAudio: true,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -135,6 +144,7 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     // default, and only an explicit false turns it off.
     hostNvenc: r.hostNvenc !== false,
     preferNativeDecode: r.preferNativeDecode !== false,
+    preferDirectAudio: r.preferDirectAudio !== false,
   };
 }
 
@@ -220,6 +230,7 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.jbGrowAt !== d.jbGrowAt ||
     t.directRetrySec !== d.directRetrySec ||
     t.hostNvenc !== d.hostNvenc ||
-    t.preferNativeDecode !== d.preferNativeDecode
+    t.preferNativeDecode !== d.preferNativeDecode ||
+    t.preferDirectAudio !== d.preferDirectAudio
   );
 }

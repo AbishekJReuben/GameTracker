@@ -71,7 +71,7 @@ import {
 import type { ContentMode, QualitySettings, RemoteLink } from "../links";
 import { startGamepadBridge } from "../gamepad";
 import { apiGet } from "../link";
-import type { ConnectSnapshot, WcStats } from "../cloud";
+import type { AudioStats, ConnectSnapshot, WcStats } from "../cloud";
 import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { tabAllowed } from "@/lib/setupMode";
@@ -135,8 +135,21 @@ type HostWcStats = {
   skipped?: number;
   bufKB?: number;
   kbpsMax?: number;
+  /** Live adaptive encode bitrate (sheds when the phone network backs up). */
+  adaptKbps?: number;
+  /** Tune-panel target the adaptive layer eases back toward. */
+  targetKbps?: number;
 };
-type HostStats = RemoteCaptureStats & { producedFps?: number; rtc?: HostRtcStats; wc?: HostWcStats };
+type HostAudioStats = {
+  mode: "pcm" | "rtc";
+  chBufKB?: number;
+};
+type HostStats = RemoteCaptureStats & {
+  producedFps?: number;
+  rtc?: HostRtcStats;
+  wc?: HostWcStats;
+  audio?: HostAudioStats;
+};
 type NetStats = {
   fps: number;
   kbps: number;
@@ -440,10 +453,13 @@ export function ControlScreen({
   soundOnRef.current = soundOn;
   useEffect(() => {
     localStorage.setItem("gt.remote.soundOn", soundOn ? "1" : "0");
-  }, [soundOn]);
+    // DIRECT audio plays through CloudConn's own AudioContext — keep it in sync.
+    link.setAudioMuted?.(!soundOn || isImmersiveActive());
+  }, [soundOn, link]);
   // Hand PC sound to ImmersiveScreen while WebXR is live; resume on exit.
   useEffect(() => {
     return onImmersiveActiveChange((active) => {
+      link.setAudioMuted?.(!soundOnRef.current || active);
       const a = audioRef.current;
       if (!a) return;
       if (active) {
@@ -458,7 +474,7 @@ export function ControlScreen({
         if (soundOnRef.current) a.play?.().catch(() => {});
       }
     });
-  }, []);
+  }, [link]);
   // Keep the display awake while streaming — Chrome on Android otherwise dims,
   // throttles rAF/timers, and tanks fps. No-op where Wake Lock isn't available
   // (older WebViews); APK + discovery web + Quest flat all benefit.
@@ -971,6 +987,7 @@ export function ControlScreen({
   const [hostStats, setHostStats] = useState<HostStats | null>(null);
   const [net, setNet] = useState<NetStats | null>(null);
   const [wcStats, setWcStats] = useState<WcStats | null>(null);
+  const [audioStats, setAudioStats] = useState<AudioStats | null>(null);
   const prodRef = useRef<{ frames: number; at: number } | null>(null);
   const netRef = useRef<{ bytes: number; at: number; jbDelay: number; jbCount: number; decT: number; decoded: number } | null>(null);
 
@@ -1107,6 +1124,17 @@ export function ControlScreen({
         } else if (state === "native") {
           setDecoderMsg(null);
         }
+      } else if (e.event === "amode") {
+        // DIRECT audio owns playback — mute the RTC <audio> so we don't double.
+        const mode = (e as { mode?: string }).mode;
+        const a = audioRef.current;
+        if (mode === "pcm") {
+          if (a) a.muted = true;
+          link.setAudioMuted?.(!soundOnRef.current || isImmersiveActive());
+        } else if (a) {
+          a.muted = !soundOnRef.current || isImmersiveActive();
+          if (soundOnRef.current && !isImmersiveActive()) a.play?.().catch(() => setSoundOn(false));
+        }
       } else if (e.event === "auth" && (e as { state?: string }).state === "ok") {
         // Capture just started on the existing track — force a rebind + play.
         const s = pendingStreamRef.current;
@@ -1116,6 +1144,7 @@ export function ControlScreen({
         if (!cs) return;
         const rtc = (e as { rtc?: HostRtcStats }).rtc;
         const wc = (e as { wc?: HostWcStats }).wc;
+        const audio = (e as { audio?: HostAudioStats }).audio;
         const now = performance.now();
         const prev = prodRef.current;
         let producedFps: number | undefined;
@@ -1124,7 +1153,7 @@ export function ControlScreen({
           if (df >= 0) producedFps = Math.round((df * 1000) / (now - prev.at));
         }
         prodRef.current = { frames: cs.producedFrames, at: now };
-        setHostStats({ ...cs, producedFps, rtc, wc });
+        setHostStats({ ...cs, producedFps, rtc, wc, audio });
         // Native Surface path never gets VideoFrame sizes — seed letterbox from host out res.
         if (wcNativeRef.current && cs.outW > 0 && cs.outH > 0) {
           const w = cs.outW;
@@ -1459,6 +1488,7 @@ export function ControlScreen({
     const id = window.setInterval(async () => {
       // Direct-video path telemetry (independent of the RTP stats below).
       setWcStats(link.wcStats?.() ?? null);
+      setAudioStats(link.audioStats?.() ?? null);
       const s = await link.netStats().catch(() => null);
       if (!alive || !s) return;
       const prev = netRef.current;
@@ -2436,10 +2466,12 @@ export function ControlScreen({
   // (video stays muted forever so Chromium never A/V-syncs the screen track).
   const toggleSound = () => {
     const a = audioRef.current;
-    if (!a) return;
     const next = !soundOn;
-    a.muted = !next;
-    if (next) a.play?.().catch(() => {});
+    if (a) {
+      a.muted = !next;
+      if (next) a.play?.().catch(() => {});
+    }
+    link.setAudioMuted?.(!next || isImmersiveActive());
     setSoundOn(next);
   };
 
@@ -2883,6 +2915,15 @@ export function ControlScreen({
               {wcStats?.native ? (
                 <span className="rounded bg-accent/25 px-1 py-0.5 text-[8px] font-800 text-accent">MediaCodec</span>
               ) : null}
+              {audioStats ? (
+                <span
+                  className={`rounded px-1 py-0.5 text-[8px] font-800 ${
+                    audioStats.mode === "pcm" ? "bg-green/20 text-green" : "bg-white/[0.08] text-ink-soft"
+                  }`}
+                >
+                  {audioStats.mode === "pcm" ? "AUD·DIRECT" : "AUD·RTC"}
+                </span>
+              ) : null}
             </span>
             <span className="flex items-center gap-1">
               {(() => {
@@ -2999,8 +3040,42 @@ export function ControlScreen({
                     <StatCell k="Enc cap" v={`${hostStats.wc.kbpsMax ?? 0}k`} />
                     <StatCell k="Skipped" v={`${hostStats.wc.skipped ?? 0}`} hi={(hostStats.wc.skipped ?? 0) > 30} />
                     <StatCell k="Ch buf" v={`${hostStats.wc.bufKB ?? 0} KB`} hi={(hostStats.wc.bufKB ?? 0) > 128} />
+                    {(hostStats.wc.adaptKbps ?? 0) > 0 && (
+                      <StatCell
+                        k="Adapt ↑"
+                        v={`${hostStats.wc.adaptKbps}k→${hostStats.wc.targetKbps ?? "?"}k`}
+                        hi={(hostStats.wc.adaptKbps ?? 0) < (hostStats.wc.targetKbps ?? 0) * 0.7}
+                      />
+                    )}
                   </>
                 )}
+              </div>
+            </>
+          )}
+          {/* Audio path — DIRECT PCM vs classic RTC Opus. */}
+          {(audioStats || hostStats?.audio) && (
+            <>
+              <div className="my-1 border-t border-white/[0.08]" />
+              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+                <StatCell k="Audio" v={(audioStats?.mode ?? hostStats?.audio?.mode ?? "rtc").toUpperCase()} />
+                <StatCell
+                  k="A-buf"
+                  v={audioStats?.mode === "pcm" ? `${audioStats.bufMs} ms` : "NetEQ"}
+                  hi={(audioStats?.bufMs ?? 0) > 80}
+                />
+                <StatCell k="A-tgt" v={audioStats?.mode === "pcm" ? `${audioStats.targetMs} ms` : "—"} />
+                <StatCell
+                  k="A ↓"
+                  v={
+                    audioStats?.mode === "pcm"
+                      ? audioStats.kbps >= 1000
+                        ? `${(audioStats.kbps / 1000).toFixed(1)}M`
+                        : `${audioStats.kbps}k`
+                      : "Opus"
+                  }
+                />
+                <StatCell k="A-underrun" v={`${audioStats?.underruns ?? 0}`} hi={(audioStats?.underruns ?? 0) > 5} />
+                <StatCell k="A-ch" v={`${hostStats?.audio?.chBufKB ?? 0} KB`} />
               </div>
             </>
           )}
@@ -3327,6 +3402,29 @@ export function ControlScreen({
                     under the WebView (lowest decode ms). OFF forces WebCodecs even on the APK. Web and Quest always use
                     WebCodecs — this toggle is a no-op there. The header shows a <b className="text-ink-dim">MediaCodec</b>{" "}
                     badge when native decode is live.
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    PC sound (DIRECT) <ScopeTag scope="direct" />
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => patchTune({ preferDirectAudio: !tune.preferDirectAudio })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
+                      tune.preferDirectAudio ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tune.preferDirectAudio ? "ON" : "OFF"}
+                  </button>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    <b className="text-ink-dim">ON (new)</b>: raw PCM over the data channel, lean ~35ms buffer on the
+                    phone — keeps sound nearly as snappy as DIRECT video/input.{" "}
+                    <b className="text-ink-dim">OFF (classic)</b>: WebRTC Opus track (NetEQ), typically 150–250ms behind
+                    the picture after NVENC. Flip OFF if DIRECT audio crackles on a flaky link. Header shows{" "}
+                    <b className="text-ink-dim">AUD·DIRECT</b> / <b className="text-ink-dim">AUD·RTC</b>.
                   </p>
                 )}
                 <button
@@ -4250,6 +4348,16 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   },
   Skipped: { long: "Frames skipped (PC)", info: "Frames the PC dropped rather than send stale — deliberate. Climbing fast means it can't keep up; the Feel slider changes how eagerly it does this." },
   "Ch buf": { long: "Channel backlog", info: "Data queued and unsent on the video channel. A backlog can only ever become lag." },
+  "Adapt ↑": {
+    long: "Adaptive bitrate",
+    info: "Live encode bitrate the PC shed down to when your phone's network couldn't drain the channel, easing back toward the Tune target when it clears. Stops a Wi-Fi dip from turning into a 14fps slideshow of skipped frames.",
+  },
+  Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound (lean ~35ms). RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
+  "A-buf": { long: "Audio playout buffer", info: "How much sound is sitting on the phone before it plays. DIRECT only — RTC uses the browser's NetEQ instead." },
+  "A-tgt": { long: "Audio buffer target", info: "What the DIRECT worklet steers toward. Grows briefly after an underrun, then eases back." },
+  "A ↓": { long: "Audio download rate", info: "PCM bytes arriving per second on DIRECT. Opus on the RTC path isn't counted here." },
+  "A-underrun": { long: "Audio underruns", info: "Times the DIRECT buffer ran dry. A climbing count means the link is starving sound — try classic RTC audio." },
+  "A-ch": { long: "Audio channel backlog", info: "Unsent PCM sitting on the PC's audio data channel." },
 };
 
 function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {

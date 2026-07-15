@@ -14,6 +14,7 @@
  */
 
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc";
+import audioFeederWorkletUrl from "@/lib/audioFeeder.worklet.js?url";
 import {
   feedNativeDecoder,
   getNativeDecoderStats,
@@ -138,6 +139,20 @@ export type RtcInboundVideoStats = {
   /** Frames rendered (if reported). */
   framesRendered: number;
   at: number;
+};
+
+/** Live telemetry for the DIRECT audio path (PCM over data channel). */
+export type AudioStats = {
+  /** "pcm" = DIRECT data-channel path; "rtc" = classic WebRTC Opus track. */
+  mode: "pcm" | "rtc";
+  /** Phone-side playout buffer (ms), DIRECT only. */
+  bufMs: number;
+  /** Target the worklet is steering toward (ms). */
+  targetMs: number;
+  /** Cumulative underruns this session. */
+  underruns: number;
+  /** Inbound PCM bitrate (kbps) over the last ~1s, DIRECT only. */
+  kbps: number;
 };
 
 /** Live telemetry for the WebCodecs direct-video path (data-channel H.264). */
@@ -273,6 +288,8 @@ export class CloudConn {
   private preferDirect = true;
   /** Android APK: MediaCodec Surface decode when true (Tune: "Phone decoder"). */
   private preferNativeDecode = true;
+  /** DIRECT PCM audio over data channel (Tune: "PC sound"). Default ON. */
+  private preferDirectAudio = true;
   private jitterTarget = JITTER_BASE_DEFAULT;
   /** Current lower bound for jitterTarget; eases toward jbMin on clean links. */
   private jitterFloor = JITTER_BASE_DEFAULT;
@@ -359,6 +376,19 @@ export class CloudConn {
   private wcPlayTimer: number | null = null;
   /** NTP-style clock samples from the data-channel heartbeat (host perf clock). */
   private clockSamples: { rtt: number; off: number }[] = [];
+
+  // ---- DIRECT audio (PCM over data channel) ---------------------------------
+  private chAudio?: RTCDataChannel;
+  private audioDirect = false;
+  private audioCtx: AudioContext | null = null;
+  private audioNode: AudioWorkletNode | null = null;
+  private audioWorkletReady = false;
+  private audioBytes = 0;
+  private audioByteWin: { at: number; bytes: number }[] = [];
+  private audioBufMs = 0;
+  private audioTargetMs = 40;
+  private audioUnderruns = 0;
+  private audioStatsTimer: number | null = null;
 
   private progressListeners = new Set<(s: ConnectSnapshot) => void>();
   private progressPhase: ConnectPhase = "idle";
@@ -462,6 +492,16 @@ export class CloudConn {
       }
     } else {
       this.preferNativeDecode = wantNative;
+    }
+    const wantAudio = tune.preferDirectAudio !== false;
+    if (wantAudio !== this.preferDirectAudio) {
+      this.preferDirectAudio = wantAudio;
+      if (this.authState === "ok") {
+        if (wantAudio) void this.maybeStartAudioDirect();
+        else this.audioFallback("Tune: direct audio off");
+      }
+    } else {
+      this.preferDirectAudio = wantAudio;
     }
     this.jitterTarget = Math.min(this.jbMax, Math.max(this.jbMin, this.jitterTarget || this.jbBase));
     this.jitterFloor = this.jbBase;
@@ -802,6 +842,11 @@ export class CloudConn {
     this.winFreezes = 0;
     // Fresh session → fresh WebCodecs negotiation (re-probed after auth-ok).
     this.wcReset(true);
+    this.audioDirect = false;
+    this.teardownAudioPlayer();
+    this.audioBytes = 0;
+    this.audioByteWin = [];
+    this.chAudio = undefined;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
     pipeIce(pc, this.sig!);
@@ -880,6 +925,11 @@ export class CloudConn {
         this.chVideo = ch;
         ch.binaryType = "arraybuffer";
         ch.onmessage = (ev) => this.onWcMsg(ev.data);
+      } else if (ch.label === "audio") {
+        // DIRECT audio: float32 PCM (or JSON cfg).
+        this.chAudio = ch;
+        ch.binaryType = "arraybuffer";
+        ch.onmessage = (ev) => this.onAudioMsg(ev.data);
       } else if (ch.label === "data") {
         this.chData = ch;
         ch.onmessage = (ev) => this.onData(ev.data as string);
@@ -1034,6 +1084,171 @@ export class CloudConn {
     if (this.wcHostRefused) return false; // host has no encoder this session
     if (this.wcRetryAt && Date.now() < this.wcRetryAt) return false;
     return true;
+  }
+
+  /** After auth-ok: ask the host to ship PCM over the data channel. */
+  private async maybeStartAudioDirect() {
+    if (this.closed || this.denied || !this.preferDirectAudio) return;
+    if (this.audioDirect) return;
+    // Need the channel (or it will arrive shortly — still ask; host queues).
+    this.sendControl({ type: "amode", mode: "pcm" });
+    await this.ensureAudioPlayer();
+  }
+
+  private audioFallback(reason: string) {
+    console.warn("[remote] DIRECT audio off — using the WebRTC track:", reason);
+    this.audioDirect = false;
+    this.teardownAudioPlayer();
+    this.sendControl({ type: "amode", mode: "rtc" });
+    if (this.audioStream) {
+      for (const t of this.audioStream.getAudioTracks()) t.enabled = true;
+    }
+    this.emitEvent({ event: "amode", mode: "rtc" });
+  }
+
+  /** Build (or resume) the lean phone-side PCM worklet. */
+  private async ensureAudioPlayer() {
+    if (this.audioWorkletReady && this.audioNode) return;
+    try {
+      if (!this.audioCtx) {
+        try {
+          this.audioCtx = new AudioContext({ sampleRate: 48000 });
+        } catch {
+          this.audioCtx = new AudioContext();
+        }
+      }
+      await this.audioCtx.resume().catch(() => {});
+      if (!this.audioWorkletReady) {
+        await this.audioCtx.audioWorklet.addModule(audioFeederWorkletUrl);
+        this.audioWorkletReady = true;
+      }
+      if (!this.audioNode) {
+        const node = new AudioWorkletNode(this.audioCtx, "gt-pcm-feeder", {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [2],
+        });
+        node.connect(this.audioCtx.destination);
+        node.port.onmessage = (e) => {
+          const s = e.data?.stats;
+          if (s) {
+            this.audioBufMs = s.bufMs ?? 0;
+            this.audioTargetMs = s.targetMs ?? 40;
+            this.audioUnderruns = s.underruns ?? 0;
+          }
+        };
+        // Lean envelope — matches near-instant DIRECT video.
+        node.port.postMessage({
+          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 20, targetMs: 35, maxMs: 100 },
+        });
+        this.audioNode = node;
+        this.startAudioStatsPoll();
+      }
+    } catch (e) {
+      console.warn("[remote] DIRECT audio player failed:", e);
+      this.audioFallback("worklet init failed");
+    }
+  }
+
+  private teardownAudioPlayer() {
+    this.stopAudioStatsPoll();
+    try {
+      this.audioNode?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    this.audioNode = null;
+    // Keep the AudioContext + loaded module for a fast re-opt-in.
+  }
+
+  private startAudioStatsPoll() {
+    this.stopAudioStatsPoll();
+    this.audioStatsTimer = window.setInterval(() => {
+      try {
+        this.audioNode?.port.postMessage({ cfg: { stats: true } });
+      } catch {
+        /* ignore */
+      }
+    }, 500);
+  }
+
+  private stopAudioStatsPoll() {
+    if (this.audioStatsTimer !== null) {
+      window.clearInterval(this.audioStatsTimer);
+      this.audioStatsTimer = null;
+    }
+  }
+
+  /** One message on the "audio" channel: JSON cfg or a float32 PCM chunk. */
+  private onAudioMsg(data: unknown) {
+    if (typeof data === "string") {
+      try {
+        const msg = JSON.parse(data) as { cfg?: { sampleRate?: number; channels?: number } };
+        if (msg.cfg && this.audioNode) {
+          this.audioNode.port.postMessage({
+            cfg: {
+              channels: msg.cfg.channels ?? 2,
+              captureRate: msg.cfg.sampleRate ?? 48000,
+              primeMs: 20,
+              targetMs: 35,
+              maxMs: 100,
+            },
+          });
+        }
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    if (!(data instanceof ArrayBuffer)) return;
+    if (!this.audioDirect) {
+      // Host started shipping before our ack — latch on and play.
+      this.audioDirect = true;
+      void this.ensureAudioPlayer().then(() => this.feedAudioChunk(data));
+      if (this.audioStream) {
+        for (const t of this.audioStream.getAudioTracks()) t.enabled = false;
+      }
+      this.emitEvent({ event: "amode", mode: "pcm" });
+      return;
+    }
+    this.feedAudioChunk(data);
+  }
+
+  private feedAudioChunk(ab: ArrayBuffer) {
+    const now = Date.now();
+    this.audioBytes += ab.byteLength;
+    this.audioByteWin.push({ at: now, bytes: ab.byteLength });
+    while (this.audioByteWin.length && now - this.audioByteWin[0].at > 2000) this.audioByteWin.shift();
+    if (!this.audioNode) return;
+    try {
+      this.audioNode.port.postMessage(ab, [ab]);
+    } catch {
+      /* node torn down */
+    }
+  }
+
+  /** Mute/unmute DIRECT audio playback (RTC path still uses the <audio> element). */
+  setAudioMuted(muted: boolean) {
+    if (this.audioCtx) {
+      if (muted) this.audioCtx.suspend().catch(() => {});
+      else this.audioCtx.resume().catch(() => {});
+    }
+  }
+
+  /** Live audio-path telemetry for the HUD. */
+  audioInfo(): AudioStats {
+    const now = Date.now();
+    let winBytes = 0;
+    for (const b of this.audioByteWin) {
+      if (now - b.at <= 1000) winBytes += b.bytes;
+    }
+    return {
+      mode: this.audioDirect ? "pcm" : "rtc",
+      bufMs: Math.round(this.audioBufMs),
+      targetMs: Math.round(this.audioTargetMs),
+      underruns: this.audioUnderruns,
+      kbps: this.audioDirect ? Math.round((winBytes * 8) / 1000) : 0,
+    };
   }
 
   /** After auth-ok (and on watchdog retries): probe decode support, opt in. */
@@ -1873,6 +2088,8 @@ export class CloudConn {
           // Opt in to the WebCodecs direct-video path when this device can decode
           // H.264 itself (bypasses the receiver jitter buffer entirely).
           void this.maybeStartWc();
+          // Same for DIRECT audio — closes the lag behind near-instant video.
+          void this.maybeStartAudioDirect();
         } else if (state === "pending") {
           this.authState = "pending";
           this.authStallSince = 0;
@@ -1901,6 +2118,23 @@ export class CloudConn {
         } else {
           // Route through wcFallback so the retry timer + backoff get armed.
           this.wcFallback("host encoder fault", false);
+        }
+      }
+      if (msg.event === "amode") {
+        const mode = (msg as { mode?: string }).mode;
+        if (mode === "pcm") {
+          this.audioDirect = true;
+          void this.ensureAudioPlayer();
+          // Mute the RTC audio track so we don't double-play.
+          if (this.audioStream) {
+            for (const t of this.audioStream.getAudioTracks()) t.enabled = false;
+          }
+        } else if (mode === "rtc") {
+          this.audioDirect = false;
+          this.teardownAudioPlayer();
+          if (this.audioStream) {
+            for (const t of this.audioStream.getAudioTracks()) t.enabled = true;
+          }
         }
       }
       this.emitEvent(msg as HostEvent);
@@ -2136,6 +2370,15 @@ export class CloudConn {
     // frames should just be closed, not painted into a dying canvas.
     this.wcFrameCb = null;
     this.wcReset(false);
+    this.audioDirect = false;
+    this.teardownAudioPlayer();
+    try {
+      this.audioCtx?.close();
+    } catch {
+      /* ignore */
+    }
+    this.audioCtx = null;
+    this.audioWorkletReady = false;
     this.clockSamples = [];
     // Defer PC/sig close one macrotask so the bye can leave the socket.
     const pc = this.pc;

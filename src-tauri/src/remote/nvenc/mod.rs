@@ -13,7 +13,9 @@
 //! finished ~30 KB Annex-B frame and forwards it to the data channel.
 //!
 //! ## Latency-shaped on purpose
-//! Preset **P1 + ULTRA_LOW_LATENCY**, CBR, `frameIntervalP = 1` (no B-frames),
+//! Preset **P1 + ULTRA_LOW_LATENCY**, CBR (avg) with a 1.25× peak and **2-frame VBV**
+//! (Sunshine-style `nvenc_vbv_increase` — pure single-frame VBV starves webcam/busy
+//! tiles into macroblocks), spatial AQ on, `frameIntervalP = 1` (no B-frames),
 //! `zeroReorderDelay`, no lookahead, infinite GOP with IDRs only on demand, and
 //! `maxNumRefFrames = 1`. The last one matters off-host: NVENC defaults the DPB to 16,
 //! which makes some Android decoders allocate 16+ buffers (Moonlight decoder-errata #1).
@@ -70,15 +72,24 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     rc.version = NV_ENC_RC_PARAMS_VER;
     rc.rateControlMode = NV_ENC_PARAMS_RC_CBR;
     rc.averageBitRate = p.bitrate_bps;
-    rc.maxBitRate = p.bitrate_bps;
-    // One frame of VBV = the encoder must fit every frame in its own budget rather
-    // than spending a burst it pays back later. This is the classic low-latency CBR
-    // setup (Sunshine does the same); it's what stops IDR spikes from queueing.
-    rc.vbvBufferSize = p.bitrate_bps / p.fps.max(1);
-    rc.vbvInitialDelay = rc.vbvBufferSize;
+    // Peak may briefly exceed the average so a complex frame (webcam, busy desktop)
+    // isn't crushed into macroblocks by a one-frame budget. Still CBR on average —
+    // VBV (below) is the real spike limiter. Mirrors Sunshine's peak-vs-avg split.
+    rc.maxBitRate = p.bitrate_bps.saturating_mul(5).saturating_div(4).max(p.bitrate_bps);
+    // Single-frame VBV is the classic low-latency floor (bitrate/fps). Pure
+    // single-frame starves complex regions (webcam tiles → heavy macroblocking)
+    // while a static desktop looks fine — the "sometimes great, sometimes blocky"
+    // symptom. Sunshine's `nvenc_vbv_increase` relaxes it; we use +100% (2×) so a
+    // busy frame can spend two frames of budget without opening a multi-frame
+    // latency window. Don't raise further without measuring phone-side skip rate.
+    let one_frame = p.bitrate_bps / p.fps.max(1);
+    rc.vbvBufferSize = one_frame.saturating_mul(2).max(one_frame);
+    rc.vbvInitialDelay = one_frame; // start lean; grow into the 2× headroom
     rc.set_zero_reorder_delay(true);
     rc.set_enable_lookahead(false);
-    rc.set_enable_aq(false);
+    // Spatial AQ: spend more bits on complex tiles (webcam, text) and fewer on
+    // flat desktop regions. Zero latency cost; big quality win under CBR.
+    rc.set_enable_aq(true);
     rc.multiPass = NV_ENC_MULTI_PASS_DISABLED;
     rc.lookaheadDepth = 0;
 

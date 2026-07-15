@@ -29,4 +29,12 @@ describe("normalizeStreamTune", () => {
   it("honours preferNativeDecode=false", () => {
     expect(normalizeStreamTune({ preferNativeDecode: false }).preferNativeDecode).toBe(false);
   });
+
+  it("defaults preferDirectAudio ON when the key is absent", () => {
+    expect(normalizeStreamTune({ maxW: 1280 }).preferDirectAudio).toBe(true);
+  });
+
+  it("honours preferDirectAudio=false", () => {
+    expect(normalizeStreamTune({ preferDirectAudio: false }).preferDirectAudio).toBe(false);
+  });
 });
