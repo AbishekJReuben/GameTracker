@@ -14,6 +14,16 @@
  */
 
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc";
+import {
+  feedNativeDecoder,
+  getNativeDecoderStats,
+  initNativeDecoder,
+  nativeDecoderPossible,
+  nativeFeedReady,
+  probeNativeDecoder,
+  resetNativeDecoder,
+  teardownNativeDecoder,
+} from "./nativeDecoder";
 import { isImmersiveActive, onImmersiveActiveChange } from "./runtime";
 import { loadStreamTune, resetStreamTune, type StreamTune } from "./streamTune";
 
@@ -153,6 +163,8 @@ export type WcStats = {
   codec: string;
   /** RTT of the best clock-sync sample (quality of the e2e estimate). */
   clockRttMs: number;
+  /** True when Annex-B is decoded by native MediaCodec → Surface (APK only). */
+  native?: boolean;
 };
 
 const HEARTBEAT_MS = 5000; // ping cadence
@@ -307,6 +319,13 @@ export class CloudConn {
   /** Host said "my encoder is gone" — respect it until the next peer session. */
   private wcHostRefused = false;
   private wcDecoder: VideoDecoder | null = null;
+  /**
+   * Android APK: decode via MediaCodec → Surface (Moonlight/Chiaki pattern) instead
+   * of WebCodecs → canvas. Web/Quest keep WebCodecs — browsers don't expose MediaCodec.
+   */
+  private wcNative = false;
+  private wcNativeFrames = 0;
+  private wcNativePoll: number | null = null;
   private wcCodec = "";
   /** Coded frame size from the host's codec announce — fed into VideoDecoderConfig
    *  so Android MediaCodec allocates the right buffers up front (avoids a mid-stream
@@ -966,6 +985,12 @@ export class CloudConn {
     this.wcErrors = 0;
     this.chVideo = undefined;
     this.wcFlushPaceQueue();
+    this.wcStopNativePoll();
+    if (this.wcNative) {
+      void teardownNativeDecoder();
+      this.wcNative = false;
+      this.wcNativeFrames = 0;
+    }
     try {
       this.wcDecoder?.close();
     } catch {
@@ -981,7 +1006,7 @@ export class CloudConn {
       // NOTE: wcSupported is a DEVICE fact — deliberately NOT cleared here. The
       // probe is expensive and its answer can't change within a page load.
     }
-    if (wasActive) this.emitEvent({ event: "wc", active: false });
+    if (wasActive) this.emitEvent({ event: "wc", active: false, native: false });
   }
 
   /** True when DIRECT is worth attempting right now (capability + policy + backoff). */
@@ -1014,6 +1039,17 @@ export class CloudConn {
 
   /** Can this device decode ANY codec on the host's ladder? (device fact, cached) */
   private async wcProbeDecoder(): Promise<boolean> {
+    // Prefer native MediaCodec on the APK — same silicon WebCodecs uses, but with
+    // Moonlight's FEATURE_LowLatency / vendor keys and a Surface present (no canvas).
+    if (nativeDecoderPossible()) {
+      const p = await probeNativeDecoder();
+      if (p.available) {
+        console.info(
+          `[remote] native MediaCodec available (${p.name || "hw"}${p.lowLatency ? ", low-latency" : ""})`,
+        );
+        return true;
+      }
+    }
     try {
       if (typeof VideoDecoder === "undefined") return false;
       for (const hw of ["prefer-hardware", "no-preference"] as const) {
@@ -1049,6 +1085,11 @@ export class CloudConn {
     this.wcRequestedAt = 0;
     this.wcAwaitKey = true;
     this.wcFlushPaceQueue();
+    this.wcStopNativePoll();
+    if (this.wcNative) {
+      void teardownNativeDecoder();
+      this.wcNative = false;
+    }
     try {
       this.wcDecoder?.close();
     } catch {
@@ -1066,16 +1107,55 @@ export class CloudConn {
       this.wcRetryBackoff = Math.min(this.wcRetryBackoff * 2, WC_RETRY_MAX_MS);
     }
     this.sendControl({ type: "vmode", mode: "rtc" });
-    if (wasActive) this.emitEvent({ event: "wc", active: false });
+    if (wasActive) this.emitEvent({ event: "wc", active: false, native: false });
   }
 
-  /** Build (or rebuild) the VideoDecoder for the host-announced codec. */
+  /** Build (or rebuild) the VideoDecoder / native MediaCodec for the host codec. */
   private wcBuildDecoder(): boolean {
     // Safety net for hosts that ship NVENC frames without a prior codec JSON
     // (pre-announce bug): Constrained Baseline matches what NVENC emits; the
     // in-band SPS is what the decoder actually keys off of once configured.
     if (!this.wcCodec) this.wcCodec = WC_CODECS[0];
     if (!this.wcCodec) return false;
+
+    // Android APK: MediaCodec → Surface (Moonlight/Chiaki). Init is async; the
+    // feed path buffers on awaitKey until __GT_DECODER__ is ready.
+    if (nativeDecoderPossible()) {
+      const w = this.wcCodedW > 0 ? this.wcCodedW : 1920;
+      const h = this.wcCodedH > 0 ? this.wcCodedH : 1080;
+      this.wcNative = true;
+      this.wcAwaitKey = true;
+      this.wcStartNativePoll();
+      void (async () => {
+        const p = await probeNativeDecoder();
+        if (!p.available) {
+          this.wcNative = false;
+          this.wcStopNativePoll();
+          // Fall through to WebCodecs on the next keyframe rebuild.
+          if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("no native or WebCodecs decoder");
+          return;
+        }
+        const ok = await initNativeDecoder(w, h);
+        if (!ok) {
+          console.warn("[remote] native MediaCodec init failed — WebCodecs fallback");
+          this.wcNative = false;
+          this.wcStopNativePoll();
+          if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("native init failed");
+          return;
+        }
+        void resetNativeDecoder();
+        if (this.wcActive) this.emitEvent({ event: "wc", active: true, native: true });
+        console.info(`[remote] DIRECT via native MediaCodec (${p.name || "hw"})`);
+        this.wcRequestKeyframe();
+      })();
+      return true;
+    }
+
+    return this.wcBuildWebCodecsDecoder();
+  }
+
+  /** WebCodecs path — used on discovery web / Quest and as Android fallback. */
+  private wcBuildWebCodecsDecoder(): boolean {
     try {
       this.wcDecoder?.close();
     } catch {
@@ -1097,10 +1177,6 @@ export class CloudConn {
         else this.wcRequestKeyframe();
       },
     });
-    // Annex-B + coded size + optimizeForLatency: Chrome maps the latency hint
-    // into MediaCodec's low-delay path when the bitstream allows it. Explicit
-    // `avc.format` stops the UA from guessing avcC vs annexb from the first
-    // chunk (a mis-guess forces an extra reconfigure / keyframe wait).
     const cfg: VideoDecoderConfig = {
       codec: this.wcCodec,
       optimizeForLatency: true,
@@ -1109,7 +1185,6 @@ export class CloudConn {
         ? { codedWidth: this.wcCodedW, codedHeight: this.wcCodedH }
         : {}),
     };
-    // `avc` is in the AVC codec registration but missing from some TS libs.
     (cfg as VideoDecoderConfig & { avc?: { format: string } }).avc = { format: "annexb" };
     try {
       dec.configure(cfg);
@@ -1134,8 +1209,48 @@ export class CloudConn {
       }
     }
     this.wcDecoder = dec;
+    this.wcNative = false;
     this.wcAwaitKey = true;
     return true;
+  }
+
+  private wcStartNativePoll() {
+    if (this.wcNativePoll !== null) return;
+    this.wcNativePoll = window.setInterval(() => {
+      void this.wcPollNativeStats();
+    }, 250);
+  }
+
+  private wcStopNativePoll() {
+    if (this.wcNativePoll !== null) {
+      window.clearInterval(this.wcNativePoll);
+      this.wcNativePoll = null;
+    }
+  }
+
+  /** Pull decode-ms / frame count from Kotlin (Surface path has no VideoFrame). */
+  private async wcPollNativeStats() {
+    if (!this.wcNative || !this.wcActive) return;
+    const st = await getNativeDecoderStats();
+    if (!st) return;
+    if (st.decodeMs > 0) {
+      this.wcDecMs = this.wcDecMs === 0 ? st.decodeMs : this.wcDecMs * 0.7 + st.decodeMs * 0.3;
+    }
+    if (st.frames > this.wcNativeFrames) {
+      const delta = Math.min(8, st.frames - this.wcNativeFrames);
+      this.wcNativeFrames = st.frames;
+      const perfNow = performance.now();
+      for (let i = 0; i < delta; i++) this.wcTimes.push(perfNow);
+      while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
+      // Approximate e2e = net+enc (at arrival) + native decode.
+      if (this.wcNetMs > 0 && this.wcDecMs > 0) {
+        const e2e = this.wcNetMs + this.wcDecMs;
+        this.wcE2eMs = this.wcE2eMs === 0 ? e2e : this.wcE2eMs * 0.85 + e2e * 0.15;
+      }
+    }
+    if (st.error) {
+      console.warn("[remote] native decoder:", st.error);
+    }
   }
 
   private wcRequestKeyframe() {
@@ -1155,7 +1270,7 @@ export class CloudConn {
           const w = typeof cfg.w === "number" && cfg.w > 0 ? Math.round(cfg.w) : this.wcCodedW;
           const h = typeof cfg.h === "number" && cfg.h > 0 ? Math.round(cfg.h) : this.wcCodedH;
           const sizeChanged = w !== this.wcCodedW || h !== this.wcCodedH;
-          if (cfg.codec !== this.wcCodec || !this.wcDecoder || sizeChanged) {
+          if (cfg.codec !== this.wcCodec || (!this.wcDecoder && !this.wcNative) || sizeChanged) {
             this.wcCodec = cfg.codec;
             this.wcCodedW = w;
             this.wcCodedH = h;
@@ -1204,7 +1319,7 @@ export class CloudConn {
     if (!this.wcActive) {
       this.wcActive = true;
       this.wcRequestedAt = 0;
-      this.emitEvent({ event: "wc", active: true });
+      this.emitEvent({ event: "wc", active: true, native: this.wcNative });
     }
     this.wcLastFrameAt = now;
     // Backgrounded (NOT PiP — a PiP window counts as visible): skip decoding to
@@ -1222,7 +1337,43 @@ export class CloudConn {
       this.wcRequestKeyframe();
       return;
     }
+
+    // ---- native MediaCodec path (APK) ----------------------------------------
+    if (this.wcNative) {
+      if (!nativeFeedReady()) {
+        // Bridge still attaching — hold for a keyframe once JS interface is up.
+        if (head.key) this.wcAwaitKey = true;
+        this.wcRequestKeyframe();
+        return;
+      }
+      if (head.key) this.wcAwaitKey = false;
+      const tsUs = Math.round(head.tsMs * 1000);
+      // Net+enc at arrival (e2e completed when Kotlin reports decode).
+      const clk = this.bestClock();
+      if (clk) {
+        const capturedAtGuest = head.tsMs - clk.off;
+        const net = now - capturedAtGuest;
+        if (net > -50 && net < 5000) {
+          this.wcNetMs = this.wcNetMs === 0 ? net : this.wcNetMs * 0.85 + net * 0.15;
+        }
+      }
+      if (!feedNativeDecoder(tsUs, head.key, bytes)) {
+        this.wcAwaitKey = true;
+        this.wcRequestKeyframe();
+        return;
+      }
+      this.wcFrames++;
+      return;
+    }
+
+    // ---- WebCodecs path (web / Quest / Android fallback) ---------------------
     if (!this.wcDecoder && !this.wcBuildDecoder()) return;
+    if (this.wcNative) {
+      // Build flipped us onto native mid-frame — retry via native branch next key.
+      this.wcAwaitKey = true;
+      this.wcRequestKeyframe();
+      return;
+    }
     if (head.key) this.wcAwaitKey = false;
     const tsUs = Math.round(head.tsMs * 1000);
     this.wcMeta.set(tsUs, { arrivedAt: now, tsMs: head.tsMs, bytes: head.len });
@@ -1376,9 +1527,10 @@ export class CloudConn {
       decodeMs: Math.round(this.wcDecMs * 10) / 10,
       e2eMs: Math.round(this.wcE2eMs),
       netMs: Math.round(this.wcNetMs),
-      queue: this.wcDecoder?.decodeQueueSize ?? 0,
+      queue: this.wcNative ? 0 : (this.wcDecoder?.decodeQueueSize ?? 0),
       codec: this.wcCodec,
       clockRttMs: clk ? Math.round(clk.rtt) : 0,
+      native: this.wcNative,
     };
   }
 

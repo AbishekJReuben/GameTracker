@@ -76,6 +76,7 @@ import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { tabAllowed } from "@/lib/setupMode";
 import { isTauri } from "@/lib/tauri";
+import { setNativeDecoderBounds } from "../nativeDecoder";
 import { isQuestBrowser } from "../device";
 import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
 import {
@@ -497,6 +498,10 @@ export function ControlScreen({
   const [wcActive, setWcActive] = useState(false);
   const wcActiveRef = useRef(false);
   wcActiveRef.current = wcActive;
+  /** APK MediaCodec → Surface path (no canvas paint). */
+  const [wcNative, setWcNative] = useState(false);
+  const wcNativeRef = useRef(false);
+  wcNativeRef.current = wcNative;
 
   // ---- web picture-in-picture (browser only — the APK has native Android PiP) ----
   // Chrome Android does NOT expose the Media Session "enterpictureinpicture" action
@@ -1084,9 +1089,13 @@ export function ControlScreen({
       else if (e.event === "gamepad") setPadAvailable(!!(e as { available?: boolean }).available);
       else if (e.event === "wc") {
         // Direct-video path toggled: swap the render surface (canvas ↔ video).
+        // `native` = MediaCodec → Surface (APK); canvas stays for hit-testing only.
         const active = !!(e as { active?: boolean }).active;
+        const native = !!(e as { native?: boolean }).native;
         setWcActive(active);
-        if (active) setHasFrame(false); // until the first decoded frame lands
+        setWcNative(active && native);
+        if (active) setHasFrame(native); // Surface paints without a VideoFrame callback
+        if (!active) setWcNative(false);
       } else if (e.event === "auth" && (e as { state?: string }).state === "ok") {
         // Capture just started on the existing track — force a rebind + play.
         const s = pendingStreamRef.current;
@@ -1105,6 +1114,19 @@ export function ControlScreen({
         }
         prodRef.current = { frames: cs.producedFrames, at: now };
         setHostStats({ ...cs, producedFps, rtc, wc });
+        // Native Surface path never gets VideoFrame sizes — seed letterbox from host out res.
+        if (wcNativeRef.current && cs.outW > 0 && cs.outH > 0) {
+          const w = cs.outW;
+          const h = cs.outH;
+          natRef.current = { w, h };
+          const canvas = canvasRef.current;
+          if (canvas && (canvas.width !== w || canvas.height !== h)) {
+            canvas.width = w;
+            canvas.height = h;
+          }
+          setRes(`${w}×${h}`);
+          setHasFrame(true);
+        }
       }
     });
     // LAN fallback: JPEG tile frames drawn to the canvas.
@@ -1124,12 +1146,44 @@ export function ControlScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);
 
+  // Keep MediaCodec SurfaceView locked to the letterboxed video box (zoom/pan/resize).
+  useEffect(() => {
+    if (!wcNative) {
+      void setNativeDecoderBounds({ x: 0, y: 0, w: 0, h: 0, visible: false });
+      return;
+    }
+    // Punch a transparent hole through the WebView so the Surface underlay shows.
+    const html = document.documentElement;
+    const body = document.body;
+    const prevHtml = html.style.background;
+    const prevBody = body.style.background;
+    html.style.background = "transparent";
+    body.style.background = "transparent";
+    syncNativeSurface();
+    const onResize = () => syncNativeSurface();
+    window.addEventListener("resize", onResize);
+    window.visualViewport?.addEventListener("resize", onResize);
+    return () => {
+      html.style.background = prevHtml;
+      body.style.background = prevBody;
+      window.removeEventListener("resize", onResize);
+      window.visualViewport?.removeEventListener("resize", onResize);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wcNative, zoom, pan, immersive, topCollapsed, dockCollapsed, hasStream, kbInset]);
+
   // Direct-video render sink: decoded VideoFrames are painted straight onto the
   // canvas the instant they leave the decoder — no <video> element, no playout
   // buffer, no compositor sampling. This is the whole point of the wc path.
+  // (Skipped visually when MediaCodec Surface is live — canvas stays for hit-test.)
   useEffect(() => {
     if (!link.onWcFrame) return;
     const un = link.onWcFrame((frame) => {
+      if (wcNativeRef.current) {
+        frame.close();
+        setHasFrame(true);
+        return;
+      }
       const canvas = canvasRef.current;
       if (!canvas) {
         frame.close();
@@ -1607,7 +1661,29 @@ export function ControlScreen({
       setZoom(zoomRef.current);
       setPan({ ...panRef.current });
       setCursor({ ...cursorRef.current });
+      syncNativeSurface();
     });
+  };
+
+  /** Keep the MediaCodec SurfaceView aligned with the letterboxed video box. */
+  const syncNativeSurface = () => {
+    if (!wcNativeRef.current) {
+      void setNativeDecoderBounds({ x: 0, y: 0, w: 0, h: 0, visible: false });
+      return;
+    }
+    const vp = viewportRef.current;
+    const nat = natRef.current;
+    if (!vp || !nat.w || !nat.h) return;
+    const vr = vp.getBoundingClientRect();
+    const l = measure(vp, nat.w, nat.h);
+    if (!l) return;
+    const z = zoomRef.current;
+    const p = panRef.current;
+    const w = l.dispW * z;
+    const h = l.dispH * z;
+    const x = vr.left + l.offX + (l.dispW - w) / 2 + p.x;
+    const y = vr.top + l.offY + (l.dispH - h) / 2 + p.y;
+    void setNativeDecoderBounds({ x, y, w, h, visible: true });
   };
 
   /** Always re-read the viewport box before mapping — never trust a stale Layout. */
@@ -2374,7 +2450,9 @@ export function ControlScreen({
 
   return (
     <div
-      className="relative flex h-full w-full flex-col overflow-hidden bg-black select-none"
+      className={`relative flex h-full w-full flex-col overflow-hidden select-none ${
+        wcNative ? "bg-transparent" : "bg-black"
+      }`}
       style={{
         overscrollBehavior: "none",
         touchAction: "none",
@@ -2644,6 +2722,9 @@ export function ControlScreen({
             transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
             transformOrigin: "center center",
             cursor: "inherit",
+            // Native MediaCodec paints a SurfaceView under the WebView — keep the
+            // canvas for hit-testing / letterbox geometry but don't composite it.
+            opacity: wcNative ? 0 : 1,
           }}
         />
         {showRemoteCursor && connected && cursorScreen && (
@@ -2782,6 +2863,9 @@ export function ControlScreen({
                   between ~1ms and ~35ms of host encode. */}
               {hostStats?.wc?.native ? (
                 <span className="rounded bg-accent-3/20 px-1 py-0.5 text-[8px] font-800 text-accent-3">NVENC</span>
+              ) : null}
+              {wcStats?.native ? (
+                <span className="rounded bg-accent/25 px-1 py-0.5 text-[8px] font-800 text-accent">MediaCodec</span>
               ) : null}
             </span>
             <span className="flex items-center gap-1">
@@ -4240,7 +4324,9 @@ function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps
     if (displayFps != null && wc.fps > 0 && displayFps < wc.fps * 0.7) {
       return "Display behind decode — phone UI thread busy.";
     }
-    return `Direct path: no jitter buffer (~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms).`;
+    return wc.native
+      ? `MediaCodec Surface (APK): no jitter buffer (~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms).`
+      : `Direct path: no jitter buffer (~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms).`;
   }
   if (!host && !net) return "Gathering stats…";
   const phoneLag = net ? Math.round(net.rttMs / 2 + net.bufMs + net.decMs) : 0;

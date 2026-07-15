@@ -1119,7 +1119,7 @@ export function startHost(opts: HostOptions): () => void {
       if (videoCh.readyState !== "open") return;
       if (!nativeAnnounced) {
         nativeAnnounced = true;
-        const codec = wcCodec || WC_CODECS[0];
+        const codec = "avc1.42C028"; // Constrained Baseline — matches NVENC output
         try {
           videoCh.send(JSON.stringify({ codec, w, h }));
         } catch {

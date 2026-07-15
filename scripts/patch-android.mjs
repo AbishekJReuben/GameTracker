@@ -18,6 +18,8 @@
 //      desktop over plain http/ws on the LAN/Tailscale).
 //   4. Immersive full-screen MainActivity (hide the status/navigation bars) so the
 //      remote screen gets the whole display and the notification panel stays out.
+//   5. WcDecoderBridge — native MediaCodec → Surface under the WebView for the
+//      DIRECT path (Moonlight/Chiaki-style low-latency decode).
 //
 // Usage: node scripts/patch-android.mjs
 
@@ -220,7 +222,7 @@ const save = (path, before, after, msg) => {
     console.warn(`[patch-android] ${mainActivityPath} not found — skipping MainActivity patch.`);
   } else {
     const before = readFileSync(mainActivityPath, "utf8");
-    const content =
+    let content =
       `package ${pkg}\n\n` +
       `import android.app.PictureInPictureParams\n` +
       `import android.content.pm.ActivityInfo\n` +
@@ -257,6 +259,10 @@ const save = (path, before, after, msg) => {
       `    enableEdgeToEdge()\n` +
       `    super.onCreate(savedInstanceState)\n` +
       `    current = WeakReference(this)\n` +
+      `    // MediaCodec → Surface under the WebView (Moonlight/Chiaki-style\n` +
+      `    // low-latency decode). JavascriptInterface + SurfaceView live in\n` +
+      `    // WcDecoderBridge; frames arrive from cloud.ts via __GT_DECODER__.\n` +
+      `    WcDecoderBridge.attach(this)\n` +
       `    // Follow the physical sensor in all four orientations, IGNORING the\n` +
       `    // system auto-rotate lock — holding the phone sideways for a moment\n` +
       `    // rotates the remote screen even with rotation lock on.\n` +
@@ -350,7 +356,44 @@ const save = (path, before, after, msg) => {
       `      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE\n` +
       `  }\n` +
       `}\n`;
-    save(mainActivityPath, before, content, "rewrote MainActivity.kt (immersive + sensor rotate + auto-enter PiP)");
+    save(mainActivityPath, before, content, "rewrote MainActivity.kt (immersive + sensor rotate + auto-enter PiP + MediaCodec attach)");
+  }
+}
+
+// --- 4b: WcDecoderBridge.java — native H.264 MediaCodec → Surface ----------
+// Copied from scripts/android-templates/WcDecoderBridge.java with the app
+// package substituted. Idempotent: rewritten whenever the template changes.
+{
+  const conf = JSON.parse(
+    readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"),
+  );
+  const pkg = String(conf.identifier || "");
+  const templatePath = join(root, "scripts", "android-templates", "WcDecoderBridge.java");
+  if (!pkg) {
+    console.warn("[patch-android] no identifier — skipping WcDecoderBridge.");
+  } else if (!existsSync(templatePath)) {
+    console.warn(`[patch-android] ${templatePath} missing — skipping WcDecoderBridge.`);
+  } else {
+    const bridgePath = join(
+      androidDir,
+      "app",
+      "src",
+      "main",
+      "java",
+      ...pkg.split("."),
+      "WcDecoderBridge.java",
+    );
+    const template = readFileSync(templatePath, "utf8");
+    const content = template.replace(/__PACKAGE__/g, pkg);
+    const exists = existsSync(bridgePath);
+    const before = exists ? readFileSync(bridgePath, "utf8") : "";
+    if (!exists) {
+      mkdirSync(dirname(bridgePath), { recursive: true });
+      writeFileSync(bridgePath, content);
+      note("created WcDecoderBridge.java");
+    } else {
+      save(bridgePath, before, content, "updated WcDecoderBridge.java");
+    }
   }
 }
 

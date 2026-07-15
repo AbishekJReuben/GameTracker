@@ -1052,9 +1052,17 @@ not regress):**
   `constraint_set1` in the SPS rewriter, and uses `sliceMode=3` (~1 slice / 540 px)
   so the phone can parallelise decode. Guest `VideoDecoder.configure` sets
   `optimizeForLatency`, `avc: { format: "annexb" }`, and `codedWidth/Height` from
-  the host announce. WebCodecs still cannot pick MediaCodec's
-  `FEATURE_LowLatency` decoder variant or vendor keys (Parsec/Moonlight native
-  path) — that needs a native Android bridge if Baseline+slices aren't enough.
+  the host announce. NVENC announces `avc1.42C028` (not High `640034`).
+- **APK native MediaCodec decode (guest).** On the Tauri Android companion, DIRECT
+  Annex-B frames skip WebCodecs and feed `WcDecoderBridge` (MediaCodec → SurfaceView
+  under the WebView) — Moonlight `MediaCodecHelper` low-latency ladder + Chiaki/ALVR
+  `push_nal` shape. Hot path is `window.__GT_DECODER__.feed` (JavascriptInterface);
+  lifecycle/bounds/stats are Tauri commands in `companion/src-tauri/src/decoder.rs`.
+  Template: `scripts/android-templates/WcDecoderBridge.java`, applied by
+  `patch-android.mjs`. Web / Quest stay on WebCodecs (browsers cannot expose
+  MediaCodec). HUD shows a **MediaCodec** badge when the native path is live.
+  Fallback to WebCodecs if probe/init fails. Do not route native frames through
+  canvas `drawImage` — that reintroduces the decode tax this removes.
 
 [ExoPlayer#8514]: https://github.com/google/ExoPlayer/issues/8514
 
