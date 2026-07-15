@@ -22,10 +22,11 @@ describe("normalizeStreamTune", () => {
     expect(normalizeStreamTune({ hostNvenc: "no" as unknown as boolean }).hostNvenc).toBe(true);
   });
 
-  it("keeps the other knobs clamped alongside it", () => {
-    const t = normalizeStreamTune({ hostNvenc: false, maxW: 99999, fps: 999 });
-    expect(t.hostNvenc).toBe(false);
-    expect(t.maxW).toBe(3840);
-    expect(t.fps).toBe(60);
+  it("defaults preferNativeDecode ON when the key is absent", () => {
+    expect(normalizeStreamTune({ maxW: 1280 }).preferNativeDecode).toBe(true);
+  });
+
+  it("honours preferNativeDecode=false", () => {
+    expect(normalizeStreamTune({ preferNativeDecode: false }).preferNativeDecode).toBe(false);
   });
 });

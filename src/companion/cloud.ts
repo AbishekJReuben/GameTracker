@@ -271,6 +271,8 @@ export class CloudConn {
   /** Windowed drop RATIO (0–1) above which the jitter buffer grows (Tune: "JB grow at"). */
   private jbGrowAt = 0.15;
   private preferDirect = true;
+  /** Android APK: MediaCodec Surface decode when true (Tune: "Phone decoder"). */
+  private preferNativeDecode = true;
   private jitterTarget = JITTER_BASE_DEFAULT;
   /** Current lower bound for jitterTarget; eases toward jbMin on clean links. */
   private jitterFloor = JITTER_BASE_DEFAULT;
@@ -449,6 +451,18 @@ export class CloudConn {
       this.wcFallback("Tune: direct path off", true);
     }
     this.preferDirect = wantDirect;
+    const wantNative = tune.preferNativeDecode !== false;
+    if (wantNative !== this.preferNativeDecode) {
+      this.preferNativeDecode = wantNative;
+      // Flip takes effect on the next decoder build / keyframe.
+      if (this.wcActive) {
+        this.wcAwaitKey = true;
+        this.wcBuildDecoder();
+        this.wcRequestKeyframe();
+      }
+    } else {
+      this.preferNativeDecode = wantNative;
+    }
     this.jitterTarget = Math.min(this.jbMax, Math.max(this.jbMin, this.jitterTarget || this.jbBase));
     this.jitterFloor = this.jbBase;
     if (paceMs === 0) this.wcFlushPaceQueue();
@@ -1041,7 +1055,7 @@ export class CloudConn {
   private async wcProbeDecoder(): Promise<boolean> {
     // Prefer native MediaCodec on the APK — same silicon WebCodecs uses, but with
     // Moonlight's FEATURE_LowLatency / vendor keys and a Surface present (no canvas).
-    if (nativeDecoderPossible()) {
+    if (nativeDecoderPossible() && this.preferNativeDecode) {
       const p = await probeNativeDecoder();
       if (p.available) {
         console.info(
@@ -1120,7 +1134,7 @@ export class CloudConn {
 
     // Android APK: MediaCodec → Surface (Moonlight/Chiaki). Init is async; the
     // feed path buffers on awaitKey until __GT_DECODER__ is ready.
-    if (nativeDecoderPossible()) {
+    if (nativeDecoderPossible() && this.preferNativeDecode) {
       const w = this.wcCodedW > 0 ? this.wcCodedW : 1920;
       const h = this.wcCodedH > 0 ? this.wcCodedH : 1080;
       this.wcNative = true;
@@ -1131,7 +1145,11 @@ export class CloudConn {
         if (!p.available) {
           this.wcNative = false;
           this.wcStopNativePoll();
-          // Fall through to WebCodecs on the next keyframe rebuild.
+          this.emitEvent({
+            event: "decoder",
+            state: "fallback",
+            reason: "MediaCodec unavailable — using WebCodecs",
+          });
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("no native or WebCodecs decoder");
           return;
         }
@@ -1140,11 +1158,17 @@ export class CloudConn {
           console.warn("[remote] native MediaCodec init failed — WebCodecs fallback");
           this.wcNative = false;
           this.wcStopNativePoll();
+          this.emitEvent({
+            event: "decoder",
+            state: "fallback",
+            reason: "MediaCodec failed to start — using WebCodecs",
+          });
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("native init failed");
           return;
         }
         void resetNativeDecoder();
         if (this.wcActive) this.emitEvent({ event: "wc", active: true, native: true });
+        this.emitEvent({ event: "decoder", state: "native", name: p.name || "hw" });
         console.info(`[remote] DIRECT via native MediaCodec (${p.name || "hw"})`);
         this.wcRequestKeyframe();
       })();
@@ -1250,6 +1274,7 @@ export class CloudConn {
     }
     if (st.error) {
       console.warn("[remote] native decoder:", st.error);
+      this.emitEvent({ event: "decoder", state: "error", reason: st.error });
     }
   }
 
@@ -2081,8 +2106,13 @@ export class CloudConn {
     this.unsubImmersive = null;
     // Tell the host we're leaving on purpose so it stops capturing immediately
     // (it no longer tears down on signaling-level "peer-left" alone).
+    // Send on BOTH channels and give the stack a tick to flush — closing the PC
+    // in the same turn used to drop the bye, leaving the host on a zombie
+    // "liveSession" that blocked the next offer.
     try {
-      if (this.chControl?.readyState === "open") this.chControl.send(JSON.stringify({ type: "bye" }));
+      const bye = JSON.stringify({ type: "bye" });
+      if (this.chControl?.readyState === "open") this.chControl.send(bye);
+      if (this.chData?.readyState === "open") this.chData.send(bye);
     } catch {
       /* ignore */
     }
@@ -2097,14 +2127,27 @@ export class CloudConn {
     this.wcFrameCb = null;
     this.wcReset(false);
     this.clockSamples = [];
-    this.pc?.close();
+    // Defer PC/sig close one macrotask so the bye can leave the socket.
+    const pc = this.pc;
+    const sig = this.sig;
     this.pc = null;
-    this.sig?.close();
     this.sig = null;
     this.stream = null;
     this.audioStream = null;
     this.streamCbs.clear();
     this.audioCbs.clear();
     this.eventCbs.clear();
+    window.setTimeout(() => {
+      try {
+        pc?.close();
+      } catch {
+        /* ignore */
+      }
+      try {
+        sig?.close();
+      } catch {
+        /* ignore */
+      }
+    }, 50);
   }
 }

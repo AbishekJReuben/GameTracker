@@ -502,6 +502,8 @@ export function ControlScreen({
   const [wcNative, setWcNative] = useState(false);
   const wcNativeRef = useRef(false);
   wcNativeRef.current = wcNative;
+  /** Transient decoder status (fallback / error) shown above the viewport. */
+  const [decoderMsg, setDecoderMsg] = useState<string | null>(null);
 
   // ---- web picture-in-picture (browser only — the APK has native Android PiP) ----
   // Chrome Android does NOT expose the Media Session "enterpictureinpicture" action
@@ -1096,6 +1098,15 @@ export function ControlScreen({
         setWcNative(active && native);
         if (active) setHasFrame(native); // Surface paints without a VideoFrame callback
         if (!active) setWcNative(false);
+      } else if (e.event === "decoder") {
+        const state = String((e as { state?: string }).state || "");
+        const reason = String((e as { reason?: string }).reason || "");
+        if (state === "fallback" || state === "error") {
+          setDecoderMsg(reason || "Decoder issue — check Tune → Phone decoder");
+          window.setTimeout(() => setDecoderMsg(null), 6000);
+        } else if (state === "native") {
+          setDecoderMsg(null);
+        }
       } else if (e.event === "auth" && (e as { state?: string }).state === "ok") {
         // Capture just started on the existing track — force a rebind + play.
         const s = pendingStreamRef.current;
@@ -2668,6 +2679,11 @@ export function ControlScreen({
 
       {/* ==== viewport — video only; chrome above/below shrinks this, never overlays it ==== */}
       <div className="relative min-h-0 flex-1">
+      {decoderMsg && (
+        <div className="absolute left-2 right-2 top-2 z-[45] rounded-lg border border-amber/40 bg-black/85 px-3 py-2 text-[11px] font-700 text-amber shadow-float backdrop-blur">
+          {decoderMsg}
+        </div>
+      )}
       {/* ---- screen viewport ---- */}
       <div
         ref={viewportRef}
@@ -3291,6 +3307,28 @@ export function ControlScreen({
                     <b className="text-ink-dim"> NVENC</b> badge whenever it's actually live.
                   </p>
                 )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    Phone decoder (MediaCodec) <ScopeTag scope="direct" />
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => patchTune({ preferNativeDecode: !tune.preferNativeDecode })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
+                      tune.preferNativeDecode ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tune.preferNativeDecode ? "ON" : "OFF"}
+                  </button>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    <b className="text-ink-dim">APK only.</b> ON feeds H.264 into Android MediaCodec and paints a Surface
+                    under the WebView (lowest decode ms). OFF forces WebCodecs even on the APK. Web and Quest always use
+                    WebCodecs — this toggle is a no-op there. The header shows a <b className="text-ink-dim">MediaCodec</b>{" "}
+                    badge when native decode is live.
+                  </p>
+                )}
                 <button
                   type="button"
                   onClick={resetTuneToDefaults}
@@ -3310,7 +3348,10 @@ export function ControlScreen({
 
       {/* ---- free-place pinned quick buttons (drag in Pin mode; positions + styles saved) ---- */}
       {pinnedDefs.length > 0 && !pipView && (
-        <div ref={pinLayerRef} className="pointer-events-none absolute inset-0 z-30 overflow-hidden">
+        <div
+          ref={pinLayerRef}
+          className={`pointer-events-none absolute inset-0 z-30 ${pinMode ? "overflow-visible" : "overflow-hidden"}`}
+        >
           {pinnedDefs.map(({ pid, def }, i) => {
             const pos = pinLayout[pid] ?? { x: 90, y: Math.min(82, 16 + i * 9) };
             const style = resolvePinStyle(chrome, pid);
@@ -4965,9 +5006,11 @@ function PinnedButton({
       whileTap={pinMode ? undefined : motionCfg.whileTap}
       transition={pinMode ? { type: "spring", stiffness: 500, damping: 30 } : motionCfg.transition}
       style={themeStyle}
-      className={`pointer-events-auto absolute flex -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-0.5 overflow-hidden border px-1.5 py-1 backdrop-blur ${shapeClass(style.shape)} ${chromeClass(style.chrome, !!active)} ${
+      className={`pointer-events-auto absolute flex -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-0.5 border px-1.5 py-1 backdrop-blur ${
+        pinMode ? "overflow-visible" : "overflow-hidden"
+      } ${shapeClass(style.shape)} ${chromeClass(style.chrome, !!active)} ${
         pinMode ? "ring-1 ring-accent-3/60" : ""
-      } ${dragging ? "z-40 shadow-glow" : "z-30"}`}
+      } ${dragging ? "z-50 shadow-glow" : pinMode ? "z-40" : "z-30"}`}
       title={
         pinMode
           ? `Drag to place · tap unpin · long-press edit ${def.keys.join(" + ")}`
@@ -5079,20 +5122,20 @@ function PinnedButton({
       )}
       {pinMode && (
         <>
-          <span className="absolute -right-1 -top-1 grid h-3.5 w-3.5 place-items-center rounded-full bg-accent-3 text-white">
-            <PinOff className="h-2 w-2" />
+          <span className="pointer-events-none absolute -right-1.5 -top-1.5 z-[60] grid h-4 w-4 place-items-center rounded-full bg-accent-3 text-white shadow-float">
+            <PinOff className="h-2.5 w-2.5" />
           </span>
           <span
             role="button"
             title="Edit look"
-            className="absolute -bottom-1 -left-1 grid h-4 w-4 place-items-center rounded-full border border-white/20 bg-black/80 text-ink-soft"
+            className="absolute -bottom-1.5 -left-1.5 z-[60] grid h-5 w-5 place-items-center rounded-full border border-white/25 bg-black/90 text-ink-soft shadow-float"
             onPointerDown={(e) => {
               e.preventDefault();
               e.stopPropagation();
               onEdit();
             }}
           >
-            <SlidersHorizontal className="h-2.5 w-2.5" />
+            <SlidersHorizontal className="h-3 w-3" />
           </span>
         </>
       )}

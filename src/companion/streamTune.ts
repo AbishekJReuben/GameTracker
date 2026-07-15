@@ -60,6 +60,13 @@ export type StreamTune = {
    * misbehaves. No-op on a PC without NVENC (it's already on the JPEG path).
    */
   hostNvenc: boolean;
+  /**
+   * Guest (Android APK only): decode DIRECT H.264 with native MediaCodec → Surface
+   * instead of WebCodecs → canvas. ON is the low-latency path (Moonlight-style).
+   * OFF forces WebCodecs even on the APK — useful if MediaCodec misbehaves on a
+   * particular SoC. No-op on web / Quest (they only have WebCodecs).
+   */
+  preferNativeDecode: boolean;
 };
 
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
@@ -83,6 +90,7 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   jbGrowAt: 15,
   directRetrySec: 15,
   hostNvenc: true,
+  preferNativeDecode: true,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -126,6 +134,7 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     // Same `!== false` shape as preferDirect: absent (an older saved tune) means the
     // default, and only an explicit false turns it off.
     hostNvenc: r.hostNvenc !== false,
+    preferNativeDecode: r.preferNativeDecode !== false,
   };
 }
 
@@ -209,6 +218,8 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.wcBufKB !== d.wcBufKB ||
     t.wcQueueMax !== d.wcQueueMax ||
     t.jbGrowAt !== d.jbGrowAt ||
-    t.directRetrySec !== d.directRetrySec
+    t.directRetrySec !== d.directRetrySec ||
+    t.hostNvenc !== d.hostNvenc ||
+    t.preferNativeDecode !== d.preferNativeDecode
   );
 }

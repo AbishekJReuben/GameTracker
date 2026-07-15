@@ -135,26 +135,30 @@ export function CompanionApp() {
     const signalUrl = localStorage.getItem(LS_SIGNAL) || DEFAULT_SIGNAL_URL;
     const secret = localStorage.getItem(LS_SECRET) || undefined;
     const room = POPOUT_MONITOR != null ? auxMonitorRoom(code, POPOUT_MONITOR) : code;
-    const c = new CloudConn(signalUrl, room, {
-      deviceId: deviceId(),
-      name: getCompanionRuntime().deviceName?.() ?? deviceName(),
-      secret,
-    });
-    autoConnRef.current = c;
-    setPendingConn(c);
-    setPhase("autoconnecting");
-    c.onStatus((s) => {
-      if (s === "connected") adopt(c);
-      else if (s === "denied") {
-        c.close();
-        autoConnRef.current = null;
-        setPendingConn(null);
-        setPhase("pairing");
-      }
-    });
-    c.connect().catch(() => {
-      /* CloudConn keeps retrying on its own */
-    });
+    // Brief delay so a prior close()'s deferred bye/PC teardown can finish —
+    // immediate reconnect used to race the host's liveSession guard.
+    window.setTimeout(() => {
+      const c = new CloudConn(signalUrl, room, {
+        deviceId: deviceId(),
+        name: getCompanionRuntime().deviceName?.() ?? deviceName(),
+        secret,
+      });
+      autoConnRef.current = c;
+      setPendingConn(c);
+      setPhase("autoconnecting");
+      c.onStatus((s) => {
+        if (s === "connected") adopt(c);
+        else if (s === "denied") {
+          c.close();
+          autoConnRef.current = null;
+          setPendingConn(null);
+          setPhase("pairing");
+        }
+      });
+      c.connect().catch(() => {
+        /* CloudConn keeps retrying on its own */
+      });
+    }, 120);
   }, [adopt]);
 
   // On launch, reconnect with the remembered code (if any).

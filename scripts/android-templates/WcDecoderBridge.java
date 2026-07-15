@@ -167,13 +167,14 @@ public final class WcDecoderBridge {
     pendingMeta.clear();
     backlog.clear();
     queueDepth.set(0);
-    MediaCodec c = codec;
-    if (c != null) {
-      try {
-        c.flush();
-      } catch (Exception ignored) {
-      }
-      freeInputs.clear();
+    freeInputs.clear();
+    // Full stop+restart beats flush alone after a session gap (MediaCodec docs:
+    // flush does not handle discontinuities; first input after restart must be
+    // a keyframe — we gate that with awaitKey).
+    stopCodecLocked();
+    Activity act = activity();
+    if (act != null && width.get() > 0 && height.get() > 0 && surfaceReady.get()) {
+      act.runOnUiThread(WcDecoderBridge::startCodecLocked);
     }
   }
 

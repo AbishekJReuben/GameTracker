@@ -361,6 +361,14 @@ export function startHost(opts: HostOptions): () => void {
   // ping — the guest pings every 5s while alive). Used to tell a *live* session
   // apart from a zombie one when signaling-level join/leave notices arrive.
   let lastGuestMsg = 0;
+  /**
+   * Set on guest bye / signaling peer-left. Cleared when we send a fresh offer.
+   * Without this, an immediate reconnect hits `liveSession` (old PC still
+   * "connected" + recent heartbeat) and the host skips `startPeer` — guest hangs
+   * on "Waiting for your PC…" until a refresh. Host-only signaling echoes must
+   * NOT set this (no peer-left), so healthy sessions survive our own socket blips.
+   */
+  let guestNeedsOffer = true;
   /** Pop-out monitor hosts spawned from the primary (monitor index → stop). */
   const auxStops = new Map<number, () => void>();
 
@@ -1416,6 +1424,7 @@ export function startHost(opts: HostOptions): () => void {
         // Explicit goodbye from the phone (user tapped Disconnect): tear down now
         // instead of waiting ~30s for ICE to notice the peer is gone.
         if (msg && msg.type === "bye") {
+          guestNeedsOffer = true;
           teardownPeer();
           return;
         }
@@ -1967,13 +1976,17 @@ export function startHost(opts: HostOptions): () => void {
         // A "peer-joined" can be an echo of a guest that's *already* attached:
         // when our own signaling socket drops and reconnects, the server
         // re-announces every peer in the room. Rebuilding then would kill a
-        // healthy session. The guest heartbeats every 5s, so "connected +
-        // recent traffic" means the live link doesn't need a new offer. A guest
-        // that genuinely rejoined has stopped pinging (it closed its peer
-        // connection first), so its join passes this check — at worst after its
-        // ~8s offer-timeout retry.
-        const liveSession = pc?.connectionState === "connected" && Date.now() - lastGuestMsg < 8000;
-        if (!liveSession) await startPeer();
+        // healthy session. BUT: after an explicit bye / peer-left the guest is
+        // gone even if ICE hasn't noticed yet — `guestNeedsOffer` forces a new
+        // offer so immediate reconnect doesn't hang waiting for one.
+        const liveSession =
+          !guestNeedsOffer &&
+          pc?.connectionState === "connected" &&
+          Date.now() - lastGuestMsg < 8000;
+        if (!liveSession) {
+          guestNeedsOffer = false;
+          await startPeer();
+        }
       } else if (m.type === "answer" && pc) {
         // Munge the guest's answer so the video encoder starts near its working
         // bitrate instead of ramping up from Chromium's ~300kbps default.
@@ -1988,9 +2001,13 @@ export function startHost(opts: HostOptions): () => void {
           /* ignore */
         }
       } else if (m.type === "peer-left") {
-        // Only the guest's *signaling* socket closed. If the peer link is live,
-        // keep serving — the phone tells us directly (bye / heartbeat silence /
-        // ICE failure) when the session itself ends.
+        // Guest signaling socket closed. Always mark that the next join needs a
+        // fresh offer — keeping a zombie PC "live" across an immediate reconnect
+        // is what stranded phones on auth / "Waiting for PC".
+        guestNeedsOffer = true;
+        // If the peer link is already dead, tear capture down now; if ICE is
+        // still connected, leave it until bye / ICE failure / the next join
+        // rebuilds (startPeer → teardownPeer).
         if (pc?.connectionState !== "connected") teardownPeer();
       }
     });
