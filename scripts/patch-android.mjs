@@ -363,6 +363,15 @@ const save = (path, before, after, msg) => {
 // --- 4b: WcDecoderBridge.java — native H.264 MediaCodec → Surface ----------
 // Copied from scripts/android-templates/WcDecoderBridge.java with the app
 // package substituted. Idempotent: rewritten whenever the template changes.
+//
+// The bridge owns the entire Android-side decode story: decoder selection
+// (Moonlight-style — prefers a *.low_latency variant, then FEATURE_LowLatency,
+// then any HW decoder, then SW as last resort), a progressive configure ladder
+// (full vendor keys → KEY_LOW_LATENCY only → plain format) so a driver that
+// rejects an unknown vendor key in configure() still starts, CSD-0/SPS+PPS
+// extraction from the first IDR (required by many HW decoders), and a
+// `probeDetail` JNI method that surfaces why the probe returned its answer so
+// "MediaCodec unavailable" is diagnosable without logcat.
 {
   const conf = JSON.parse(
     readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"),

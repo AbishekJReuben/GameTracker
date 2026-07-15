@@ -16,6 +16,10 @@ pub struct DecoderProbe {
     pub available: bool,
     pub name: String,
     pub low_latency: bool,
+    /// Human-readable reason the probe returned its answer — surfaces the bridge's
+    /// internal state (which decoder was picked, why none was, or which configure
+    /// attempt failed) so "MediaCodec unavailable" is diagnosable without logcat.
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,10 +148,21 @@ mod android {
                 let js: JString = name_obj.into();
                 env.get_string(&js).map(|s| s.into()).unwrap_or_default()
             };
+            let detail_obj = env
+                .call_static_method(&class, "probeDetail", "()Ljava/lang/String;", &[])
+                .map(|v| v.l().unwrap_or_default())
+                .unwrap_or_default();
+            let detail = if detail_obj.is_null() {
+                String::new()
+            } else {
+                let js: JString = detail_obj.into();
+                env.get_string(&js).map(|s| s.into()).unwrap_or_default()
+            };
             Ok(DecoderProbe {
                 available,
                 name,
                 low_latency,
+                detail,
             })
         })
     }
@@ -287,6 +302,7 @@ fn decoder_probe_impl() -> Result<DecoderProbe, String> {
         available: false,
         name: String::new(),
         low_latency: false,
+        detail: String::new(),
     })
 }
 #[cfg(not(target_os = "android"))]

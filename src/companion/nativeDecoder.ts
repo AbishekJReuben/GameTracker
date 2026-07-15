@@ -15,6 +15,8 @@ export type DecoderProbe = {
   available: boolean;
   name: string;
   lowLatency: boolean;
+  /** Diagnostic — the bridge's reason for the probe result (e.g. "picked=c2.qti.avc.decoder"). */
+  detail: string;
 };
 
 export type DecoderStats = {
@@ -56,14 +58,19 @@ let probeCache: DecoderProbe | null = null;
 /** Probe once per page load — MediaCodec availability doesn't change. */
 export async function probeNativeDecoder(): Promise<DecoderProbe> {
   if (!nativeDecoderPossible()) {
-    return { available: false, name: "", lowLatency: false };
+    return { available: false, name: "", lowLatency: false, detail: "not Tauri/companion" };
   }
   if (probeCache) return probeCache;
   try {
     probeCache = await invoke<DecoderProbe>("decoder_probe");
   } catch (e) {
     console.warn("[nativeDecoder] probe failed:", e);
-    probeCache = { available: false, name: "", lowLatency: false };
+    probeCache = {
+      available: false,
+      name: "",
+      lowLatency: false,
+      detail: `probe threw: ${String(e).slice(0, 160)}`,
+    };
   }
   return probeCache;
 }

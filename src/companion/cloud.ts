@@ -1063,6 +1063,10 @@ export class CloudConn {
         );
         return true;
       }
+      // Native was preferred but unavailable. Log the bridge's reason so it's
+      // visible even if the fallback toast was dismissed — `wcSupported` will
+      // then be set by the WebCodecs probe below (or DIRECT is off entirely).
+      if (p.detail) console.warn(`[remote] native MediaCodec unavailable: ${p.detail}`);
     }
     try {
       if (typeof VideoDecoder === "undefined") return false;
@@ -1145,10 +1149,15 @@ export class CloudConn {
         if (!p.available) {
           this.wcNative = false;
           this.wcStopNativePoll();
+          // Surface the bridge's own reason so "MediaCodec unavailable" stops
+          // being a mystery — the detail string carries which decoder was
+          // considered, what configure attempt failed, or whether the bridge
+          // even loaded. Visible in the transient toast above the viewport.
+          const detail = p.detail ? ` (${p.detail})` : "";
           this.emitEvent({
             event: "decoder",
             state: "fallback",
-            reason: "MediaCodec unavailable — using WebCodecs",
+            reason: `MediaCodec unavailable — using WebCodecs${detail}`,
           });
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("no native or WebCodecs decoder");
           return;
@@ -1158,10 +1167,11 @@ export class CloudConn {
           console.warn("[remote] native MediaCodec init failed — WebCodecs fallback");
           this.wcNative = false;
           this.wcStopNativePoll();
+          const detail = p.detail ? ` (${p.detail})` : "";
           this.emitEvent({
             event: "decoder",
             state: "fallback",
-            reason: "MediaCodec failed to start — using WebCodecs",
+            reason: `MediaCodec failed to start — using WebCodecs${detail}`,
           });
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("native init failed");
           return;

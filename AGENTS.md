@@ -1063,6 +1063,27 @@ not regress):**
   MediaCodec). HUD shows a **MediaCodec** badge when the native path is live.
   Fallback to WebCodecs if probe/init fails. Do not route native frames through
   canvas `drawImage` — that reintroduces the decode tax this removes.
+- **MediaCodec "unavailable" was a progressive-configure failure, not a missing
+  decoder (v3.9.34 fix — do not regress).** The original `pickDecoderName()`
+  returned null on devices whose only H.264 HW decoder didn't advertise
+  `FEATURE_LowLatency`, and even when a name came back, `configure()` would
+  throw on drivers that reject unknown vendor keys — leaving the user on the
+  WebCodecs path with no diagnostic. The rewrite (borrowed from
+  moonlight-android `setDecoderLowLatencyOptions` + `findKnownSafeDecoder`):
+  (1) **probe never returns null** — falls through `.low_latency` variant →
+  `FEATURE_LowLatency` → any HW decoder → framework `findDecoderForFormat` →
+  software decoder (last resort) so a software path always exists;
+  (2) **progressive configure ladder** — try full vendor-key set, then
+  KEY_LOW_LATENCY + Qualcomm POC + operating-rate, then KEY_LOW_LATENCY only,
+  then (MTK) `vdec-lowlatency`, then a bare format with no LL hints;
+  (3) **CSD-0/SPS+PPS extraction** from the first IDR queued as
+  `BUFFER_FLAG_CODEC_CONFIG` before the slice — many Android HW decoders
+  silently render nothing without an explicit CSD;
+  (4) **`probeDetail` JNI method** + `DecoderProbe.detail` field surfaces the
+  bridge's reason for its answer (which decoder was picked / which configure
+  attempt failed) into the toast so "MediaCodec unavailable" is diagnosable
+  without logcat. Confirmed working on Moto G57 Power 5G (Snapdragon 6s Gen 4,
+  `c2.qti.avc.decoder`).
 
 [ExoPlayer#8514]: https://github.com/google/ExoPlayer/issues/8514
 

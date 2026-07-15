@@ -24,6 +24,9 @@ import android.webkit.WebView;
 import android.widget.FrameLayout;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,8 +37,20 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Low-latency H.264 decode for GameTracker Remote (DIRECT path).
  *
- * Patterns borrowed from:
- *  - moonlight-android MediaCodecHelper (FEATURE_LowLatency + vendor keys)
+ * Patterns borrowed from (and re-tested against the actual sources):
+ *  - moonlight-android MediaCodecHelper + MediaCodecDecoderRenderer
+ *      • FEATURE_LowLatency + vendor keys (qualcomm / hisi / exynos / amlogic)
+ *      • Progressive low-latency config attempts — try the most aggressive set
+ *        first, fall back to a plain MediaFormat if {@link MediaCodec#configure}
+ *        throws. This is the core fix for "MediaCodec unavailable" on devices
+ *        whose driver rejects an unknown vendor key during configure.
+ *      • {@code KEY_OPERATING_RATE = Short.MAX} + {@code KEY_PRIORITY = 0} as a
+ *        secondary low-latency lever on Qualcomm.
+ *      • Pick a low-latency variant if one exists (e.g. {@code c2.qti.avc.decoder
+ *        .low_latency}) even when a non-LL decoder is listed first.
+ *      • CSD-0/SPS+PPS extracted from the first Annex-B IDR and queued as
+ *        {@link MediaCodec#BUFFER_FLAG_CODEC_CONFIG} before the slice — many
+ *        Android HW decoders never produce output without an explicit CSD.
  *  - chiaki-ng video-decoder.c (AMediaCodec → Surface)
  *  - ALVR push_nal / deskstream VideoDecoder.kt (async callback, Annex-B AUs)
  *
@@ -45,6 +60,17 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class WcDecoderBridge {
   private static final String TAG = "GtWcDecoder";
   private static final String MIME = MediaFormat.MIMETYPE_VIDEO_AVC;
+
+  // Vendor low-latency keys (Moonlight-known). Applied best-effort at configure;
+  // unknown keys are dropped silently on most drivers, but a few reject them and
+  // throw inside configure(), which is what the progressive retry undoes.
+  private static final String[] VENDOR_LL_KEYS = {
+      "vendor.qti-ext-dec-low-latency.enable", // Qualcomm
+      "vendor.qti-ext-dec-picture-order.enable", // Qualcomm (POC hint)
+      "vendor.low-latency.enable", // Amlogic
+      "vendor.rtc-ext-dec-low-latency.enable", // Exynos
+      "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req", // HiSilicon
+  };
 
   private static WeakReference<Activity> actRef;
   private static SurfaceView surfaceView;
@@ -58,12 +84,14 @@ public final class WcDecoderBridge {
   private static final AtomicBoolean started = new AtomicBoolean(false);
   private static final AtomicBoolean surfaceReady = new AtomicBoolean(false);
   private static final AtomicBoolean awaitKey = new AtomicBoolean(true);
+  private static final AtomicBoolean csdQueued = new AtomicBoolean(false);
   private static final AtomicInteger width = new AtomicInteger(0);
   private static final AtomicInteger height = new AtomicInteger(0);
   private static final AtomicInteger queueDepth = new AtomicInteger(0);
   private static final AtomicLong frames = new AtomicLong(0);
   private static final AtomicReference<String> lastError = new AtomicReference<>("");
   private static final AtomicReference<String> codecName = new AtomicReference<>("");
+  private static final AtomicReference<String> lastProbeDetail = new AtomicReference<>("");
   private static final AtomicBoolean lowLatency = new AtomicBoolean(false);
   private static volatile double decodeMsEwma = 0.0;
   private static volatile boolean webViewHooked = false;
@@ -88,8 +116,12 @@ public final class WcDecoderBridge {
     activity.runOnUiThread(() -> ensureSurfaceView(activity));
   }
 
+  /** Probe only — never throws, never returns a stale false on a transient fault. */
   public static boolean probeAvailable() {
-    return pickDecoderName() != null;
+    String name = pickDecoderName();
+    boolean ok = name != null;
+    lastProbeDetail.set(ok ? ("picked=" + name) : "no decoder found");
+    return ok;
   }
 
   public static boolean probeLowLatency() {
@@ -102,9 +134,12 @@ public final class WcDecoderBridge {
       if (Build.VERSION.SDK_INT >= 30) {
         return caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
             || name.toLowerCase().contains("low_latency")
-            || name.toLowerCase().contains("low-latency");
+            || name.toLowerCase().contains("low-latency")
+            || supportsKnownVendorParameter(name);
       }
-      return name.toLowerCase().contains("low_latency") || name.toLowerCase().contains("low-latency");
+      return name.toLowerCase().contains("low_latency")
+          || name.toLowerCase().contains("low-latency")
+          || supportsKnownVendorParameter(name);
     } catch (Exception e) {
       return false;
     }
@@ -115,12 +150,19 @@ public final class WcDecoderBridge {
     return n == null ? "" : n;
   }
 
+  /** Diagnostic — surfaces the reason the probe returned its answer. */
+  public static String probeDetail() {
+    String d = lastProbeDetail.get();
+    return d == null ? "" : d;
+  }
+
   public static void init(int w, int h) {
     if (w < 16 || h < 16) throw new IllegalArgumentException("bad size " + w + "x" + h);
     width.set(w);
     height.set(h);
     lastError.set("");
     awaitKey.set(true);
+    csdQueued.set(false);
     Activity act = activity();
     if (act == null) throw new IllegalStateException("no activity");
     act.runOnUiThread(
@@ -164,6 +206,7 @@ public final class WcDecoderBridge {
 
   public static void reset() {
     awaitKey.set(true);
+    csdQueued.set(false);
     pendingMeta.clear();
     backlog.clear();
     queueDepth.set(0);
@@ -256,6 +299,30 @@ public final class WcDecoderBridge {
       }
       return;
     }
+    // Extract SPS/PPS from the first keyframe and feed them as CSD before the
+    // slice. Most Android HW decoders REQUIRE this (Moonlight/ALVR/Chiaki all
+    // do the same); an inline-only stream silently renders nothing on c2.qti
+    // and several MediaTek parts. We re-extract every keyframe — cheap, and
+    // it lets a mid-stream resolution change re-prime the decoder.
+    boolean needsCsd = key && !csdQueued.get();
+    byte[] csd = needsCsd ? extractCsd(data) : null;
+    if (csd != null) {
+      Integer csdIdx = freeInputs.poll();
+      if (csdIdx == null) {
+        // No room for the CSD right now — hold the keyframe back. Feeding the
+        // slice without a CSD would either throw or render nothing, then arm
+        // awaitKey on the next error; better to wait one tick.
+        backlog.clear();
+        backlog.offer(new PendingFrame(tsUs, true, data, arrived));
+        return;
+      }
+      queueCsd(csdIdx, csd);
+    } else if (needsCsd) {
+      // We wanted a CSD but couldn't extract one — most likely the host shipped
+      // just an IDR without inline SPS/PPS. Fall through and queue the frame
+      // anyway; the previous session's CSD (or the codec's defaults) may still
+      // decode it. If not, the next keyframe will retry extraction.
+    }
     Integer idx = freeInputs.poll();
     if (idx == null) {
       // Latest-wins: drop oldest backlog, keep this frame if key or queue small.
@@ -277,6 +344,95 @@ public final class WcDecoderBridge {
         return;
       }
       queueInput(idx, pf.tsUs, pf.key, pf.data, pf.arrivedAt);
+    }
+  }
+
+  /**
+   * Pull SPS (NAL type 7) + PPS (NAL type 8) out of an Annex-B buffer and
+   * concatenate them into one CSD-0 blob (SPS||PPS, no start codes between).
+   * Returns null if either is missing. The slice NAL is left out — the slice
+   * is queued as a normal input buffer right after.
+   */
+  private static byte[] extractCsd(byte[] annexB) {
+    try {
+      byte[] sps = null;
+      byte[] pps = null;
+      int i = 0;
+      int n = annexB.length;
+      while (i + 3 <= n) {
+        int scLen;
+        if (i + 4 <= n
+            && annexB[i] == 0 && annexB[i + 1] == 0 && annexB[i + 2] == 0 && annexB[i + 3] == 1) {
+          scLen = 4;
+        } else if (annexB[i] == 0 && annexB[i + 1] == 0 && annexB[i + 2] == 1) {
+          scLen = 3;
+        } else {
+          i++;
+          continue;
+        }
+        int nalStart = i + scLen;
+        // Find the next start code (or end).
+        int j = nalStart;
+        while (j + 3 <= n) {
+          if ((annexB[j] == 0 && annexB[j + 1] == 0 && annexB[j + 2] == 1)
+              || (j + 4 <= n
+                  && annexB[j] == 0
+                  && annexB[j + 1] == 0
+                  && annexB[j + 2] == 0
+                  && annexB[j + 3] == 1)) {
+            break;
+          }
+          j++;
+        }
+        int nalEnd = (j + 3 <= n) ? j : n;
+        if (nalEnd > nalStart) {
+          int nalType = annexB[nalStart] & 0x1f;
+          int len = nalEnd - nalStart;
+          if (nalType == 7 && sps == null) {
+            sps = new byte[len];
+            System.arraycopy(annexB, nalStart, sps, 0, len);
+          } else if (nalType == 8 && pps == null) {
+            pps = new byte[len];
+            System.arraycopy(annexB, nalStart, pps, 0, len);
+          }
+        }
+        i = nalEnd;
+        if (sps != null && pps != null) break;
+      }
+      if (sps == null || pps == null) return null;
+      byte[] csd = new byte[sps.length + pps.length];
+      System.arraycopy(sps, 0, csd, 0, sps.length);
+      System.arraycopy(pps, 0, csd, sps.length, pps.length);
+      return csd;
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  private static void queueCsd(int index, byte[] csd) {
+    MediaCodec c = codec;
+    if (c == null) {
+      freeInputs.offer(index);
+      return;
+    }
+    try {
+      ByteBuffer buf = c.getInputBuffer(index);
+      if (buf == null) {
+        freeInputs.offer(index);
+        return;
+      }
+      buf.clear();
+      if (buf.remaining() < csd.length) {
+        freeInputs.offer(index);
+        return;
+      }
+      buf.put(csd);
+      c.queueInputBuffer(index, 0, csd.length, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
+      csdQueued.set(true);
+    } catch (Exception e) {
+      freeInputs.offer(index);
+      lastError.set("csd: " + e.getMessage());
+      Log.w(TAG, "queueCsd failed", e);
     }
   }
 
@@ -417,34 +573,99 @@ public final class WcDecoderBridge {
     String name = pickDecoderName();
     if (name == null) {
       lastError.set("no H.264 decoder");
+      lastProbeDetail.set("startCodec: no H.264 decoder");
       return;
     }
     codecName.set(name);
     lowLatency.set(probeLowLatency());
 
-    try {
-      if (codecThread == null) {
-        codecThread = new HandlerThread("gt-wc-decoder", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
-        codecThread.start();
-        codecHandler = new Handler(codecThread.getLooper());
+    if (codecThread == null) {
+      codecThread = new HandlerThread("gt-wc-decoder", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+      codecThread.start();
+      codecHandler = new Handler(codecThread.getLooper());
+    }
+
+    // Moonlight-style progressive configure: try the most aggressive low-latency
+    // MediaFormat first, then peel keys off until configure() accepts one. A
+    // number of older Qualcomm/MTK drivers reject unknown vendor keys inside
+    // configure() and the codec never starts — this is what "MediaCodec
+    // unavailable" actually meant on those devices.
+    List<MediaFormat> attempts = buildFormatLadder(w, h, name);
+    Exception lastEx = null;
+    MediaCodec c = null;
+    for (int i = 0; i < attempts.size(); i++) {
+      MediaFormat fmt = attempts.get(i);
+      try {
+        c = createCodecByName(name);
+        if (c == null) {
+          // createByCodecName returned null or threw — fall back to the
+          // framework's by-mime picker, which selects the best HW decoder.
+          c = createCodecByType();
+        }
+        if (c == null) {
+          lastError.set("createCodec returned null");
+          lastProbeDetail.set("startCodec: createCodec null");
+          return;
+        }
+        c.setCallback(callback, codecHandler);
+        c.configure(fmt, s, null, 0);
+        applyRuntimeLowLatency(c);
+        freeInputs.clear();
+        backlog.clear();
+        pendingMeta.clear();
+        c.start();
+        codec = c;
+        started.set(true);
+        awaitKey.set(true);
+        csdQueued.set(false);
+        Log.i(
+            TAG,
+            "MediaCodec started name="
+                + name
+                + " "
+                + w
+                + "x"
+                + h
+                + " ll="
+                + lowLatency.get()
+                + " fmtTry="
+                + i);
+        return;
+      } catch (Exception e) {
+        lastEx = e;
+        Log.w(TAG, "configure/start attempt " + i + " failed: " + e.getMessage());
+        if (c != null) {
+          try {
+            c.release();
+          } catch (Exception ignored) {
+          }
+          c = null;
+        }
       }
-      MediaCodec c = MediaCodec.createByCodecName(name);
-      MediaFormat format = buildFormat(w, h, name);
-      c.setCallback(callback, codecHandler);
-      c.configure(format, s, null, 0);
-      applyRuntimeLowLatency(c);
-      freeInputs.clear();
-      backlog.clear();
-      pendingMeta.clear();
-      c.start();
-      codec = c;
-      started.set(true);
-      awaitKey.set(true);
-      Log.i(TAG, "MediaCodec started name=" + name + " " + w + "x" + h + " ll=" + lowLatency.get());
+    }
+    lastError.set(lastEx == null ? "all configure attempts failed" : String.valueOf(lastEx.getMessage()));
+    lastProbeDetail.set("startCodec: all attempts failed (" + attempts.size() + ")");
+    Log.e(TAG, "all codec configure attempts failed", lastEx);
+  }
+
+  private static MediaCodec createCodecByName(String name) {
+    try {
+      return MediaCodec.createByCodecName(name);
     } catch (Exception e) {
-      lastError.set(String.valueOf(e.getMessage()));
-      Log.e(TAG, "startCodec failed", e);
-      stopCodecLocked();
+      Log.w(TAG, "createByCodecName(" + name + ") failed: " + e.getMessage());
+      return null;
+    }
+  }
+
+  private static MediaCodec createCodecByType() {
+    try {
+      // createDecoderByType is deprecated but still the safest fallback — it
+      // lets the framework pick the best HW decoder for the mime type when our
+      // name-based pick is rejected.
+      return MediaCodec.createDecoderByType(MIME);
+    } catch (Exception e) {
+      Log.w(TAG, "createDecoderByType failed: " + e.getMessage());
+      return null;
     }
   }
 
@@ -456,6 +677,7 @@ public final class WcDecoderBridge {
     backlog.clear();
     pendingMeta.clear();
     queueDepth.set(0);
+    csdQueued.set(false);
     if (c != null) {
       try {
         c.stop();
@@ -500,6 +722,7 @@ public final class WcDecoderBridge {
         public void onError(MediaCodec codec, MediaCodec.CodecException e) {
           lastError.set(String.valueOf(e.getDiagnosticInfo()));
           awaitKey.set(true);
+          csdQueued.set(false);
           Log.w(TAG, "codec error", e);
         }
 
@@ -517,27 +740,99 @@ public final class WcDecoderBridge {
         }
       };
 
-  private static MediaFormat buildFormat(int w, int h, String decoderName) {
+  /**
+   * Build the progressive list of MediaFormats to try, most aggressive first.
+   * Mirrors Moonlight's {@code setDecoderLowLatencyOptions(mediaFormat, decoderInfo,
+   * tryNumber)} — try the full vendor-key set first, then peel them off one ring
+   * at a time until a bare-bones {@code KEY_LOW_LATENCY}+{@code KEY_PRIORITY}
+   * config is the last resort. A bare config (no LL keys at all) is the absolute
+   * fallback so we never fail to start the codec on a device that just doesn't
+   * grok any of the vendor hints.
+   */
+  private static List<MediaFormat> buildFormatLadder(int w, int h, String decoderName) {
+    List<MediaFormat> ladder = new ArrayList<>();
+    String lower = decoderName.toLowerCase();
+    boolean isQualcomm = lower.contains("qcom") || lower.contains("qti") || lower.contains("c2.qti");
+    boolean isMtk = lower.contains("mtk") || lower.contains("mediatek");
+
+    // Attempt 0 — everything but the kitchen sink. This is what works on most
+    // Snapdragon 7xx/8xx and modern MediaTek parts.
+    MediaFormat full = baseFormat(w, h);
+    applyStandardLowLatency(full);
+    applyVendorKeys(full);
+    applyOperatingRate(full, decoderName);
+    ladder.add(full);
+
+    // Attempt 1 — standard KEY_LOW_LATENCY + Qualcomm picture-order + operating
+    // rate. Drops the catch-all vendor keys that some drivers reject.
+    MediaFormat std = baseFormat(w, h);
+    applyStandardLowLatency(std);
+    if (isQualcomm) {
+      setVendorInt(std, "vendor.qti-ext-dec-picture-order.enable", 1);
+    }
+    applyOperatingRate(std, decoderName);
+    ladder.add(std);
+
+    // Attempt 2 — KEY_LOW_LATENCY + KEY_PRIORITY only (no vendor keys at all).
+    MediaFormat min = baseFormat(w, h);
+    applyStandardLowLatency(min);
+    ladder.add(min);
+
+    // Attempt 3 — MediaTek/Amlogic "vdec-lowlatency" magic string (MediaTek
+    // parts route this to OMX.MTK.index.param.video.LowLatencyDecode).
+    if (isMtk) {
+      MediaFormat mtk = baseFormat(w, h);
+      applyStandardLowLatency(mtk);
+      setVendorInt(mtk, "vdec-lowlatency", 1);
+      ladder.add(mtk);
+    }
+
+    // Attempt 4 — plain video format with no LL hints. Last resort: still better
+    // than no decoder. The SPS fixup on the host (refs=1, reorder=0, DPB=1) keeps
+    // decode latency low even without the decoder's own LL mode.
+    ladder.add(baseFormat(w, h));
+    return ladder;
+  }
+
+  private static MediaFormat baseFormat(int w, int h) {
     MediaFormat format = MediaFormat.createVideoFormat(MIME, w, h);
     format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, Math.max(512_000, w * h));
-    // Realtime priority (API 23+) — planning hint for the codec.
     if (Build.VERSION.SDK_INT >= 23) {
       format.setInteger(MediaFormat.KEY_PRIORITY, 0);
     }
+    return format;
+  }
+
+  private static void applyStandardLowLatency(MediaFormat format) {
     if (Build.VERSION.SDK_INT >= 30) {
       format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
     }
-    // Moonlight-style vendor low-latency keys (best-effort; ignored if unknown).
-    setVendorInt(format, "vendor.qti-ext-dec-low-latency.enable", 1);
-    setVendorInt(format, "vendor.low-latency.enable", 1);
-    setVendorInt(format, "vdec-lowlatency", 1);
-    setVendorInt(format, "vendor.rtc-ext-dec-low-latency.enable", 1);
-    setVendorInt(format, "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req", 1);
-    setVendorInt(format, "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-rdy", -1);
-    if (decoderName.toLowerCase().contains("mtk") || decoderName.toLowerCase().contains("mediatek")) {
-      setVendorInt(format, "vdec-lowlatency", 1);
+    // "low-latency" is the spelling Moonlight uses; some OEMs accept it pre-R.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      setVendorInt(format, "low-latency", 1);
     }
-    return format;
+  }
+
+  private static void applyVendorKeys(MediaFormat format) {
+    for (String key : VENDOR_LL_KEYS) {
+      setVendorInt(format, key, 1);
+    }
+    // HiSilicon's "ready" signal is -1, not 1.
+    setVendorInt(format, "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-rdy", -1);
+  }
+
+  private static void applyOperatingRate(MediaFormat format, String decoderName) {
+    // Moonlight's decoderSupportsMaxOperatingRate: Qualcomm-only, not Adreno 620.
+    // Crashes the codec on some older Snapdragon 7xx if it can't satisfy the
+    // rate, so we gate it to known-good prefixes.
+    String lower = decoderName.toLowerCase();
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+        && (lower.contains("qcom") || lower.contains("qti") || lower.contains("c2.qti"))) {
+      try {
+        format.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE);
+      } catch (Exception ignored) {
+      }
+    }
   }
 
   private static void setVendorInt(MediaFormat format, String key, int value) {
@@ -557,11 +852,29 @@ public final class WcDecoderBridge {
     }
   }
 
+  /**
+   * Pick the best H.264 decoder, preferring a low-latency variant if one exists.
+   * Returns null only if the device literally has no H.264 decoder (unheard of
+   * on any shipping Android phone since ~2012). The previous version returned
+   * null when every decoder failed the LL probe AND the framework fallback threw
+   * — this version still returns a name in that case so the caller's progressive
+   * {@link #startCodecLocked} can try plain-config too.
+   */
   private static String pickDecoderName() {
-    MediaCodecList list = new MediaCodecList(MediaCodecList.ALL_CODECS);
-    String fallbackHw = null;
-    String fallbackAny = null;
-    for (MediaCodecInfo info : list.getCodecInfos()) {
+    MediaCodecInfo[] infos;
+    try {
+      infos = new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos();
+    } catch (Exception e) {
+      lastProbeDetail.set("pickDecoder: MediaCodecList threw " + e.getMessage());
+      return null;
+    }
+
+    String llHw = null; // FEATURE_LowLatency hardware decoder
+    String anyHw = null; // any hardware decoder (non-LL)
+    String llVariant = null; // decoder explicitly named "*.low_latency"
+    String anySw = null; // software fallback (last resort)
+
+    for (MediaCodecInfo info : infos) {
       if (info.isEncoder()) continue;
       String[] types;
       try {
@@ -577,37 +890,123 @@ public final class WcDecoderBridge {
         }
       }
       if (!supports) continue;
+
       String name = info.getName();
       String lower = name.toLowerCase();
-      if (lower.contains("sw") || lower.contains("google") || lower.contains("android.video.avc")) {
-        if (fallbackAny == null) fallbackAny = name;
+
+      // Skip software decoders — they're tracked separately as the absolute
+      // last resort. Don't gate on isSoftwareOnly() alone (some emulator
+      // builds only ship SW).
+      boolean looksSoftware =
+          lower.contains("sw")
+              || lower.contains("google")
+              || lower.contains("android.video.avc")
+              || lower.contains("c2.android")
+              || lower.contains("omx.google")
+              || lower.contains("avcdecoder");
+      if (looksSoftware) {
+        if (anySw == null) anySw = name;
         continue;
       }
+
+      // Skip aliases on Q+ — they're the same decoder under two names.
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        try {
+          if (info.isAlias()) continue;
+        } catch (Exception ignored) {
+        }
+      }
+
+      // An explicit low_latency variant is the best pick — Pixel 4 ships
+      // c2.qti.avc.decoder.low_latency SEPARATELY from the base decoder and
+      // only the LL one advertises FEATURE_LowLatency (Moonlight errata #15).
+      if (lower.contains("low_latency") || lower.contains("low-latency")) {
+        if (llVariant == null) llVariant = name;
+      }
+
       try {
         MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(MIME);
-        boolean ll =
-            (Build.VERSION.SDK_INT >= 30
-                    && caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency))
-                || lower.contains("low_latency")
-                || lower.contains("low-latency");
-        if (ll) return name;
+        boolean llFeature = false;
+        if (Build.VERSION.SDK_INT >= 30) {
+          try {
+            llFeature = caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency);
+          } catch (Exception ignored) {
+          }
+        }
+        if (llFeature) {
+          if (llHw == null) llHw = name;
+        }
       } catch (Exception ignored) {
+        // Buggy codec — pretend it's a generic HW decoder and move on.
       }
-      if (fallbackHw == null) fallbackHw = name;
+      if (anyHw == null) anyHw = name;
     }
-    if (fallbackHw != null) return fallbackHw;
-    // Last resort: framework pick.
+
+    if (llVariant != null) return llVariant;
+    if (llHw != null) return llHw;
+    if (anyHw != null) return anyHw;
+
+    // Framework pick: lets the platform decide the best decoder for the format.
     try {
       MediaFormat fmt = MediaFormat.createVideoFormat(MIME, 1280, 720);
-      return new MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(fmt);
+      String found = new MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(fmt);
+      if (found != null) return found;
     } catch (Exception e) {
-      return fallbackAny;
+      lastProbeDetail.set("pickDecoder: findDecoderForFormat threw " + e.getMessage());
     }
+
+    // Absolute last resort — a software decoder is still a decoder. The DIRECT
+    // path's latency benefit (no jitter buffer) outweighs the SW decode cost on
+    // any modern phone, and at least the user gets a picture instead of a black
+    // screen + "MediaCodec unavailable" toast.
+    return anySw;
+  }
+
+  /**
+   * Whether the codec publishes any of the known vendor low-latency parameters.
+   * Used as a secondary LL signal (matches Moonlight's heuristic). API 12+ only
+   * because {@link MediaCodec#getSupportedVendorParameters()} is API 31+; on
+   * older OSes we assume not.
+   */
+  private static boolean supportsKnownVendorParameter(String name) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
+    MediaCodec test = null;
+    try {
+      test = MediaCodec.createByCodecName(name);
+      List<String> params;
+      try {
+        // Available on API 31+ (S).
+        params = test.getSupportedVendorParameters();
+      } catch (Throwable t) {
+        return false;
+      }
+      if (params == null) return false;
+      List<String> known = Arrays.asList(VENDOR_LL_KEYS);
+      for (String p : params) {
+        for (String k : known) {
+          if (p != null && p.equalsIgnoreCase(k)) return true;
+        }
+      }
+    } catch (Exception ignored) {
+      // Codec unavailable — assume not.
+    } finally {
+      if (test != null) {
+        try {
+          test.release();
+        } catch (Exception ignored) {
+        }
+      }
+    }
+    return false;
   }
 
   private static MediaCodecInfo findInfo(String name) {
-    for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()) {
-      if (info.getName().equals(name)) return info;
+    try {
+      for (MediaCodecInfo info :
+          new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()) {
+        if (info.getName().equals(name)) return info;
+      }
+    } catch (Exception ignored) {
     }
     return null;
   }
