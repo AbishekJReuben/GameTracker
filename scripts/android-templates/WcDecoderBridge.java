@@ -91,6 +91,13 @@ public final class WcDecoderBridge {
    * {@link #applyVisibility}.
    */
   private static final AtomicBoolean wanted = new AtomicBoolean(false);
+  /**
+   * Self-healing safety net for "surfaceCreated never fires": set while we are
+   * waiting for the SurfaceFlinger to hand us a Surface after a VISIBLE flip,
+   * cleared the instant {@link SurfaceHolder.Callback#surfaceCreated} lands (or
+   * on teardown). See {@link #armSurfaceWatchdog} / {@link #cancelSurfaceWatchdog}.
+   */
+  private static final AtomicBoolean surfaceWatchdogArmed = new AtomicBoolean(false);
   private static final AtomicBoolean awaitKey = new AtomicBoolean(true);
   private static final AtomicBoolean csdQueued = new AtomicBoolean(false);
   private static final AtomicInteger width = new AtomicInteger(0);
@@ -103,6 +110,28 @@ public final class WcDecoderBridge {
   private static final AtomicBoolean lowLatency = new AtomicBoolean(false);
   private static volatile double decodeMsEwma = 0.0;
   private static volatile boolean webViewHooked = false;
+
+  /**
+   * Watchdog that kicks a VISIBLE SurfaceView when SurfaceFlinger never hands us
+   * a Surface. The MainActivity's window is already showing by {@link #init}, so
+   * a brand-new VISIBLE SurfaceView should receive surfaceCreated within a frame
+   * or two. When it does not (a finicky OEM/Android-16 build can wedge the
+   * surface negotiation for a view that was created GONE at {@code onCreate} and
+   * flipped VISIBLE later — the GtWcDecoder log shows nothing, and the JS
+   * watchdog reports "accepted N frame(s) but decoded 0 ... surfaceReady=false"),
+   * we detach the view and re-add it, which forces a fresh surface session.
+   * Bounded: {@link #SURFACE_KICK_MAX} attempts × {@link #SURFACE_KICK_DELAY_MS}
+   * = 2s, comfortably inside the 3s JS fallback deadline (cloud.ts), and
+   * disarmed the moment a Surface arrives or the decoder is torn down. Uses the
+   * {@link HandlerThread} that {@link #startCodecLocked} lazily creates — but
+   * resolves a surface without ever needing the codec, so it creates its own
+   * thread if the codec one isn't up yet.
+   */
+  private static final long SURFACE_KICK_DELAY_MS = 500L;
+  private static final int SURFACE_KICK_MAX = 4;
+  private static final AtomicInteger surfaceKicks = new AtomicInteger(0);
+  private static HandlerThread watchdogThread;
+  private static Handler watchdogHandler;
 
   private static final class PendingFrame {
     final long tsUs;
@@ -137,6 +166,139 @@ public final class WcDecoderBridge {
     if (sv == null) return;
     int want = wanted.get() ? View.VISIBLE : View.GONE;
     if (sv.getVisibility() != want) sv.setVisibility(want);
+  }
+
+  /** Lazily create the watchdog {@link HandlerThread} (independent of the codec
+   *  thread, which does not exist until a Surface is realised). */
+  private static synchronized Handler watchdogLooper() {
+    if (watchdogHandler != null) return watchdogHandler;
+    watchdogThread =
+        new HandlerThread("gt-wc-surface-watchdog", android.os.Process.THREAD_PRIORITY_BACKGROUND);
+    watchdogThread.start();
+    watchdogHandler = new Handler(watchdogThread.getLooper());
+    return watchdogHandler;
+  }
+
+  /**
+   * Arm the surface-creation watchdog. Call on the UI thread right after the
+   * view is flipped VISIBLE expecting a Surface. If {@code surfaceCreated}
+   * hasn't fired within {@link #SURFACE_KICK_DELAY_MS}, {@link #surfaceKick}
+   * re-attaches the view to force a fresh surface session. Idempotent: safe to
+   * call repeatedly; it only schedules work while no Surface has arrived and the
+   * decoder is still {@link #wanted}.
+   *
+   * <p>Does NOT reset {@link #surfaceKicks} — that is the caller's job. {@link
+   * #init} zeroes it before the first arm; {@link #surfaceKick} leaves it alone
+   * so the count accumulates across re-arms and {@link #SURFACE_KICK_MAX} is
+   * actually honoured.
+   */
+  private static void armSurfaceWatchdog() {
+    if (!wanted.get()) return;
+    if (surfaceReady.get() || surfaceView == null) return;
+    if (!surfaceWatchdogArmed.compareAndSet(false, true)) return;
+    watchdogLooper()
+        .postDelayed(
+            () -> {
+              if (surfaceView == null || !surfaceWatchdogArmed.get()) return;
+              Activity act = activity();
+              if (act == null) {
+                surfaceWatchdogArmed.set(false);
+                return;
+              }
+              // A Surface arrived between the schedule and the fire — nothing to do.
+              if (surfaceReady.get()) {
+                surfaceWatchdogArmed.set(false);
+                return;
+              }
+              act.runOnUiThread(WcDecoderBridge::surfaceKick);
+            },
+            SURFACE_KICK_DELAY_MS);
+  }
+
+  /**
+   * Disarm the watchdog. Safe to call from any thread; called from
+   * {@code surfaceCreated} (UI thread) and {@link #teardown} (Rust worker → UI).
+   */
+  private static void cancelSurfaceWatchdog() {
+    surfaceWatchdogArmed.set(false);
+    if (watchdogHandler != null) watchdogHandler.removeCallbacksAndMessages(null);
+  }
+
+  /**
+   * Detach the SurfaceView from its parent and re-add it at the same position
+   * with the same layout params. Re-parenting is the documented recovery for a
+   * SurfaceView whose {@code surfaceCreated} never fires (camera/video libraries
+   * on finicky OEM builds use the same trick): the old surface session is torn
+   * down by {@code surfaceDestroyed} and the freshly attached view gets a new
+   * one. After re-attaching we re-apply visibility and re-arm the watchdog for
+   * another round, up to {@link #SURFACE_KICK_MAX}. {@link #ensureSurfaceView}
+   * is NOT re-run — it is guarded by {@code surfaceView != null} and we reuse
+   * the existing view (its holder/callbacks survive the re-parent). Must run on
+   * the UI thread.
+   */
+  private static void surfaceKick() {
+    if (surfaceView == null) return;
+    // We may have raced a successful surfaceCreated — nothing to recover from.
+    if (surfaceReady.get()) {
+      cancelSurfaceWatchdog();
+      return;
+    }
+    if (!wanted.get()) {
+      cancelSurfaceWatchdog();
+      return;
+    }
+    int kick = surfaceKicks.incrementAndGet();
+    if (kick > SURFACE_KICK_MAX) {
+      surfaceWatchdogArmed.set(false);
+      lastProbeDetail.set("surfaceCreated never fired after " + SURFACE_KICK_MAX + " re-attach kicks");
+      Log.w(
+          TAG,
+          "surfaceCreated never fired — giving up after "
+              + SURFACE_KICK_MAX
+              + " kicks. The JS watchdog will fall back to WebCodecs.");
+      return;
+    }
+    android.view.ViewGroup parent = (android.view.ViewGroup) surfaceView.getParent();
+    if (parent == null) {
+      // Detached but somehow parentless — re-seat it under the WebView.
+      ensureSurfaceViewReseat();
+    } else {
+      int index = parent.indexOfChild(surfaceView);
+      android.view.ViewGroup.LayoutParams lp = surfaceView.getLayoutParams();
+      Log.i(TAG, "surfaceCreated never fired — re-attaching SurfaceView (kick " + kick + ")");
+      parent.removeView(surfaceView);
+      // removeView can tear down the holder's surface (if any partial one
+      // existed) — clear our latch so surfaceCreated on the new session is the
+      // only thing that flips it true.
+      surfaceReady.set(false);
+      surface = null;
+      try {
+        parent.addView(surfaceView, Math.max(0, index), lp);
+      } catch (Exception e) {
+        Log.w(TAG, "re-add failed, reseating under content", e);
+        ensureSurfaceViewReseat();
+      }
+    }
+    applyVisibility(surfaceView);
+    // Re-arm for the next round if this kick also doesn't produce a Surface.
+    surfaceWatchdogArmed.set(false);
+    armSurfaceWatchdog();
+  }
+
+  /** Re-seat the existing {@code surfaceView} under the content view (fallback
+   *  when its parent is null or re-add threw). */
+  private static void ensureSurfaceViewReseat() {
+    Activity act = activity();
+    if (act == null || surfaceView == null) return;
+    ViewGroup content = act.findViewById(android.R.id.content);
+    if (content == null) return;
+    surfaceReady.set(false);
+    surface = null;
+    FrameLayout.LayoutParams lp =
+        new FrameLayout.LayoutParams(
+            width.get() > 0 ? width.get() : 1, height.get() > 0 ? height.get() : 1);
+    lp.gravity = Gravity.TOP | Gravity.START;
+    content.addView(surfaceView, 0, lp);
   }
 
   /** Bound from MainActivity.onCreate — owns the SurfaceView under the WebView. */
@@ -305,6 +467,14 @@ public final class WcDecoderBridge {
           // otherwise surfaceCreated starts us as soon as the view is realised.
           if (surfaceReady.get()) {
             startCodecLocked();
+          } else {
+            // No Surface yet — arm the watchdog so a wedged surfaceCreated
+            // (e.g. the GONE-at-onCreate→VISIBLE-later SurfaceFlinger stall on
+            // some OEM/Android-16 builds) self-heals instead of stranding the
+            // codec with nothing to render into. See armSurfaceWatchdog. This is
+            // the START of a decode attempt, so zero the kick counter here.
+            surfaceKicks.set(0);
+            armSurfaceWatchdog();
           }
         });
   }
@@ -374,6 +544,8 @@ public final class WcDecoderBridge {
     // Clear the latch first, for the same reason init() sets it first: any
     // setBounds racing us must not re-show a view whose codec we just stopped.
     wanted.set(false);
+    // Stop trying to conjure a Surface for a decoder the JS side has torn down.
+    cancelSurfaceWatchdog();
     Activity act = activity();
     Runnable stop =
         () -> {
@@ -666,6 +838,11 @@ public final class WcDecoderBridge {
               public void surfaceCreated(SurfaceHolder holder) {
                 surface = holder.getSurface();
                 surfaceReady.set(true);
+                // A Surface arrived — stop the re-attach watchdog (if it was
+                // armed) and reset its kick count so a later teardown+init arms
+                // a fresh one. Without this disarm the watchdog would happily
+                // kick an already-working SurfaceView off the hierarchy.
+                cancelSurfaceWatchdog();
                 if (width.get() > 0 && height.get() > 0) startCodecLocked();
               }
 

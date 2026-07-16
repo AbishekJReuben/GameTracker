@@ -2630,12 +2630,7 @@ export function ControlScreen({
                 <Loader2 className="h-3 w-3 animate-spin" /> {progress ? statusLabel(progress) : "Connecting"}
               </span>
             )}
-            {connected && (
-              <span className="flex items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-ink-faint">
-                <Wifi className="h-3 w-3 shrink-0" />
-                <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
-              </span>
-            )}
+            {connected && <FpsLatencyPill fps={fps} wcStats={wcStats} net={net} variant="compact" />}
             {pcTextField && (
               <button
                 onClick={() => kbdRef.current?.focus()}
@@ -2932,12 +2927,7 @@ export function ControlScreen({
           style={{ top: "0.375rem" }}
         >
           <div className="flex items-center gap-1.5">
-            {connected && (
-              <span className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-black/45 px-2.5 py-1 text-[10px] font-700 text-green backdrop-blur">
-                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-green" style={{ boxShadow: "0 0 6px #34d399" }} />
-                <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
-              </span>
-            )}
+            {connected && <FpsLatencyPill fps={fps} wcStats={wcStats} net={net} variant="floating" />}
           </div>
           <div className="flex items-center gap-1.5">
             <ZoomChip
@@ -4763,6 +4753,77 @@ function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps
 /** A thin vertical divider between icon groups in a panel row. */
 function Sep() {
   return <span className="mx-0.5 h-6 w-px shrink-0 bg-white/10" />;
+}
+
+/**
+ * Glass-to-glass latency for the top-bar pill. Mirrors the dense-stats estimate
+ * (line ~3043): the DIRECT/wc path measures it for real (clock-synced
+ * capture→decode); the RTC path approximates rtt/2 + jitter buffer + decode.
+ * Returns null when neither side has reported yet (nothing to show).
+ */
+function topBarLag(
+  wcStats: WcStats | null,
+  net: NetStats | null,
+): number | null {
+  if (wcStats) return wcStats.e2eMs;
+  if (net) return Math.round(net.rttMs / 2 + net.bufMs + net.decMs);
+  return null;
+}
+
+/** Latency colour by the same thresholds the dense-stats lag pill uses. */
+function lagColor(lag: number): string {
+  if (lag <= 50) return "text-green";
+  if (lag <= 100) return "text-amber";
+  return "text-red";
+}
+
+/**
+ * Top-bar FPS + latency pill. Stacks the fps (top, at half the original line
+ * height so the pair fits in the same panel footprint) over a small latency
+ * line beneath it, neatly leading-aligned. `variant="compact"` is the inline
+ * toolbar chip (Wifi icon, left border); `variant="floating"` is the
+ * black/45 backdrop pill shown in immersive / collapsed-top states.
+ */
+function FpsLatencyPill({
+  fps,
+  wcStats,
+  net,
+  variant,
+}: {
+  fps: number;
+  wcStats: WcStats | null;
+  net: NetStats | null;
+  variant: "compact" | "floating";
+}) {
+  const lag = topBarLag(wcStats, net);
+  if (variant === "floating") {
+    return (
+      <span className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-black/45 px-2.5 py-1 text-[10px] font-700 text-green backdrop-blur">
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-green" style={{ boxShadow: "0 0 6px #34d399" }} />
+        <span className="flex flex-col items-start leading-none">
+          <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
+          {lag != null && (
+            <span className={`mt-0.5 text-[8px] leading-none tabular-nums ${lagColor(Math.max(1, lag))}`}>
+              ~{Math.max(1, lag)}ms
+            </span>
+          )}
+        </span>
+      </span>
+    );
+  }
+  return (
+    <span className="flex items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-ink-faint">
+      <Wifi className="h-3 w-3 shrink-0" />
+      <span className="flex flex-col items-start leading-none">
+        <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
+        {lag != null && (
+          <span className={`mt-0.5 text-[8px] leading-none tabular-nums ${lagColor(Math.max(1, lag))}`}>
+            ~{Math.max(1, lag)}ms
+          </span>
+        )}
+      </span>
+    </span>
+  );
 }
 
 /** Compact 25%–1000% toolbar scale cycle — sits outside the zoomed row so it stays small. */
