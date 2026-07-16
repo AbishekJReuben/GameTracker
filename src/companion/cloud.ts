@@ -296,6 +296,11 @@ export class CloudConn {
   private authed = false; // host approved this device (streaming allowed)
   private denied = false; // host rejected us — stop auto-reconnecting
   private videoReceiver: RTCRtpReceiver | null = null;
+  /** Inbound Opus track (RTC audio path). Only used to steer NetEQ's target
+   *  delay from the Tune panel — DIRECT audio never touches this receiver. */
+  private audioReceiver: RTCRtpReceiver | null = null;
+  /** Tune "RTC aud delay" (ms). 0 = leave the browser's adaptive default. */
+  private audioJbMs = 0;
   private jbBase = JITTER_BASE_DEFAULT;
   private jbMax = JITTER_MAX_DEFAULT;
   private jbMin = JITTER_MIN_DEFAULT;
@@ -524,6 +529,13 @@ export class CloudConn {
       }
     } else {
       this.preferNativeDecode = wantNative;
+    }
+    // RTC audio playout delay — applies live to the existing receiver, so the
+    // slider is audible mid-stream without a reconnect.
+    const wantAudioJb = clampNum(Number(tune.audioJbMs) || 0, 0, 400);
+    if (wantAudioJb !== this.audioJbMs) {
+      this.audioJbMs = wantAudioJb;
+      this.applyAudioJitter();
     }
     const wantAudio = tune.preferDirectAudio !== false;
     if (wantAudio !== this.preferDirectAudio) {
@@ -858,6 +870,7 @@ export class CloudConn {
     this.audioStream = null;
     this.stopJitterHold();
     this.videoReceiver = null;
+    this.audioReceiver = null;
     this.authed = false; // every fresh peer requires re-authorization by the host
     this.authState = "none";
     this.authSentCount = 0;
@@ -919,6 +932,8 @@ export class CloudConn {
         // Replace any prior audio track (ICE restart / renegotiation).
         for (const t of this.audioStream.getAudioTracks()) this.audioStream.removeTrack(t);
         this.audioStream.addTrack(e.track);
+        this.audioReceiver = e.receiver;
+        this.applyAudioJitter();
         this.emitAudio();
         return;
       }
@@ -1781,7 +1796,14 @@ export class CloudConn {
           detail:
             `MediaCodec accepted ${this.wcFrames} frame(s) but decoded 0 in 3s.` +
             (st.error ? `\ncodec error: ${st.error}` : "") +
-            `\ncodec active=${st.active} size=${st.width}x${st.height} queue=${st.queue}`,
+            `\ncodec active=${st.active} surfaceReady=${st.surfaceReady ?? "?"} ` +
+            `size=${st.width}x${st.height} queue=${st.queue}` +
+            // active=false + no error means it never STARTED, and the only way
+            // that happens is a missing Surface — say so instead of making the
+            // next person re-derive it.
+            (!st.active && !st.error && st.surfaceReady === false
+              ? `\ncause: the SurfaceView never produced a Surface, so the codec was never configured.`
+              : ""),
         });
         this.wcBuildWebCodecsDecoder();
         this.wcRequestKeyframe();
@@ -2134,6 +2156,38 @@ export class CloudConn {
       rx.jitterBufferDelayHint = this.jitterTarget / 1000;
     } catch {
       /* unsupported */
+    }
+  }
+
+  /**
+   * Steer NetEQ's target playout delay for the RTC audio track (Tune: "RTC aud
+   * delay"). This is the ~150–250ms that made RTC sound lag behind the picture
+   * once NVENC made video near-instant — but it is a MINIMUM, not a cap, and
+   * NetEQ still pads above it on a jittery link. Asking too low buys the delay
+   * back in concealment artifacts, which is why 0 (the browser's own adaptive
+   * behaviour, i.e. what shipped) stays the default.
+   *
+   * DIRECT audio bypasses this receiver entirely, so the knob is a no-op there.
+   */
+  private applyAudioJitter() {
+    const rx = this.audioReceiver as unknown as {
+      jitterBufferTarget?: number | null;
+      playoutDelayHint?: number;
+    } | null;
+    if (!rx) return;
+    try {
+      // null hands control back to the UA — a plain 0 would instead be read as
+      // "target zero delay", which is not the same thing as "your call".
+      rx.jitterBufferTarget = this.audioJbMs > 0 ? this.audioJbMs : null;
+    } catch {
+      /* unsupported (Safari / older Chromium) */
+    }
+    if (this.audioJbMs > 0) {
+      try {
+        rx.playoutDelayHint = this.audioJbMs / 1000;
+      } catch {
+        /* unsupported */
+      }
     }
   }
 

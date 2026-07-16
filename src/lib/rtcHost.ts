@@ -433,7 +433,24 @@ export function startHost(opts: HostOptions): () => void {
     // Let Rust encode natively (NVENC). The phone can turn this off to fall back to
     // the long-standing JPEG→canvas→WebCodecs path.
     hostNvenc: true,
+    // RTC audio: this worklet's playout target (ms) before the Opus encoder.
+    // DIRECT audio diverts upstream of the worklet, so this only shapes the
+    // classic track. Prime/max are derived (see audioEnvelope).
+    audioHostMs: 55,
   };
+
+  /**
+   * Host worklet envelope derived from the Tune target. 8/11 and 30/11 are
+   * exactly the shipped 40 : 55 : 150 ratios, so leaving the slider at its 55ms
+   * default reproduces the long-standing envelope to the millisecond — this
+   * knob can only change behaviour when someone actually moves it. (The worklet
+   * clamps maxMs to 300, which only bites past ~110ms.)
+   */
+  const audioEnvelope = (targetMs: number) => ({
+    primeMs: Math.max(10, Math.round((targetMs * 8) / 11)),
+    targetMs,
+    maxMs: Math.round((targetMs * 30) / 11),
+  });
 
   // Adaptive bitrate for the DIRECT path. Phone Wi-Fi can jump; when the video
   // channel backs up we shed bitrate so frames keep flowing (FPS stays up, blocks
@@ -924,12 +941,15 @@ export function startHost(opts: HostOptions): () => void {
     node.connect(dest);
     audioNode = node;
     // RTC path: wider than the phone DIRECT defaults — absorbs IPC jitter from
-    // the Tauri channel under game load. Restored to 40/55/150 (a leaner 30/40
+    // the Tauri channel under game load. Defaults to 40/55/150 (a leaner 30/40
     // experiment caused audible underrun chop): this worklet feeds the Opus
     // track, which sits behind NetEQ's ~150ms+ anyway, so 15ms shaved here is
     // inaudible latency-wise while the underruns it causes are very audible.
+    // The Tune panel can move it ("RTC aud buf") for A/B hunting.
     try {
-      node.port.postMessage({ cfg: { channels: 2, captureRate: ctx.sampleRate, primeMs: 40, targetMs: 55, maxMs: 150 } });
+      node.port.postMessage({
+        cfg: { channels: 2, captureRate: ctx.sampleRate, ...audioEnvelope(quality.audioHostMs) },
+      });
     } catch {
       /* ignore */
     }
@@ -1199,7 +1219,7 @@ export function startHost(opts: HostOptions): () => void {
       liveFmt = { sampleRate: captureRate, channels };
       try {
         node.port.postMessage({
-          cfg: { channels, captureRate, primeMs: 40, targetMs: 55, maxMs: 150 },
+          cfg: { channels, captureRate, ...audioEnvelope(quality.audioHostMs) },
         });
       } catch {
         /* node torn down */
@@ -1251,6 +1271,9 @@ export function startHost(opts: HostOptions): () => void {
     let setAudioDirectSink: ((ch: RTCDataChannel | null) => void) | null = null;
     let setAudioDirectCodec: ((codecs: string[]) => Promise<"opus" | "f32">) | null = null;
     let audioStats: (() => { codec: "opus" | "f32"; dropped: number }) | null = null;
+    /** Live capture format — re-posting the worklet envelope must not change it
+     *  (a framing change makes the worklet drop its buffer and re-prime). */
+    let audioFormat: (() => { sampleRate: number; channels: number } | null) | null = null;
     let audioDirect = false;
     // Capture-stall watchdog bookkeeping (restart capture if it wedges).
     let lastProduced = -1;
@@ -1931,6 +1954,7 @@ export function startHost(opts: HostOptions): () => void {
         setAudioDirectSink = a.setDirectSink;
         setAudioDirectCodec = a.setDirectCodec;
         audioStats = a.stats;
+        audioFormat = a.format;
       }
     }
 
@@ -2145,6 +2169,29 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.wcKeyMs === "number") quality.wcKeyMs = clamp(msg.wcKeyMs, 1000, 30000);
           if (typeof msg.wcBufKB === "number") quality.wcBufKB = clamp(msg.wcBufKB, 64, 1024);
           if (typeof msg.wcQueueMax === "number") quality.wcQueueMax = clamp(msg.wcQueueMax, 1, 6);
+          // RTC audio buffer: re-post the envelope so the slider is audible on
+          // the live worklet without a reconnect. The worklet only resets its
+          // adaptive target when the BASE actually changes, so re-sending an
+          // unchanged value is a genuine no-op (quality messages repeat on every
+          // connect and twice more after).
+          if (typeof msg.audioHostMs === "number") {
+            const want = clamp(msg.audioHostMs, 20, 200);
+            if (want !== quality.audioHostMs) {
+              quality.audioHostMs = want;
+              const fmt = audioFormat?.();
+              try {
+                audioNode?.port.postMessage({
+                  cfg: {
+                    channels: fmt?.channels ?? 2,
+                    captureRate: fmt?.sampleRate ?? audioCtx?.sampleRate ?? 48000,
+                    ...audioEnvelope(quality.audioHostMs),
+                  },
+                });
+              } catch {
+                /* node torn down */
+              }
+            }
+          }
           // Explicit Tune bitrate change resets the adaptive ceiling so a raise
           // isn't stuck under a previous network-shed floor.
           adaptKbps = targetKbps();

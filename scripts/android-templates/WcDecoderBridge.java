@@ -261,6 +261,26 @@ public final class WcDecoderBridge {
           ensureSurfaceView(act);
           hookWebView(act);
           makeWebViewTransparent(act);
+          // A GONE SurfaceView never receives surfaceCreated, so it never owns a
+          // Surface, so MediaCodec can never be configured against one. Showing
+          // it is therefore part of STARTING the decoder, not part of laying it
+          // out — it must not wait on JS.
+          //
+          // It used to wait: the view was created GONE and only `setBounds` from
+          // Control's layout effect made it visible, but that effect returns
+          // early until a frame has established the video's natural size. On the
+          // native path no frame can arrive before the codec runs, so nothing
+          // ever made it visible: no Surface → no codec → no frames → no size →
+          // no bounds. The HUD's tell was "active=false" with no codec error.
+          //
+          // Size/position are still JS's job (setBounds); a 1×1 view here is
+          // invisible either way, and surfaceCreated fires regardless.
+          SurfaceView sv = surfaceView;
+          if (sv != null && sv.getVisibility() != View.VISIBLE) {
+            sv.setVisibility(View.VISIBLE);
+          }
+          // Already had a Surface (re-init after a teardown) — start right now;
+          // otherwise surfaceCreated starts us as soon as the view is realised.
           if (surfaceReady.get()) {
             startCodecLocked();
           }
@@ -338,6 +358,16 @@ public final class WcDecoderBridge {
 
   public static boolean statsActive() {
     return started.get();
+  }
+
+  /**
+   * Whether the SurfaceView has handed us a live Surface. Reported alongside the
+   * stats because "no picture" has exactly two shapes and they need opposite
+   * fixes: the codec faulted (statsError says how), or the codec never started
+   * for want of a Surface — which says nothing at all unless we surface this.
+   */
+  public static boolean statsSurfaceReady() {
+    return surfaceReady.get() && surface != null;
   }
 
   public static int statsWidth() {

@@ -32,6 +32,10 @@ pub struct DecoderStats {
     pub width: i32,
     pub height: i32,
     pub error: String,
+    /// Whether the SurfaceView has a live Surface. `active: false` with an empty
+    /// `error` is otherwise indistinguishable between "the codec faulted" and
+    /// "the codec never started because it had no Surface to render into".
+    pub surface_ready: bool,
 }
 
 #[tauri::command]
@@ -292,6 +296,11 @@ mod android {
                 .map_err(|e| format!("statsActive: {e}"))?
                 .z()
                 .unwrap_or(false);
+            let surface_ready = env
+                .call_static_method(&class, "statsSurfaceReady", "()Z", &[])
+                .map_err(|e| format!("statsSurfaceReady: {e}"))?
+                .z()
+                .unwrap_or(false);
             let width = env
                 .call_static_method(&class, "statsWidth", "()I", &[])
                 .map_err(|e| format!("statsWidth: {e}"))?
@@ -316,6 +325,7 @@ mod android {
             Ok(DecoderStats {
                 decode_ms,
                 queue,
+                surface_ready,
                 frames,
                 active,
                 width,
@@ -392,5 +402,6 @@ fn decoder_get_stats_impl() -> Result<DecoderStats, String> {
         width: 0,
         height: 0,
         error: String::new(),
+        surface_ready: false,
     })
 }

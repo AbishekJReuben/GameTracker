@@ -1058,6 +1058,7 @@ export function ControlScreen({
       wcBufKB: tune.wcBufKB,
       wcQueueMax: tune.wcQueueMax,
       hostNvenc: tune.hostNvenc,
+      audioHostMs: tune.audioHostMs,
     }),
     [tune],
   );
@@ -1200,6 +1201,7 @@ export function ControlScreen({
         if (wcNativeRef.current && cs.outW > 0 && cs.outH > 0) {
           const w = cs.outW;
           const h = cs.outH;
+          const grew = natRef.current.w !== w || natRef.current.h !== h;
           natRef.current = { w, h };
           const canvas = canvasRef.current;
           if (canvas && (canvas.width !== w || canvas.height !== h)) {
@@ -1208,6 +1210,11 @@ export function ControlScreen({
           }
           setRes(`${w}×${h}`);
           setHasFrame(true);
+          // `natRef` is a ref, so this never re-renders and the layout effect
+          // that positions the Surface won't re-run on its own. Re-sync here or
+          // the Surface keeps whatever geometry it was given before the aspect
+          // was known — on the native path that's the pre-first-frame fallback.
+          if (grew) syncNativeSurface();
         }
       }
     });
@@ -1756,8 +1763,19 @@ export function ControlScreen({
     }
     const vp = viewportRef.current;
     const nat = natRef.current;
-    if (!vp || !nat.w || !nat.h) return;
+    if (!vp) return;
     const vr = vp.getBoundingClientRect();
+    // No natural size yet. Show the surface across the whole viewport rather
+    // than returning: on the native path the size can only come FROM a decoded
+    // frame, and no frame can decode until the SurfaceView is visible (a GONE
+    // SurfaceView never gets a Surface, so MediaCodec is never configured).
+    // Waiting for `nat` here was a deadlock — no bounds → no Surface → no codec
+    // → no frames → no `nat`. The aspect corrects itself on the next sync, once
+    // the codec reports a size (capstats seeds `nat` and re-syncs).
+    if (!nat.w || !nat.h) {
+      void setNativeDecoderBounds({ x: vr.left, y: vr.top, w: vr.width, h: vr.height, visible: true });
+      return;
+    }
     const l = measure(vp, nat.w, nat.h);
     if (!l) return;
     const z = zoomRef.current;
@@ -3487,6 +3505,31 @@ export function ControlScreen({
                   step={1}
                   fmt={(v) => `${v}%`}
                   onChange={(v) => patchTune({ jbGrowAt: v })}
+                />
+                <TuneSection label="RTC audio — the classic Opus track (bypassed on DIRECT)" />
+                <TuneRow
+                  label="RTC aud delay"
+                  scope="rtc"
+                  showHint={tuneHints}
+                  hint="Playout delay the phone asks NetEQ for. 0 = auto: the browser's own adaptive buffer, which is the ~150–250ms that puts RTC sound behind the picture. Like the video JB it's a MINIMUM — a low ask is a request, and NetEQ pays for one it can't meet with choppy concealment. Only affects the RTC path; DIRECT audio has no jitter buffer."
+                  value={tune.audioJbMs}
+                  min={0}
+                  max={400}
+                  step={10}
+                  fmt={(v) => (v === 0 ? "auto" : `${v}ms`)}
+                  onChange={(v) => patchTune({ audioJbMs: v })}
+                />
+                <TuneRow
+                  label="RTC aud buf"
+                  scope="host"
+                  showHint={tuneHints}
+                  hint="The PC's own sound buffer before it encodes Opus, so it adds to whatever NetEQ then does. Lower trims real lag; too low and the worklet underruns whenever a game janks the capture thread — that's the crackle. Prime/max scale with it."
+                  value={tune.audioHostMs}
+                  min={20}
+                  max={200}
+                  step={5}
+                  fmt={(v) => `${v}ms`}
+                  onChange={(v) => patchTune({ audioHostMs: v })}
                 />
                 <TuneSection label="Modes" />
                 <div className="flex items-center justify-between gap-2 px-0.5 pt-0.5">

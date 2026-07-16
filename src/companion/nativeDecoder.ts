@@ -27,6 +27,9 @@ export type DecoderStats = {
   width: number;
   height: number;
   error: string;
+  /** SurfaceView has a live Surface. Without it the codec cannot start at all,
+   *  which looks identical to a fault (`active: false`) but has a different cause. */
+  surfaceReady?: boolean;
 };
 
 type GtDecoderJs = {

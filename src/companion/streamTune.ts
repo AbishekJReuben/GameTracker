@@ -75,6 +75,22 @@ export type StreamTune = {
    * crackles on a bad link.
    */
   preferDirectAudio: boolean;
+  /**
+   * RTC audio only: playout delay (ms) the phone asks NetEQ for on the Opus
+   * track. 0 = leave the browser's own adaptive behaviour alone (what shipped —
+   * typically 150–250ms). Like the video JB this is a MINIMUM, so a low ask is
+   * a request, not a guarantee: NetEQ pads above it on a jittery link and pays
+   * for a too-low value in concealment (choppy/robotic sound). No effect while
+   * DIRECT audio is live — that path has no jitter buffer at all.
+   */
+  audioJbMs: number;
+  /**
+   * RTC audio only: the PC's own playout buffer (ms) feeding the Opus encoder.
+   * Sits BEFORE the network, so it adds to whatever NetEQ then does. Lower =
+   * less lag but the worklet underruns (crackle) when a game janks the capture
+   * thread; the prime/max envelope is derived from it.
+   */
+  audioHostMs: number;
 };
 
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
@@ -100,6 +116,8 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   hostNvenc: true,
   preferNativeDecode: true,
   preferDirectAudio: true,
+  audioJbMs: 0,
+  audioHostMs: 55,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -145,6 +163,10 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     hostNvenc: r.hostNvenc !== false,
     preferNativeDecode: r.preferNativeDecode !== false,
     preferDirectAudio: r.preferDirectAudio !== false,
+    // 0 means "auto" (don't touch NetEQ) and is the default, so `||` would
+    // swallow a deliberate 0 — test finite, like `pace`.
+    audioJbMs: clamp(Number.isFinite(Number(r.audioJbMs)) ? Number(r.audioJbMs) : d.audioJbMs, 0, 400),
+    audioHostMs: clamp(Number(r.audioHostMs) || d.audioHostMs, 20, 200),
   };
 }
 
@@ -231,6 +253,8 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.directRetrySec !== d.directRetrySec ||
     t.hostNvenc !== d.hostNvenc ||
     t.preferNativeDecode !== d.preferNativeDecode ||
-    t.preferDirectAudio !== d.preferDirectAudio
+    t.preferDirectAudio !== d.preferDirectAudio ||
+    t.audioJbMs !== d.audioJbMs ||
+    t.audioHostMs !== d.audioHostMs
   );
 }

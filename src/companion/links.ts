@@ -70,6 +70,10 @@ export type QualitySettings = {
   wcQueueMax?: number;
   /** Host: allow native NVENC encode (false = force the JPEG→WebCodecs path). */
   hostNvenc?: boolean;
+  /** Host/RTC audio: the PC's playout buffer target (ms) feeding the Opus
+   *  encoder. Prime/max are derived from it. No effect on DIRECT audio, which
+   *  bypasses the host worklet entirely. */
+  audioHostMs?: number;
 };
 
 export interface RemoteLink {
