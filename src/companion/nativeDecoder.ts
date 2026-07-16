@@ -30,6 +30,10 @@ export type DecoderStats = {
   /** SurfaceView has a live Surface. Without it the codec cannot start at all,
    *  which looks identical to a fault (`active: false`) but has a different cause. */
   surfaceReady?: boolean;
+  /** Still waiting for IDR/CSD — JS feed counts are mostly no-ops. */
+  awaitKey?: boolean;
+  /** SPS/PPS accepted as CODEC_CONFIG this session. */
+  csdQueued?: boolean;
 };
 
 type GtDecoderJs = {

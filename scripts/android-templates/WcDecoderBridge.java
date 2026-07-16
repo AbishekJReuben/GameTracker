@@ -504,6 +504,14 @@ public final class WcDecoderBridge {
 
   public static void init(int w, int h) {
     if (w < 16 || h < 16) throw new IllegalArgumentException("bad size " + w + "x" + h);
+    // Coalesce duplicate inits (JS often fires twice in the same frame). A second
+    // init used to flip awaitKey/csdQueued back to "need keyframe" WHILE the codec
+    // was already running — every in-flight AU was then dropped or mis-fed, and
+    // the media-overlay Surface stayed black on top of the opaque WebView.
+    if (wanted.get() && started.get() && width.get() == w && height.get() == h) {
+      jlog("init " + w + "x" + h + " — already running, skip");
+      return;
+    }
     width.set(w);
     height.set(h);
     lastError.set("");
@@ -520,32 +528,20 @@ public final class WcDecoderBridge {
         () -> {
           ensureSurfaceView(act);
           // attach() ran before Tauri created the WebView, so the SurfaceView
-          // was seated at content[0] — potentially below wry wrapper views
-          // whose backgrounds draw after (and over) the punch. Now the WebView
-          // exists: move the view to be its immediate lower sibling so the
-          // ONLY thing drawn between the punch and the user is the (transparent)
-          // WebView itself. Skip when a live Surface exists — re-parenting
-          // destroys it, and a working decoder beats a tidier hierarchy.
+          // was seated at content[0] — potentially below wry wrapper views.
+          // With media-overlay the Surface sits above the WebView pixels; we
+          // still seat it as the WebView's lower sibling for hit-testing layout.
           if (!surfaceReady.get()) reseatBelowWebView(act);
           hookWebView(act);
           makeCompositingTransparent(act);
-          // Showing the view is part of STARTING the decoder, not part of laying
-          // it out — no Surface exists until it is VISIBLE, so this must never
-          // wait on (or be undone by) JS. See applyVisibility.
-          //
-          // Size/position remain JS's job (setBounds); a 1×1 view here is
-          // invisible either way, and surfaceCreated fires regardless.
           applyVisibility(surfaceView);
-          // Already had a Surface (re-init after a teardown) — start right now;
-          // otherwise surfaceCreated starts us as soon as the view is realised.
           if (surfaceReady.get()) {
+            // Size change while a codec is live → rebuild against the new Surface.
+            if (started.get()) {
+              stopCodecLocked();
+            }
             startCodecLocked();
           } else {
-            // No Surface yet — arm the watchdog so a wedged surfaceCreated
-            // (e.g. the GONE-at-onCreate→VISIBLE-later SurfaceFlinger stall on
-            // some OEM/Android-16 builds) self-heals instead of stranding the
-            // codec with nothing to render into. See armSurfaceWatchdog. This is
-            // the START of a decode attempt, so zero the kick counter here.
             surfaceKicks.set(0);
             armSurfaceWatchdog();
           }
@@ -654,6 +650,16 @@ public final class WcDecoderBridge {
    */
   public static boolean statsSurfaceReady() {
     return surfaceReady.get() && surface != null;
+  }
+
+  /** True while the bridge is still waiting for an IDR (or CSD) before accepting deltas. */
+  public static boolean statsAwaitKey() {
+    return awaitKey.get();
+  }
+
+  /** True once SPS/PPS were accepted as BUFFER_FLAG_CODEC_CONFIG for this codec session. */
+  public static boolean statsCsdQueued() {
+    return csdQueued.get();
   }
 
   public static int statsWidth() {
@@ -881,37 +887,57 @@ public final class WcDecoderBridge {
       return;
     }
     // Extract SPS/PPS from the first keyframe and feed them as CSD before the
-    // slice. Most Android HW decoders REQUIRE this (Moonlight/ALVR/Chiaki all
-    // do the same); an inline-only stream silently renders nothing on c2.qti
-    // and several MediaTek parts. We re-extract every keyframe — cheap, and
-    // it lets a mid-stream resolution change re-prime the decoder.
+    // slice. Most Android HW decoders REQUIRE this (Moonlight/ALVR/Chiaki).
+    // CRITICAL: after queuing CSD, strip SPS/PPS from the AU before queueInput —
+    // feeding parameter sets twice (CSD + inline) makes c2.qti stall with
+    // frames=0 / no error, which is exactly the black media-overlay Surface.
     boolean needsCsd = key && !csdQueued.get();
-    byte[] csd = needsCsd ? extractCsd(data) : null;
-    if (csd != null) {
-      Integer csdIdx = freeInputs.poll();
-      if (csdIdx == null) {
-        // No room for the CSD right now — hold the keyframe back. Feeding the
-        // slice without a CSD would either throw or render nothing, then arm
-        // awaitKey on the next error; better to wait one tick.
+    byte[] slice = data;
+    if (needsCsd) {
+      byte[] csd = extractCsd(data);
+      if (csd == null) {
+        jlog("submit: key without SPS/PPS — holding (await next IDR with param sets)");
         backlog.clear();
         backlog.offer(new PendingFrame(tsUs, true, data, arrived));
         return;
       }
-      queueCsd(csdIdx, csd);
-    } else if (needsCsd) {
-      // We wanted a CSD but couldn't extract one — most likely the host shipped
-      // just an IDR without inline SPS/PPS. Fall through and queue the frame
-      // anyway; the previous session's CSD (or the codec's defaults) may still
-      // decode it. If not, the next keyframe will retry extraction.
+      Integer csdIdx = freeInputs.poll();
+      if (csdIdx == null) {
+        backlog.clear();
+        backlog.offer(new PendingFrame(tsUs, true, data, arrived));
+        return;
+      }
+      if (!queueCsd(csdIdx, csd)) {
+        // Start-code CSD rejected — try stripped (some OEM drivers want raw RBSP).
+        byte[] stripped = extractCsdRaw(data);
+        Integer retry = freeInputs.poll();
+        if (stripped == null || retry == null || !queueCsd(retry, stripped)) {
+          jlog("submit: CSD queue failed — holding keyframe");
+          backlog.clear();
+          backlog.offer(new PendingFrame(tsUs, true, data, arrived));
+          return;
+        }
+      }
+      slice = stripParameterSets(data);
+      if (slice == null || slice.length < 4) {
+        jlog("submit: strip left no VCL NAL — dropping");
+        return;
+      }
+    } else if (key && csdQueued.get()) {
+      // Later IDRs still carry SPS/PPS (NVENC repeatSPSPPS). Feeding them again
+      // after CSD stalls c2.qti with frames=0 — always strip.
+      byte[] stripped = stripParameterSets(data);
+      if (stripped != null && stripped.length >= 4) slice = stripped;
     }
     Integer idx = freeInputs.poll();
     if (idx == null) {
-      // Latest-wins: drop oldest backlog, keep this frame if key or queue small.
       if (backlog.size() >= 2) backlog.poll();
-      backlog.offer(new PendingFrame(tsUs, key, data, arrived));
+      // Prefer the (possibly stripped) slice so drainBacklog doesn't re-inject
+      // parameter sets after CSD was already queued on this attempt.
+      backlog.offer(new PendingFrame(tsUs, key, slice, arrived));
       return;
     }
-    queueInput(idx, tsUs, key, data, arrived);
+    queueInput(idx, tsUs, key, slice, arrived);
     drainBacklog();
   }
 
@@ -919,33 +945,82 @@ public final class WcDecoderBridge {
     while (true) {
       PendingFrame pf = backlog.peek();
       if (pf == null) return;
-      // Backlogged keyframes must get a CSD before the slice — the old path
-      // queued the IDR alone when freeInputs filled after start, leaving
-      // c2.qti with frames=0 / awaitKey stuck / silent black until WebCodecs.
+      byte[] slice = pf.data;
       if (pf.key && !csdQueued.get()) {
         byte[] csd = extractCsd(pf.data);
-        if (csd != null) {
-          Integer csdIdx = freeInputs.poll();
-          if (csdIdx == null) return;
-          queueCsd(csdIdx, csd);
-        } else {
-          jlog("drainBacklog: keyframe without SPS/PPS — requesting next IDR");
+        if (csd == null) {
+          jlog("drainBacklog: keyframe without SPS/PPS — drop and wait");
+          backlog.poll();
+          continue;
         }
+        Integer csdIdx = freeInputs.poll();
+        if (csdIdx == null) return;
+        if (!queueCsd(csdIdx, csd)) {
+          byte[] stripped = extractCsdRaw(pf.data);
+          Integer retry = freeInputs.poll();
+          if (stripped == null || retry == null || !queueCsd(retry, stripped)) {
+            jlog("drainBacklog: CSD queue failed");
+            return;
+          }
+        }
+        slice = stripParameterSets(pf.data);
+        if (slice == null || slice.length < 4) {
+          backlog.poll();
+          continue;
+        }
+      } else if (pf.key && csdQueued.get()) {
+        // CSD already live — still strip param sets from this IDR.
+        byte[] stripped = stripParameterSets(pf.data);
+        if (stripped != null && stripped.length >= 4) slice = stripped;
       }
       Integer idx = freeInputs.poll();
       if (idx == null) return;
       backlog.poll();
-      queueInput(idx, pf.tsUs, pf.key, pf.data, pf.arrivedAt);
+      queueInput(idx, pf.tsUs, pf.key, slice, pf.arrivedAt);
     }
   }
 
   /**
-   * Pull SPS (NAL type 7) + PPS (NAL type 8) out of an Annex-B buffer and
-   * build a CSD-0 blob WITH Annex-B start codes (00 00 00 01 SPS 00 00 00 01 PPS).
-   * Qualcomm c2.qti often ignores / stalls on startcode-stripped CSD; Moonlight
-   * and Chiaki ship the start codes. Returns null if either NAL is missing.
+   * Pull SPS (7) + PPS (8) out of Annex-B and build CSD-0 WITH start codes
+   * (Moonlight/Chiaki shape). Returns null if either NAL is missing.
    */
   private static byte[] extractCsd(byte[] annexB) {
+    byte[][] hold = new byte[2][];
+    if (!findSpsPps(annexB, hold)) {
+      jlog("extractCsd: missing " + (hold[0] == null ? "SPS" : "") + (hold[1] == null ? "PPS" : ""));
+      return null;
+    }
+    byte[] sps = hold[0];
+    byte[] pps = hold[1];
+    byte[] csd = new byte[4 + sps.length + 4 + pps.length];
+    csd[0] = 0;
+    csd[1] = 0;
+    csd[2] = 0;
+    csd[3] = 1;
+    System.arraycopy(sps, 0, csd, 4, sps.length);
+    int o = 4 + sps.length;
+    csd[o] = 0;
+    csd[o + 1] = 0;
+    csd[o + 2] = 0;
+    csd[o + 3] = 1;
+    System.arraycopy(pps, 0, csd, o + 4, pps.length);
+    return csd;
+  }
+
+  /** Same SPS/PPS but concatenated without start codes (fallback for picky OEMs). */
+  private static byte[] extractCsdRaw(byte[] annexB) {
+    byte[][] hold = new byte[2][];
+    if (!findSpsPps(annexB, hold)) return null;
+    byte[] sps = hold[0];
+    byte[] pps = hold[1];
+    byte[] csd = new byte[sps.length + pps.length];
+    System.arraycopy(sps, 0, csd, 0, sps.length);
+    System.arraycopy(pps, 0, csd, sps.length, pps.length);
+    return csd;
+  }
+
+  /** Find first SPS + PPS NAL payloads (no start codes). */
+  private static boolean findSpsPps(byte[] annexB, byte[][] outSpsPps) {
     try {
       byte[] sps = null;
       byte[] pps = null;
@@ -990,54 +1065,96 @@ public final class WcDecoderBridge {
         i = nalEnd;
         if (sps != null && pps != null) break;
       }
-      if (sps == null || pps == null) {
-        jlog("extractCsd: missing " + (sps == null ? "SPS" : "") + (pps == null ? "PPS" : ""));
-        return null;
-      }
-      // 4-byte start code + SPS + 4-byte start code + PPS
-      byte[] csd = new byte[4 + sps.length + 4 + pps.length];
-      csd[0] = 0;
-      csd[1] = 0;
-      csd[2] = 0;
-      csd[3] = 1;
-      System.arraycopy(sps, 0, csd, 4, sps.length);
-      int o = 4 + sps.length;
-      csd[o] = 0;
-      csd[o + 1] = 0;
-      csd[o + 2] = 0;
-      csd[o + 3] = 1;
-      System.arraycopy(pps, 0, csd, o + 4, pps.length);
-      return csd;
+      outSpsPps[0] = sps;
+      outSpsPps[1] = pps;
+      return sps != null && pps != null;
     } catch (Exception e) {
-      jlog("extractCsd threw: " + e.getMessage());
-      return null;
+      return false;
     }
   }
 
-  private static void queueCsd(int index, byte[] csd) {
+  /**
+   * Drop SPS/PPS NALs from an Annex-B AU, keeping VCL (and SEI/AUD). Used after
+   * CSD so the decoder never sees parameter sets twice.
+   */
+  private static byte[] stripParameterSets(byte[] annexB) {
+    try {
+      java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(annexB.length);
+      int i = 0;
+      int n = annexB.length;
+      boolean any = false;
+      while (i + 3 <= n) {
+        int scLen;
+        int scStart = i;
+        if (i + 4 <= n
+            && annexB[i] == 0 && annexB[i + 1] == 0 && annexB[i + 2] == 0 && annexB[i + 3] == 1) {
+          scLen = 4;
+        } else if (annexB[i] == 0 && annexB[i + 1] == 0 && annexB[i + 2] == 1) {
+          scLen = 3;
+        } else {
+          i++;
+          continue;
+        }
+        int nalStart = i + scLen;
+        int j = nalStart;
+        while (j + 3 <= n) {
+          if ((annexB[j] == 0 && annexB[j + 1] == 0 && annexB[j + 2] == 1)
+              || (j + 4 <= n
+                  && annexB[j] == 0
+                  && annexB[j + 1] == 0
+                  && annexB[j + 2] == 0
+                  && annexB[j + 3] == 1)) {
+            break;
+          }
+          j++;
+        }
+        int nalEnd = (j + 3 <= n) ? j : n;
+        if (nalEnd > nalStart) {
+          int nalType = annexB[nalStart] & 0x1f;
+          // Keep everything except SPS(7) / PPS(8).
+          if (nalType != 7 && nalType != 8) {
+            out.write(annexB, scStart, nalEnd - scStart);
+            any = true;
+          }
+        }
+        i = nalEnd;
+      }
+      return any ? out.toByteArray() : null;
+    } catch (Exception e) {
+      return annexB;
+    }
+  }
+
+  /** @return true if CSD was accepted by MediaCodec. */
+  private static boolean queueCsd(int index, byte[] csd) {
     MediaCodec c = codec;
     if (c == null) {
       freeInputs.offer(index);
-      return;
+      return false;
     }
     try {
       ByteBuffer buf = c.getInputBuffer(index);
       if (buf == null) {
         freeInputs.offer(index);
-        return;
+        return false;
       }
       buf.clear();
       if (buf.remaining() < csd.length) {
         freeInputs.offer(index);
-        return;
+        jlog("queueCsd: buffer too small need=" + csd.length + " have=" + buf.remaining());
+        return false;
       }
       buf.put(csd);
       c.queueInputBuffer(index, 0, csd.length, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
       csdQueued.set(true);
+      jlog("queueCsd ok bytes=" + csd.length);
+      return true;
     } catch (Exception e) {
       freeInputs.offer(index);
       lastError.set("csd: " + e.getMessage());
       Log.w(TAG, "queueCsd failed", e);
+      jlog("queueCsd failed: " + e.getMessage());
+      return false;
     }
   }
 
@@ -1278,8 +1395,13 @@ public final class WcDecoderBridge {
         c.configure(fmt, s, null, 0);
         applyRuntimeLowLatency(c);
         freeInputs.clear();
-        backlog.clear();
+        // Do NOT clear backlog here — keyframes often arrive while the Surface is
+        // still coming up (submit() parks them). Wiping them left awaitKey=true
+        // with no IDR until the next host keyframe (~GOP), during which the
+        // media-overlay Surface stayed black and the JS stall watchdog fell back.
         pendingMeta.clear();
+        frames.set(0);
+        decodeMsEwma = 0.0;
         c.start();
         codec = c;
         started.set(true);

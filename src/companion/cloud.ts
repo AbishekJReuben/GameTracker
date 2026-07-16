@@ -24,7 +24,6 @@ import {
   nativeDecoderPossible,
   nativeFeedReady,
   probeNativeDecoder,
-  resetNativeDecoder,
   teardownNativeDecoder,
 } from "./nativeDecoder";
 import { hitchMaybeE2eJump, hitchMaybeFrameGap, hitchNote } from "./hitchLog";
@@ -1665,7 +1664,10 @@ export class CloudConn {
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("native init failed");
           return;
         }
-        void resetNativeDecoder();
+        // Do NOT resetNativeDecoder() here — init already starts the codec.
+        // A follow-up reset stop+start'd a second session (journal: double
+        // "MediaCodec started"), wiped the pre-Surface keyframe backlog, and
+        // left the media-overlay Surface black until the next IDR / stall fallback.
         if (this.wcActive) this.emitEvent({ event: "wc", active: true, native: true });
         this.emitEvent({ event: "decoder", state: "native", name: p.name || "hw" });
         console.info(`[remote] DIRECT via native MediaCodec (${p.name || "hw"})`);
@@ -1802,30 +1804,29 @@ export class CloudConn {
     if (!this.wcNative || !this.wcActive) return;
     const st = await getNativeDecoderStats();
     if (!st) return;
-    // Watchdog: we are handing MediaCodec complete access units (wcFrames climbs)
-    // but nothing is coming back out. That's a blank screen, and every cause is
-    // device-specific and unrecoverable in place (driver refused the format, the
-    // Surface never became valid, the bridge isn't really bound). Give it 3s,
-    // then self-heal onto WebCodecs instead of stranding the user on a black
-    // rectangle until they reconnect by hand.
-    if (this.wcFrames > 0 && st.frames === 0) {
+    // Watchdog: MediaCodec accepting AUs but producing no picture → black
+    // media-overlay Surface. JS `wcFrames` also counts feeds Java dropped while
+    // awaitKey (deltas before the first IDR), so give a longer budget until CSD
+    // is queued; once CSD is in, 3s with frames=0 is a real hang.
+    if (this.wcFrames > 0 && st.frames === 0 && st.active !== false) {
       const now = Date.now();
+      const budgetMs = st.csdQueued ? 3000 : 8000;
       if (this.wcNativeStallAt === 0) this.wcNativeStallAt = now;
-      else if (now - this.wcNativeStallAt > 3000) {
+      else if (now - this.wcNativeStallAt > budgetMs) {
         this.wcNativeStallAt = 0;
         console.warn("[remote] native decoder produced no frames — falling back to WebCodecs");
-        hitchNote("native-stall", "MediaCodec produced 0 frames in 3s — falling back to WebCodecs", {
+        hitchNote("native-stall", "MediaCodec produced 0 frames — falling back to WebCodecs", {
           fed: this.wcFrames,
+          csdQueued: st.csdQueued ? 1 : 0,
+          awaitKey: st.awaitKey ? 1 : 0,
         });
         void this.emitDecoderFallback(
           "Phone decoder produced no picture — using WebCodecs",
-          `MediaCodec accepted ${this.wcFrames} frame(s) but decoded 0 in 3s.` +
+          `MediaCodec accepted ${this.wcFrames} frame(s) but decoded 0 in ${Math.round(budgetMs / 1000)}s.` +
             (st.error ? `\ncodec error: ${st.error}` : "") +
             `\ncodec active=${st.active} surfaceReady=${st.surfaceReady ?? "?"} ` +
+            `csdQueued=${st.csdQueued ?? "?"} awaitKey=${st.awaitKey ?? "?"} ` +
             `size=${st.width}x${st.height} queue=${st.queue}` +
-            // active=false + no error means it never STARTED, and the only way
-            // that happens is a missing Surface — say so instead of making the
-            // next person re-derive it.
             (!st.active && !st.error && st.surfaceReady === false
               ? `\ncause: the SurfaceView never produced a Surface, so the codec was never configured.`
               : ""),

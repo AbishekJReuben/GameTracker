@@ -36,6 +36,10 @@ pub struct DecoderStats {
     /// `error` is otherwise indistinguishable between "the codec faulted" and
     /// "the codec never started because it had no Surface to render into".
     pub surface_ready: bool,
+    /// Bridge still waiting for an IDR / CSD — JS "fed" counts are mostly drops.
+    pub await_key: bool,
+    /// SPS/PPS were accepted as CODEC_CONFIG for this session.
+    pub csd_queued: bool,
 }
 
 #[tauri::command]
@@ -327,6 +331,16 @@ mod android {
                 .map_err(|e| format!("statsSurfaceReady: {e}"))?
                 .z()
                 .unwrap_or(false);
+            let await_key = env
+                .call_static_method(&class, "statsAwaitKey", "()Z", &[])
+                .map_err(|e| format!("statsAwaitKey: {e}"))?
+                .z()
+                .unwrap_or(true);
+            let csd_queued = env
+                .call_static_method(&class, "statsCsdQueued", "()Z", &[])
+                .map_err(|e| format!("statsCsdQueued: {e}"))?
+                .z()
+                .unwrap_or(false);
             let width = env
                 .call_static_method(&class, "statsWidth", "()I", &[])
                 .map_err(|e| format!("statsWidth: {e}"))?
@@ -352,6 +366,8 @@ mod android {
                 decode_ms,
                 queue,
                 surface_ready,
+                await_key,
+                csd_queued,
                 frames,
                 active,
                 width,
@@ -437,5 +453,7 @@ fn decoder_get_stats_impl() -> Result<DecoderStats, String> {
         height: 0,
         error: String::new(),
         surface_ready: false,
+        await_key: true,
+        csd_queued: false,
     })
 }
