@@ -83,6 +83,14 @@ public final class WcDecoderBridge {
   private static final ConcurrentLinkedQueue<PendingFrame> backlog = new ConcurrentLinkedQueue<>();
   private static final AtomicBoolean started = new AtomicBoolean(false);
   private static final AtomicBoolean surfaceReady = new AtomicBoolean(false);
+  /**
+   * The decoder is meant to be running: set by {@link #init}, cleared by
+   * {@link #teardown}. This — and nothing else — decides whether the SurfaceView
+   * is VISIBLE, because the Surface's whole lifecycle hangs off that visibility
+   * and must never be at the mercy of a racing JS call. See
+   * {@link #applyVisibility}.
+   */
+  private static final AtomicBoolean wanted = new AtomicBoolean(false);
   private static final AtomicBoolean awaitKey = new AtomicBoolean(true);
   private static final AtomicBoolean csdQueued = new AtomicBoolean(false);
   private static final AtomicInteger width = new AtomicInteger(0);
@@ -108,6 +116,27 @@ public final class WcDecoderBridge {
       this.data = data;
       this.arrivedAt = arrivedAt;
     }
+  }
+
+  /**
+   * The ONE place SurfaceView visibility is decided: VISIBLE exactly while the
+   * decoder is {@link #wanted}. Must be called on the UI thread.
+   *
+   * Visibility is not cosmetic here — a GONE SurfaceView never receives
+   * surfaceCreated, so it never owns a Surface, so MediaCodec is never
+   * configured. It therefore belongs to the decoder's lifecycle (init/teardown)
+   * and to nothing else. In particular {@link #setBounds} must not touch it:
+   * every bridge command is a separate `spawn_blocking` task on the Rust side
+   * (decoder.rs), so an older setBounds(visible=false) can — and on some devices
+   * routinely does — land on the UI thread AFTER init()'s VISIBLE. That hid the
+   * view again with no error and no way back: the codec sat waiting for a
+   * Surface while JS happily fed it frames, and the 3s watchdog reported
+   * "accepted N frame(s) but decoded 0 ... surfaceReady=false".
+   */
+  private static void applyVisibility(SurfaceView sv) {
+    if (sv == null) return;
+    int want = wanted.get() ? View.VISIBLE : View.GONE;
+    if (sv.getVisibility() != want) sv.setVisibility(want);
   }
 
   /** Bound from MainActivity.onCreate — owns the SurfaceView under the WebView. */
@@ -256,29 +285,22 @@ public final class WcDecoderBridge {
     csdQueued.set(false);
     Activity act = activity();
     if (act == null) throw new IllegalStateException("no activity");
+    // Latch BEFORE hopping to the UI thread: a setBounds already in flight on
+    // another Rust worker must observe "decoder wanted" and leave the view
+    // alone, whichever of the two runnables the looper happens to run first.
+    wanted.set(true);
     act.runOnUiThread(
         () -> {
           ensureSurfaceView(act);
           hookWebView(act);
           makeWebViewTransparent(act);
-          // A GONE SurfaceView never receives surfaceCreated, so it never owns a
-          // Surface, so MediaCodec can never be configured against one. Showing
-          // it is therefore part of STARTING the decoder, not part of laying it
-          // out — it must not wait on JS.
+          // Showing the view is part of STARTING the decoder, not part of laying
+          // it out — no Surface exists until it is VISIBLE, so this must never
+          // wait on (or be undone by) JS. See applyVisibility.
           //
-          // It used to wait: the view was created GONE and only `setBounds` from
-          // Control's layout effect made it visible, but that effect returns
-          // early until a frame has established the video's natural size. On the
-          // native path no frame can arrive before the codec runs, so nothing
-          // ever made it visible: no Surface → no codec → no frames → no size →
-          // no bounds. The HUD's tell was "active=false" with no codec error.
-          //
-          // Size/position are still JS's job (setBounds); a 1×1 view here is
+          // Size/position remain JS's job (setBounds); a 1×1 view here is
           // invisible either way, and surfaceCreated fires regardless.
-          SurfaceView sv = surfaceView;
-          if (sv != null && sv.getVisibility() != View.VISIBLE) {
-            sv.setVisibility(View.VISIBLE);
-          }
+          applyVisibility(surfaceView);
           // Already had a Surface (re-init after a teardown) — start right now;
           // otherwise surfaceCreated starts us as soon as the view is realised.
           if (surfaceReady.get()) {
@@ -287,9 +309,24 @@ public final class WcDecoderBridge {
         });
   }
 
+  /**
+   * Geometry only. {@code visible} is accepted for call compatibility but
+   * deliberately IGNORED — visibility follows {@link #wanted} (see
+   * {@link #applyVisibility}). JS drives this from a React layout effect whose
+   * view of "is the native path live" lags the decoder's own by a frame or two,
+   * and the calls are unordered besides, so honouring the flag let a stale
+   * {@code visible=false} tear the Surface out from under a running codec (blank
+   * screen, no error) and a stale {@code visible=true} park a dead Surface on
+   * top of the WebCodecs canvas (frozen picture).
+   */
   public static void setBounds(double x, double y, double w, double h, boolean visible) {
     Activity act = activity();
     if (act == null) return;
+    // An empty box is JS saying "I have no geometry for you" (it pairs the zeroes
+    // with visible=false), not "shrink to a pixel". Keep whatever geometry we
+    // have: collapsing a live decoder's Surface to 1×1 on a stale call is the
+    // same class of bug as hiding it, just less obvious on screen.
+    if (w < 1 || h < 1) return;
     act.runOnUiThread(
         () -> {
           SurfaceView sv = surfaceView;
@@ -311,7 +348,8 @@ public final class WcDecoderBridge {
           lp.topMargin = iy;
           lp.gravity = Gravity.TOP | Gravity.START;
           sv.setLayoutParams(lp);
-          sv.setVisibility(visible ? View.VISIBLE : View.GONE);
+          // NOT sv.setVisibility(visible ? ...) — see the javadoc above.
+          applyVisibility(sv);
         });
   }
 
@@ -333,12 +371,14 @@ public final class WcDecoderBridge {
   }
 
   public static void teardown() {
+    // Clear the latch first, for the same reason init() sets it first: any
+    // setBounds racing us must not re-show a view whose codec we just stopped.
+    wanted.set(false);
     Activity act = activity();
     Runnable stop =
         () -> {
           stopCodecLocked();
-          SurfaceView sv = surfaceView;
-          if (sv != null) sv.setVisibility(View.GONE);
+          applyVisibility(surfaceView);
         };
     if (act != null) act.runOnUiThread(stop);
     else stop.run();
