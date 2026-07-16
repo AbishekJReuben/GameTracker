@@ -233,8 +233,10 @@ const save = (path, before, after, msg) => {
       `import android.os.Bundle\n` +
       `import android.util.Rational\n` +
       `import android.webkit.WebView\n` +
+      `import android.view.WindowManager\n` +
       `import androidx.activity.enableEdgeToEdge\n` +
       `import androidx.annotation.RequiresApi\n` +
+      `import androidx.core.view.ViewCompat\n` +
       `import androidx.core.view.WindowInsetsCompat\n` +
       `import androidx.core.view.WindowInsetsControllerCompat\n` +
       `import java.lang.ref.WeakReference\n\n` +
@@ -270,6 +272,23 @@ const save = (path, before, after, msg) => {
       `    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR\n` +
       `    hideSystemBars()\n` +
       `    updatePipParams()\n` +
+      `    // Keyboard must SHRINK the webview, never pan the window. With\n` +
+      `    // enableEdgeToEdge + hidden system bars the IME default degrades to\n` +
+      `    // adjustPan (fullscreen windows are exempt from adjustResize), which\n` +
+      `    // slides the whole surface up — the top of the remote viewport leaves\n` +
+      `    // the screen and JS cannot even see it (visualViewport doesn't change\n` +
+      `    // when the WINDOW moves). Requesting ADJUST_RESIZE plus applying the\n` +
+      `    // ime inset as bottom padding makes the content view physically\n` +
+      `    // shrink, so the page lays out inside the visible band like any\n` +
+      `    // normal resize.\n` +
+      `    @Suppress("DEPRECATION")\n` +
+      `    window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)\n` +
+      `    val content = findViewById<android.view.View>(android.R.id.content)\n` +
+      `    ViewCompat.setOnApplyWindowInsetsListener(content) { v, insets ->\n` +
+      `      val ime = insets.getInsets(WindowInsetsCompat.Type.ime())\n` +
+      `      v.setPadding(0, 0, 0, ime.bottom)\n` +
+      `      insets\n` +
+      `    }\n` +
       `  }\n\n` +
       `  /** Tauri fires this when the WebView is constructed, BEFORE it loads the\n` +
       `   *  app URL — the only correct moment to inject a JavascriptInterface.\n` +

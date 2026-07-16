@@ -133,6 +133,26 @@ public final class WcDecoderBridge {
   private static HandlerThread watchdogThread;
   private static Handler watchdogHandler;
 
+  /**
+   * Timestamped ring buffer of every lifecycle event the bridge sees (attach,
+   * init, visibility flips, surfaceCreated/Changed/Destroyed, kicks, codec
+   * configure attempts and results, errors). This is the flight recorder for a
+   * device we do not own: the black-screen family of bugs here has repeatedly
+   * produced *no* codec error and *no* logcat we could reach, and each round
+   * trip through a user toast has to carry everything we might want to ask.
+   * Dumped (with device/decoder/view-hierarchy state) by {@link #dumpDiagnostics}.
+   */
+  private static final ConcurrentLinkedQueue<String> journal = new ConcurrentLinkedQueue<>();
+  private static final int JOURNAL_MAX = 160;
+  private static final long bootAt = SystemClock.elapsedRealtime();
+
+  private static void jlog(String msg) {
+    long t = SystemClock.elapsedRealtime() - bootAt;
+    journal.offer("+" + (t / 1000) + "." + String.format("%03d", t % 1000) + "s " + msg);
+    while (journal.size() > JOURNAL_MAX) journal.poll();
+    Log.i(TAG, msg);
+  }
+
   private static final class PendingFrame {
     final long tsUs;
     final boolean key;
@@ -265,7 +285,7 @@ public final class WcDecoderBridge {
     } else {
       int index = parent.indexOfChild(surfaceView);
       android.view.ViewGroup.LayoutParams lp = surfaceView.getLayoutParams();
-      Log.i(TAG, "surfaceCreated never fired — re-attaching SurfaceView (kick " + kick + ")");
+      jlog("surfaceCreated never fired — re-attaching SurfaceView (kick " + kick + ")");
       parent.removeView(surfaceView);
       // removeView can tear down the holder's surface (if any partial one
       // existed) — clear our latch so surfaceCreated on the new session is the
@@ -286,7 +306,9 @@ public final class WcDecoderBridge {
   }
 
   /** Re-seat the existing {@code surfaceView} under the content view (fallback
-   *  when its parent is null or re-add threw). */
+   *  when its parent is null or re-add threw). Layout params are 1×1 — the video
+   *  size is in VIDEO pixels, not layout px, and setBounds re-establishes real
+   *  geometry the moment JS syncs anyway. */
   private static void ensureSurfaceViewReseat() {
     Activity act = activity();
     if (act == null || surfaceView == null) return;
@@ -294,11 +316,50 @@ public final class WcDecoderBridge {
     if (content == null) return;
     surfaceReady.set(false);
     surface = null;
+    android.view.ViewGroup.LayoutParams prev = surfaceView.getLayoutParams();
     FrameLayout.LayoutParams lp =
-        new FrameLayout.LayoutParams(
-            width.get() > 0 ? width.get() : 1, height.get() > 0 ? height.get() : 1);
+        prev instanceof FrameLayout.LayoutParams
+            ? (FrameLayout.LayoutParams) prev
+            : new FrameLayout.LayoutParams(1, 1);
     lp.gravity = Gravity.TOP | Gravity.START;
+    jlog("reseat: fallback under content[0]");
     content.addView(surfaceView, 0, lp);
+  }
+
+  /**
+   * Move the SurfaceView to be the WebView's immediate lower sibling. Only the
+   * views drawn AFTER the punch can cover it, so the fewer of those the better —
+   * ideally exactly one: the WebView itself. No-op when already seated there,
+   * when the WebView hasn't been created yet, or when the view currently owns a
+   * live Surface (re-parenting destroys it). Must run on the UI thread.
+   */
+  private static void reseatBelowWebView(Activity act) {
+    SurfaceView sv = surfaceView;
+    if (sv == null) return;
+    ViewGroup content = act.findViewById(android.R.id.content);
+    WebView web = content == null ? null : findWebView(content);
+    if (web == null || !(web.getParent() instanceof ViewGroup)) return;
+    ViewGroup wparent = (ViewGroup) web.getParent();
+    int webIdx = wparent.indexOfChild(web);
+    // Already the immediate lower sibling — nothing to do.
+    if (sv.getParent() == wparent && wparent.indexOfChild(sv) == webIdx - 1) return;
+    android.view.ViewGroup.LayoutParams prev = sv.getLayoutParams();
+    ViewGroup oldParent = sv.getParent() instanceof ViewGroup ? (ViewGroup) sv.getParent() : null;
+    if (oldParent != null) oldParent.removeView(sv);
+    surfaceReady.set(false);
+    surface = null;
+    FrameLayout.LayoutParams lp =
+        prev instanceof FrameLayout.LayoutParams
+            ? (FrameLayout.LayoutParams) prev
+            : new FrameLayout.LayoutParams(1, 1);
+    lp.gravity = Gravity.TOP | Gravity.START;
+    try {
+      wparent.addView(sv, Math.max(0, wparent.indexOfChild(web)), lp);
+      jlog("reseat: below WebView in " + wparent.getClass().getSimpleName());
+    } catch (Exception e) {
+      jlog("reseat below WebView failed: " + e);
+      ensureSurfaceViewReseat();
+    }
   }
 
   /** Bound from MainActivity.onCreate — owns the SurfaceView under the WebView. */
@@ -451,11 +512,20 @@ public final class WcDecoderBridge {
     // another Rust worker must observe "decoder wanted" and leave the view
     // alone, whichever of the two runnables the looper happens to run first.
     wanted.set(true);
+    jlog("init " + w + "x" + h + " surfaceReady=" + surfaceReady.get());
     act.runOnUiThread(
         () -> {
           ensureSurfaceView(act);
+          // attach() ran before Tauri created the WebView, so the SurfaceView
+          // was seated at content[0] — potentially below wry wrapper views
+          // whose backgrounds draw after (and over) the punch. Now the WebView
+          // exists: move the view to be its immediate lower sibling so the
+          // ONLY thing drawn between the punch and the user is the (transparent)
+          // WebView itself. Skip when a live Surface exists — re-parenting
+          // destroys it, and a working decoder beats a tidier hierarchy.
+          if (!surfaceReady.get()) reseatBelowWebView(act);
           hookWebView(act);
-          makeWebViewTransparent(act);
+          makeCompositingTransparent(act);
           // Showing the view is part of STARTING the decoder, not part of laying
           // it out — no Surface exists until it is VISIBLE, so this must never
           // wait on (or be undone by) JS. See applyVisibility.
@@ -544,6 +614,7 @@ public final class WcDecoderBridge {
     // Clear the latch first, for the same reason init() sets it first: any
     // setBounds racing us must not re-show a view whose codec we just stopped.
     wanted.set(false);
+    jlog("teardown");
     // Stop trying to conjure a Surface for a decoder the JS side has torn down.
     cancelSurfaceWatchdog();
     Activity act = activity();
@@ -593,6 +664,180 @@ public final class WcDecoderBridge {
   public static String statsError() {
     String e = lastError.get();
     return e == null ? "" : e;
+  }
+
+  /**
+   * Everything we would ask for over a user's shoulder, in one copy-pastable
+   * blob: device identity, decoder inventory with low-latency capabilities,
+   * live codec/surface/view state, the full view hierarchy above the punch
+   * (class, visibility, alpha, background, layer type — the black-screen bugs
+   * live HERE, in whichever layer forgot to be transparent), and the lifecycle
+   * journal. Called over JNI (decoder_dump_diag) and attached to the decoder
+   * error toast's copy-to-clipboard payload.
+   */
+  public static String dumpDiagnostics() {
+    StringBuilder sb = new StringBuilder(8192);
+    try {
+      sb.append("=== device ===\n");
+      sb.append("model=").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+          .append(" device=").append(Build.DEVICE).append(" board=").append(Build.BOARD).append('\n');
+      sb.append("android=").append(Build.VERSION.RELEASE).append(" sdk=").append(Build.VERSION.SDK_INT)
+          .append(" build=").append(Build.DISPLAY).append('\n');
+      sb.append("soc=");
+      if (Build.VERSION.SDK_INT >= 31) {
+        sb.append(Build.SOC_MANUFACTURER).append(' ').append(Build.SOC_MODEL);
+      } else {
+        sb.append(Build.HARDWARE);
+      }
+      sb.append(" abi=").append(Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "?").append('\n');
+
+      Activity act = activity();
+      if (act != null) {
+        android.util.DisplayMetrics dm = act.getResources().getDisplayMetrics();
+        sb.append("screen=").append(dm.widthPixels).append('x').append(dm.heightPixels)
+            .append(" dpr=").append(dm.density).append('\n');
+      }
+
+      sb.append("\n=== decoder state ===\n");
+      sb.append("wanted=").append(wanted.get())
+          .append(" started=").append(started.get())
+          .append(" surfaceReady=").append(surfaceReady.get())
+          .append(" surfaceValid=").append(surface != null && surface.isValid())
+          .append('\n');
+      sb.append("codec=").append(codecName.get())
+          .append(" ll=").append(lowLatency.get())
+          .append(" size=").append(width.get()).append('x').append(height.get())
+          .append(" frames=").append(frames.get())
+          .append(" queue=").append(queueDepth.get()).append('+').append(backlog.size())
+          .append(" decodeMsEwma=").append(String.format("%.1f", decodeMsEwma))
+          .append('\n');
+      sb.append("awaitKey=").append(awaitKey.get())
+          .append(" csdQueued=").append(csdQueued.get())
+          .append(" kicks=").append(surfaceKicks.get())
+          .append(" jsHooked=").append(webViewHooked)
+          .append('\n');
+      sb.append("lastError=").append(statsError()).append('\n');
+      sb.append("probeDetail=").append(probeDetail()).append('\n');
+
+      sb.append("\n=== h264 decoders ===\n");
+      appendDecoderInventory(sb);
+
+      sb.append("\n=== view stack (bottom→top; punch survives only if everything ABOVE the SurfaceView is transparent) ===\n");
+      appendViewState(sb);
+
+      sb.append("\n=== journal ===\n");
+      for (String line : journal) sb.append(line).append('\n');
+    } catch (Throwable t) {
+      sb.append("\n[dumpDiagnostics itself threw: ").append(describeThrowable(t)).append(']');
+    }
+    return sb.toString();
+  }
+
+  /** Every H.264 decoder with the capability bits that decide our pick. */
+  private static void appendDecoderInventory(StringBuilder sb) {
+    MediaCodecInfo[] infos;
+    try {
+      infos = new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos();
+    } catch (Throwable t) {
+      sb.append("MediaCodecList threw: ").append(describeThrowable(t)).append('\n');
+      return;
+    }
+    for (MediaCodecInfo info : infos) {
+      try {
+        if (info.isEncoder()) continue;
+        boolean supports = false;
+        for (String t : info.getSupportedTypes()) {
+          if (MIME.equalsIgnoreCase(t)) {
+            supports = true;
+            break;
+          }
+        }
+        if (!supports) continue;
+        sb.append(info.getName());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+          sb.append(info.isHardwareAccelerated() ? " hw" : " sw");
+          if (info.isAlias()) sb.append(" alias");
+        }
+        try {
+          MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(MIME);
+          if (Build.VERSION.SDK_INT >= 30
+              && caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)) {
+            sb.append(" FEATURE_LowLatency");
+          }
+          MediaCodecInfo.VideoCapabilities vc = caps.getVideoCapabilities();
+          if (vc != null) {
+            sb.append(" max=").append(vc.getSupportedWidths().getUpper())
+                .append('x').append(vc.getSupportedHeights().getUpper());
+          }
+        } catch (Throwable ignored) {
+        }
+        sb.append('\n');
+      } catch (Throwable perCodec) {
+        // One rogue plugin must not sink the dump.
+      }
+    }
+  }
+
+  /** SurfaceView placement + every view drawn after it (those can cover the punch). */
+  private static void appendViewState(StringBuilder sb) {
+    Activity act = activity();
+    if (act == null) {
+      sb.append("no activity\n");
+      return;
+    }
+    try {
+      android.graphics.drawable.Drawable winBg = act.getWindow().getDecorView().getBackground();
+      sb.append("window bg=").append(describeDrawable(winBg)).append('\n');
+    } catch (Throwable ignored) {
+    }
+    ViewGroup content = act.findViewById(android.R.id.content);
+    if (content == null) {
+      sb.append("no content view\n");
+      return;
+    }
+    SurfaceView sv = surfaceView;
+    if (sv != null) {
+      sb.append("SurfaceView attached=").append(sv.isAttachedToWindow())
+          .append(" shown=").append(sv.isShown())
+          .append(" vis=").append(visName(sv.getVisibility()))
+          .append(" size=").append(sv.getWidth()).append('x').append(sv.getHeight())
+          .append(" winVis=").append(visName(sv.getWindowVisibility()))
+          .append(" mediaOverlay=false zTop=false")
+          .append('\n');
+    } else {
+      sb.append("SurfaceView: null\n");
+    }
+    dumpViewTree(sb, content, 0);
+  }
+
+  private static String visName(int v) {
+    return v == View.VISIBLE ? "VISIBLE" : v == View.INVISIBLE ? "INVISIBLE" : "GONE";
+  }
+
+  private static String describeDrawable(android.graphics.drawable.Drawable d) {
+    if (d == null) return "null(transparent)";
+    if (d instanceof android.graphics.drawable.ColorDrawable) {
+      return String.format("#%08X", ((android.graphics.drawable.ColorDrawable) d).getColor());
+    }
+    return d.getClass().getSimpleName();
+  }
+
+  private static void dumpViewTree(StringBuilder sb, View v, int depth) {
+    if (depth > 6) return;
+    for (int i = 0; i < depth; i++) sb.append("  ");
+    sb.append(v.getClass().getSimpleName())
+        .append(' ').append(visName(v.getVisibility()))
+        .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
+        .append(" alpha=").append(v.getAlpha())
+        .append(" bg=").append(describeDrawable(v.getBackground()))
+        .append(" layer=").append(v.getLayerType());
+    if (v == surfaceView) sb.append("  <== OUR SURFACEVIEW");
+    if (v instanceof WebView) sb.append("  <== WEBVIEW");
+    sb.append('\n');
+    if (v instanceof ViewGroup) {
+      ViewGroup g = (ViewGroup) v;
+      for (int i = 0; i < g.getChildCount(); i++) dumpViewTree(sb, g.getChildAt(i), depth + 1);
+    }
   }
 
   /** JavascriptInterface — installed as {@code window.__GT_DECODER__}. */
@@ -838,6 +1083,7 @@ public final class WcDecoderBridge {
               public void surfaceCreated(SurfaceHolder holder) {
                 surface = holder.getSurface();
                 surfaceReady.set(true);
+                jlog("surfaceCreated valid=" + holder.getSurface().isValid());
                 // A Surface arrived — stop the re-attach watchdog (if it was
                 // armed) and reset its kick count so a later teardown+init arms
                 // a fresh one. Without this disarm the watchdog would happily
@@ -850,12 +1096,14 @@ public final class WcDecoderBridge {
               public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
                 surface = holder.getSurface();
                 surfaceReady.set(true);
+                jlog("surfaceChanged " + w + "x" + h);
               }
 
               @Override
               public void surfaceDestroyed(SurfaceHolder holder) {
                 surfaceReady.set(false);
                 surface = null;
+                jlog("surfaceDestroyed");
                 stopCodecLocked();
               }
             });
@@ -882,13 +1130,69 @@ public final class WcDecoderBridge {
     installJsInterface(web);
   }
 
-  private static void makeWebViewTransparent(Activity act) {
+  /**
+   * Make every layer that composites ABOVE the SurfaceView's punched hole
+   * transparent. The hole works like this: the SurfaceView's surface sits
+   * BEHIND the app window's surface, and the view hierarchy leaves alpha=0
+   * pixels where the view is — so the video shows through only if everything
+   * drawn after the punch in that rect (the WebView, every ancestor wrapper's
+   * background, later siblings) is itself transparent. Clearing just the
+   * WebView's own background was not enough: wry/Tauri wraps the WebView in
+   * its own view(s), and an opaque wrapper background paints straight over the
+   * hole — the codec decodes happily (stats climb, no error, the JS watchdog
+   * stays quiet because frames ARE being produced) while the user stares at
+   * black. That is exactly the "black until I toggle the decoder in Tune"
+   * shape: switching to WebCodecs paints the canvas IN the WebView, on top of
+   * everything, so it works.
+   *
+   * Also deliberately does NOT force a hardware LAYER on the WebView any more.
+   * setLayerType(LAYER_TYPE_HARDWARE) flattens the WebView into an offscreen
+   * texture, and transparent-WebView-in-a-layer is a documented bug farm
+   * (issuetracker 36925660 heritage): several Chromium builds composite the
+   * layer as opaque. LAYER_TYPE_NONE is still hardware-accelerated rendering —
+   * it is the layer, not the acceleration, that breaks alpha.
+   *
+   * Re-applied on a delay: some pages/OEM WebView builds repaint an opaque
+   * background after load or after a renderer restart.
+   */
+  private static void makeCompositingTransparent(Activity act) {
+    applyCompositingTransparency(act);
+    ViewGroup content = act.findViewById(android.R.id.content);
+    if (content != null) {
+      content.postDelayed(() -> applyCompositingTransparency(act), 500);
+      content.postDelayed(() -> applyCompositingTransparency(act), 2000);
+    }
+  }
+
+  private static void applyCompositingTransparency(Activity act) {
+    try {
+      act.getWindow().setBackgroundDrawable(
+          new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+    } catch (Exception e) {
+      jlog("window bg clear failed: " + e);
+    }
     ViewGroup content = act.findViewById(android.R.id.content);
     WebView web = content == null ? null : findWebView(content);
-    if (web == null) return;
+    if (web == null) {
+      jlog("compositing: no WebView found");
+      return;
+    }
     web.setBackgroundColor(Color.TRANSPARENT);
-    // Software layer can break transparency on some OEMs; hardware is fine.
-    web.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+    if (web.getLayerType() != View.LAYER_TYPE_NONE) {
+      web.setLayerType(View.LAYER_TYPE_NONE, null);
+      jlog("webview layer -> NONE");
+    }
+    // Every wrapper between the WebView and the window: their backgrounds all
+    // draw after the punch and each one can independently blacken it.
+    View walk = web;
+    while (walk.getParent() instanceof View) {
+      walk = (View) walk.getParent();
+      android.graphics.drawable.Drawable bg = walk.getBackground();
+      if (bg != null) {
+        jlog("cleared opaque bg on " + walk.getClass().getSimpleName() + " (" + describeDrawable(bg) + ")");
+        walk.setBackgroundColor(Color.TRANSPARENT);
+      }
+    }
   }
 
   private static WebView findWebView(View root) {
@@ -964,8 +1268,7 @@ public final class WcDecoderBridge {
         // which the JS poll surfaces as a "decoder error" toast even though the
         // codec is now running fine.
         lastError.set("");
-        Log.i(
-            TAG,
+        jlog(
             "MediaCodec started name="
                 + name
                 + " "
@@ -979,7 +1282,7 @@ public final class WcDecoderBridge {
         return;
       } catch (Exception e) {
         lastEx = e;
-        Log.w(TAG, "configure/start attempt " + i + " failed: " + e.getMessage());
+        jlog("configure/start attempt " + i + " failed: " + e.getMessage());
         if (c != null) {
           try {
             c.release();
@@ -991,7 +1294,7 @@ public final class WcDecoderBridge {
     }
     lastError.set(lastEx == null ? "all configure attempts failed" : String.valueOf(lastEx.getMessage()));
     lastProbeDetail.set("startCodec: all attempts failed (" + attempts.size() + ")");
-    Log.e(TAG, "all codec configure attempts failed", lastEx);
+    jlog("all codec configure attempts failed: " + (lastEx == null ? "?" : lastEx.getMessage()));
   }
 
   private static MediaCodec createCodecByName(String name) {
@@ -1074,7 +1377,7 @@ public final class WcDecoderBridge {
           lastError.set(String.valueOf(e.getDiagnosticInfo()));
           awaitKey.set(true);
           csdQueued.set(false);
-          Log.w(TAG, "codec error", e);
+          jlog("codec onError: " + e.getDiagnosticInfo());
         }
 
         @Override

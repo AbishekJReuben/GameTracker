@@ -498,31 +498,68 @@ export function startHost(opts: HostOptions): () => void {
   // into the overshoot that caused the skip — that climb-skip-climb sawtooth is
   // what reads as "the stream hitches every couple of seconds" in motion scenes.
   let lastSkipAt = 0;
+  // The bitrate that last provably exceeded the link (it caused a skip-cut).
+  // Without this memory the ease-back climbed 5%/1.2s straight back to the same
+  // overshoot, and the ONLY thing that stopped the climb was another skipped
+  // frame — i.e. a visible blocky artifact plus a recovery IDR, every ~5-6s, in
+  // a perfectly periodic sharp→mushy→reset cycle on any link slower than the
+  // Tune target. Near/above this ceiling the probe slows to a crawl, so the
+  // "does the link have more?" question stops being answered with user-visible
+  // damage. Decays upward slowly so genuinely improved links are re-discovered.
+  let probeCeilKbps = 0;
+  let lastCeilDecayAt = Date.now();
+  let lastFillTrimAt = 0;
 
   const adaptFromBuffer = (buffered: number, maxBuffered: number, skippedThisFrame: boolean) => {
     const tgt = targetKbps();
     if (adaptKbps <= 0) adaptKbps = tgt;
     const fill = maxBuffered > 0 ? buffered / maxBuffered : 0;
+    const now = Date.now();
+    // Forget the ceiling gradually (~4%/10s): capacity may have returned, and a
+    // stale ceiling would otherwise cap a healthy link forever.
+    if (probeCeilKbps > 0 && now - lastCeilDecayAt > 10_000) {
+      lastCeilDecayAt = now;
+      probeCeilKbps = Math.round(probeCeilKbps * 1.04);
+      if (probeCeilKbps >= tgt) probeCeilKbps = 0; // ceiling above target = no ceiling
+    }
     if (skippedThisFrame || fill > 0.55) {
       // Network can't drain. A hard skip cuts deeper (~15%) than a merely-filling
       // channel (~8%) so one visible hitch sheds enough to end the burst instead
       // of rationing it out over several. Floor at 1.5 Mbps / Tune min so we
       // don't spiral into unreadable mush.
-      if (skippedThisFrame) lastSkipAt = Date.now();
+      if (skippedThisFrame) {
+        lastSkipAt = now;
+        // This rate broke the link — remember it as the probe ceiling.
+        probeCeilKbps = probeCeilKbps > 0 ? Math.min(probeCeilKbps, adaptKbps) : adaptKbps;
+        lastCeilDecayAt = now;
+      }
       const cut = skippedThisFrame ? 0.85 : 0.92;
       adaptKbps = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * cut));
       adaptCleanTicks = 0;
       pushAdaptBitrate();
-    } else if (fill < 0.12 && Date.now() - lastSkipAt > 3000) {
+    } else if (fill < 0.12 && now - lastSkipAt > 3000) {
       adaptCleanTicks++;
-      // ~1.2s of a drained channel → ease 5% back toward the Tune target.
+      // ~1.2s of a drained channel → ease back toward the Tune target: briskly
+      // while clearly under the known ceiling, at a crawl once near/above it
+      // (the crawl is the probe — sized so an overshoot fits in the buffer's
+      // slack and gets caught by the fill-trim below, not by a skipped frame).
       if (adaptCleanTicks >= 3 && adaptKbps < tgt) {
-        adaptKbps = Math.min(tgt, Math.round(adaptKbps * 1.05 + 50));
+        const nearCeil = probeCeilKbps > 0 && adaptKbps >= probeCeilKbps * 0.85;
+        adaptKbps = Math.min(tgt, nearCeil ? Math.round(adaptKbps * 1.01 + 10) : Math.round(adaptKbps * 1.05 + 50));
         adaptCleanTicks = 0;
         pushAdaptBitrate();
       }
     } else {
       adaptCleanTicks = 0;
+      // Mid-band congestion signal: the channel is accumulating (>30% full) but
+      // nothing has been skipped yet. Trim gently and invisibly NOW so the probe
+      // failure never has to become a dropped frame + artifact + recovery IDR.
+      if (fill > 0.3 && now - lastFillTrimAt > 800) {
+        lastFillTrimAt = now;
+        probeCeilKbps = probeCeilKbps > 0 ? Math.min(probeCeilKbps, adaptKbps) : adaptKbps;
+        adaptKbps = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * 0.97));
+        pushAdaptBitrate();
+      }
     }
   };
 
@@ -980,11 +1017,21 @@ export function startHost(opts: HostOptions): () => void {
       return f.sampleRate * f.channels * 4;
     };
 
-    /** True when the channel already holds > AUDIO_MAX_BUF_MS of audio. */
+    /** True when the channel already holds "too much" queued audio. */
     const audioChBacked = () => {
       const sink = directSink;
       if (!sink) return true;
-      const cap = Math.max(8192, Math.round((audioBytesPerSec() * AUDIO_MAX_BUF_MS) / 1000));
+      // The wall-clock cap was built to stop RAW PCM (384 KB/s) from banking
+      // seconds of stale audio. Applied to Opus it works out to ~4 KB — small
+      // enough that any video-congestion ripple on the shared SCTP association
+      // trips it, and the host then drops FRESH 10ms packets in clusters. Every
+      // cluster is a seq-gap the guest must conceal: sustained slow-network
+      // sessions turned into machine-gun concealment (the robotic chop).
+      // Compressed audio gets a deep cushion (1s ≈ 16 KB — negligible); the
+      // guest worklet's runaway-latency trim handles late arrivals in ONE
+      // splice instead of many drops.
+      const capMs = audioCodec === "opus" ? 1000 : AUDIO_MAX_BUF_MS;
+      const cap = Math.max(8192, Math.round((audioBytesPerSec() * capMs) / 1000));
       return sink.bufferedAmount > cap;
     };
 
@@ -1054,11 +1101,14 @@ export function startHost(opts: HostOptions): () => void {
         bitrate: AUDIO_OPUS_BPS,
         opus: {
           frameDuration: AUDIO_OPUS_FRAME_US,
-          // The audio channel is unreliable by design (maxRetransmits: 0), so
-          // let Opus carry its own redundancy: in-band FEC + a loss hint lets
-          // the decoder reconstruct a dropped packet instead of clicking.
-          useinbandfec: true,
-          packetlossperc: 10,
+          // NO in-band FEC: reconstructing a lost packet from the next one's
+          // embedded copy requires decoding that packet with the loss flagged
+          // (libopus decode_fec=1) — WebCodecs' AudioDecoder has no such hook,
+          // so the guest can never use the redundancy. The ~10% bitrate it
+          // cost was pure dead weight; losses are concealed guest-side instead
+          // (seq-gap → worklet filler). Revisit if playout moves to wasm-libopus.
+          useinbandfec: false,
+          packetlossperc: 0,
           complexity: 5,
         },
       } as unknown as AudioEncoderConfig;

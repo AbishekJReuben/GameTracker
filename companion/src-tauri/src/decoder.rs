@@ -86,6 +86,17 @@ pub async fn decoder_get_stats() -> Result<DecoderStats, String> {
         .map_err(|e| format!("decoder_get_stats panicked: {e}"))?
 }
 
+/// Full diagnostics blob (device, decoder inventory, view hierarchy above the
+/// hole punch, lifecycle journal). Attached to the decoder error toast's
+/// copy-to-clipboard payload so a black screen on a device we don't own is
+/// debuggable from one paste.
+#[tauri::command]
+pub async fn decoder_dump_diag() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(decoder_dump_diag_impl)
+        .await
+        .map_err(|e| format!("decoder_dump_diag panicked: {e}"))?
+}
+
 #[cfg(target_os = "android")]
 mod android {
     use super::{DecoderProbe, DecoderStats};
@@ -274,6 +285,21 @@ mod android {
         })
     }
 
+    pub fn dump_diag() -> Result<String, String> {
+        with_bridge(|env, class| {
+            let obj = env
+                .call_static_method(&class, "dumpDiagnostics", "()Ljava/lang/String;", &[])
+                .map_err(|e| format!("dumpDiagnostics: {e}"))?
+                .l()
+                .map_err(|e| e.to_string())?;
+            if obj.is_null() {
+                return Ok(String::new());
+            }
+            let js: JString = obj.into();
+            Ok(env.get_string(&js).map(String::from).unwrap_or_default())
+        })
+    }
+
     pub fn stats() -> Result<DecoderStats, String> {
         with_bridge(|env, class| {
             let decode_ms = env
@@ -360,6 +386,10 @@ fn decoder_teardown_impl() -> Result<(), String> {
 fn decoder_get_stats_impl() -> Result<DecoderStats, String> {
     android::stats()
 }
+#[cfg(target_os = "android")]
+fn decoder_dump_diag_impl() -> Result<String, String> {
+    android::dump_diag()
+}
 
 #[cfg(not(target_os = "android"))]
 fn decoder_probe_impl() -> Result<DecoderProbe, String> {
@@ -391,6 +421,10 @@ fn decoder_reset_impl() -> Result<(), String> {
 #[cfg(not(target_os = "android"))]
 fn decoder_teardown_impl() -> Result<(), String> {
     Ok(())
+}
+#[cfg(not(target_os = "android"))]
+fn decoder_dump_diag_impl() -> Result<String, String> {
+    Ok(String::new())
 }
 #[cfg(not(target_os = "android"))]
 fn decoder_get_stats_impl() -> Result<DecoderStats, String> {

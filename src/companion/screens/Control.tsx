@@ -480,11 +480,29 @@ export function ControlScreen({
   const [showReconnect, setShowReconnect] = useState(false);
   const [hasStream, setHasStream] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
-  // PC sound remembers its last state: restored automatically on connect, with a
-  // graceful drop back to "off" if the platform still demands a fresh gesture.
+  // PC sound remembers its last state: restored automatically on connect. When
+  // the platform blocks the auto-play (no user gesture yet on a fresh page —
+  // standard WebView policy), the retry below re-plays on the FIRST tap instead
+  // of flipping the preference off. The old `.catch(() => setSoundOn(false))`
+  // is why sound "never stayed on": every app launch auto-played before any
+  // gesture, got blocked, and overwrote the saved preference with off.
   const [soundOn, setSoundOn] = useState(() => localStorage.getItem("gt.remote.soundOn") === "1");
   const soundOnRef = useRef(false);
   soundOnRef.current = soundOn;
+  const audioRetryArmed = useRef(false);
+  const retryAudioOnGesture = (a: HTMLAudioElement) => {
+    if (audioRetryArmed.current) return;
+    audioRetryArmed.current = true;
+    const retry = () => {
+      audioRetryArmed.current = false;
+      if (!soundOnRef.current || isImmersiveActive()) return;
+      a.muted = false;
+      a.play?.().catch(() => {
+        /* still blocked — the next gesture re-arms via the callers */
+      });
+    };
+    window.addEventListener("pointerdown", retry, { once: true, capture: true });
+  };
   useEffect(() => {
     localStorage.setItem("gt.remote.soundOn", soundOn ? "1" : "0");
     // DIRECT audio plays through CloudConn's own AudioContext — keep it in sync.
@@ -1019,6 +1037,55 @@ export function ControlScreen({
   /** Long labels + a plain-language line per stat. Off by default — the dense grid
    *  is the at-a-glance view; this is the "what does JB tgt/min even mean" view. */
   const [statsVerbose, setStatsVerbose] = useState(false);
+  /** Compact stats strip: header row only (mode badges, fps, lag, bitrate).
+   *  Persisted — whoever collapses the HUD wants it to stay collapsed. */
+  const [statsCompact, setStatsCompact] = useState(() => {
+    try {
+      return localStorage.getItem("gt.statsCompact") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleStatsCompact = () => {
+    setStatsCompact((c) => {
+      try {
+        localStorage.setItem("gt.statsCompact", c ? "0" : "1");
+      } catch {
+        /* private mode */
+      }
+      return !c;
+    });
+  };
+  /** "Copy diag" feedback: flips to true for a beat after a successful copy. */
+  const [diagCopied, setDiagCopied] = useState(false);
+  const copyDiagnostics = async () => {
+    // Everything a bug report needs, phone-side: the native bridge's full dump
+    // (device, decoder inventory, view stack above the hole punch, lifecycle
+    // journal) plus the JS view of the session. Works even when nothing has
+    // failed — the "decodes fine but the screen is black" class of bug never
+    // raises an error toast, so this button is its only evidence channel.
+    const { dumpNativeDecoderDiag } = await import("../nativeDecoder");
+    const native = await dumpNativeDecoderDiag();
+    const lines = [
+      `GameTracker Remote diagnostics @ ${new Date().toISOString()}`,
+      `ua: ${navigator.userAgent}`,
+      `screen: ${window.innerWidth}x${window.innerHeight} dpr=${window.devicePixelRatio}`,
+      `path: ${wcStats ? (wcStats.native ? "DIRECT native MediaCodec" : "DIRECT WebCodecs") : hasStream ? "RTC" : "LAN"}`,
+      `fps=${fps} res=${res || "?"}`,
+      wcStats ? `wc: ${JSON.stringify(wcStats)}` : "wc: null",
+      net ? `rtc: ${JSON.stringify(net)}` : "rtc: null",
+      audioStats ? `audio: ${JSON.stringify(audioStats)}` : "audio: null",
+      hostStats ? `host: ${JSON.stringify(hostStats)}` : "host: null",
+      native ? `\n${native}` : "",
+    ];
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      setDiagCopied(true);
+      window.setTimeout(() => setDiagCopied(false), 1500);
+    } catch {
+      /* clipboard denied — the toast path still works */
+    }
+  };
   const [fps, setFps] = useState(0);
   const [res, setRes] = useState("");
   const frameTimes = useRef<number[]>([]);
@@ -1139,7 +1206,7 @@ export function ControlScreen({
       a.srcObject = stream;
       // ImmersiveScreen owns PC sound while WebXR is up (avoids double audio).
       a.muted = !soundOnRef.current || isImmersiveActive();
-      if (soundOnRef.current && !isImmersiveActive()) a.play?.().catch(() => setSoundOn(false));
+      if (soundOnRef.current && !isImmersiveActive()) a.play?.().catch(() => retryAudioOnGesture(a));
     });
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     const unsubEvent = link.onEvent((e) => {
@@ -1176,7 +1243,7 @@ export function ControlScreen({
           link.setAudioMuted?.(!soundOnRef.current || isImmersiveActive());
         } else if (a) {
           a.muted = !soundOnRef.current || isImmersiveActive();
-          if (soundOnRef.current && !isImmersiveActive()) a.play?.().catch(() => setSoundOn(false));
+          if (soundOnRef.current && !isImmersiveActive()) a.play?.().catch(() => retryAudioOnGesture(a));
         }
       } else if (e.event === "auth" && (e as { state?: string }).state === "ok") {
         // Capture just started on the existing track — force a rebind + play.
@@ -1241,20 +1308,28 @@ export function ControlScreen({
       void setNativeDecoderBounds({ x: 0, y: 0, w: 0, h: 0, visible: false });
       return;
     }
-    // Punch a transparent hole through the WebView so the Surface underlay shows.
-    const html = document.documentElement;
-    const body = document.body;
-    const prevHtml = html.style.background;
-    const prevBody = body.style.background;
-    html.style.background = "transparent";
-    body.style.background = "transparent";
+    // Punch a transparent hole through the WebView so the Surface underlay
+    // shows. EVERY ancestor between this screen and <html> must be transparent
+    // — one opaque layer anywhere in the chain blacks out the video while the
+    // codec decodes merrily underneath (no error, no fallback: from JS's view
+    // nothing is wrong). That was literally shipping: companion.html styles
+    // `#root { background: #06070d }` inline, html/body were cleared here but
+    // #root never was, so the native path decoded into a Surface nobody could
+    // see. Walk the real DOM chain instead of naming wrappers, so the next
+    // wrapper div someone adds can't regress this.
+    const cleared: Array<{ el: HTMLElement; prev: string }> = [];
+    let el: HTMLElement | null = viewportRef.current;
+    while (el) {
+      cleared.push({ el, prev: el.style.background });
+      el.style.background = "transparent";
+      el = el.parentElement;
+    }
     syncNativeSurface();
     const onResize = () => syncNativeSurface();
     window.addEventListener("resize", onResize);
     window.visualViewport?.addEventListener("resize", onResize);
     return () => {
-      html.style.background = prevHtml;
-      body.style.background = prevBody;
+      for (const { el: e, prev } of cleared) e.style.background = prev;
       window.removeEventListener("resize", onResize);
       window.visualViewport?.removeEventListener("resize", onResize);
     };
@@ -1529,10 +1604,13 @@ export function ControlScreen({
     };
   }, [connected]);
 
-  // Poll decode-side WebRTC video stats (bitrate/fps/jitter/loss) while the HUD
-  // is open, so the phone can show where the frame-rate bottleneck actually is.
+  // Poll decode-side WebRTC video stats (bitrate/fps/jitter/loss). Runs
+  // whenever connected — the top-bar latency pill reads `wcStats`/`net` too, so
+  // gating this on the stats panel froze the pill's number the moment the panel
+  // closed (it showed whatever the last open-panel poll had seen). The panel
+  // gets the fast cadence; the pill only needs a relaxed tick.
   useEffect(() => {
-    if (!showStats) return;
+    if (!connected) return;
     let alive = true;
     const id = window.setInterval(async () => {
       // Direct-video path telemetry (independent of the RTP stats below).
@@ -1584,12 +1662,12 @@ export function ControlScreen({
         framesRendered: s.framesRendered ?? 0,
         framesDecoded: s.framesDecoded ?? 0,
       });
-    }, 500);
+    }, showStats ? 500 : 1000);
     return () => {
       alive = false;
       window.clearInterval(id);
     };
-  }, [link, showStats]);
+  }, [link, showStats, connected]);
 
   const selectMonitor = (i: number) => {
     if (popoutMonitor != null) return; // pop-out tabs are locked to one display
@@ -2979,16 +3057,23 @@ export function ControlScreen({
         </div>
       )}
 
-      {/* ---- performance / debug HUD — full-width bottom strip, shorter + closable ---- */}
+      {/* ---- performance / debug HUD — top strip (below the toolbar), height-capped,
+           collapsible to a one-row compact form ---- */}
       {showStats && !immersive && !topCollapsed && !pipView && (
         <StatVerboseCtx.Provider value={statsVerbose}>
         <div
-          className={`absolute bottom-2 left-2 right-2 z-30 mx-auto max-w-[110rem] rounded-xl border border-white/[0.1] bg-black/75 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md ${
-            statsVerbose ? "max-h-[60vh] overflow-y-auto" : ""
+          className={`absolute left-2 right-2 z-30 mx-auto max-w-[110rem] rounded-xl border border-white/[0.1] bg-black/75 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md ${
+            statsCompact ? "" : "max-h-[40vh] overflow-y-auto"
           }`}
-          style={statsVerbose ? { scrollbarWidth: "thin" } : undefined}
+          style={{
+            // Just under the top toolbar (py-1.5 + h-7 row + border ≈ 2.8rem,
+            // plus whatever the notch adds). Anchored top so the HUD stops
+            // fighting the dock/keyboard for the bottom edge.
+            top: "calc(max(0.35rem, env(safe-area-inset-top)) + 2.9rem)",
+            ...(statsCompact ? null : { scrollbarWidth: "thin" as const }),
+          }}
         >
-          <div className="mb-1 flex flex-wrap items-center justify-between gap-1.5">
+          <div className={`flex flex-wrap items-center justify-between gap-1.5 ${statsCompact ? "" : "mb-1"}`}>
             <span className="flex flex-wrap items-center gap-1 text-[10px] font-800 text-white">
               <Gauge className="h-3 w-3 text-accent-3" /> Stream stats
               <span className={`rounded px-1 py-0.5 text-[8px] font-800 ${wcStats ? "bg-green/20 text-green" : "bg-white/[0.08] text-ink-soft"}`}>
@@ -3027,6 +3112,21 @@ export function ControlScreen({
               )}
             </span>
             <span className="flex items-center gap-1">
+              {/* Compact mode folds the essentials into the header row so the
+                  strip is one line tall: fps, bitrate, then the lag pill. */}
+              {statsCompact && (
+                <span className="rounded bg-white/[0.08] px-1 py-0.5 font-800 tabular-nums text-white">{fps} fps</span>
+              )}
+              {statsCompact &&
+                (() => {
+                  const kbps = wcStats ? wcStats.kbps : net?.kbps ?? 0;
+                  if (!kbps) return null;
+                  return (
+                    <span className="rounded bg-white/[0.08] px-1 py-0.5 font-800 tabular-nums text-ink-soft">
+                      {kbps >= 1000 ? `${(kbps / 1000).toFixed(1)}M` : `${kbps}k`}
+                    </span>
+                  );
+                })()}
               {(() => {
                 // Glass-to-glass estimate: wc path measures it for real (clock-synced
                 // capture→decode); the RTC path approximates rtt/2 + buffer + decode.
@@ -3042,17 +3142,40 @@ export function ControlScreen({
                   </span>
                 );
               })()}
-              {/* Expand every cell to a full label + what it means. Off by default so
-                  the dense grid stays the at-a-glance view it was designed to be. */}
+              {/* Full phone-side diagnostics to the clipboard — the only evidence
+                  channel for bugs that never raise an error toast. */}
               <button
                 type="button"
-                onClick={() => setStatsVerbose((s) => !s)}
-                title={statsVerbose ? "Compact stats" : "Explain each stat"}
+                onClick={() => void copyDiagnostics()}
+                title="Copy diagnostics (device, decoder, stream state)"
                 className={`grid h-4 w-4 shrink-0 place-items-center rounded ${
-                  statsVerbose ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.08] text-ink-dim"
+                  diagCopied ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
                 }`}
               >
-                <Info className="h-2.5 w-2.5" />
+                {diagCopied ? <CheckIcon className="h-2.5 w-2.5" /> : <CopyIcon className="h-2.5 w-2.5" />}
+              </button>
+              {/* Expand every cell to a full label + what it means. Off by default so
+                  the dense grid stays the at-a-glance view it was designed to be. */}
+              {!statsCompact && (
+                <button
+                  type="button"
+                  onClick={() => setStatsVerbose((s) => !s)}
+                  title={statsVerbose ? "Compact stats" : "Explain each stat"}
+                  className={`grid h-4 w-4 shrink-0 place-items-center rounded ${
+                    statsVerbose ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.08] text-ink-dim"
+                  }`}
+                >
+                  <Info className="h-2.5 w-2.5" />
+                </button>
+              )}
+              {/* Collapse to the one-row compact strip / expand back to the grids. */}
+              <button
+                type="button"
+                onClick={toggleStatsCompact}
+                title={statsCompact ? "Expand stats" : "Collapse to compact"}
+                className="grid h-4 w-4 shrink-0 place-items-center rounded bg-white/[0.08] text-ink-dim"
+              >
+                {statsCompact ? <ChevronDown className="h-2.5 w-2.5" /> : <ChevronUp className="h-2.5 w-2.5" />}
               </button>
               {/* Close button — the panel is full-width so a corner tap to dismiss
                   isn't obvious. Explicit X keeps the escape hatch visible. */}
@@ -3066,6 +3189,7 @@ export function ControlScreen({
               </button>
             </span>
           </div>
+          {!statsCompact && <>
           {/* Artifact / recovery summary row — always visible so the user can see
               when the stream had to recover (and that it did). Prominent because
               "is the stream healthy?" is the question the HUD exists to answer. */}
@@ -3650,6 +3774,7 @@ export function ControlScreen({
               </div>
             )}
           </div>
+          </>}
         </div>
         </StatVerboseCtx.Provider>
       )}
@@ -5523,19 +5648,35 @@ function PinnedButton({
           transition={{ duration: 0.4 }}
         />
       )}
-      {showKeys && !(style.labelMode === "label" && labelText) && (
-        <KeyCombo keys={def.keys} active={active} small />
-      )}
-      {showLabel && labelText && style.labelMode !== "keys" && (
-        <span
-          className={`max-w-full truncate px-0.5 font-800 leading-tight ${
-            showKeys && style.labelMode === "keys+label" ? "text-[8px] text-ink-dim" : "text-[10px]"
-          }`}
-          style={{ color: style.theme.fg }}
-        >
-          {labelText}
-        </span>
-      )}
+      {/* Content zooms WITH the box. The box (baseW/baseH) already multiplies by
+          style.scale, but the keycaps/labels inside are fixed-px type — so
+          "scale" used to inflate an empty panel around an unchanged button face.
+          transform-scale the content layer by the same factor; its pre-scale
+          width is 1/scale of the box so truncation still clips at the visual
+          edge. Corner badges (unpin/edit) stay outside — they're chrome, not
+          button face, and must stay tappable at their normal size. */}
+      <span
+        className="pointer-events-none flex min-w-0 flex-col items-center justify-center gap-0.5"
+        style={{
+          width: `${100 / Math.max(0.1, style.scale)}%`,
+          transform: `scale(${style.scale})`,
+          transformOrigin: "center",
+        }}
+      >
+        {showKeys && !(style.labelMode === "label" && labelText) && (
+          <KeyCombo keys={def.keys} active={active} small />
+        )}
+        {showLabel && labelText && style.labelMode !== "keys" && (
+          <span
+            className={`max-w-full truncate px-0.5 font-800 leading-tight ${
+              showKeys && style.labelMode === "keys+label" ? "text-[8px] text-ink-dim" : "text-[10px]"
+            }`}
+            style={{ color: style.theme.fg }}
+          >
+            {labelText}
+          </span>
+        )}
+      </span>
       {pinMode && (
         <>
           <span className="pointer-events-none absolute -right-1.5 -top-1.5 z-[60] grid h-4 w-4 place-items-center rounded-full bg-accent-3 text-white shadow-float">

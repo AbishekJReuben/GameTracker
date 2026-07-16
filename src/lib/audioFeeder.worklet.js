@@ -66,6 +66,20 @@ class GtPcmFeeder extends AudioWorkletProcessor {
         if (this.avail > max) this.drop(this.avail - this.ms(this.targetMs));
         return;
       }
+      if (d && typeof d.gap === "number") {
+        // Conceal a known upstream loss (dropped Opus packets — the DIRECT
+        // channel is lossy by design and WebCodecs' AudioDecoder has no
+        // FEC/PLC hook to rebuild them). Without this, every loss silently
+        // shrank the buffered timeline by the lost duration: the level sagged,
+        // the resampler's ±0.4% steer couldn't catch a 10ms step, and a few
+        // losses later the buffer underran — fade-out/fade-in chop on top of a
+        // waveform click at every seam. That combination is the "robotic"
+        // DIRECT sound. Filling the hole with a decaying hold of the last
+        // buffered sample keeps the level (no underrun cascade) and makes the
+        // leading seam click-free; the trailing seam is a single soft step.
+        this.conceal(d.gap);
+        return;
+      }
       if (d && d.cfg) {
         const ch = Math.max(1, Math.min(2, d.cfg.channels | 0));
         const rate = d.cfg.captureRate > 8000 ? d.cfg.captureRate : sampleRate;
@@ -111,6 +125,30 @@ class GtPcmFeeder extends AudioWorkletProcessor {
   /** ms → interleaved sample count at the context rate. */
   ms(m) {
     return Math.round((sampleRate * m) / 1000) * this.channels;
+  }
+
+  /**
+   * Synthesize `gapMs` of filler (capped at 80ms — beyond that it's a dropout,
+   * and stretching a hold that long sounds worse than re-priming) from a
+   * decaying hold of the last buffered sample. Skipped while priming or empty:
+   * there is nothing to hold, and PRIME already covers the resume.
+   */
+  conceal(gapMs) {
+    if (this.priming || this.avail < this.channels || !(gapMs > 0)) return;
+    const frames = Math.round((this.captureRate * Math.min(gapMs, 80)) / 1000);
+    if (frames <= 0) return;
+    const ch = this.channels;
+    // Last buffered frame = the tail of the newest chunk.
+    const tailChunk = this.chunks[this.chunks.length - 1];
+    const tail = new Float32Array(ch);
+    for (let c = 0; c < ch; c++) tail[c] = tailChunk[tailChunk.length - ch + c] || 0;
+    const fill = new Float32Array(frames * ch);
+    for (let i = 0; i < frames; i++) {
+      const g = 1 - i / frames; // linear fade to silence across the hole
+      for (let c = 0; c < ch; c++) fill[i * ch + c] = tail[c] * g;
+    }
+    this.chunks.push(fill);
+    this.avail += fill.length;
   }
 
   /** Discard n interleaved samples from the front of the buffer. */

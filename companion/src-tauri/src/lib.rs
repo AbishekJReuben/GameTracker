@@ -28,6 +28,7 @@ pub fn run() {
             decoder::decoder_reset,
             decoder::decoder_teardown,
             decoder::decoder_get_stats,
+            decoder::decoder_dump_diag,
         ])
         .run(tauri::generate_context!())
         .expect("error while running GameTracker Remote");

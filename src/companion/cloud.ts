@@ -17,6 +17,7 @@ import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc
 import { AUDIO_HDR_BYTES, audioSeqGap, audioSeqOf, isOpusPacket } from "@/lib/audioWire";
 import audioFeederWorkletUrl from "@/lib/audioFeeder.worklet.js?url";
 import {
+  dumpNativeDecoderDiag,
   feedNativeDecoder,
   getNativeDecoderStats,
   initNativeDecoder,
@@ -349,6 +350,8 @@ export class CloudConn {
    */
   private wcSupported: boolean | null = null;
   private wcActive = false;
+  /** Consecutive handshake-shaped rebuilds; ≥3 falls the Tune back to defaults. */
+  private rebuildStrikes = 0;
   private wcRequestedAt = 0; // vmode "wc" sent; frames must arrive or we revert
   /** Earliest time we may re-attempt DIRECT after a soft failure (0 = now). */
   private wcRetryAt = 0;
@@ -1220,7 +1223,7 @@ export class CloudConn {
         // rides just above the typical gap; the worklet still grows adaptively
         // toward maxMs if a given link is burstier.
         node.port.postMessage({
-          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 20, targetMs: 30, maxMs: 120 },
+          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 20, targetMs: 30, maxMs: 180 },
         });
         this.audioNode = node;
         this.startAudioStatsPoll();
@@ -1386,7 +1389,7 @@ export class CloudConn {
             // The worklet always consumes interleaved f32 at the capture rate —
             // Opus changes what crosses the wire, not what gets played.
             this.audioNode.port.postMessage({
-              cfg: { channels: ch, captureRate: rate, primeMs: 20, targetMs: 30, maxMs: 120 },
+              cfg: { channels: ch, captureRate: rate, primeMs: 20, targetMs: 30, maxMs: 180 },
             });
           }
         }
@@ -1421,7 +1424,21 @@ export class CloudConn {
     // PCM worklet — or PCM to the Opus decoder — during a switch.
     if (isOpusPacket(ab)) {
       const seq = audioSeqOf(ab);
-      this.audioLost += audioSeqGap(this.audioLastSeq, seq);
+      const gap = audioSeqGap(this.audioLastSeq, seq);
+      if (gap > 0) {
+        this.audioLost += gap;
+        // Tell the worklet how much timeline just vanished (10ms per packet —
+        // AUDIO_OPUS_FRAME_US) so it can conceal the hole. WebCodecs has no
+        // FEC/PLC path, so unconcealed losses both click AND drain the jitter
+        // buffer toward an underrun — the robotic chop. Posted before decode:
+        // the decoded PCM of THIS packet reaches the worklet strictly later
+        // (decode is async), so the filler lands in the right order.
+        try {
+          this.audioNode?.port.postMessage({ gap: gap * 10 });
+        } catch {
+          /* node torn down */
+        }
+      }
       this.audioLastSeq = seq;
       const dec = this.audioDec;
       // No decoder yet ⇒ the cfg naming Opus hasn't landed (it repeats every 2s).
@@ -1631,12 +1648,7 @@ export class CloudConn {
           // being a mystery — `detail` carries the FULL diagnostic (which decoder
           // was considered, the Java throwable + stack if the probe threw). The
           // toast shows it scrollable with a copy-to-clipboard button.
-          this.emitEvent({
-            event: "decoder",
-            state: "fallback",
-            reason: "MediaCodec unavailable — using WebCodecs",
-            detail: p.detail || "",
-          });
+          void this.emitDecoderFallback("MediaCodec unavailable — using WebCodecs", p.detail || "");
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("no native or WebCodecs decoder");
           return;
         }
@@ -1648,12 +1660,7 @@ export class CloudConn {
           // Lead with the real init error (Rust now attaches the Java throwable
           // + stack); the probe detail is secondary context.
           const detail = p.detail ? `${initErr}\nprobe: ${p.detail}` : initErr;
-          this.emitEvent({
-            event: "decoder",
-            state: "fallback",
-            reason: "MediaCodec failed to start — using WebCodecs",
-            detail,
-          });
+          void this.emitDecoderFallback("MediaCodec failed to start — using WebCodecs", detail);
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("native init failed");
           return;
         }
@@ -1772,6 +1779,23 @@ export class CloudConn {
    *  spam the "decoder error" message every tick. */
   private wcLastNativeError = "";
 
+  /**
+   * Native-decode fallback toast with the FULL Java-side diagnostics attached:
+   * device identity, decoder inventory, the view hierarchy above the hole
+   * punch, and the bridge's lifecycle journal. The toast's copy-to-clipboard is
+   * the only debugging channel we have into a stranger's phone, so every
+   * fallback pays the (one-off, off-hot-path) cost of the dump.
+   */
+  private async emitDecoderFallback(reason: string, detail: string) {
+    const diag = await dumpNativeDecoderDiag();
+    this.emitEvent({
+      event: "decoder",
+      state: "fallback",
+      reason,
+      detail: diag ? `${detail}\n\n${diag}` : detail,
+    });
+  }
+
   /** Pull decode-ms / frame count from Kotlin (Surface path has no VideoFrame). */
   private async wcPollNativeStats() {
     if (!this.wcNative || !this.wcActive) return;
@@ -1789,12 +1813,9 @@ export class CloudConn {
       else if (now - this.wcNativeStallAt > 3000) {
         this.wcNativeStallAt = 0;
         console.warn("[remote] native decoder produced no frames — falling back to WebCodecs");
-        this.emitEvent({
-          event: "decoder",
-          state: "fallback",
-          reason: "Phone decoder produced no picture — using WebCodecs",
-          detail:
-            `MediaCodec accepted ${this.wcFrames} frame(s) but decoded 0 in 3s.` +
+        void this.emitDecoderFallback(
+          "Phone decoder produced no picture — using WebCodecs",
+          `MediaCodec accepted ${this.wcFrames} frame(s) but decoded 0 in 3s.` +
             (st.error ? `\ncodec error: ${st.error}` : "") +
             `\ncodec active=${st.active} surfaceReady=${st.surfaceReady ?? "?"} ` +
             `size=${st.width}x${st.height} queue=${st.queue}` +
@@ -1804,7 +1825,7 @@ export class CloudConn {
             (!st.active && !st.error && st.surfaceReady === false
               ? `\ncause: the SurfaceView never produced a Surface, so the codec was never configured.`
               : ""),
-        });
+        );
         this.wcBuildWebCodecsDecoder();
         this.wcRequestKeyframe();
         return;
@@ -2220,20 +2241,26 @@ export class CloudConn {
     this.clearReconnect();
     this.noteEvent(`rebuild: ${reason}`);
     console.warn("[remote] forcing session rebuild:", reason);
-    // Cold-start / auth / negotiation wedges: wipe experimental Tune values that
-    // may have broken the handshake (extreme JB / bitrate / etc.) so the retry
-    // lands on known-good defaults.
+    // Cold-start / auth / negotiation wedges: extreme experimental Tune values
+    // (JB / bitrate / etc.) CAN break the handshake — but a single stall is far
+    // more often just the network hiccuping, and this used to nuke the user's
+    // saved quality/audio settings on every flaky-Wi-Fi rebuild ("the app never
+    // remembers my tuning"). Only fall back to defaults after several
+    // consecutive failed rebuilds; a successful auth clears the strike counter.
     if (
       reason.includes("stalled") ||
       reason.includes("unanswered") ||
       reason.includes("no transport") ||
       reason.includes("authorization")
     ) {
-      try {
-        this.resetStreamDefaults();
-        this.noteEvent("tune reset → defaults");
-      } catch {
-        /* ignore */
+      this.rebuildStrikes++;
+      if (this.rebuildStrikes >= 3) {
+        try {
+          this.resetStreamDefaults();
+          this.noteEvent("tune reset → defaults (3 failed rebuilds)");
+        } catch {
+          /* ignore */
+        }
       }
     }
     this.setProgress("reconnecting", "Connection stalled — rebuilding…");
@@ -2458,6 +2485,7 @@ export class CloudConn {
         if (state === "ok") {
           this.authState = "ok";
           this.authStallSince = 0;
+          this.rebuildStrikes = 0; // healthy handshake — the tune wasn't the problem
           this.noteEvent("auth ok");
           this.authed = true;
           this.emit("connected");

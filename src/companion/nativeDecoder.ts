@@ -135,6 +135,22 @@ export async function getNativeDecoderStats(): Promise<DecoderStats | null> {
   }
 }
 
+/**
+ * Full native-side diagnostics blob: device identity, H.264 decoder inventory
+ * with capabilities, live codec/surface state, the view hierarchy above the
+ * SurfaceView's hole punch, and the bridge's lifecycle journal. Everything a
+ * black-screen bug report needs in one paste. Empty string off-Android or on
+ * failure (never throws — this runs inside error paths).
+ */
+export async function dumpNativeDecoderDiag(): Promise<string> {
+  if (!nativeDecoderPossible()) return "";
+  try {
+    return await invoke<string>("decoder_dump_diag");
+  } catch (e) {
+    return `decoder_dump_diag failed: ${String(e).slice(0, 500)}`;
+  }
+}
+
 /** True when the JavascriptInterface is installed (MainActivity attached). */
 export function nativeFeedReady(): boolean {
   return typeof window.__GT_DECODER__?.feed === "function";
