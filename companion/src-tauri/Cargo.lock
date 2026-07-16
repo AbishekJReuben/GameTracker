@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "gametracker-companion"
-version = "3.9.40"
+version = "3.9.41"
 dependencies = [
  "jni",
  "serde",
