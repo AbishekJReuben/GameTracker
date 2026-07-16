@@ -78,7 +78,7 @@ import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { tabAllowed } from "@/lib/setupMode";
 import { isTauri } from "@/lib/tauri";
-import { setNativeDecoderBounds } from "../nativeDecoder";
+import { setNativeDecoderBounds, setStreamPowerActive } from "../nativeDecoder";
 import {
   hitchFormat,
   hitchNote,
@@ -576,6 +576,29 @@ export function ControlScreen({
   const [wcNative, setWcNative] = useState(false);
   const wcNativeRef = useRef(false);
   wcNativeRef.current = wcNative;
+  // Video-box rect (viewport-relative CSS px) while native MediaCodec paints.
+  // Drives the opaque letterbox backdrop that bounds the hole-punch
+  // transparency to exactly the video box — everything else keeps an opaque
+  // backing so semi-opaque chrome can't hit the Android-16 WebView
+  // redraw-accumulation "smudge". Null = punch closed.
+  const [punch, setPunch] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const punchRef = useRef<typeof punch>(null);
+  const setPunchIfChanged = (r: typeof punch) => {
+    const prev = punchRef.current;
+    if (
+      prev === r ||
+      (prev !== null &&
+        r !== null &&
+        Math.abs(prev.x - r.x) < 0.5 &&
+        Math.abs(prev.y - r.y) < 0.5 &&
+        Math.abs(prev.w - r.w) < 0.5 &&
+        Math.abs(prev.h - r.h) < 0.5)
+    ) {
+      return;
+    }
+    punchRef.current = r;
+    setPunch(r);
+  };
   /** Transient decoder status (fallback / error) shown above the viewport.
    *  `detail` carries the full diagnostic (Java throwable + stack from the
    *  native bridge) — rendered scrollable with a copy-to-clipboard button so a
@@ -1338,20 +1361,78 @@ export function ControlScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);
 
+  // Wi-Fi low-latency lock + keep-screen-on for exactly as long as the remote
+  // screen is open. Android Wi-Fi power save parks the radio between beacons
+  // when traffic looks idle; inbound video then arrives in bursts — the
+  // periodic 100–700 ms frame gaps (with healthy RTT in between) the hitch log
+  // kept recording on the moto g57. No-op outside the Tauri companion shell.
+  useEffect(() => {
+    void setStreamPowerActive(true);
+    return () => {
+      void setStreamPowerActive(false);
+    };
+  }, []);
+
   // Keep MediaCodec SurfaceView locked to the letterboxed video box (zoom/pan/resize).
-  // Video paints via SurfaceView setZOrderMediaOverlay(true) ABOVE the WebView —
-  // so we deliberately do NOT make the WebView transparent (that caused the
-  // Live/fps "smudge" where semi-opaque chrome accumulated every frame).
+  //
+  // The SurfaceView renders BEHIND the WebView (setZOrderMediaOverlay never
+  // lifts a surface above the window — 3.9.47 shipped exactly that assumption
+  // and the picture sat invisible behind an opaque WebView while the codec
+  // decoded merrily). So the video shows through a hole punch: EVERY layer
+  // between this screen and the Android window must be transparent where the
+  // video is. The native side clears window/decor/wrappers/WebView; here we
+  // clear the DOM ancestor chain (companion.html styles `#root { background:
+  // #06070d }` inline — one opaque layer anywhere blacks the picture with no
+  // error whatsoever). Walk the real DOM chain instead of naming wrappers, so
+  // the next wrapper div someone adds can't regress this.
+  //
+  // The transparency is BOUNDED to the video box: the `punch` rect drives
+  // opaque letterbox bars around it. That containment is the fix for the old
+  // "Live / fps smudge" — with the whole window transparent, Android 16's
+  // WebView accumulated semi-opaque chrome across redraws because nothing
+  // opaque ever backed it.
   useEffect(() => {
     if (!wcNative) {
+      setPunchIfChanged(null);
       void setNativeDecoderBounds({ x: 0, y: 0, w: 0, h: 0, visible: false });
       return;
+    }
+    // Also clear backgroundColor / backgroundImage separately — some OEM
+    // WebViews honour those over the shorthand `background`, and restoring
+    // only `background` left a solid #06070d paint over the punch.
+    type Cleared = { el: HTMLElement; bg: string; bgc: string; bgi: string };
+    const cleared: Cleared[] = [];
+    const clearBg = (el: HTMLElement) => {
+      if (cleared.some((c) => c.el === el)) return;
+      cleared.push({
+        el,
+        bg: el.style.background,
+        bgc: el.style.backgroundColor,
+        bgi: el.style.backgroundImage,
+      });
+      el.style.background = "transparent";
+      el.style.backgroundColor = "transparent";
+      el.style.backgroundImage = "none";
+    };
+    let el: HTMLElement | null = viewportRef.current;
+    while (el) {
+      clearBg(el);
+      el = el.parentElement;
+    }
+    // Belt-and-braces: companion.html sets these on html/body/#root.
+    for (const sel of [document.documentElement, document.body, document.getElementById("root")]) {
+      if (sel instanceof HTMLElement) clearBg(sel);
     }
     syncNativeSurface();
     const onResize = () => syncNativeSurface();
     window.addEventListener("resize", onResize);
     window.visualViewport?.addEventListener("resize", onResize);
     return () => {
+      for (const { el: e, bg, bgc, bgi } of cleared) {
+        e.style.background = bg;
+        e.style.backgroundColor = bgc;
+        e.style.backgroundImage = bgi;
+      }
       window.removeEventListener("resize", onResize);
       window.visualViewport?.removeEventListener("resize", onResize);
     };
@@ -1883,6 +1964,7 @@ export function ControlScreen({
   /** Keep the MediaCodec SurfaceView aligned with the letterboxed video box. */
   const syncNativeSurface = () => {
     if (!wcNativeRef.current) {
+      setPunchIfChanged(null);
       void setNativeDecoderBounds({ x: 0, y: 0, w: 0, h: 0, visible: false });
       return;
     }
@@ -1898,6 +1980,7 @@ export function ControlScreen({
     // → no frames → no `nat`. The aspect corrects itself on the next sync, once
     // the codec reports a size (capstats seeds `nat` and re-syncs).
     if (!nat.w || !nat.h) {
+      setPunchIfChanged({ x: 0, y: 0, w: vr.width, h: vr.height });
       void setNativeDecoderBounds({ x: vr.left, y: vr.top, w: vr.width, h: vr.height, visible: true });
       return;
     }
@@ -1909,6 +1992,7 @@ export function ControlScreen({
     const h = l.dispH * z;
     const x = vr.left + l.offX + (l.dispW - w) / 2 + p.x;
     const y = vr.top + l.offY + (l.dispH - h) / 2 + p.y;
+    setPunchIfChanged({ x: x - vr.left, y: y - vr.top, w, h });
     void setNativeDecoderBounds({ x, y, w, h, visible: true });
   };
 
@@ -2890,7 +2974,13 @@ export function ControlScreen({
       {/* ==== viewport — video only; chrome above/below shrinks this, never overlays it ==== */}
       <div className="relative min-h-0 flex-1">
       {decoderMsg && (
-        <div className="absolute left-2 right-2 top-2 z-[45] rounded-lg border border-amber/40 bg-black/85 px-3 py-2 text-[11px] text-amber shadow-float backdrop-blur">
+        <div
+          className={`absolute left-2 right-2 top-2 z-[45] rounded-lg border border-amber/40 px-3 py-2 text-[11px] text-amber shadow-float ${
+            // Solid over the hole punch — semi-opaque surfaces over the
+            // transparent video box are the WebView smudge-accumulation risk.
+            wcNative ? "bg-black" : "bg-black/85 backdrop-blur"
+          }`}
+        >
           <div className="flex items-start gap-2">
             <span className="min-w-0 flex-1 font-700">{decoderMsg.text}</span>
             <button
@@ -2974,6 +3064,25 @@ export function ControlScreen({
         onPointerCancel={onPointerUp}
         onContextMenu={(e) => e.preventDefault()}
       >
+        {/* Opaque letterbox backdrop while native MediaCodec paints. The hole
+            punch makes the WHOLE compositing chain transparent; these bars put
+            opaque pixels back everywhere EXCEPT the video box, so chrome
+            outside it never sits on an unbacked transparent region (the old
+            "Live / fps smudge"). Bars, not clip-path: evenodd polygon support
+            is spotty across OEM WebViews. First children → everything else in
+            the viewport (cursor, toasts, placeholders) still draws above. */}
+        {wcNative &&
+          punch &&
+          (
+            [
+              { left: 0, right: 0, top: 0, height: Math.max(0, punch.y) },
+              { left: 0, right: 0, top: punch.y + punch.h, bottom: 0 },
+              { left: 0, top: punch.y, width: Math.max(0, punch.x), height: punch.h },
+              { left: punch.x + punch.w, right: 0, top: punch.y, height: punch.h },
+            ] as const
+          ).map((s, i) => (
+            <div key={i} aria-hidden className="pointer-events-none absolute bg-black" style={s} />
+          ))}
         <video
           ref={videoRef}
           autoPlay
@@ -3123,7 +3232,7 @@ export function ControlScreen({
               <motion.button
                 whileTap={{ scale: 0.92 }}
                 onClick={() => setImmersive(false)}
-                className="flex items-center gap-1.5 rounded-full bg-black/45 px-3 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
+                className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-700 text-white/90 ${wcNative ? "bg-[#0b0d14]" : "bg-black/45 backdrop-blur"}`}
                 title="Show controls"
               >
                 <Minimize2 className="h-4 w-4" /> Controls
@@ -3132,7 +3241,7 @@ export function ControlScreen({
               <motion.button
                 whileTap={{ scale: 0.92 }}
                 onClick={() => setTopCollapsed(false)}
-                className="flex items-center gap-1.5 rounded-full bg-black/45 px-3 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
+                className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-700 text-white/90 ${wcNative ? "bg-[#0b0d14]" : "bg-black/45 backdrop-blur"}`}
                 title="Show toolbar"
               >
                 <ChevronDown className="h-4 w-4" /> Toolbar
@@ -3147,9 +3256,10 @@ export function ControlScreen({
       {showStats && !immersive && !topCollapsed && !pipView && (
         <StatVerboseCtx.Provider value={statsVerbose}>
         <div
-          className={`absolute left-2 right-2 z-30 mx-auto max-w-[110rem] rounded-xl border border-white/[0.1] bg-black/75 p-2 text-[9px] leading-snug text-ink-soft shadow-float backdrop-blur-md ${
-            statsCompact ? "" : "max-h-[40vh] overflow-y-auto"
-          }`}
+          className={`absolute left-2 right-2 z-30 mx-auto max-w-[110rem] rounded-xl border border-white/[0.1] p-2 text-[9px] leading-snug text-ink-soft shadow-float ${
+            // Solid over the hole punch (see the letterbox backdrop note).
+            wcNative ? "bg-black" : "bg-black/75 backdrop-blur-md"
+          } ${statsCompact ? "" : "max-h-[40vh] overflow-y-auto"}`}
           style={{
             // Just under the top toolbar (py-1.5 + h-7 row + border ≈ 2.8rem,
             // plus whatever the notch adds). Anchored top so the HUD stops
@@ -3981,7 +4091,7 @@ export function ControlScreen({
               if (immersive) setImmersive(false);
               else setDockCollapsed(false);
             }}
-            className="ml-auto flex items-center gap-1.5 rounded-full bg-black/45 px-3 py-1.5 text-xs font-700 text-white/90 backdrop-blur"
+            className={`ml-auto flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-700 text-white/90 ${wcNative ? "bg-[#0b0d14]" : "bg-black/45 backdrop-blur"}`}
             title="Show controls"
           >
             <ChevronUp className="h-4 w-4" /> Controls
@@ -4086,7 +4196,12 @@ export function ControlScreen({
           initial={{ y: 32, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
           transition={{ type: "spring", stiffness: 380, damping: 32 }}
-          className="shrink-0 border-t border-white/10 bg-base/95 backdrop-blur"
+          className={`shrink-0 border-t border-white/10 ${
+            // Solid while the hole punch is open: the screen root behind the
+            // dock is transparent then, and a 95%-alpha surface over an
+            // unbacked region is exactly the WebView smudge-accumulation bug.
+            wcNative ? "bg-base" : "bg-base/95 backdrop-blur"
+          }`}
           style={{
             paddingBottom: "env(safe-area-inset-bottom)",
             // Curved-edge phones bend the leftmost/rightmost controls (Mouse tab,
@@ -4926,7 +5041,7 @@ function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps
       return "Display behind decode — phone UI thread busy.";
     }
     return wc.native
-      ? `MediaCodec Surface overlay (opaque WebView): ~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms.`
+      ? `MediaCodec Surface (hole punch): ~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms.`
       : `Direct path: no jitter buffer (~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms).`;
   }
   if (!host && !net) return "Gathering stats…";

@@ -75,6 +75,23 @@ const save = (path, before, after, msg) => {
     }
   }
 
+  // Wi-Fi low-latency lock while a remote session streams (WcDecoderBridge
+  // .setStreamActive): WifiLock.acquire needs WAKE_LOCK; creating the lock off
+  // WifiManager wants ACCESS_WIFI_STATE. Both are normal-level (no prompt).
+  for (const p of ["android.permission.WAKE_LOCK", "android.permission.ACCESS_WIFI_STATE"]) {
+    if (!m.includes(p)) {
+      const perm = `    <uses-permission android:name="${p}" />${eol}`;
+      if (/android\.permission\.INTERNET/.test(m)) {
+        m = m.replace(
+          /([ \t]*<uses-permission android:name="android\.permission\.INTERNET"[ \t]*\/>[ \t]*\r?\n)/,
+          `$1${perm}`,
+        );
+      } else {
+        m = m.replace(/(<manifest\b[^>]*>[ \t]*\r?\n)/, `$1${perm}`);
+      }
+    }
+  }
+
   // FileProvider (needed to share the downloaded APK with the installer).
   if (!m.includes("androidx.core.content.FileProvider")) {
     const provider =

@@ -24,6 +24,7 @@ import {
   nativeDecoderPossible,
   nativeFeedReady,
   probeNativeDecoder,
+  setStreamPowerActive,
   teardownNativeDecoder,
 } from "./nativeDecoder";
 import { hitchMaybeE2eJump, hitchMaybeFrameGap, hitchNote } from "./hitchLog";
@@ -2782,6 +2783,9 @@ export class CloudConn {
   }
   close() {
     this.closed = true;
+    // Belt-and-braces: Control.tsx owns the Wi-Fi low-latency lock's lifetime
+    // (mount/unmount), but a session close must never strand a held lock.
+    void setStreamPowerActive(false);
     document.removeEventListener("visibilitychange", this.onVisibility);
     this.unsubImmersive?.();
     this.unsubImmersive = null;

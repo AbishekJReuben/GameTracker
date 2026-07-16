@@ -56,9 +56,19 @@ import java.util.concurrent.atomic.AtomicReference;
  * Hot path: {@link JsApi#feed} via JavascriptInterface (base64 Annex-B).
  * Lifecycle: static methods called from Rust over JNI.
  *
- * Compositing: {@link SurfaceView#setZOrderMediaOverlay(true)} puts the decoded
- * picture ABOVE an opaque WebView (no hole-punch). Transparent WebView +
- * semi-opaque chrome caused additive "smudge" redraws on Android 16 WebView.
+ * Compositing: hole-punch. The SurfaceView's surface sits BEHIND the app
+ * window ({@code setZOrderMediaOverlay} only orders it against other surface
+ * views — it does NOT lift it above the window; only {@code setZOrderOnTop}
+ * does, and that would blind every DOM overlay drawn over the picture). So the
+ * window must be transparent wherever the video shows: window/decor/content/
+ * wry-wrapper/WebView backgrounds are all cleared, and the PAGE keeps itself
+ * opaque everywhere except the letterboxed video box (Control.tsx paints
+ * opaque letterbox bars around it). Bounding the transparency to the video box
+ * is what fixes the 3.9.46 "Live / fps smudge": with the WHOLE window
+ * transparent, semi-opaque chrome had no opaque backing anywhere and Android
+ * 16's WebView accumulated it across redraws. (3.9.47's "opaque WebView +
+ * media-overlay Surface" attempt was a black screen by construction — the
+ * decoder ran flawlessly into a Surface hidden behind an opaque window.)
  */
 public final class WcDecoderBridge {
   private static final String TAG = "GtWcDecoder";
@@ -507,7 +517,7 @@ public final class WcDecoderBridge {
     // Coalesce duplicate inits (JS often fires twice in the same frame). A second
     // init used to flip awaitKey/csdQueued back to "need keyframe" WHILE the codec
     // was already running — every in-flight AU was then dropped or mis-fed, and
-    // the media-overlay Surface stayed black on top of the opaque WebView.
+    // the punched Surface stayed black with no error anywhere.
     if (wanted.get() && started.get() && width.get() == w && height.get() == h) {
       jlog("init " + w + "x" + h + " — already running, skip");
       return;
@@ -529,8 +539,8 @@ public final class WcDecoderBridge {
           ensureSurfaceView(act);
           // attach() ran before Tauri created the WebView, so the SurfaceView
           // was seated at content[0] — potentially below wry wrapper views.
-          // With media-overlay the Surface sits above the WebView pixels; we
-          // still seat it as the WebView's lower sibling for hit-testing layout.
+          // Seat it as the WebView's immediate lower sibling: only views drawn
+          // AFTER it can cover the punch, and ideally that's the WebView alone.
           if (!surfaceReady.get()) reseatBelowWebView(act);
           hookWebView(act);
           makeCompositingTransparent(act);
@@ -606,6 +616,70 @@ public final class WcDecoderBridge {
     Activity act = activity();
     if (act != null && width.get() > 0 && height.get() > 0 && surfaceReady.get()) {
       act.runOnUiThread(WcDecoderBridge::startCodecLocked);
+    }
+  }
+
+  /** Held while a remote session is live — see {@link #setStreamActive}. */
+  private static android.net.wifi.WifiManager.WifiLock wifiLock;
+
+  /**
+   * Hold/release the Wi-Fi low-latency lock (and keep the screen on) while a
+   * remote-control session is live. Android Wi-Fi power save parks the radio
+   * between DTIM beacons whenever traffic looks idle; inbound video then
+   * arrives in bursts — the exact periodic 100–700 ms frame gaps (healthy RTT
+   * in between) the hitch log records on budget phones (moto g57 / SM6435).
+   * WIFI_MODE_FULL_LOW_LATENCY (API 29+) disables power save while the app is
+   * foreground+screen-on; WIFI_MODE_FULL_HIGH_PERF is the pre-29 fallback.
+   * Same lever Moonlight pulls for game streaming.
+   *
+   * Called over JNI from decoder.rs ({@code stream_active}), driven by
+   * cloud.ts on session connect/disconnect — for BOTH the native MediaCodec
+   * and WebCodecs paths (the radio doesn't care who decodes). Idempotent;
+   * never throws (a failed lock must not take the session down with it).
+   */
+  public static void setStreamActive(boolean active) {
+    Activity act = activity();
+    try {
+      if (active) {
+        if (wifiLock == null && act != null) {
+          android.net.wifi.WifiManager wm =
+              (android.net.wifi.WifiManager)
+                  act.getApplicationContext()
+                      .getSystemService(android.content.Context.WIFI_SERVICE);
+          if (wm != null) {
+            int mode =
+                Build.VERSION.SDK_INT >= 29
+                    ? android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                    : android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+            wifiLock = wm.createWifiLock(mode, "GameTracker:remote");
+            wifiLock.setReferenceCounted(false);
+          }
+        }
+        if (wifiLock != null && !wifiLock.isHeld()) {
+          wifiLock.acquire();
+          jlog("wifi low-latency lock acquired");
+        }
+      } else if (wifiLock != null && wifiLock.isHeld()) {
+        wifiLock.release();
+        jlog("wifi lock released");
+      }
+    } catch (Throwable t) {
+      jlog("wifi lock " + (active ? "acquire" : "release") + " failed: " + t);
+    }
+    if (act != null) {
+      act.runOnUiThread(
+          () -> {
+            try {
+              if (active) {
+                act.getWindow()
+                    .addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+              } else {
+                act.getWindow()
+                    .clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+              }
+            } catch (Throwable ignored) {
+            }
+          });
     }
   }
 
@@ -731,7 +805,7 @@ public final class WcDecoderBridge {
       sb.append("\n=== h264 decoders ===\n");
       appendDecoderInventory(sb);
 
-      sb.append("\n=== view stack (bottom→top; Surface is mediaOverlay — WebView stays opaque) ===\n");
+      sb.append("\n=== view stack (bottom→top; punch survives only if everything ABOVE the SurfaceView is transparent) ===\n");
       appendViewState(sb);
 
       sb.append("\n=== journal ===\n");
@@ -890,7 +964,7 @@ public final class WcDecoderBridge {
     // slice. Most Android HW decoders REQUIRE this (Moonlight/ALVR/Chiaki).
     // CRITICAL: after queuing CSD, strip SPS/PPS from the AU before queueInput —
     // feeding parameter sets twice (CSD + inline) makes c2.qti stall with
-    // frames=0 / no error, which is exactly the black media-overlay Surface.
+    // frames=0 / no error, which is exactly the black punched Surface.
     boolean needsCsd = key && !csdQueued.get();
     byte[] slice = data;
     if (needsCsd) {
@@ -1215,14 +1289,10 @@ public final class WcDecoderBridge {
       index = 0;
     }
     SurfaceView sv = new SurfaceView(act);
-    // Media overlay: the Surface sits ABOVE the WebView's pixels in this rect.
-    // That lets the WebView stay fully opaque (no hole-punch), which is the only
-    // reliable way to stop Android WebView from accumulating semi-transparent
-    // chrome (Live/fps pills) into a bright smudge. Hole-punch + transparent
-    // WebView was the "UI not clearing" bug on moto g57 / Android 16.
-    // Chrome outside this Surface's bounds (top bar, dock) draws normally;
-    // overlays drawn IN the video rect sit under the Surface (touch still hits
-    // the WebView — pointer events don't need to paint over the picture).
+    // Hole-punch: the surface stays BEHIND the window (media-overlay only
+    // orders it above other SurfaceViews, e.g. an exoplayer leftover — it is
+    // NOT above the window). Video shows through because the whole compositing
+    // chain above it is transparent in the video box; see the class javadoc.
     sv.setZOrderMediaOverlay(true);
     FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
     lp.gravity = Gravity.TOP | Gravity.START;
@@ -1283,55 +1353,83 @@ public final class WcDecoderBridge {
   }
 
   /**
-   * Keep the WebView OPAQUE. Video is shown by a SurfaceView with
-   * {@link SurfaceView#setZOrderMediaOverlay(true)} above the WebView in the
-   * letterboxed video rect — so we must NOT punch a transparent hole through
-   * the WebView. Transparent WebView + semi-opaque chrome was the "Live / fps
-   * smudge" bug: Chromium stops clearing the framebuffer and every redraw
-   * composites on top of the last, getting brighter each frame.
+   * Make every layer that composites ABOVE the SurfaceView's punched hole
+   * transparent: window background, DecorView, android.R.id.content, every
+   * wry/Tauri wrapper between the WebView and the window, and the WebView
+   * itself. One opaque layer anywhere in that chain paints straight over the
+   * hole — the codec decodes happily (stats climb, no error, the JS watchdog
+   * stays quiet because frames ARE being produced) while the user stares at
+   * black. The PAGE is responsible for staying opaque outside the video box
+   * (Control.tsx paints letterbox bars) so the transparent region — and with it
+   * the Android-16 WebView redraw-accumulation "smudge" — is bounded to the
+   * video rect.
    *
-   * Still force LAYER_TYPE_NONE (a hardware layer can reintroduce odd alpha
-   * paths) and re-apply on a delay in case wry/Tauri repaints wrappers.
+   * Deliberately does NOT force a hardware LAYER on the WebView.
+   * setLayerType(LAYER_TYPE_HARDWARE) flattens the WebView into an offscreen
+   * texture, and transparent-WebView-in-a-layer is a documented bug farm
+   * (issuetracker 36925660 heritage): several Chromium builds composite the
+   * layer as opaque. LAYER_TYPE_NONE is still hardware-accelerated rendering —
+   * it is the layer, not the acceleration, that breaks alpha.
+   *
+   * Re-applied on a delay: some pages/OEM WebView builds repaint an opaque
+   * background after load or after a renderer restart.
    */
   private static void makeCompositingTransparent(Activity act) {
-    applyOpaqueWebView(act);
+    applyCompositingTransparency(act);
     ViewGroup content = act.findViewById(android.R.id.content);
     if (content != null) {
-      content.postDelayed(() -> applyOpaqueWebView(act), 500);
-      content.postDelayed(() -> applyOpaqueWebView(act), 2000);
+      content.postDelayed(() -> applyCompositingTransparency(act), 500);
+      content.postDelayed(() -> applyCompositingTransparency(act), 2000);
     }
   }
 
-  private static void applyOpaqueWebView(Activity act) {
+  private static void applyCompositingTransparency(Activity act) {
     try {
-      // Solid window — Surface media-overlay paints on top of the video rect.
       act.getWindow().setBackgroundDrawable(
-          new android.graphics.drawable.ColorDrawable(0xFF06070D));
+          new android.graphics.drawable.ColorDrawable(0x00000000));
+      // Some OEM themes paint the DecorView after setBackgroundDrawable — force
+      // the root view transparent too so the SurfaceView hole punch survives.
       View decor = act.getWindow().getDecorView();
-      if (decor != null) decor.setBackgroundColor(0xFF06070D);
+      if (decor != null) {
+        decor.setBackgroundColor(0x00000000);
+      }
     } catch (Exception e) {
-      jlog("window bg set failed: " + e);
+      jlog("window bg clear failed: " + e);
     }
     ViewGroup content = act.findViewById(android.R.id.content);
     if (content != null) {
-      content.setBackgroundColor(0xFF06070D);
+      content.setBackgroundColor(0x00000000);
     }
     WebView web = content == null ? null : findWebView(content);
     if (web == null) {
       jlog("compositing: no WebView found");
       return;
     }
-    // Opaque WebView = chrome clears every frame. Video is the Surface overlay.
-    web.setBackgroundColor(0xFF06070D);
+    web.setBackgroundColor(0x00000000);
+    // Also clear any ColorDrawable left by Tauri/wry on the WebView itself —
+    // setBackgroundColor alone doesn't always replace a prior setBackground.
     try {
       web.setBackground(null);
-      web.setBackgroundColor(0xFF06070D);
+      web.setBackgroundColor(0x00000000);
     } catch (Exception e) {
       /* older WebView */
     }
     if (web.getLayerType() != View.LAYER_TYPE_NONE) {
       web.setLayerType(View.LAYER_TYPE_NONE, null);
       jlog("webview layer -> NONE");
+    }
+    // Every wrapper between the WebView and the window: their backgrounds all
+    // draw after the punch and each one can independently blacken it.
+    View walk = web;
+    while (walk.getParent() instanceof View) {
+      walk = (View) walk.getParent();
+      android.graphics.drawable.Drawable bg = walk.getBackground();
+      if (bg != null) {
+        jlog("cleared opaque bg on " + walk.getClass().getSimpleName() + " (" + describeDrawable(bg) + ")");
+      }
+      // Always force transparent — a null background can still inherit an opaque
+      // theme colour on some devices; transparent is the safe punch.
+      walk.setBackgroundColor(0x00000000);
     }
   }
 

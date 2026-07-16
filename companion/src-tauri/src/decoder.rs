@@ -83,6 +83,18 @@ pub async fn decoder_teardown() -> Result<(), String> {
         .map_err(|e| format!("decoder_teardown panicked: {e}"))?
 }
 
+/// Hold/release the Wi-Fi low-latency lock (+ keep-screen-on) for the duration
+/// of a remote session. Android Wi-Fi power save batches inbound packets when
+/// the radio thinks the app is idle — the periodic 100–700 ms frame gaps in the
+/// hitch log. Independent of the decoder: the WebCodecs path needs it just as
+/// much, so cloud.ts drives this on session connect/disconnect.
+#[tauri::command]
+pub async fn stream_active(active: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || stream_active_impl(active))
+        .await
+        .map_err(|e| format!("stream_active panicked: {e}"))?
+}
+
 #[tauri::command]
 pub async fn decoder_get_stats() -> Result<DecoderStats, String> {
     tauri::async_runtime::spawn_blocking(decoder_get_stats_impl)
@@ -289,6 +301,19 @@ mod android {
         })
     }
 
+    pub fn stream_active(active: bool) -> Result<(), String> {
+        with_bridge(|env, class| {
+            env.call_static_method(
+                &class,
+                "setStreamActive",
+                "(Z)V",
+                &[JValue::Bool(u8::from(active))],
+            )
+            .map_err(|e| format!("setStreamActive: {e}"))?;
+            Ok(())
+        })
+    }
+
     pub fn dump_diag() -> Result<String, String> {
         with_bridge(|env, class| {
             let obj = env
@@ -399,6 +424,10 @@ fn decoder_teardown_impl() -> Result<(), String> {
     android::teardown()
 }
 #[cfg(target_os = "android")]
+fn stream_active_impl(active: bool) -> Result<(), String> {
+    android::stream_active(active)
+}
+#[cfg(target_os = "android")]
 fn decoder_get_stats_impl() -> Result<DecoderStats, String> {
     android::stats()
 }
@@ -436,6 +465,10 @@ fn decoder_reset_impl() -> Result<(), String> {
 }
 #[cfg(not(target_os = "android"))]
 fn decoder_teardown_impl() -> Result<(), String> {
+    Ok(())
+}
+#[cfg(not(target_os = "android"))]
+fn stream_active_impl(_active: bool) -> Result<(), String> {
     Ok(())
 }
 #[cfg(not(target_os = "android"))]

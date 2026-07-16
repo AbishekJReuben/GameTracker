@@ -155,6 +155,23 @@ export async function dumpNativeDecoderDiag(): Promise<string> {
   }
 }
 
+/**
+ * Hold/release the Android Wi-Fi low-latency lock (+ keep-screen-on) for the
+ * duration of a remote session. Wi-Fi power save batches inbound packets when
+ * the radio thinks the app is idle — that's the periodic 100–700 ms frame-gap
+ * pattern in the hitch log on budget phones. Applies to BOTH decode paths
+ * (the radio doesn't care who decodes); no-op outside the Tauri companion.
+ * Best-effort: a failed lock must never take the session down.
+ */
+export async function setStreamPowerActive(active: boolean): Promise<void> {
+  if (!nativeDecoderPossible()) return;
+  try {
+    await invoke("stream_active", { active });
+  } catch {
+    /* best effort */
+  }
+}
+
 /** True when the JavascriptInterface is installed (MainActivity attached). */
 export function nativeFeedReady(): boolean {
   return typeof window.__GT_DECODER__?.feed === "function";
