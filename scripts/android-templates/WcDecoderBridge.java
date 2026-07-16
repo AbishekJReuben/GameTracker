@@ -12,10 +12,10 @@ import android.os.HandlerThread;
 import android.os.SystemClock;
 import android.util.Base64;
 import android.util.Log;
+import android.graphics.SurfaceTexture;
 import android.view.Gravity;
 import android.view.Surface;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.JavascriptInterface;
@@ -56,19 +56,15 @@ import java.util.concurrent.atomic.AtomicReference;
  * Hot path: {@link JsApi#feed} via JavascriptInterface (base64 Annex-B).
  * Lifecycle: static methods called from Rust over JNI.
  *
- * Compositing: hole-punch. The SurfaceView's surface sits BEHIND the app
- * window ({@code setZOrderMediaOverlay} only orders it against other surface
- * views — it does NOT lift it above the window; only {@code setZOrderOnTop}
- * does, and that would blind every DOM overlay drawn over the picture). So the
- * window must be transparent wherever the video shows: window/decor/content/
- * wry-wrapper/WebView backgrounds are all cleared, and the PAGE keeps itself
- * opaque everywhere except the letterboxed video box (Control.tsx paints
- * opaque letterbox bars around it). Bounding the transparency to the video box
- * is what fixes the 3.9.46 "Live / fps smudge": with the WHOLE window
- * transparent, semi-opaque chrome had no opaque backing anywhere and Android
- * 16's WebView accumulated it across redraws. (3.9.47's "opaque WebView +
- * media-overlay Surface" attempt was a black screen by construction — the
- * decoder ran flawlessly into a Surface hidden behind an opaque window.)
+ * Compositing: {@link TextureView} under a transparent WebView (NOT
+ * SurfaceView hole-punch). SurfaceView punches through the window via
+ * SurfaceFlinger; on Android 16 WebView that path fails to clear semi-opaque
+ * DOM between frames ("UI burn-in" — stats text stacking, pins going opaque,
+ * mouse-cursor trails). TextureView composites in the normal View hierarchy, so
+ * the WebView clears and blends correctly while still showing video through
+ * transparent pixels. Window/decor/content/wry/WebView backgrounds are cleared;
+ * Control.tsx keeps opaque letterbox bars around the video box so chrome never
+ * sits on an unbacked transparent region.
  */
 public final class WcDecoderBridge {
   private static final String TAG = "GtWcDecoder";
@@ -86,8 +82,14 @@ public final class WcDecoderBridge {
   };
 
   private static WeakReference<Activity> actRef;
-  private static SurfaceView surfaceView;
+  /** Video sink under the WebView. Named historically; type is TextureView. */
+  private static TextureView surfaceView;
+  private static SurfaceTexture surfaceTexture;
   private static Surface surface;
+  /** Serialises init runnables so concurrent decoder_init calls can't triple-start. */
+  private static final AtomicInteger initGen = new AtomicInteger(0);
+  /** Prevents overlapping startCodec from surface-available + init races. */
+  private static final AtomicBoolean starting = new AtomicBoolean(false);
   private static MediaCodec codec;
   private static HandlerThread codecThread;
   private static Handler codecHandler;
@@ -181,21 +183,19 @@ public final class WcDecoderBridge {
   }
 
   /**
-   * The ONE place SurfaceView visibility is decided: VISIBLE exactly while the
+   * The ONE place TextureView visibility is decided: VISIBLE exactly while the
    * decoder is {@link #wanted}. Must be called on the UI thread.
    *
-   * Visibility is not cosmetic here — a GONE SurfaceView never receives
-   * surfaceCreated, so it never owns a Surface, so MediaCodec is never
-   * configured. It therefore belongs to the decoder's lifecycle (init/teardown)
-   * and to nothing else. In particular {@link #setBounds} must not touch it:
-   * every bridge command is a separate `spawn_blocking` task on the Rust side
-   * (decoder.rs), so an older setBounds(visible=false) can — and on some devices
-   * routinely does — land on the UI thread AFTER init()'s VISIBLE. That hid the
-   * view again with no error and no way back: the codec sat waiting for a
-   * Surface while JS happily fed it frames, and the 3s watchdog reported
-   * "accepted N frame(s) but decoded 0 ... surfaceReady=false".
+   * Visibility is not cosmetic here — a GONE TextureView never receives
+   * {@code onSurfaceTextureAvailable}, so it never owns a Surface, so MediaCodec
+   * is never configured. It therefore belongs to the decoder's lifecycle
+   * (init/teardown) and to nothing else. In particular {@link #setBounds} must
+   * not touch it: every bridge command is a separate `spawn_blocking` task on
+   * the Rust side (decoder.rs), so an older setBounds(visible=false) can — and
+   * on some devices routinely does — land on the UI thread AFTER init()'s
+   * VISIBLE. That hid the view again with no error and no way back.
    */
-  private static void applyVisibility(SurfaceView sv) {
+  private static void applyVisibility(TextureView sv) {
     if (sv == null) return;
     int want = wanted.get() ? View.VISIBLE : View.GONE;
     if (sv.getVisibility() != want) sv.setVisibility(want);
@@ -214,16 +214,9 @@ public final class WcDecoderBridge {
 
   /**
    * Arm the surface-creation watchdog. Call on the UI thread right after the
-   * view is flipped VISIBLE expecting a Surface. If {@code surfaceCreated}
-   * hasn't fired within {@link #SURFACE_KICK_DELAY_MS}, {@link #surfaceKick}
-   * re-attaches the view to force a fresh surface session. Idempotent: safe to
-   * call repeatedly; it only schedules work while no Surface has arrived and the
-   * decoder is still {@link #wanted}.
-   *
-   * <p>Does NOT reset {@link #surfaceKicks} — that is the caller's job. {@link
-   * #init} zeroes it before the first arm; {@link #surfaceKick} leaves it alone
-   * so the count accumulates across re-arms and {@link #SURFACE_KICK_MAX} is
-   * actually honoured.
+   * view is flipped VISIBLE expecting a SurfaceTexture. If
+   * {@code onSurfaceTextureAvailable} hasn't fired within
+   * {@link #SURFACE_KICK_DELAY_MS}, {@link #surfaceKick} re-attaches the view.
    */
   private static void armSurfaceWatchdog() {
     if (!wanted.get()) return;
@@ -250,7 +243,7 @@ public final class WcDecoderBridge {
 
   /**
    * Disarm the watchdog. Safe to call from any thread; called from
-   * {@code surfaceCreated} (UI thread) and {@link #teardown} (Rust worker → UI).
+   * {@code onSurfaceTextureAvailable} (UI thread) and {@link #teardown}.
    */
   private static void cancelSurfaceWatchdog() {
     surfaceWatchdogArmed.set(false);
@@ -258,20 +251,13 @@ public final class WcDecoderBridge {
   }
 
   /**
-   * Detach the SurfaceView from its parent and re-add it at the same position
-   * with the same layout params. Re-parenting is the documented recovery for a
-   * SurfaceView whose {@code surfaceCreated} never fires (camera/video libraries
-   * on finicky OEM builds use the same trick): the old surface session is torn
-   * down by {@code surfaceDestroyed} and the freshly attached view gets a new
-   * one. After re-attaching we re-apply visibility and re-arm the watchdog for
-   * another round, up to {@link #SURFACE_KICK_MAX}. {@link #ensureSurfaceView}
-   * is NOT re-run — it is guarded by {@code surfaceView != null} and we reuse
-   * the existing view (its holder/callbacks survive the re-parent). Must run on
-   * the UI thread.
+   * Detach the TextureView from its parent and re-add it at the same position
+   * with the same layout params. Re-parenting recovers a TextureView whose
+   * {@code onSurfaceTextureAvailable} never fires. Must run on the UI thread.
    */
   private static void surfaceKick() {
     if (surfaceView == null) return;
-    // We may have raced a successful surfaceCreated — nothing to recover from.
+    // We may have raced a successful surface — nothing to recover from.
     if (surfaceReady.get()) {
       cancelSurfaceWatchdog();
       return;
@@ -283,28 +269,25 @@ public final class WcDecoderBridge {
     int kick = surfaceKicks.incrementAndGet();
     if (kick > SURFACE_KICK_MAX) {
       surfaceWatchdogArmed.set(false);
-      lastProbeDetail.set("surfaceCreated never fired after " + SURFACE_KICK_MAX + " re-attach kicks");
+      lastProbeDetail.set(
+          "onSurfaceTextureAvailable never fired after " + SURFACE_KICK_MAX + " re-attach kicks");
       Log.w(
           TAG,
-          "surfaceCreated never fired — giving up after "
+          "SurfaceTexture never arrived — giving up after "
               + SURFACE_KICK_MAX
               + " kicks. The JS watchdog will fall back to WebCodecs.");
       return;
     }
     android.view.ViewGroup parent = (android.view.ViewGroup) surfaceView.getParent();
     if (parent == null) {
-      // Detached but somehow parentless — re-seat it under the WebView.
       ensureSurfaceViewReseat();
     } else {
       int index = parent.indexOfChild(surfaceView);
       android.view.ViewGroup.LayoutParams lp = surfaceView.getLayoutParams();
-      jlog("surfaceCreated never fired — re-attaching SurfaceView (kick " + kick + ")");
+      jlog("SurfaceTexture never arrived — re-attaching TextureView (kick " + kick + ")");
       parent.removeView(surfaceView);
-      // removeView can tear down the holder's surface (if any partial one
-      // existed) — clear our latch so surfaceCreated on the new session is the
-      // only thing that flips it true.
       surfaceReady.set(false);
-      surface = null;
+      releaseSurfaceOnly();
       try {
         parent.addView(surfaceView, Math.max(0, index), lp);
       } catch (Exception e) {
@@ -313,22 +296,31 @@ public final class WcDecoderBridge {
       }
     }
     applyVisibility(surfaceView);
-    // Re-arm for the next round if this kick also doesn't produce a Surface.
     surfaceWatchdogArmed.set(false);
     armSurfaceWatchdog();
   }
 
-  /** Re-seat the existing {@code surfaceView} under the content view (fallback
-   *  when its parent is null or re-add threw). Layout params are 1×1 — the video
-   *  size is in VIDEO pixels, not layout px, and setBounds re-establishes real
-   *  geometry the moment JS syncs anyway. */
+  /** Drop the MediaCodec Surface wrapper without touching the TextureView. */
+  private static void releaseSurfaceOnly() {
+    Surface s = surface;
+    surface = null;
+    surfaceTexture = null;
+    if (s != null) {
+      try {
+        s.release();
+      } catch (Exception ignored) {
+      }
+    }
+  }
+
+  /** Re-seat the existing TextureView under the content view (fallback). */
   private static void ensureSurfaceViewReseat() {
     Activity act = activity();
     if (act == null || surfaceView == null) return;
     ViewGroup content = act.findViewById(android.R.id.content);
     if (content == null) return;
     surfaceReady.set(false);
-    surface = null;
+    releaseSurfaceOnly();
     android.view.ViewGroup.LayoutParams prev = surfaceView.getLayoutParams();
     FrameLayout.LayoutParams lp =
         prev instanceof FrameLayout.LayoutParams
@@ -340,14 +332,14 @@ public final class WcDecoderBridge {
   }
 
   /**
-   * Move the SurfaceView to be the WebView's immediate lower sibling. Only the
-   * views drawn AFTER the punch can cover it, so the fewer of those the better —
+   * Move the TextureView to be the WebView's immediate lower sibling. Only the
+   * views drawn AFTER it can cover the video, so the fewer of those the better —
    * ideally exactly one: the WebView itself. No-op when already seated there,
    * when the WebView hasn't been created yet, or when the view currently owns a
    * live Surface (re-parenting destroys it). Must run on the UI thread.
    */
   private static void reseatBelowWebView(Activity act) {
-    SurfaceView sv = surfaceView;
+    TextureView sv = surfaceView;
     if (sv == null) return;
     ViewGroup content = act.findViewById(android.R.id.content);
     WebView web = content == null ? null : findWebView(content);
@@ -360,7 +352,7 @@ public final class WcDecoderBridge {
     ViewGroup oldParent = sv.getParent() instanceof ViewGroup ? (ViewGroup) sv.getParent() : null;
     if (oldParent != null) oldParent.removeView(sv);
     surfaceReady.set(false);
-    surface = null;
+    releaseSurfaceOnly();
     FrameLayout.LayoutParams lp =
         prev instanceof FrameLayout.LayoutParams
             ? (FrameLayout.LayoutParams) prev
@@ -375,7 +367,7 @@ public final class WcDecoderBridge {
     }
   }
 
-  /** Bound from MainActivity.onCreate — owns the SurfaceView under the WebView. */
+  /** Bound from MainActivity.onCreate — owns the TextureView under the WebView. */
   public static void attach(Activity activity) {
     actRef = new WeakReference<>(activity);
     activity.runOnUiThread(() -> ensureSurfaceView(activity));
@@ -517,11 +509,12 @@ public final class WcDecoderBridge {
     // Coalesce duplicate inits (JS often fires twice in the same frame). A second
     // init used to flip awaitKey/csdQueued back to "need keyframe" WHILE the codec
     // was already running — every in-flight AU was then dropped or mis-fed, and
-    // the punched Surface stayed black with no error anywhere.
+    // the TextureView stayed black with no error anywhere.
     if (wanted.get() && started.get() && width.get() == w && height.get() == h) {
       jlog("init " + w + "x" + h + " — already running, skip");
       return;
     }
+    final int gen = initGen.incrementAndGet();
     width.set(w);
     height.set(h);
     lastError.set("");
@@ -533,14 +526,27 @@ public final class WcDecoderBridge {
     // another Rust worker must observe "decoder wanted" and leave the view
     // alone, whichever of the two runnables the looper happens to run first.
     wanted.set(true);
+    // Keep the producer buffer aspect locked to the bitstream, not the view
+    // layout size — TextureView then scales without stretching.
+    applyBufferSize(w, h);
     jlog("init " + w + "x" + h + " surfaceReady=" + surfaceReady.get());
     act.runOnUiThread(
         () -> {
+          // A newer init superseded us while we waited for the looper.
+          if (gen != initGen.get()) {
+            jlog("init " + w + "x" + h + " — superseded by newer init, skip");
+            return;
+          }
+          // UI-thread re-check: concurrent inits can both pass the outer guard
+          // before either sets started — without this we triple-start the codec.
+          if (started.get() && width.get() == w && height.get() == h && surfaceReady.get()) {
+            jlog("init " + w + "x" + h + " — already running on UI thread, skip");
+            return;
+          }
           ensureSurfaceView(act);
-          // attach() ran before Tauri created the WebView, so the SurfaceView
+          // attach() ran before Tauri created the WebView, so the TextureView
           // was seated at content[0] — potentially below wry wrapper views.
-          // Seat it as the WebView's immediate lower sibling: only views drawn
-          // AFTER it can cover the punch, and ideally that's the WebView alone.
+          // Seat it as the WebView's immediate lower sibling.
           if (!surfaceReady.get()) reseatBelowWebView(act);
           hookWebView(act);
           makeCompositingTransparent(act);
@@ -556,6 +562,17 @@ public final class WcDecoderBridge {
             armSurfaceWatchdog();
           }
         });
+  }
+
+  /** Push codec WxH into the SurfaceTexture so the view can scale without stretch. */
+  private static void applyBufferSize(int w, int h) {
+    SurfaceTexture st = surfaceTexture;
+    if (st == null || w < 16 || h < 16) return;
+    try {
+      st.setDefaultBufferSize(w, h);
+    } catch (Exception e) {
+      jlog("setDefaultBufferSize failed: " + e.getMessage());
+    }
   }
 
   /**
@@ -578,7 +595,7 @@ public final class WcDecoderBridge {
     if (w < 1 || h < 1) return;
     act.runOnUiThread(
         () -> {
-          SurfaceView sv = surfaceView;
+          TextureView sv = surfaceView;
           if (sv == null) return;
           float dpr = act.getResources().getDisplayMetrics().density;
           // JS sends CSS pixels from getBoundingClientRect; layout params are px.
@@ -586,6 +603,24 @@ public final class WcDecoderBridge {
           int iy = Math.round((float) (y * dpr));
           int iw = Math.max(1, Math.round((float) (w * dpr)));
           int ih = Math.max(1, Math.round((float) (h * dpr)));
+          // getBoundingClientRect is relative to the WebView viewport; LayoutParams
+          // are relative to the TextureView's parent. Add the WebView's offset
+          // inside that parent or the picture (and hit-test) drifts — usually on Y
+          // when a wrapper/inset sits above the WebView.
+          ViewGroup parent = sv.getParent() instanceof ViewGroup ? (ViewGroup) sv.getParent() : null;
+          WebView web = parent != null ? findWebView(parent) : null;
+          if (web == null) {
+            ViewGroup content = act.findViewById(android.R.id.content);
+            web = content != null ? findWebView(content) : null;
+          }
+          if (web != null && parent != null) {
+            int[] webLoc = new int[2];
+            int[] parentLoc = new int[2];
+            web.getLocationInWindow(webLoc);
+            parent.getLocationInWindow(parentLoc);
+            ix += webLoc[0] - parentLoc[0];
+            iy += webLoc[1] - parentLoc[1];
+          }
           FrameLayout.LayoutParams lp =
               (FrameLayout.LayoutParams) sv.getLayoutParams();
           if (lp == null) {
