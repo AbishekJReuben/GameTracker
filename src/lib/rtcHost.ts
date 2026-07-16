@@ -511,6 +511,27 @@ export function startHost(opts: HostOptions): () => void {
   let lastCeilDecayAt = Date.now();
   let lastFillTrimAt = 0;
 
+  /**
+   * Video-channel send budget in BYTES. The Tune `wcBufKB` is only the ceiling:
+   * a fixed byte budget converts to SECONDS of standing latency on a slow link
+   * (384 KB parked in the channel at ~2 Mbps ≈ 1.5 s — every frame arrives that
+   * late, forever, which is exactly the "stream is consistently behind" bug).
+   * So the real bound is TIME: at most ~WC_BUF_MS of the live encode bitrate may
+   * sit unsent (~2 frames at 40 fps). On fast links the KB ceiling can still bite
+   * first; on slow links time wins and standing latency stays frame-scale.
+   * Floored at 8 KB (≈1–2 P-frames) — NOT 64 KB, which alone is ~250 ms at
+   * 2 Mbps. Keyframes already jump the ceiling (4×) so a recovery IDR can always
+   * enqueue. `pace` (Feel) still widens the budget — smoothness buys staleness.
+   */
+  const WC_BUF_MS = 50;
+  const wcBufBudget = () => {
+    const pace = clamp(quality.pace, 0, 100) / 100;
+    const capBytes = quality.wcBufKB * 1024 * (1 + pace);
+    const kbps = adaptKbps > 0 ? adaptKbps : targetKbps();
+    const timeBytes = (kbps * WC_BUF_MS * (1 + pace)) / 8; // kbit/s × ms / 8 = bytes
+    return Math.max(8 * 1024, Math.min(capBytes, timeBytes));
+  };
+
   const adaptFromBuffer = (buffered: number, maxBuffered: number, skippedThisFrame: boolean) => {
     const tgt = targetKbps();
     if (adaptKbps <= 0) adaptKbps = tgt;
@@ -1633,7 +1654,16 @@ export function startHost(opts: HostOptions): () => void {
     let nativeRecoveryPendingAt = 0; // when the deferral started (time-caps the wait)
     let nativeKeyRequestAt = 0;
     let nativeArtifactEvents = 0; // count of soft-recovery armings (HUD "artifacts")
-    let nativeRecoveredEvents = 0; // count of clean IDR arrivals that closed a recovery
+    let nativeRecoveredEvents = 0; // count of clean IDRs that closed a recovery
+    /** P-frames dropped by backpressure since the last on-wire IDR. */
+    let skipsSinceKey = 0;
+    /** Last time a soft-recovery IDR was armed — cooldown stops the skip→IDR sawtooth. */
+    let lastSoftRecoverAt = 0;
+    // A single skipped P-frame is often invisible (and an IDR hitch is worse).
+    // Only spend a recovery IDR after a real skip burst, and at most ~every few
+    // seconds — the periodic wcKeyMs safety net still cleans up anything left.
+    const SKIP_RECOVER_AT = 4;
+    const SOFT_RECOVER_MIN_MS = 4000;
     const requestNativeKeyframe = () => {
       const now = performance.now();
       // Coalesce capture-rate calls while Rust's atomic request is still pending.
@@ -1648,18 +1678,36 @@ export function startHost(opts: HostOptions): () => void {
     /** Arm soft recovery: get an IDR on the way while P-frames keep flowing so the
      *  stream never freezes. Transient artifacting is expected until the IDR lands.
      *  `defer` postpones the actual encoder request until the channel has drained —
-     *  used by the backpressure path so the recovery IDR isn't itself skipped. */
-    const armNativeRecovery = (defer = false) => {
+     *  used by the backpressure path so the recovery IDR isn't itself skipped.
+     *  Returns false when the cooldown / coalescing gate refused the arm. */
+    const armNativeRecovery = (defer = false, force = false) => {
+      const now = performance.now();
+      if (!force && nativeRecovering) {
+        // Already waiting on an IDR — just keep/refresh the deferral.
+        if (defer) {
+          if (!nativeRecoveryPending) nativeRecoveryPendingAt = now;
+          nativeRecoveryPending = true;
+        }
+        return false;
+      }
+      if (!force && now - lastSoftRecoverAt < SOFT_RECOVER_MIN_MS) return false;
       if (!nativeRecovering) {
         nativeRecovering = true;
         nativeArtifactEvents++;
+        lastSoftRecoverAt = now;
       }
       if (defer) {
-        if (!nativeRecoveryPending) nativeRecoveryPendingAt = performance.now();
+        if (!nativeRecoveryPending) nativeRecoveryPendingAt = now;
         nativeRecoveryPending = true;
       } else {
         requestNativeKeyframe();
       }
+      return true;
+    };
+    /** After a skip burst, ask for one deferred IDR — not on every skipped frame. */
+    const maybeRecoverAfterSkips = () => {
+      if (skipsSinceKey < SKIP_RECOVER_AT) return;
+      if (armNativeRecovery(true)) skipsSinceKey = 0;
     };
     nativeSink = (payload, key, w = 0, h = 0) => {
       if (videoCh.readyState !== "open") return;
@@ -1678,15 +1726,12 @@ export function startHost(opts: HostOptions): () => void {
         if (!key) nativeAwaitKey = true;
         requestNativeKeyframe();
       }
-      // The native path previously ignored `wcKeyMs`, so a decoder fault could live
-      // forever. Its periodic IDR is the final safety net for corruption the guest
-      // cannot report explicitly. This is a SOFT recovery — keep forwarding so motion
-      // scenes don't stall waiting for the IDR to land.
+      // Periodic safety-net IDR (Tune wcKeyMs). This is routine hygiene, NOT an
+      // artifact event — never arm the recovering/HUD counters for it.
       if (!key && performance.now() - wcLastKeyAt >= quality.wcKeyMs) {
-        armNativeRecovery();
+        requestNativeKeyframe();
       }
-      const pace = clamp(quality.pace, 0, 100) / 100;
-      const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
+      const maxBuffered = wcBufBudget();
       const buffered = videoCh.bufferedAmount;
       // HARD gate: only set on a true reference-chain break (config/resize/partial AU).
       if (nativeAwaitKey && !key) {
@@ -1702,12 +1747,12 @@ export function startHost(opts: HostOptions): () => void {
       }
       if (!key) {
         if (buffered > maxBuffered) {
-          // Backpressure: skip THIS frame (latest-wins) but do NOT gate subsequent
-          // P-frames — that was the high-motion freeze. The dropped P-frame may cause
-          // a brief artifact on the guest; arm a DEFERRED recovery IDR to clean it up
-          // once the channel drains (an IDR requested mid-burst just feeds the burst).
+          // Backpressure: skip THIS frame (latest-wins). Do NOT arm recovery on
+          // every skip — that was the "Artifacting — recovering" spam (and an IDR
+          // hitch) before the eye could see any damage. Count the burst; one
+          // deferred IDR fires once the channel is healthy again if it was real.
           wcSkipped++;
-          armNativeRecovery(true);
+          skipsSinceKey++;
           adaptFromBuffer(buffered, maxBuffered, true);
           return;
         }
@@ -1718,7 +1763,8 @@ export function startHost(opts: HostOptions): () => void {
         // several seconds of backlog) may shed one, and then the gates stay armed so
         // the NEXT IDR is still awaited rather than the stream resuming corrupt.
         wcSkipped++;
-        armNativeRecovery(true);
+        skipsSinceKey++;
+        armNativeRecovery(true, true);
         adaptFromBuffer(buffered, maxBuffered, true);
         return;
       }
@@ -1730,7 +1776,7 @@ export function startHost(opts: HostOptions): () => void {
         // Channel threw mid-frame — the guest received a partial access unit, which
         // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
         nativeAwaitKey = true;
-        armNativeRecovery();
+        armNativeRecovery(false, true);
         return;
       }
       if (key) {
@@ -1745,15 +1791,20 @@ export function startHost(opts: HostOptions): () => void {
         }
         nativeRecoveryPending = false;
         nativeAwaitKey = false;
-      } else if (
-        nativeRecoveryPending &&
-        (buffered < maxBuffered * 0.5 || performance.now() - nativeRecoveryPendingAt > 600)
-      ) {
-        // The burst that deferred the recovery has drained (or hovered near-full
-        // long enough that waiting further just prolongs the artifacting) —
-        // request the IDR now; keyframes may jump the ceiling, so it WILL go out.
-        nativeRecoveryPending = false;
-        requestNativeKeyframe();
+        skipsSinceKey = 0;
+      } else {
+        // Channel accepted a P-frame — if a skip burst just ended, one recovery IDR.
+        maybeRecoverAfterSkips();
+        if (
+          nativeRecoveryPending &&
+          (buffered < maxBuffered * 0.5 || performance.now() - nativeRecoveryPendingAt > 600)
+        ) {
+          // The burst that deferred the recovery has drained (or hovered near-full
+          // long enough that waiting further just prolongs the artifacting) —
+          // request the IDR now; keyframes may jump the ceiling, so it WILL go out.
+          nativeRecoveryPending = false;
+          requestNativeKeyframe();
+        }
       }
     };
 
@@ -1777,6 +1828,7 @@ export function startHost(opts: HostOptions): () => void {
       nativeAwaitKey = true;
       nativeRecovering = false;
       nativeRecoveryPending = false;
+      skipsSinceKey = 0;
       try {
         api.remoteSetCaptureNative(false);
       } catch {
@@ -1854,7 +1906,7 @@ export function startHost(opts: HostOptions): () => void {
       // evenness by accepting staleness the responsive end refuses. The Tune
       // panel sets the base ceilings; pace scales them from there.
       const pace = clamp(quality.pace, 0, 100) / 100;
-      const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
+      const maxBuffered = wcBufBudget();
       const maxQueue = quality.wcQueueMax + Math.round(pace * 2);
       if (videoCh.bufferedAmount > maxBuffered || enc.encodeQueueSize > maxQueue) {
         wcSkipped++;
@@ -2517,9 +2569,7 @@ export function startHost(opts: HostOptions): () => void {
             // Periodic adapt even when no frames were skipped this tick — a slow
             // drain (fill 0.2–0.5) still wants a gentle shed before it hits the wall.
             if (nativeActive || wcSink) {
-              const pace = clamp(quality.pace, 0, 100) / 100;
-              const maxBuf = quality.wcBufKB * 1024 * (1 + pace);
-              adaptFromBuffer(videoCh.bufferedAmount, maxBuf, false);
+              adaptFromBuffer(videoCh.bufferedAmount, wcBufBudget(), false);
             }
             try {
               data.send(

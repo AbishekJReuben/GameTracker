@@ -2123,15 +2123,17 @@ export class CloudConn {
 
   /**
    * Smooth a latency EWMA so NVENC/DIRECT HUD (and Feel pacing) don't jump when
-   * a single clock sample or skipped frame spikes. Clamp the sample toward the
-   * previous value (±18ms) then blend heavily — perceived "latency jumping"
-   * was the raw 0.85/0.15 EWMA tracking every outlier.
+   * a single clock sample or skipped frame spikes. Rise is clamped (±18 ms) so
+   * a blip doesn't spike the Feel playout target; fall is allowed much faster
+   * (up to 200 ms/sample) so draining a standing send-buffer backlog is
+   * reflected in the HUD within a second instead of hanging at ~1.4 s for minutes.
    */
   private smoothLatency(prev: number, sample: number): number {
     if (!(sample > -50 && sample < 5000)) return prev;
     if (prev === 0) return sample;
-    const clamped = prev + Math.max(-18, Math.min(18, sample - prev));
-    return prev * 0.92 + clamped * 0.08;
+    const delta = sample - prev;
+    const clamped = prev + (delta < 0 ? Math.max(-200, delta) : Math.min(18, delta));
+    return prev * 0.85 + clamped * 0.15;
   }
 
   /**

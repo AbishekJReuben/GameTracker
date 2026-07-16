@@ -3734,7 +3734,7 @@ export function ControlScreen({
                   label="Channel buf cap"
                   scope="direct"
                   showHint={tuneHints}
-                  hint="The PC skips encoding while this much data is still unsent. Low = drop stale frames to stay fresh; high = send everything and fall behind. The Feel slider widens this."
+                  hint="Byte ceiling for unsent DIRECT frames (fast links). Standing latency is hard-capped at ~50 ms of the live encode bitrate on the PC — this KB slider only matters above that. Low = drop stale frames; high = more headroom before skip. Feel widens both."
                   value={tune.wcBufKB}
                   min={64}
                   max={1024}
@@ -4889,7 +4889,7 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   },
   Artifacts: {
     long: "Artifact events",
-    info: "Cumulative times the PC armed a soft recovery (backpressure skip or the periodic safety-net IDR) this session. Each one may cause a brief burst of macroblocking until the recovery IDR lands. A slow, steady climb during high-motion scenes is normal; a fast spike with no recovery means the link is undersized.",
+    info: "Times the PC spent a recovery IDR after a real skip burst (≥4 dropped P-frames), not routine keyframes. Isolated skips no longer count — those were the spam before anything looked wrong. A slow climb in heavy scenes is fine; a fast spike means the link is shedding too hard.",
   },
   Recovered: {
     long: "Clean recoveries",

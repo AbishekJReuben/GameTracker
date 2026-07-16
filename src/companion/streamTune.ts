@@ -45,9 +45,10 @@ export type StreamTune = {
   pace: number;
   /** Host/DIRECT: recovery keyframe cadence (ms). Long GOP dodges the ~1Hz IDR hitch. */
   wcKeyMs: number;
-  /** Host/DIRECT: skip encoding while this many KB sit unsent on the video channel.
-   *  Higher = fewer latest-wins skips (smoother NVENC latency) at the cost of
-   *  a little more backlog under a congested link. */
+  /** Host/DIRECT: byte CEILING for unsent video-channel data (KB). Standing
+   *  latency is actually capped by ~50 ms of the live encode bitrate on the host
+   *  (see `wcBufBudget` in rtcHost) — this KB value only bites on fast links.
+   *  Higher = fewer latest-wins skips under congestion; lower = less headroom. */
   wcBufKB: number;
   /** Host/DIRECT: skip encoding while more than this many frames are in the encoder. */
   wcQueueMax: number;

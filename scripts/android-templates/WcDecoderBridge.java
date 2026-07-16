@@ -100,17 +100,18 @@ public final class WcDecoderBridge {
   private static final AtomicBoolean surfaceReady = new AtomicBoolean(false);
   /**
    * The decoder is meant to be running: set by {@link #init}, cleared by
-   * {@link #teardown}. This — and nothing else — decides whether the SurfaceView
+   * {@link #teardown}. This — and nothing else — decides whether the TextureView
    * is VISIBLE, because the Surface's whole lifecycle hangs off that visibility
    * and must never be at the mercy of a racing JS call. See
    * {@link #applyVisibility}.
    */
   private static final AtomicBoolean wanted = new AtomicBoolean(false);
   /**
-   * Self-healing safety net for "surfaceCreated never fires": set while we are
-   * waiting for the SurfaceFlinger to hand us a Surface after a VISIBLE flip,
-   * cleared the instant {@link SurfaceHolder.Callback#surfaceCreated} lands (or
-   * on teardown). See {@link #armSurfaceWatchdog} / {@link #cancelSurfaceWatchdog}.
+   * Self-healing safety net for "onSurfaceTextureAvailable never fires": set
+   * while we are waiting for a SurfaceTexture after a VISIBLE flip, cleared the
+   * instant {@link TextureView.SurfaceTextureListener#onSurfaceTextureAvailable}
+   * lands (or on teardown). See {@link #armSurfaceWatchdog} /
+   * {@link #cancelSurfaceWatchdog}.
    */
   private static final AtomicBoolean surfaceWatchdogArmed = new AtomicBoolean(false);
   private static final AtomicBoolean awaitKey = new AtomicBoolean(true);
@@ -127,12 +128,12 @@ public final class WcDecoderBridge {
   private static volatile boolean webViewHooked = false;
 
   /**
-   * Watchdog that kicks a VISIBLE SurfaceView when SurfaceFlinger never hands us
-   * a Surface. The MainActivity's window is already showing by {@link #init}, so
-   * a brand-new VISIBLE SurfaceView should receive surfaceCreated within a frame
-   * or two. When it does not (a finicky OEM/Android-16 build can wedge the
-   * surface negotiation for a view that was created GONE at {@code onCreate} and
-   * flipped VISIBLE later — the GtWcDecoder log shows nothing, and the JS
+   * Watchdog that kicks a VISIBLE TextureView when {@code onSurfaceTextureAvailable}
+   * never fires. The MainActivity's window is already showing by {@link #init},
+   * so a brand-new VISIBLE TextureView should receive its SurfaceTexture within
+   * a frame or two. When it does not (a finicky OEM/Android-16 build can wedge
+   * the surface negotiation for a view that was created GONE at {@code onCreate}
+   * and flipped VISIBLE later — the GtWcDecoder log shows nothing, and the JS
    * watchdog reports "accepted N frame(s) but decoded 0 ... surfaceReady=false"),
    * we detach the view and re-add it, which forces a fresh surface session.
    * Bounded: {@link #SURFACE_KICK_MAX} attempts × {@link #SURFACE_KICK_DELAY_MS}
@@ -752,7 +753,7 @@ public final class WcDecoderBridge {
   }
 
   /**
-   * Whether the SurfaceView has handed us a live Surface. Reported alongside the
+   * Whether the TextureView has handed us a live Surface. Reported alongside the
    * stats because "no picture" has exactly two shapes and they need opposite
    * fixes: the codec faulted (statsError says how), or the codec never started
    * for want of a Surface — which says nothing at all unless we surface this.
@@ -840,7 +841,7 @@ public final class WcDecoderBridge {
       sb.append("\n=== h264 decoders ===\n");
       appendDecoderInventory(sb);
 
-      sb.append("\n=== view stack (bottom→top; punch survives only if everything ABOVE the SurfaceView is transparent) ===\n");
+      sb.append("\n=== view stack (bottom→top; video shows through transparent WebView pixels above the TextureView) ===\n");
       appendViewState(sb);
 
       sb.append("\n=== journal ===\n");
@@ -896,7 +897,7 @@ public final class WcDecoderBridge {
     }
   }
 
-  /** SurfaceView placement + every view drawn after it (those can cover the punch). */
+  /** TextureView placement + every view drawn after it (those can cover the video). */
   private static void appendViewState(StringBuilder sb) {
     Activity act = activity();
     if (act == null) {
@@ -913,17 +914,17 @@ public final class WcDecoderBridge {
       sb.append("no content view\n");
       return;
     }
-    SurfaceView sv = surfaceView;
+    TextureView sv = surfaceView;
     if (sv != null) {
-      sb.append("SurfaceView attached=").append(sv.isAttachedToWindow())
+      sb.append("TextureView attached=").append(sv.isAttachedToWindow())
           .append(" shown=").append(sv.isShown())
           .append(" vis=").append(visName(sv.getVisibility()))
           .append(" size=").append(sv.getWidth()).append('x').append(sv.getHeight())
           .append(" winVis=").append(visName(sv.getWindowVisibility()))
-          .append(" mediaOverlay=true zTop=false")
+          .append(" available=").append(sv.isAvailable())
           .append('\n');
     } else {
-      sb.append("SurfaceView: null\n");
+      sb.append("TextureView: null\n");
     }
     dumpViewTree(sb, content, 0);
   }
@@ -949,7 +950,7 @@ public final class WcDecoderBridge {
         .append(" alpha=").append(v.getAlpha())
         .append(" bg=").append(describeDrawable(v.getBackground()))
         .append(" layer=").append(v.getLayerType());
-    if (v == surfaceView) sb.append("  <== OUR SURFACEVIEW");
+    if (v == surfaceView) sb.append("  <== OUR TEXTUREVIEW");
     if (v instanceof WebView) sb.append("  <== WEBVIEW");
     sb.append('\n');
     if (v instanceof ViewGroup) {
@@ -1323,47 +1324,69 @@ public final class WcDecoderBridge {
       parent = content;
       index = 0;
     }
-    SurfaceView sv = new SurfaceView(act);
-    // Hole-punch: the surface stays BEHIND the window (media-overlay only
-    // orders it above other SurfaceViews, e.g. an exoplayer leftover — it is
-    // NOT above the window). Video shows through because the whole compositing
-    // chain above it is transparent in the video box; see the class javadoc.
-    sv.setZOrderMediaOverlay(true);
+    // TextureView (not SurfaceView): composites in the normal View hierarchy so
+    // Android 16 WebView can clear/blend chrome over video without burn-in.
+    // Video shows through transparent pixels in the letterboxed video box.
+    TextureView sv = new TextureView(act);
     FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
     lp.gravity = Gravity.TOP | Gravity.START;
     sv.setVisibility(View.GONE);
+    sv.setOpaque(false);
+    sv.setSurfaceTextureListener(
+        new TextureView.SurfaceTextureListener() {
+          @Override
+          public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
+            surfaceTexture = st;
+            applyBufferSize(width.get(), height.get());
+            Surface prev = surface;
+            surface = new Surface(st);
+            if (prev != null) {
+              try {
+                prev.release();
+              } catch (Exception ignored) {
+              }
+            }
+            surfaceReady.set(true);
+            jlog("surfaceTextureAvailable " + w + "x" + h + " valid=" + surface.isValid());
+            // A Surface arrived — stop the re-attach watchdog (if it was armed)
+            // and reset its kick count so a later teardown+init arms a fresh one.
+            cancelSurfaceWatchdog();
+            if (width.get() > 0 && height.get() > 0) startCodecLocked();
+          }
+
+          @Override
+          public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) {
+            surfaceTexture = st;
+            jlog("surfaceTextureSizeChanged " + w + "x" + h);
+            // Keep the producer buffer locked to the bitstream aspect; the view
+            // scales. Don't rebuild the codec on every layout bounce (zoom/pan).
+            applyBufferSize(width.get(), height.get());
+          }
+
+          @Override
+          public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+            surfaceReady.set(false);
+            Surface s = surface;
+            surface = null;
+            surfaceTexture = null;
+            if (s != null) {
+              try {
+                s.release();
+              } catch (Exception ignored) {
+              }
+            }
+            jlog("surfaceTextureDestroyed");
+            stopCodecLocked();
+            // true → TextureView releases the SurfaceTexture.
+            return true;
+          }
+
+          @Override
+          public void onSurfaceTextureUpdated(SurfaceTexture st) {
+            // Per-frame; no-op (MediaCodec pushes; we don't need a draw loop).
+          }
+        });
     parent.addView(sv, Math.max(0, index), lp);
-    sv.getHolder()
-        .addCallback(
-            new SurfaceHolder.Callback() {
-              @Override
-              public void surfaceCreated(SurfaceHolder holder) {
-                surface = holder.getSurface();
-                surfaceReady.set(true);
-                jlog("surfaceCreated valid=" + holder.getSurface().isValid());
-                // A Surface arrived — stop the re-attach watchdog (if it was
-                // armed) and reset its kick count so a later teardown+init arms
-                // a fresh one. Without this disarm the watchdog would happily
-                // kick an already-working SurfaceView off the hierarchy.
-                cancelSurfaceWatchdog();
-                if (width.get() > 0 && height.get() > 0) startCodecLocked();
-              }
-
-              @Override
-              public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
-                surface = holder.getSurface();
-                surfaceReady.set(true);
-                jlog("surfaceChanged " + w + "x" + h);
-              }
-
-              @Override
-              public void surfaceDestroyed(SurfaceHolder holder) {
-                surfaceReady.set(false);
-                surface = null;
-                jlog("surfaceDestroyed");
-                stopCodecLocked();
-              }
-            });
     surfaceView = sv;
   }
 
@@ -1388,16 +1411,14 @@ public final class WcDecoderBridge {
   }
 
   /**
-   * Make every layer that composites ABOVE the SurfaceView's punched hole
-   * transparent: window background, DecorView, android.R.id.content, every
-   * wry/Tauri wrapper between the WebView and the window, and the WebView
-   * itself. One opaque layer anywhere in that chain paints straight over the
-   * hole — the codec decodes happily (stats climb, no error, the JS watchdog
-   * stays quiet because frames ARE being produced) while the user stares at
-   * black. The PAGE is responsible for staying opaque outside the video box
-   * (Control.tsx paints letterbox bars) so the transparent region — and with it
-   * the Android-16 WebView redraw-accumulation "smudge" — is bounded to the
-   * video rect.
+   * Make every layer that composites ABOVE the TextureView transparent: window
+   * background, DecorView, android.R.id.content, every wry/Tauri wrapper between
+   * the WebView and the window, and the WebView itself. One opaque layer anywhere
+   * in that chain paints over the video — the codec decodes happily (stats climb,
+   * no error) while the user stares at black. The PAGE is responsible for staying
+   * opaque outside the video box (Control.tsx paints letterbox bars) so the
+   * transparent region — and with it the Android-16 WebView redraw-accumulation
+   * "smudge" — is bounded to the video rect.
    *
    * Deliberately does NOT force a hardware LAYER on the WebView.
    * setLayerType(LAYER_TYPE_HARDWARE) flattens the WebView into an offscreen
@@ -1423,7 +1444,7 @@ public final class WcDecoderBridge {
       act.getWindow().setBackgroundDrawable(
           new android.graphics.drawable.ColorDrawable(0x00000000));
       // Some OEM themes paint the DecorView after setBackgroundDrawable — force
-      // the root view transparent too so the SurfaceView hole punch survives.
+      // the root view transparent too so TextureView video shows through.
       View decor = act.getWindow().getDecorView();
       if (decor != null) {
         decor.setBackgroundColor(0x00000000);
