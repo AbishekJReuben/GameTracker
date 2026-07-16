@@ -117,6 +117,39 @@ public final class WcDecoderBridge {
   }
 
   /**
+   * Install the {@code window.__GT_DECODER__} JavascriptInterface.
+   *
+   * MUST run BEFORE the page loads. Android only exposes an injected object to
+   * JavaScript on the NEXT page load — "injected objects will not appear in
+   * JavaScript until the page is next (re)loaded" per the
+   * {@link WebView#addJavascriptInterface} contract. This used to be called
+   * from {@link #init} (i.e. when a DIRECT session starts, long after the app
+   * page loaded), so {@code window.__GT_DECODER__} stayed undefined forever:
+   * the JS feed path bailed on every frame, MediaCodec was fed nothing, and the
+   * phone sat on a blank screen re-requesting keyframes in a loop while the
+   * HUD showed "Frames 0 / Keyframes N".
+   *
+   * MainActivity calls this from WryActivity's {@code onWebViewCreate} hook,
+   * which Tauri fires when the WebView is constructed — before it loads the app
+   * URL. Idempotent.
+   */
+  public static void installJsInterface(WebView web) {
+    if (web == null || webViewHooked) return;
+    try {
+      web.addJavascriptInterface(new JsApi(), "__GT_DECODER__");
+      webViewHooked = true;
+      Log.i(TAG, "JavascriptInterface __GT_DECODER__ installed (pre-load)");
+    } catch (Exception e) {
+      Log.w(TAG, "addJavascriptInterface failed", e);
+    }
+  }
+
+  /** True once {@link JsApi} is bound — JS-visible only after the next page load. */
+  public static boolean jsInterfaceReady() {
+    return webViewHooked;
+  }
+
+  /**
    * One-line description of a Throwable for the probe-detail channel: class,
    * message, the top few stack frames, and the root cause. This is what ends up
    * in the phone's error toast (with a copy-to-clipboard button), so it must be
@@ -582,22 +615,24 @@ public final class WcDecoderBridge {
     surfaceView = sv;
   }
 
+  /**
+   * Late fallback for the JS interface (normal path is {@link #installJsInterface}
+   * from onWebViewCreate). Adding the object here only takes effect on the NEXT
+   * page load, so this cannot rescue the current page — it exists so a webview
+   * that Tauri rebuilt after onCreate still ends up bound. JS never assumes the
+   * interface exists: `nativeFeedReady()` gates the native decode path.
+   */
   private static void hookWebView(Activity act) {
     if (webViewHooked) return;
     ViewGroup content = act.findViewById(android.R.id.content);
-    WebView web = content == null ? null : findWebView(content);
+    if (content == null) return; // no content view yet; onWebViewCreate covers the real path
+    WebView web = findWebView(content);
     if (web == null) {
       // Tauri may attach the WebView a frame later.
       content.postDelayed(() -> hookWebView(act), 50);
       return;
     }
-    try {
-      web.addJavascriptInterface(new JsApi(), "__GT_DECODER__");
-      webViewHooked = true;
-      Log.i(TAG, "JavascriptInterface __GT_DECODER__ installed");
-    } catch (Exception e) {
-      Log.w(TAG, "addJavascriptInterface failed", e);
-    }
+    installJsInterface(web);
   }
 
   private static void makeWebViewTransparent(Activity act) {

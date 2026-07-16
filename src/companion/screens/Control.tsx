@@ -149,6 +149,10 @@ type HostWcStats = {
 type HostAudioStats = {
   mode: "pcm" | "rtc";
   chBufKB?: number;
+  /** DIRECT wire format the host settled on (see rtcHost.ts setDirectCodec). */
+  codec?: "opus" | "f32";
+  /** Chunks the host's backpressure guard refused because the channel was full. */
+  dropped?: number;
 };
 type HostStats = RemoteCaptureStats & {
   producedFps?: number;
@@ -3226,7 +3230,29 @@ export function ControlScreen({
                   }
                 />
                 <StatCell k="A-underrun" v={`${audioStats?.underruns ?? 0}`} hi={(audioStats?.underruns ?? 0) > 5} />
-                <StatCell k="A-ch" v={`${hostStats?.audio?.chBufKB ?? 0} KB`} />
+                {/* A backlog here is THE cause of robotic DIRECT sound: audio
+                    arrives in bursts, the worklet trims each burst then starves.
+                    Opus keeps it near zero; flag early (32KB ≈ 2s of Opus). */}
+                <StatCell
+                  k="A-ch"
+                  v={`${hostStats?.audio?.chBufKB ?? 0} KB`}
+                  hi={(hostStats?.audio?.chBufKB ?? 0) > 32}
+                />
+                {audioStats?.mode === "pcm" && (
+                  <>
+                    <StatCell
+                      k="A-codec"
+                      v={(audioStats.codec ?? hostStats?.audio?.codec ?? "f32") === "opus" ? "Opus" : "PCM f32"}
+                      hi={(audioStats.codec ?? hostStats?.audio?.codec ?? "f32") !== "opus"}
+                    />
+                    <StatCell k="A-loss" v={`${audioStats.lost ?? 0}`} hi={(audioStats.lost ?? 0) > 50} />
+                    <StatCell
+                      k="A-drop"
+                      v={`${hostStats?.audio?.dropped ?? 0}`}
+                      hi={(hostStats?.audio?.dropped ?? 0) > 0}
+                    />
+                  </>
+                )}
               </div>
             </>
           )}
@@ -4516,11 +4542,26 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
     info: "Times the phone's decoder reported an error and asked the PC for a keyframe. A climbing count on the WebCodecs path usually means the H.264 stream hit a reference the decoder couldn't reconcile; on the native path it's the bridge's own fault count.",
   },
   Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound (lean ~30ms). RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
+  "A-codec": {
+    long: "DIRECT audio wire format",
+    info: "Opus (~128kbps) is what you want. PCM f32 is the uncompressed fallback at ~3.1Mbps — 24× more data, enough to back the channel up and make the sound robotic. It's used when the PC's capture rate isn't one Opus supports (not 48/24/16/12/8kHz), when this device can't decode Opus, or when the encoder faulted mid-session.",
+  },
+  "A-loss": {
+    long: "Opus packets lost",
+    info: "Audio rides an unreliable channel on purpose — a lost packet is skipped instead of stalling everything behind it, and Opus in-band FEC reconstructs most of them inaudibly. A slow climb under load is normal and healthy; a fast one means the link is genuinely saturated.",
+  },
+  "A-drop": {
+    long: "Audio chunks dropped by the PC",
+    info: "The PC refuses to queue more than ~250ms of audio into the channel: stale sound is worthless, and an unbounded queue is exactly what made DIRECT audio robotic (it once reached 1.9MB — five seconds — arriving in bursts). Anything above zero means the link couldn't carry even the audio at that moment.",
+  },
   "A-buf": { long: "Audio playout buffer", info: "How much sound is sitting on the phone before it plays. DIRECT only — RTC uses the browser's NetEQ instead." },
+  "A-ch": {
+    long: "Audio queued on the PC",
+    info: "Bytes waiting to leave the PC's audio channel. Should sit near zero: audio is realtime, so a backlog here means you're hearing the past. This is the number that exposed the robotic-sound bug — it had reached 1.9MB (about five seconds) of raw PCM.",
+  },
   "A-tgt": { long: "Audio buffer target", info: "What the DIRECT worklet steers toward. Grows briefly after an underrun, then eases back." },
   "A ↓": { long: "Audio download rate", info: "PCM bytes arriving per second on DIRECT. Opus on the RTC path isn't counted here." },
   "A-underrun": { long: "Audio underruns", info: "Times the DIRECT buffer ran dry. A climbing count means the link is starving sound — try classic RTC audio." },
-  "A-ch": { long: "Audio channel backlog", info: "Unsent PCM sitting on the PC's audio data channel." },
 };
 
 function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {

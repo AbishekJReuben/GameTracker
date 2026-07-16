@@ -232,6 +232,7 @@ const save = (path, before, after, msg) => {
       `import android.os.Build\n` +
       `import android.os.Bundle\n` +
       `import android.util.Rational\n` +
+      `import android.webkit.WebView\n` +
       `import androidx.activity.enableEdgeToEdge\n` +
       `import androidx.annotation.RequiresApi\n` +
       `import androidx.core.view.WindowInsetsCompat\n` +
@@ -269,6 +270,17 @@ const save = (path, before, after, msg) => {
       `    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR\n` +
       `    hideSystemBars()\n` +
       `    updatePipParams()\n` +
+      `  }\n\n` +
+      `  /** Tauri fires this when the WebView is constructed, BEFORE it loads the\n` +
+      `   *  app URL — the only correct moment to inject a JavascriptInterface.\n` +
+      `   *  Android exposes injected objects to JS only on the NEXT page load, so\n` +
+      `   *  binding __GT_DECODER__ any later (it used to happen in the bridge's\n` +
+      `   *  init(), when a DIRECT session starts) leaves it undefined for the whole\n` +
+      `   *  session: MediaCodec is never fed and the screen stays blank while the\n` +
+      `   *  phone re-requests keyframes forever. */\n` +
+      `  override fun onWebViewCreate(webView: WebView) {\n` +
+      `    super.onWebViewCreate(webView)\n` +
+      `    WcDecoderBridge.installJsInterface(webView)\n` +
       `  }\n\n` +
       `  override fun onWindowFocusChanged(hasFocus: Boolean) {\n` +
       `    super.onWindowFocusChanged(hasFocus)\n` +

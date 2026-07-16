@@ -14,6 +14,7 @@
  */
 
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc";
+import { AUDIO_HDR_BYTES, audioSeqGap, audioSeqOf, isOpusPacket } from "@/lib/audioWire";
 import audioFeederWorkletUrl from "@/lib/audioFeeder.worklet.js?url";
 import {
   feedNativeDecoder,
@@ -153,6 +154,10 @@ export type AudioStats = {
   underruns: number;
   /** Inbound PCM bitrate (kbps) over the last ~1s, DIRECT only. */
   kbps: number;
+  /** DIRECT wire format: Opus (~128kbps) or raw interleaved float32 (~3.1Mbps). */
+  codec?: "opus" | "f32";
+  /** Opus packets lost in flight (the audio channel is unreliable by design). */
+  lost?: number;
 };
 
 /** Live telemetry for the WebCodecs direct-video path (data-channel H.264). */
@@ -356,6 +361,11 @@ export class CloudConn {
   private wcNative = false;
   private wcNativeFrames = 0;
   private wcNativePoll: number | null = null;
+  /** When the native path first looked stalled (complete frames handed to
+   *  MediaCodec but zero decoded frames coming back). Drives the watchdog that
+   *  self-heals onto WebCodecs — a silent native decoder is a blank screen, and
+   *  before this the only cure was a manual reconnect. 0 = not stalling. */
+  private wcNativeStallAt = 0;
   private wcCodec = "";
   /** Coded frame size from the host's codec announce — fed into VideoDecoderConfig
    *  so Android MediaCodec allocates the right buffers up front (avoids a mid-stream
@@ -868,6 +878,7 @@ export class CloudConn {
     this.teardownAudioPlayer();
     this.audioBytes = 0;
     this.audioByteWin = [];
+    this.audioLost = 0;
     this.chAudio = undefined;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
@@ -1109,12 +1120,39 @@ export class CloudConn {
     return true;
   }
 
-  /** After auth-ok: ask the host to ship PCM over the data channel. */
+  /**
+   * Audio wire formats we can decode, best first. Opus costs ~128kbps against
+   * raw float32's ~3.1Mbps — on a phone link the raw stream was big enough to
+   * back the data channel up by seconds, which is what made DIRECT sound
+   * robotic. The host picks the first entry it can produce; an empty/unknown
+   * list means raw f32 (what every build shipped before this).
+   */
+  private async audioDecodeCodecs(): Promise<string[]> {
+    const list: string[] = [];
+    if (typeof AudioDecoder !== "undefined" && typeof AudioData !== "undefined") {
+      try {
+        const sup = await AudioDecoder.isConfigSupported({
+          codec: "opus",
+          sampleRate: 48000,
+          numberOfChannels: 2,
+        });
+        if (sup?.supported) list.push("opus");
+      } catch {
+        /* no Opus decode here (older Safari) — raw PCM it is */
+      }
+    }
+    list.push("f32");
+    return list;
+  }
+
+  /** After auth-ok: ask the host to ship DIRECT audio over the data channel. */
   private async maybeStartAudioDirect() {
     if (this.closed || this.denied || !this.preferDirectAudio) return;
     if (this.audioDirect) return;
+    const codecs = await this.audioDecodeCodecs();
+    if (this.closed || this.denied || !this.preferDirectAudio) return;
     // Need the channel (or it will arrive shortly — still ask; host queues).
-    this.sendControl({ type: "amode", mode: "pcm" });
+    this.sendControl({ type: "amode", mode: "pcm", codecs });
     await this.ensureAudioPlayer();
   }
 
@@ -1187,9 +1225,14 @@ export class CloudConn {
     }
     this.audioNode = null;
     // A rebuilt node starts from defaults — forget the dedupe so the next host
-    // cfg is forwarded even if the format itself didn't change.
+    // cfg is forwarded even if the format itself didn't change. The Opus
+    // decoder goes with it: the host re-negotiates on every DIRECT re-opt-in.
     this.audioCfgRate = 0;
     this.audioCfgCh = 0;
+    this.audioWireCodec = "f32";
+    this.audioDecRate = 0;
+    this.audioDecCh = 0;
+    this.closeAudioDecoder();
     // Keep the AudioContext + loaded module for a fast re-opt-in.
   }
 
@@ -1218,25 +1261,117 @@ export class CloudConn {
   private audioCfgRate = 0;
   private audioCfgCh = 0;
 
-  /** One message on the "audio" channel: JSON cfg or a float32 PCM chunk. */
+  /** Wire format the host announced (`cfg.codec`). Opus packets carry a 'GA'
+   *  header; raw f32 is headerless, exactly as older hosts sent it. */
+  private audioWireCodec: "opus" | "f32" = "f32";
+  private audioDec: AudioDecoder | null = null;
+  /** Opus packets dropped in flight (seq gaps) — the audio channel is lossy by
+   *  design, so a gap is expected under load, not an error. HUD "A-loss". */
+  private audioLost = 0;
+  private audioLastSeq = -1;
+  /** Format the live Opus decoder was configured for (cfg-change detection). */
+  private audioDecRate = 0;
+  private audioDecCh = 0;
+  /** Monotonic timestamp counter for decode submissions (see feedAudioChunk). */
+  private audioDecTsUs = 0;
+
+  /** Tear the Opus decoder down (format change / mode switch / teardown). */
+  private closeAudioDecoder() {
+    const dec = this.audioDec;
+    this.audioDec = null;
+    this.audioLastSeq = -1;
+    this.audioDecTsUs = 0;
+    if (!dec) return;
+    try {
+      if (dec.state !== "closed") dec.close();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** Build the Opus decoder for the host's announced format. */
+  private buildAudioDecoder(rate: number, channels: number): boolean {
+    this.closeAudioDecoder();
+    if (typeof AudioDecoder === "undefined") return false;
+    try {
+      const dec = new AudioDecoder({
+        output: (frame) => this.onAudioFrameOut(frame),
+        error: (e) => {
+          console.warn("[remote] Opus decoder error:", e);
+          this.closeAudioDecoder();
+          // Ask the host for raw PCM rather than going silent: re-advertising
+          // f32-only makes it re-negotiate on the spot.
+          this.sendControl({ type: "amode", mode: "pcm", codecs: ["f32"] });
+        },
+      });
+      dec.configure({ codec: "opus", sampleRate: rate, numberOfChannels: channels });
+      this.audioDec = dec;
+      return true;
+    } catch (e) {
+      console.warn("[remote] Opus decoder configure failed:", e);
+      this.closeAudioDecoder();
+      return false;
+    }
+  }
+
+  /** Decoded Opus → interleaved float32 → the same worklet the raw path feeds. */
+  private onAudioFrameOut(frame: AudioData) {
+    try {
+      const ch = frame.numberOfChannels;
+      const frames = frame.numberOfFrames;
+      const out = new Float32Array(frames * ch);
+      // Copy per plane and interleave by hand: "f32" (interleaved) is not a
+      // guaranteed copyTo target across engines, but "f32-planar" always is.
+      const plane = new Float32Array(frames);
+      for (let c = 0; c < ch; c++) {
+        frame.copyTo(plane, { planeIndex: c, format: "f32-planar" });
+        for (let i = 0; i < frames; i++) out[i * ch + c] = plane[i];
+      }
+      this.pushAudioSamples(out.buffer);
+    } catch (e) {
+      console.warn("[remote] Opus frame copy failed:", e);
+    } finally {
+      frame.close();
+    }
+  }
+
+  /** One message on the "audio" channel: JSON cfg, an Opus packet, or raw PCM. */
   private onAudioMsg(data: unknown) {
     if (typeof data === "string") {
       try {
-        const msg = JSON.parse(data) as { cfg?: { sampleRate?: number; channels?: number } };
-        if (msg.cfg && this.audioNode) {
+        const msg = JSON.parse(data) as {
+          cfg?: { sampleRate?: number; channels?: number; codec?: string };
+        };
+        if (msg.cfg) {
           const rate = msg.cfg.sampleRate ?? 48000;
           const ch = msg.cfg.channels ?? 2;
-          if (rate !== this.audioCfgRate || ch !== this.audioCfgCh) {
+          const codec = msg.cfg.codec === "opus" ? "opus" : "f32";
+          // 1. Decoder lifecycle — independent of the worklet being up yet.
+          if (codec !== this.audioWireCodec || rate !== this.audioDecRate || ch !== this.audioDecCh) {
+            this.audioWireCodec = codec;
+            this.audioDecRate = rate;
+            this.audioDecCh = ch;
+            if (codec === "opus") {
+              if (!this.buildAudioDecoder(rate, ch)) {
+                // Can't decode what the host announced — demand raw PCM.
+                this.audioWireCodec = "f32";
+                this.sendControl({ type: "amode", mode: "pcm", codecs: ["f32"] });
+              }
+            } else {
+              this.closeAudioDecoder();
+            }
+          }
+          // 2. Worklet format. Latch the dedupe ONLY once the node has actually
+          // been told: the cfg can arrive before the player exists, and marking
+          // it applied then would leave the worklet on its default format for
+          // the whole session (the host's cfg burst is finite).
+          if (this.audioNode && (rate !== this.audioCfgRate || ch !== this.audioCfgCh)) {
             this.audioCfgRate = rate;
             this.audioCfgCh = ch;
+            // The worklet always consumes interleaved f32 at the capture rate —
+            // Opus changes what crosses the wire, not what gets played.
             this.audioNode.port.postMessage({
-              cfg: {
-                channels: ch,
-                captureRate: rate,
-                primeMs: 20,
-                targetMs: 30,
-                maxMs: 120,
-              },
+              cfg: { channels: ch, captureRate: rate, primeMs: 20, targetMs: 30, maxMs: 120 },
             });
           }
         }
@@ -1264,6 +1399,42 @@ export class CloudConn {
     this.audioBytes += ab.byteLength;
     this.audioByteWin.push({ at: now, bytes: ab.byteLength });
     while (this.audioByteWin.length && now - this.audioByteWin[0].at > 2000) this.audioByteWin.shift();
+    // Route on the FRAMING, not on the negotiated codec: the cfg (audio channel)
+    // and the host's format switch race, and the control-channel ack is a third
+    // stream with no ordering guarantee between them. The 'GA' header makes each
+    // packet self-describing, so neither side can ever hand Opus bytes to the
+    // PCM worklet — or PCM to the Opus decoder — during a switch.
+    if (isOpusPacket(ab)) {
+      const seq = audioSeqOf(ab);
+      this.audioLost += audioSeqGap(this.audioLastSeq, seq);
+      this.audioLastSeq = seq;
+      const dec = this.audioDec;
+      // No decoder yet ⇒ the cfg naming Opus hasn't landed (it repeats every 2s).
+      // Dropping a few packets beats decoding with a guessed sample rate.
+      if (!dec || dec.state !== "configured") return;
+      try {
+        dec.decode(
+          new EncodedAudioChunk({
+            type: "key", // every Opus packet is independently decodable
+            // Playout is buffer-driven (the worklet owns timing) so the value is
+            // never read back — it only has to be monotonic for the decoder.
+            timestamp: this.audioDecTsUs,
+            data: new Uint8Array(ab, AUDIO_HDR_BYTES),
+          }),
+        );
+        this.audioDecTsUs += 10_000;
+      } catch (e) {
+        console.warn("[remote] Opus decode submit failed:", e);
+      }
+      return;
+    }
+    // Headerless ⇒ raw interleaved float32 (the host only sends this while its
+    // codec is f32), which is exactly what the worklet consumes.
+    this.pushAudioSamples(ab);
+  }
+
+  /** Hand interleaved float32 to the playout worklet (both wire formats end here). */
+  private pushAudioSamples(ab: ArrayBuffer) {
     if (!this.audioNode) return;
     try {
       this.audioNode.port.postMessage(ab, [ab]);
@@ -1293,6 +1464,8 @@ export class CloudConn {
       targetMs: Math.round(this.audioTargetMs),
       underruns: this.audioUnderruns,
       kbps: this.audioDirect ? Math.round((winBytes * 8) / 1000) : 0,
+      codec: this.audioWireCodec,
+      lost: this.audioLost,
     };
   }
 
@@ -1398,11 +1571,41 @@ export class CloudConn {
 
     // Android APK: MediaCodec → Surface (Moonlight/Chiaki). Init is async; the
     // feed path buffers on awaitKey until __GT_DECODER__ is ready.
+    //
+    // `nativeFeedReady()` is a HARD precondition, not a wait-for-it: the JS
+    // interface is installed at page-load time (MainActivity.onWebViewCreate),
+    // so if it isn't here now it never will be this session — and choosing the
+    // native path without it means feeding MediaCodec nothing while the guest
+    // re-requests keyframes forever (blank screen, "Frames 0 / Keyframes N").
+    // Prefer a decoder that can actually receive frames.
+    if (nativeDecoderPossible() && this.preferNativeDecode && !nativeFeedReady()) {
+      console.warn("[remote] __GT_DECODER__ missing — native decode impossible, using WebCodecs");
+      this.emitEvent({
+        event: "decoder",
+        state: "fallback",
+        reason: "Phone decode bridge unavailable — using WebCodecs",
+        detail:
+          "window.__GT_DECODER__ is not installed. The JavascriptInterface must be bound before the page loads " +
+          "(MainActivity.onWebViewCreate → WcDecoderBridge.installJsInterface). This APK predates that fix, or the " +
+          "WebView was rebuilt after onCreate.",
+      });
+      return this.wcBuildWebCodecsDecoder();
+    }
     if (nativeDecoderPossible() && this.preferNativeDecode) {
       const w = this.wcCodedW > 0 ? this.wcCodedW : 1920;
       const h = this.wcCodedH > 0 ? this.wcCodedH : 1080;
+      // Switching INTO native: drop any WebCodecs decoder so two decoders never
+      // race for the same stream (mid-stream Tune flip).
+      try {
+        this.wcDecoder?.close();
+      } catch {
+        /* already closed */
+      }
+      this.wcDecoder = null;
       this.wcNative = true;
       this.wcAwaitKey = true;
+      this.wcNativeFrames = 0;
+      this.wcNativeStallAt = 0;
       this.wcStartNativePoll();
       void (async () => {
         const p = await probeNativeDecoder();
@@ -1453,6 +1656,24 @@ export class CloudConn {
 
   /** WebCodecs path — used on discovery web / Quest and as Android fallback. */
   private wcBuildWebCodecsDecoder(): boolean {
+    // Leaving the native path: the MediaCodec SurfaceView sits ON TOP of the
+    // WebView, so merely flipping `wcNative` left the Surface visible and
+    // covering the canvas we're about to paint into — the picture stayed frozen
+    // until a full reconnect ran wcReset(). Tear the codec down (teardown()
+    // also hides the SurfaceView) and tell the UI, so a mid-stream Tune flip
+    // switches decoders live.
+    if (this.wcNative) {
+      this.wcNative = false;
+      this.wcNativeFrames = 0;
+      this.wcNativeStallAt = 0;
+      this.wcStopNativePoll();
+      void teardownNativeDecoder();
+      if (this.wcActive) this.emitEvent({ event: "wc", active: true, native: false });
+    }
+    if (typeof VideoDecoder === "undefined") {
+      this.wcFallback("no WebCodecs VideoDecoder");
+      return false;
+    }
     try {
       this.wcDecoder?.close();
     } catch {
@@ -1541,6 +1762,34 @@ export class CloudConn {
     if (!this.wcNative || !this.wcActive) return;
     const st = await getNativeDecoderStats();
     if (!st) return;
+    // Watchdog: we are handing MediaCodec complete access units (wcFrames climbs)
+    // but nothing is coming back out. That's a blank screen, and every cause is
+    // device-specific and unrecoverable in place (driver refused the format, the
+    // Surface never became valid, the bridge isn't really bound). Give it 3s,
+    // then self-heal onto WebCodecs instead of stranding the user on a black
+    // rectangle until they reconnect by hand.
+    if (this.wcFrames > 0 && st.frames === 0) {
+      const now = Date.now();
+      if (this.wcNativeStallAt === 0) this.wcNativeStallAt = now;
+      else if (now - this.wcNativeStallAt > 3000) {
+        this.wcNativeStallAt = 0;
+        console.warn("[remote] native decoder produced no frames — falling back to WebCodecs");
+        this.emitEvent({
+          event: "decoder",
+          state: "fallback",
+          reason: "Phone decoder produced no picture — using WebCodecs",
+          detail:
+            `MediaCodec accepted ${this.wcFrames} frame(s) but decoded 0 in 3s.` +
+            (st.error ? `\ncodec error: ${st.error}` : "") +
+            `\ncodec active=${st.active} size=${st.width}x${st.height} queue=${st.queue}`,
+        });
+        this.wcBuildWebCodecsDecoder();
+        this.wcRequestKeyframe();
+        return;
+      }
+    } else if (st.frames > 0) {
+      this.wcNativeStallAt = 0;
+    }
     if (st.decodeMs > 0) {
       this.wcDecMs = this.wcDecMs === 0 ? st.decodeMs : this.wcDecMs * 0.7 + st.decodeMs * 0.3;
     }

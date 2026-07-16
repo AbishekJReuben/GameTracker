@@ -15,6 +15,7 @@ import { Channel } from "@tauri-apps/api/core";
 import { api, type RemoteCaptureStats } from "./api";
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "./rtc";
 import { auxMonitorRoom } from "./remoteConfig";
+import { AUDIO_HDR_BYTES, audioPacket } from "./audioWire";
 // Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
 import audioFeederWorkletUrl from "./audioFeeder.worklet.js?url";
 
@@ -85,6 +86,26 @@ const WC_MAX_BUFFERED = 262144;
 /** Recovery keyframe cadence (ms). Transport is reliable, so keyframes are only
  *  for decoder recovery/joins — long GOPs also avoid Chromium's ~1Hz IDR hitch. */
 const WC_KEY_INTERVAL_MS = 10000;
+
+// ---- DIRECT audio ("amode: pcm") -------------------------------------------
+// Raw float32 PCM costs sampleRate × channels × 4 = 384 KB/s ≈ 3.1 Mbps at 48k
+// stereo. Measured on a phone link: that was 4.1 Mbps of the budget with 1.9 MB
+// (five SECONDS) of backlog sitting in the audio data channel, arriving in
+// bursts the worklet could only trim-then-starve on — the "robotic" sound. Opus
+// carries the same audio for ~4% of that, and it is what WebRTC itself uses.
+/** Opus target bitrate — transparent for game/desktop audio at stereo 48k. */
+const AUDIO_OPUS_BPS = 128_000;
+/** Opus frame size (µs). 10ms halves the algorithmic delay of the 20ms default;
+ *  at this bitrate the extra per-packet overhead is irrelevant. */
+const AUDIO_OPUS_FRAME_US = 10_000;
+/** Sample rates libopus encodes natively. Chromium won't resample into the
+ *  encoder and a decoder config must name one of these too, so a capture at any
+ *  other rate (rare — WASAPI shared mode is 48k almost everywhere) uses raw PCM. */
+const AUDIO_OPUS_RATES = [8000, 12000, 16000, 24000, 48000];
+/** Never leave more than this much wall-clock audio queued in the channel.
+ *  SCTP has no "drop the stale stuff" knob, so refusing to enqueue is the only
+ *  backpressure available — and stale audio is worthless by definition. */
+const AUDIO_MAX_BUF_MS = 250;
 
 const CONTENT_NUM: Record<string, number> = { auto: 0, text: 1, video: 2 };
 /** Video-track content hint + bitrate-degradation preference per content mode. */
@@ -874,6 +895,9 @@ export function startHost(opts: HostOptions): () => void {
     track: MediaStreamTrack;
     start: () => Promise<void>;
     setDirectSink: (ch: RTCDataChannel | null) => void;
+    /** Negotiate the wire codec against the guest's advertised decode support. */
+    setDirectCodec: (codecs: string[]) => Promise<"opus" | "f32">;
+    stats: () => { codec: "opus" | "f32"; dropped: number };
     format: () => { sampleRate: number; channels: number } | null;
   } | null> => {
     try {
@@ -913,6 +937,198 @@ export function startHost(opts: HostOptions): () => void {
     let directSink: RTCDataChannel | null = null;
     let liveFmt: { sampleRate: number; channels: number } | null = null;
 
+    // ---- DIRECT audio codec (negotiated per guest) --------------------------
+    /** Wire format in use: Opus packets (headered) or raw interleaved float32. */
+    let audioCodec: "opus" | "f32" = "f32";
+    let audioEnc: AudioEncoder | null = null;
+    /** Format the live encoder was configured for. A capture-device change can
+     *  hand us a new mix rate mid-session; encoding AudioData at a rate the
+     *  encoder wasn't built for is garbage, so this forces a rebuild. */
+    let audioEncRate = 0;
+    let audioEncCh = 0;
+    let audioSeq = 0;
+    let audioTsUs = 0;
+    /** Chunks refused because the channel was already full (HUD "A-drop"). */
+    let audioDropped = 0;
+    /** What the guest told us it can decode; replayed when the format changes. */
+    let guestAudioCodecs: string[] = [];
+
+    /** Bytes/sec the live DIRECT format costs on the wire. */
+    const audioBytesPerSec = () => {
+      if (audioCodec === "opus") return AUDIO_OPUS_BPS / 8;
+      const f = liveFmt ?? { sampleRate: 48000, channels: 2 };
+      return f.sampleRate * f.channels * 4;
+    };
+
+    /** True when the channel already holds > AUDIO_MAX_BUF_MS of audio. */
+    const audioChBacked = () => {
+      const sink = directSink;
+      if (!sink) return true;
+      const cap = Math.max(8192, Math.round((audioBytesPerSec() * AUDIO_MAX_BUF_MS) / 1000));
+      return sink.bufferedAmount > cap;
+    };
+
+    const sendDirectRaw = (ab: ArrayBuffer) => {
+      const sink = directSink;
+      if (!sink || sink.readyState !== "open") return;
+      if (audioChBacked()) {
+        audioDropped++;
+        return;
+      }
+      try {
+        sink.send(ab);
+      } catch {
+        /* channel torn down */
+      }
+    };
+
+    /** Ship one Opus packet: shared 8-byte header + payload. The header makes
+     *  the stream self-describing, so a guest can never feed Opus bytes to its
+     *  PCM worklet (or vice versa) across a format switch. */
+    const sendOpusChunk = (chunk: EncodedAudioChunk) => {
+      const sink = directSink;
+      if (!sink || sink.readyState !== "open") return;
+      if (audioChBacked()) {
+        audioDropped++;
+        return;
+      }
+      const buf = audioPacket(audioSeq++, chunk.byteLength);
+      chunk.copyTo(new Uint8Array(buf, AUDIO_HDR_BYTES));
+      try {
+        sink.send(buf);
+      } catch {
+        /* channel torn down */
+      }
+    };
+
+    const closeAudioEncoder = () => {
+      const enc = audioEnc;
+      audioEnc = null;
+      audioEncRate = 0;
+      audioEncCh = 0;
+      if (!enc) return;
+      try {
+        if (enc.state !== "closed") enc.close();
+      } catch {
+        /* already gone */
+      }
+    };
+
+    /** Fall back to raw PCM mid-session (encoder fault) without dropping sound. */
+    const revertAudioToRaw = (why: string, e?: unknown) => {
+      if (audioCodec === "f32") return;
+      console.warn(`[remote] DIRECT audio → raw PCM: ${why}`, e ?? "");
+      closeAudioEncoder();
+      audioCodec = "f32";
+      startCfgBurst();
+    };
+
+    /** Build the Opus encoder for the live capture format. Null ⇒ use raw PCM. */
+    const buildOpusEncoder = async (rate: number, channels: number): Promise<AudioEncoder | null> => {
+      if (typeof AudioEncoder === "undefined" || typeof AudioData === "undefined") return null;
+      if (!AUDIO_OPUS_RATES.includes(rate)) return null;
+      const cfg = {
+        codec: "opus",
+        sampleRate: rate,
+        numberOfChannels: channels,
+        bitrate: AUDIO_OPUS_BPS,
+        opus: {
+          frameDuration: AUDIO_OPUS_FRAME_US,
+          // The audio channel is unreliable by design (maxRetransmits: 0), so
+          // let Opus carry its own redundancy: in-band FEC + a loss hint lets
+          // the decoder reconstruct a dropped packet instead of clicking.
+          useinbandfec: true,
+          packetlossperc: 10,
+          complexity: 5,
+        },
+      } as unknown as AudioEncoderConfig;
+      try {
+        const sup = await AudioEncoder.isConfigSupported(cfg);
+        if (!sup?.supported) return null;
+      } catch {
+        return null;
+      }
+      try {
+        const enc = new AudioEncoder({
+          output: (chunk) => sendOpusChunk(chunk),
+          error: (e) => revertAudioToRaw("Opus encoder error", e),
+        });
+        enc.configure(cfg);
+        return enc;
+      } catch (e) {
+        console.warn("[remote] DIRECT audio: Opus configure failed — raw PCM:", e);
+        return null;
+      }
+    };
+
+    /** Encode one PCM chunk. False ⇒ caller degrades this session to raw PCM. */
+    const encodeDirectAudio = (ab: ArrayBuffer): boolean => {
+      const enc = audioEnc;
+      const fmt = liveFmt;
+      if (!enc || !fmt || enc.state !== "configured") return false;
+      // The capture format moved out from under the encoder (device change) —
+      // degrade to raw rather than encode AudioData it wasn't built for. The
+      // next `start()` re-negotiates Opus at the new rate.
+      if (fmt.sampleRate !== audioEncRate || fmt.channels !== audioEncCh) return false;
+      const src = new Float32Array(ab);
+      const frames = Math.floor(src.length / fmt.channels);
+      if (frames <= 0) return true; // empty chunk — nothing to do, stay on Opus
+      try {
+        const ad = new AudioData({
+          format: "f32", // Rust ships interleaved float32
+          sampleRate: fmt.sampleRate,
+          numberOfFrames: frames,
+          numberOfChannels: fmt.channels,
+          timestamp: audioTsUs,
+          data: src.subarray(0, frames * fmt.channels),
+        });
+        audioTsUs += Math.round((frames * 1_000_000) / fmt.sampleRate);
+        enc.encode(ad);
+        ad.close();
+        return true;
+      } catch (e) {
+        console.warn("[remote] DIRECT audio encode failed:", e);
+        return false;
+      }
+    };
+
+    /**
+     * Negotiate the DIRECT audio codec against what the guest can decode, and
+     * (re)build the encoder. Old guests advertise nothing → raw f32, which is
+     * byte-for-byte what they already expect. Returns the codec now in use.
+     */
+    const setDirectCodec = async (codecs: string[]): Promise<"opus" | "f32"> => {
+      guestAudioCodecs = codecs;
+      const fmt = liveFmt;
+      if (!codecs.includes("opus") || !fmt) {
+        // No Opus (or the capture format isn't known yet — `start()` re-runs us).
+        closeAudioEncoder();
+        audioCodec = "f32";
+        return audioCodec;
+      }
+      // Already encoding this exact format — nothing to do.
+      if (audioEnc && audioCodec === "opus" && audioEncRate === fmt.sampleRate && audioEncCh === fmt.channels) {
+        return audioCodec;
+      }
+      const enc = await buildOpusEncoder(fmt.sampleRate, fmt.channels);
+      closeAudioEncoder();
+      if (!enc) {
+        audioCodec = "f32";
+        return audioCodec;
+      }
+      audioEnc = enc;
+      audioEncRate = fmt.sampleRate;
+      audioEncCh = fmt.channels;
+      audioSeq = 0;
+      audioTsUs = 0;
+      audioCodec = "opus";
+      console.info(
+        `[remote] DIRECT audio via Opus @ ${Math.round(AUDIO_OPUS_BPS / 1000)}kbps ` +
+          `(${fmt.sampleRate}Hz ×${fmt.channels}) — was ${Math.round((fmt.sampleRate * fmt.channels * 4 * 8) / 1000)}kbps raw`,
+      );
+      return audioCodec;
+    };
+
     // The audio channel is partially reliable (maxRetransmits: 0) so the one-shot
     // format JSON can be lost in transit. Repeat it for a short burst after a sink
     // attaches (and after every capture-format change) so at least one copy lands.
@@ -933,7 +1149,11 @@ export function startHost(opts: HostOptions): () => void {
         return;
       }
       try {
-        directSink.send(JSON.stringify({ cfg: { sampleRate: liveFmt.sampleRate, channels: liveFmt.channels } }));
+        directSink.send(
+          JSON.stringify({
+            cfg: { sampleRate: liveFmt.sampleRate, channels: liveFmt.channels, codec: audioCodec },
+          }),
+        );
       } catch {
         /* ignore */
       }
@@ -945,16 +1165,17 @@ export function startHost(opts: HostOptions): () => void {
       if (directSink && directSink.readyState === "open") cfgTimer = window.setInterval(sendDirectCfg, 2000);
     };
 
-    // DIRECT → data channel (copy); RTC → worklet (transfer).
+    // DIRECT → data channel (Opus, or a raw copy); RTC → worklet (transfer).
     const ch = new Channel<ArrayBuffer>();
     ch.onmessage = (buf) => {
       const ab = buf as unknown as ArrayBuffer;
       if (directSink && directSink.readyState === "open") {
-        try {
-          directSink.send(ab.slice(0));
-        } catch {
-          /* channel torn down */
+        if (audioCodec === "opus") {
+          // sendOpusChunk() ships the packets from the encoder's output callback.
+          if (encodeDirectAudio(ab)) return;
+          revertAudioToRaw("encode failed mid-session");
         }
+        sendDirectRaw(ab.slice(0));
         return;
       }
       try {
@@ -983,16 +1204,33 @@ export function startHost(opts: HostOptions): () => void {
       } catch {
         /* node torn down */
       }
-      if (directSink) startCfgBurst();
+      // The real capture format is only known now, and Opus needs it to build —
+      // a guest that opted into DIRECT before capture started got raw PCM, so
+      // re-negotiate against its advertised codecs and announce the result.
+      if (directSink) {
+        await setDirectCodec(guestAudioCodecs);
+        startCfgBurst();
+      }
     };
     return {
       track,
       start,
       setDirectSink: (sink) => {
         directSink = sink;
-        if (sink) startCfgBurst();
-        else stopCfgBurst();
+        if (sink) {
+          startCfgBurst();
+        } else {
+          stopCfgBurst();
+          // Back to the RTC track: drop the encoder so a later re-opt-in starts
+          // from a clean timestamp/sequence base.
+          closeAudioEncoder();
+          audioCodec = "f32";
+          audioSeq = 0;
+          audioTsUs = 0;
+        }
       },
+      setDirectCodec,
+      stats: () => ({ codec: audioCodec, dropped: audioDropped }),
       format: () => liveFmt,
     };
   };
@@ -1011,6 +1249,8 @@ export function startHost(opts: HostOptions): () => void {
     let startVideoCapture: (() => Promise<void>) | null = null;
     let startAudioCapture: (() => Promise<void>) | null = null;
     let setAudioDirectSink: ((ch: RTCDataChannel | null) => void) | null = null;
+    let setAudioDirectCodec: ((codecs: string[]) => Promise<"opus" | "f32">) | null = null;
+    let audioStats: (() => { codec: "opus" | "f32"; dropped: number }) | null = null;
     let audioDirect = false;
     // Capture-stall watchdog bookkeeping (restart capture if it wedges).
     let lastProduced = -1;
@@ -1689,6 +1929,8 @@ export function startHost(opts: HostOptions): () => void {
         pc.addTrack(audioTrack, new MediaStream([audioTrack]));
         startAudioCapture = a.start;
         setAudioDirectSink = a.setDirectSink;
+        setAudioDirectCodec = a.setDirectCodec;
+        audioStats = a.stats;
       }
     }
 
@@ -1828,15 +2070,27 @@ export function startHost(opts: HostOptions): () => void {
         if (msg && msg.type === "amode") {
           if (msg.mode === "pcm" && authorized) {
             audioDirect = true;
-            setAudioDirectSink?.(audioCh);
-            if (audioTrack) audioTrack.enabled = false;
-            if (dataCh?.readyState === "open") {
-              try {
-                dataCh.send(JSON.stringify({ event: "amode", mode: "pcm" }));
-              } catch {
-                /* ignore */
+            // The guest advertises what it can DECODE, in preference order. An
+            // older APK sends no list at all → raw f32, byte-for-byte what it
+            // expects. Codec selection must finish before the sink is attached,
+            // otherwise the first chunks go out in a format the guest hasn't
+            // been told about yet.
+            const codecs = Array.isArray(msg.codecs)
+              ? (msg.codecs as unknown[]).map((c) => String(c))
+              : [];
+            void (async () => {
+              const codec = (await setAudioDirectCodec?.(codecs)) ?? "f32";
+              if (pc !== myPc) return; // session replaced while negotiating
+              setAudioDirectSink?.(audioCh);
+              if (audioTrack) audioTrack.enabled = false;
+              if (dataCh?.readyState === "open") {
+                try {
+                  dataCh.send(JSON.stringify({ event: "amode", mode: "pcm", codec }));
+                } catch {
+                  /* ignore */
+                }
               }
-            }
+            })();
           } else {
             audioDirect = false;
             setAudioDirectSink?.(null);
@@ -2220,10 +2474,15 @@ export function startHost(opts: HostOptions): () => void {
                           recovering: nativeRecovering,
                         }
                       : { on: false },
-                  // Audio path telemetry for the phone HUD.
+                  // Audio path telemetry for the phone HUD. `codec` says whether
+                  // DIRECT is paying 128kbps (Opus) or ~3.1Mbps (raw f32), and
+                  // `dropped` counts chunks the backpressure guard refused —
+                  // a climbing count means the link can't even carry the audio.
                   audio: {
                     mode: audioDirect ? "pcm" : "rtc",
                     chBufKB: Math.round((audioCh.bufferedAmount || 0) / 1024),
+                    codec: audioStats?.().codec ?? "f32",
+                    dropped: audioStats?.().dropped ?? 0,
                   },
                   at: Date.now(),
                 }),
