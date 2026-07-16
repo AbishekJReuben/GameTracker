@@ -80,8 +80,15 @@ if (-not $SkipWebBuild) {
     Write-Host "Building web bundle (npm run build)..."
     npm run build
     if ($LASTEXITCODE -ne 0) { throw "web build failed (exit $LASTEXITCODE)" }
+    # The web + Quest companions (signaling/static) share this same src/, so
+    # refresh them alongside the APK — otherwise the browser companion ships
+    # stale UI while the phone app moves on. (Skipped under -SkipWebBuild: the
+    # orchestrator Build-All.ps1 builds it once up front.)
+    Write-Host "Building web companion bundle (npm run discovery:build -> signaling\static)..."
+    npm run discovery:build
+    if ($LASTEXITCODE -ne 0) { throw "discovery (web companion) build failed (exit $LASTEXITCODE)" }
 } else {
-    Write-Host "Skipping web bundle (dist\ already built)."
+    Write-Host "Skipping web bundle (dist\ + signaling\static already built)."
 }
 
 # --- apply Android project customizations (permission/FileProvider/cleartext) ---

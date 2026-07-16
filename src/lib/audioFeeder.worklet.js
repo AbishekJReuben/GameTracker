@@ -8,18 +8,21 @@
  * thread missed audio deadlines and the phone heard crackling. Keep ALL audio
  * work in here — the main thread only forwards chunks.
  *
- * Logic (ported from the old node, tuned against earlier pop complaints):
- *  - PRIME before (re)starting playback so delivery bursts are absorbed.
- *  - A streaming linear resampler consumes input at `captureRate / sampleRate`
- *    (WASAPI runs at the endpoint's mix rate — 44.1k/96k/192k, not always 48k),
- *    nudged ±0.4% (inaudible) to steer the buffer toward TARGET, so clock skew
- *    never forces a trim or an underrun in steady state.
- *  - A slew-limited gain ramp (~6ms) makes every silence↔audio edge click-free.
- *  - TARGET grows on each underrun up to `maxMs`, and eases back after ~10s clean.
+ * Playout model (v2 — "hold, don't fade"):
+ *  - PRIME before (re)starting so delivery bursts are absorbed.
+ *  - Streaming linear resampler at `captureRate / sampleRate`, nudged ±0.25%
+ *    toward TARGET (tighter than ±0.4% — less stretchy "robotic" pitch hunt).
+ *  - On underrun: HOLD the last sample at full gain. The old fade-out/fade-in
+ *    on every brief gap is what users heard as choppy/robotic DIRECT audio —
+ *    amplitude pumping on a 10–30ms cadence. A held sample clicks far less
+ *    than a gain envelope, and keeps NetEQ-/worklet-fed RTC from pumping too.
+ *  - TARGET grows on each underrun up to `maxMs`; eases back after ~8s clean.
+ *  - Seq-gap concealment fills holes with a short crossfaded hold (not a fade
+ *    to silence) so losses don't drain the buffer into another underrun.
  *
  * Buffer envelope is configurable via `{cfg:{primeMs,targetMs,maxMs}}` so the
  * host's RTC feeder (wider, absorbs IPC jitter) and the phone's DIRECT feeder
- * (lean, matches the near-instant video path) can share one processor.
+ * (leaner) can share one processor.
  *
  * No per-frame allocations in `process()` — GC pauses on the audio thread are
  * themselves a crackle source.
@@ -36,16 +39,12 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     this.head = 0;
     this.avail = 0; // interleaved samples currently buffered
     // Envelope (ms): prime, steer toward target, trim runaway latency.
-    // Defaults = lean DIRECT profile; the host RTC path widens these via cfg.
-    // The 12/18ms floor experiment sounded "robotic": the data channel delivers
-    // PCM in bursts (it shares the SCTP link with video), and a target smaller
-    // than the burst gap means an underrun — with its fade-out/fade-in — every
-    // few quanta, i.e. audible amplitude chop. 20/30 rides just above the
-    // typical burst gap while staying well under a video frame of extra lag.
-    this.primeMs = 20;
-    this.targetMs = 30;
-    this.maxMs = 120;
-    this.baseTargetMs = 30;
+    // Defaults = DIRECT profile (callers override). Wider than the old 20/30
+    // so a single SCTP burst gap under video load doesn't underrun.
+    this.primeMs = 40;
+    this.targetMs = 65;
+    this.maxMs = 240;
+    this.baseTargetMs = 65;
     this.priming = true;
     this.gain = 0;
     // Resampler state: interpolating between input frames f0 and f1, phase∈[0,1).
@@ -54,6 +53,8 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     this.f1 = new Float32Array(2);
     this.cleanQuanta = 0;
     this.underruns = 0;
+    /** Consecutive quanta spent holding (for slow re-prime only when truly dry). */
+    this.holdQuanta = 0;
     this.port.onmessage = (e) => {
       const d = e.data;
       if (d instanceof ArrayBuffer) {
@@ -62,40 +63,34 @@ class GtPcmFeeder extends AudioWorkletProcessor {
         this.avail += f32.length;
         // Runaway-latency guard: past target+headroom, trim back to target in one
         // splice (rare — steady-state drift is handled by the resampler).
-        const max = this.ms(Math.min(this.maxMs, this.targetMs + 80));
+        const max = this.ms(Math.min(this.maxMs, this.targetMs + 100));
         if (this.avail > max) this.drop(this.avail - this.ms(this.targetMs));
         return;
       }
       if (d && typeof d.gap === "number") {
         // Conceal a known upstream loss (dropped Opus packets — the DIRECT
         // channel is lossy by design and WebCodecs' AudioDecoder has no
-        // FEC/PLC hook to rebuild them). Without this, every loss silently
-        // shrank the buffered timeline by the lost duration: the level sagged,
-        // the resampler's ±0.4% steer couldn't catch a 10ms step, and a few
-        // losses later the buffer underran — fade-out/fade-in chop on top of a
-        // waveform click at every seam. That combination is the "robotic"
-        // DIRECT sound. Filling the hole with a decaying hold of the last
-        // buffered sample keeps the level (no underrun cascade) and makes the
-        // leading seam click-free; the trailing seam is a single soft step.
+        // FEC/PLC hook). Fill with a crossfaded hold so level stays up and
+        // the next real packet joins without a gain pump.
         this.conceal(d.gap);
         return;
       }
       if (d && d.cfg) {
         const ch = Math.max(1, Math.min(2, d.cfg.channels | 0));
         const rate = d.cfg.captureRate > 8000 ? d.cfg.captureRate : sampleRate;
-        if (typeof d.cfg.primeMs === "number") this.primeMs = Math.max(10, Math.min(120, d.cfg.primeMs));
+        if (typeof d.cfg.primeMs === "number") this.primeMs = Math.max(10, Math.min(160, d.cfg.primeMs));
         if (typeof d.cfg.targetMs === "number") {
           // Only reset the LIVE target when the base actually changes: cfg may be
           // re-sent periodically (the DIRECT channel is lossy, so the host repeats
           // it), and clamping targetMs back down on every repeat would erase the
           // adaptive underrun growth right when it's needed.
-          const base = Math.max(15, Math.min(200, d.cfg.targetMs));
+          const base = Math.max(20, Math.min(250, d.cfg.targetMs));
           if (base !== this.baseTargetMs) {
             this.baseTargetMs = base;
             this.targetMs = base;
           }
         }
-        if (typeof d.cfg.maxMs === "number") this.maxMs = Math.max(this.baseTargetMs, Math.min(300, d.cfg.maxMs));
+        if (typeof d.cfg.maxMs === "number") this.maxMs = Math.max(this.baseTargetMs, Math.min(400, d.cfg.maxMs));
         if (ch !== this.channels || rate !== this.captureRate) {
           // Framing changed: buffered bytes were queued under the old
           // assumption — drop them and re-prime.
@@ -106,6 +101,7 @@ class GtPcmFeeder extends AudioWorkletProcessor {
           this.avail = 0;
           this.priming = true;
           this.phase = 0;
+          this.holdQuanta = 0;
         }
         // Stats poll from the main thread.
         if (d.cfg.stats) {
@@ -128,23 +124,26 @@ class GtPcmFeeder extends AudioWorkletProcessor {
   }
 
   /**
-   * Synthesize `gapMs` of filler (capped at 80ms — beyond that it's a dropout,
-   * and stretching a hold that long sounds worse than re-priming) from a
-   * decaying hold of the last buffered sample. Skipped while priming or empty:
-   * there is nothing to hold, and PRIME already covers the resume.
+   * Synthesize `gapMs` of filler (capped at 60ms) from a decaying hold of the
+   * last buffered sample, with a soft attack so the leading seam doesn't click.
+   * Unlike a fade-to-silence hole, this keeps buffer level up so one loss
+   * doesn't cascade into an underrun.
    */
   conceal(gapMs) {
     if (this.priming || this.avail < this.channels || !(gapMs > 0)) return;
-    const frames = Math.round((this.captureRate * Math.min(gapMs, 80)) / 1000);
+    const frames = Math.round((this.captureRate * Math.min(gapMs, 60)) / 1000);
     if (frames <= 0) return;
     const ch = this.channels;
-    // Last buffered frame = the tail of the newest chunk.
     const tailChunk = this.chunks[this.chunks.length - 1];
     const tail = new Float32Array(ch);
     for (let c = 0; c < ch; c++) tail[c] = tailChunk[tailChunk.length - ch + c] || 0;
     const fill = new Float32Array(frames * ch);
+    const attack = Math.min(48, frames);
     for (let i = 0; i < frames; i++) {
-      const g = 1 - i / frames; // linear fade to silence across the hole
+      // Soft attack, then gentle decay — never reaches 0 before the next packet
+      // is expected (gap is typically one 20ms Opus frame).
+      const a = i < attack ? i / attack : 1;
+      const g = a * (0.85 - 0.35 * (i / frames));
       for (let c = 0; c < ch; c++) fill[i * ch + c] = tail[c] * g;
     }
     this.chunks.push(fill);
@@ -193,6 +192,7 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     if (this.priming) {
       if (this.avail >= this.ms(this.primeMs)) {
         this.priming = false;
+        this.holdQuanta = 0;
         if (!this.readFrameInto(this.f0)) this.f0.fill(0);
         if (!this.readFrameInto(this.f1)) this.f1.set(this.f0);
         this.phase = 0;
@@ -204,17 +204,19 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     }
 
     // Drift-adaptive playback ratio: steer buffered frames toward TARGET.
+    // ±0.25% (was ±0.4%) — less audible pitch hunt when the buffer breathes.
     const targetFrames = this.ms(this.targetMs) / this.channels;
     const availFrames = this.avail / this.channels;
     const err = targetFrames > 0 ? (availFrames - targetFrames) / targetFrames : 0;
-    const ratio = (this.captureRate / sampleRate) * (1 + Math.max(-0.004, Math.min(0.004, err * 0.05)));
-    const slew = 1 / Math.max(1, 0.006 * sampleRate); // ~6ms full fade in/out
+    const ratio = (this.captureRate / sampleRate) * (1 + Math.max(-0.0025, Math.min(0.0025, err * 0.04)));
+    // Fast attack when coming out of prime; slow release unused (we hold now).
+    const slewUp = 1 / Math.max(1, 0.004 * sampleRate); // ~4ms fade-in from silence
 
     let g = this.gain;
-    let underran = false;
+    let holding = false;
     for (let i = 0; i < frames; i++) {
-      const tgt = underran ? 0 : 1;
-      g += Math.max(-slew, Math.min(slew, tgt - g));
+      // Always steer gain toward 1 while playing — never pump to 0 on a brief hold.
+      g += Math.min(slewUp, 1 - g);
       for (let c = 0; c < nch; c++) {
         const src = Math.min(c, this.channels - 1);
         out[c][i] = (this.f0[src] * (1 - this.phase) + this.f1[src] * this.phase) * g;
@@ -224,31 +226,33 @@ class GtPcmFeeder extends AudioWorkletProcessor {
         this.phase -= 1;
         this.f0.set(this.f1);
         if (!this.readFrameInto(this.f1)) {
-          // Buffer emptied mid-quantum: hold the last frame and fade out.
+          // Hold last frame at full level — no fade-out. That's the new approach.
           this.f1.set(this.f0);
-          underran = true;
+          holding = true;
         }
       }
     }
     this.gain = g;
 
-    if (underran) {
+    if (holding) {
       this.cleanQuanta = 0;
       this.underruns++;
-      // Bursty delivery (game hogging the CPU delays chunk forwarding): hold
-      // more audio before resuming so the next gap fits inside the buffer.
-      // +20ms per underrun: the +12 experiment grew too slowly to outrun a
-      // congestion burst, so several consecutive underruns each added their own
-      // fade-out/fade-in — the "robotic" chop. One decisive step ends it sooner.
-      this.targetMs = Math.min(this.maxMs, this.targetMs + 20);
-      // Ran fully dry → refill to PRIME before resuming (prevents machine-gun
-      // clicking when the stream is briefly starved).
-      if (this.avail < this.channels) this.priming = true;
-    } else if (++this.cleanQuanta * frames > sampleRate * 6 && this.targetMs > this.baseTargetMs) {
-      // ~6s clean (was 10) → ease latency back down one step. Faster ease-back
-      // keeps the post-underrun dwell short so total audio lag tracks the video.
-      this.cleanQuanta = 0;
-      this.targetMs = Math.max(this.baseTargetMs, this.targetMs - 6);
+      this.holdQuanta++;
+      // Grow the cushion so the next burst gap fits. Bigger step than before so
+      // one congestion event doesn't become a string of holds.
+      this.targetMs = Math.min(this.maxMs, this.targetMs + 25);
+      // Only re-prime after ~80ms of continuous hold with a dry buffer — avoids
+      // the machine-gun silence/restart that made DIRECT sound robotic.
+      if (this.avail < this.channels && this.holdQuanta * frames > sampleRate * 0.08) {
+        this.priming = true;
+        this.holdQuanta = 0;
+      }
+    } else {
+      this.holdQuanta = 0;
+      if (++this.cleanQuanta * frames > sampleRate * 8 && this.targetMs > this.baseTargetMs) {
+        this.cleanQuanta = 0;
+        this.targetMs = Math.max(this.baseTargetMs, this.targetMs - 4);
+      }
     }
     return true;
   }

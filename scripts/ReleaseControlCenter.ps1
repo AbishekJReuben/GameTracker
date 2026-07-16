@@ -123,7 +123,7 @@ $(Get-CgResourceXaml)
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19" Margin="0,0,0,6"
                 Text="1. Bump - rewrite the version in package.json, both tauri.conf.json files, and both Cargo.toml/lock files (desktop + companion must match)."/>
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19" Margin="0,0,0,6"
-                Text="2. Commit - record those file edits on main so the tag points at a real snapshot."/>
+                Text="2. Commit - stage the whole working tree (feature work + version bump), then commit so the tag points at a complete snapshot."/>
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19" Margin="0,0,0,6"
                 Text="3. Tag vX.Y.Z - annotated git tag. The Release workflow only starts on v* tags."/>
               <TextBlock TextWrapping="Wrap" Foreground="$($t.Sub)" FontSize="12.5" LineHeight="19" Margin="0,0,0,6"
@@ -224,7 +224,7 @@ function Invoke-Ship([switch]$DryRun) {
   }
   $confirm = if ($DryRun) { 'Yes' } else {
     [System.Windows.MessageBox]::Show(
-      "Ship v$ver to personal?`n`nThis will bump files, commit, tag v$ver, and push to personal (starts CI).",
+      "Ship v$ver to personal?`n`nThis will bump the version, commit ALL working-tree changes (not just version files), tag v$ver, and push to personal (starts CI).",
       'Confirm release', 'YesNo', 'Question')
   }
   if ($confirm -ne 'Yes') { return }

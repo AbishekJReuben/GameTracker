@@ -45,7 +45,9 @@ export type StreamTune = {
   pace: number;
   /** Host/DIRECT: recovery keyframe cadence (ms). Long GOP dodges the ~1Hz IDR hitch. */
   wcKeyMs: number;
-  /** Host/DIRECT: skip encoding while this many KB sit unsent on the video channel. */
+  /** Host/DIRECT: skip encoding while this many KB sit unsent on the video channel.
+   *  Higher = fewer latest-wins skips (smoother NVENC latency) at the cost of
+   *  a little more backlog under a congested link. */
   wcBufKB: number;
   /** Host/DIRECT: skip encoding while more than this many frames are in the encoder. */
   wcQueueMax: number;
@@ -68,20 +70,16 @@ export type StreamTune = {
    */
   preferNativeDecode: boolean;
   /**
-   * PC sound path. ON = DIRECT: raw float32 PCM over the data channel, lean
-   * worklet on the phone (~40ms) — matches near-instant DIRECT video. OFF = RTC:
-   * the classic WebRTC Opus audio track (NetEQ + host worklet, ~150–250ms behind
-   * video after NVENC made the picture instant). Flip OFF if DIRECT audio
-   * crackles on a bad link.
+   * PC sound path. ON = DIRECT: Opus (or raw f32) over the high-priority audio
+   * data channel → hold-based phone worklet (~65ms target). OFF = RTC: WebRTC
+   * Opus track (NetEQ + host worklet). Flip OFF if DIRECT crackles on a bad link.
    */
   preferDirectAudio: boolean;
   /**
    * RTC audio only: playout delay (ms) the phone asks NetEQ for on the Opus
-   * track. 0 = leave the browser's own adaptive behaviour alone (what shipped —
-   * typically 150–250ms). Like the video JB this is a MINIMUM, so a low ask is
-   * a request, not a guarantee: NetEQ pads above it on a jittery link and pays
-   * for a too-low value in concealment (choppy/robotic sound). No effect while
-   * DIRECT audio is live — that path has no jitter buffer at all.
+   * track. 0 = browser adaptive. A modest floor (default 100) stops NetEQ from
+   * fighting video congestion into concealment chop; too-low asks pay for it in
+   * PLC artifacts. No effect while DIRECT audio is live.
    */
   audioJbMs: number;
   /**
@@ -109,15 +107,15 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   preferDirect: true,
   pace: 0,
   wcKeyMs: 10000,
-  wcBufKB: 256,
-  wcQueueMax: 2,
+  wcBufKB: 384,
+  wcQueueMax: 3,
   jbGrowAt: 15,
   directRetrySec: 15,
   hostNvenc: true,
   preferNativeDecode: true,
   preferDirectAudio: true,
-  audioJbMs: 0,
-  audioHostMs: 55,
+  audioJbMs: 100,
+  audioHostMs: 90,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -137,6 +135,19 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
   let jbMax = clamp(Number(r.jbMax) || d.jbMax, 40, 400);
   if (jbMin > jbBase) jbMin = jbBase;
   if (jbMax < jbBase) jbMax = jbBase;
+  // Soft-migrate prior shipped defaults that caused the regressions this pass
+  // fixed (host RTC underrun at 55ms; NVENC skip storms at 256KB video buf).
+  // Only when the saved value IS the old default — a deliberate custom 55 stays.
+  const rawHost = Number(r.audioHostMs);
+  const rawBuf = Number(r.wcBufKB);
+  const rawQueue = Number(r.wcQueueMax);
+  const audioHostMs = clamp(
+    rawHost === 55 ? d.audioHostMs : rawHost || d.audioHostMs,
+    20,
+    200,
+  );
+  const wcBufKB = clamp(rawBuf === 256 ? d.wcBufKB : rawBuf || d.wcBufKB, 64, 1024);
+  const wcQueueMax = clamp(rawQueue === 2 ? d.wcQueueMax : rawQueue || d.wcQueueMax, 1, 6);
   return {
     maxW: clamp(Number(r.maxW) || d.maxW, 320, 3840),
     jpeg: clamp(Number(r.jpeg) || d.jpeg, 20, 95),
@@ -154,8 +165,8 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     // 0 is a meaningful value (the default), so `||` would swallow it — test finite.
     pace: clamp(Number.isFinite(Number(r.pace)) ? Number(r.pace) : d.pace, 0, 100),
     wcKeyMs: clamp(Number(r.wcKeyMs) || d.wcKeyMs, 1000, 30000),
-    wcBufKB: clamp(Number(r.wcBufKB) || d.wcBufKB, 64, 1024),
-    wcQueueMax: clamp(Number(r.wcQueueMax) || d.wcQueueMax, 1, 6),
+    wcBufKB,
+    wcQueueMax,
     jbGrowAt: clamp(Number(r.jbGrowAt) || d.jbGrowAt, 5, 40),
     directRetrySec: clamp(Number(r.directRetrySec) || d.directRetrySec, 5, 120),
     // Same `!== false` shape as preferDirect: absent (an older saved tune) means the
@@ -163,10 +174,9 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     hostNvenc: r.hostNvenc !== false,
     preferNativeDecode: r.preferNativeDecode !== false,
     preferDirectAudio: r.preferDirectAudio !== false,
-    // 0 means "auto" (don't touch NetEQ) and is the default, so `||` would
-    // swallow a deliberate 0 — test finite, like `pace`.
+    // 0 means "auto" (don't touch NetEQ). Finite test — like `pace`.
     audioJbMs: clamp(Number.isFinite(Number(r.audioJbMs)) ? Number(r.audioJbMs) : d.audioJbMs, 0, 400),
-    audioHostMs: clamp(Number(r.audioHostMs) || d.audioHostMs, 20, 200),
+    audioHostMs,
   };
 }
 

@@ -1317,19 +1317,49 @@ export function ControlScreen({
     // #root never was, so the native path decoded into a Surface nobody could
     // see. Walk the real DOM chain instead of naming wrappers, so the next
     // wrapper div someone adds can't regress this.
-    const cleared: Array<{ el: HTMLElement; prev: string }> = [];
+    //
+    // Also clear backgroundColor / backgroundImage separately — some OEM
+    // WebViews honour those over the shorthand `background`, and restoring
+    // only `background` left a solid #06070d paint over the punch.
+    type Cleared = { el: HTMLElement; bg: string; bgc: string; bgi: string };
+    const cleared: Cleared[] = [];
     let el: HTMLElement | null = viewportRef.current;
     while (el) {
-      cleared.push({ el, prev: el.style.background });
+      cleared.push({
+        el,
+        bg: el.style.background,
+        bgc: el.style.backgroundColor,
+        bgi: el.style.backgroundImage,
+      });
       el.style.background = "transparent";
+      el.style.backgroundColor = "transparent";
+      el.style.backgroundImage = "none";
       el = el.parentElement;
+    }
+    // Belt-and-braces: companion.html sets these on html/body/#root.
+    for (const sel of [document.documentElement, document.body, document.getElementById("root")]) {
+      if (!(sel instanceof HTMLElement)) continue;
+      if (cleared.some((c) => c.el === sel)) continue;
+      cleared.push({
+        el: sel,
+        bg: sel.style.background,
+        bgc: sel.style.backgroundColor,
+        bgi: sel.style.backgroundImage,
+      });
+      sel.style.background = "transparent";
+      sel.style.backgroundColor = "transparent";
+      sel.style.backgroundImage = "none";
     }
     syncNativeSurface();
     const onResize = () => syncNativeSurface();
     window.addEventListener("resize", onResize);
     window.visualViewport?.addEventListener("resize", onResize);
     return () => {
-      for (const { el: e, prev } of cleared) e.style.background = prev;
+      for (const { el: e, bg, bgc, bgi } of cleared) {
+        e.style.background = bg;
+        e.style.backgroundColor = bgc;
+        e.style.backgroundImage = bgi;
+      }
       window.removeEventListener("resize", onResize);
       window.visualViewport?.removeEventListener("resize", onResize);
     };
@@ -1364,7 +1394,10 @@ export function ControlScreen({
         if (l) layoutRef.current = l;
         ctxRef.current = null; // canvas resize invalidates the 2d context state
       }
-      if (!ctxRef.current) ctxRef.current = canvas.getContext("2d", { alpha: false, desynchronized: true });
+      // alpha:true — an opaque (alpha:false) canvas promotes a compositor layer
+      // that blacks the MediaCodec SurfaceView hole punch even at opacity:0 on
+      // several Android WebViews. WebCodecs paint doesn't need the opaque hint.
+      if (!ctxRef.current) ctxRef.current = canvas.getContext("2d", { alpha: true, desynchronized: true });
       try {
         ctxRef.current?.drawImage(frame, 0, 0);
       } catch {
@@ -1709,11 +1742,20 @@ export function ControlScreen({
     return () => window.clearTimeout(t);
   }, [connected]);
 
-  // Sample fps once a second for the stats overlay.
+  // Sample fps once a second for the stats overlay. Native MediaCodec paints a
+  // SurfaceView under the WebView — there is no canvas/rVFC to fill frameTimes,
+  // so credit the decode-side wc fps (that IS the displayed picture).
   useEffect(() => {
-    const id = window.setInterval(() => setFps(frameTimes.current.length), 1000);
+    const id = window.setInterval(() => {
+      if (wcNativeRef.current) {
+        const w = link.wcStats?.() ?? null;
+        setFps(w?.fps ?? 0);
+      } else {
+        setFps(frameTimes.current.length);
+      }
+    }, 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [link]);
 
   // Keep layout measurement fresh on resize / orientation / chrome / fullscreen /
   // keyboard pin. Remeasure + reclamp pan so a shrunk viewport can't leave a
@@ -2938,14 +2980,25 @@ export function ControlScreen({
         <canvas
           ref={canvasRef}
           hidden={hasStream && !wcActive}
-          className="max-h-full max-w-full select-none object-contain will-change-transform"
+          // will-change-transform promotes a compositor layer; combined with an
+          // opacity:0 canvas that still had opaque pixels it punched a black
+          // rectangle over the MediaCodec SurfaceView. Drop the hint while
+          // native decode owns the picture (hit-test lives on the viewport).
+          className={
+            wcNative
+              ? "max-h-full max-w-full select-none object-contain"
+              : "max-h-full max-w-full select-none object-contain will-change-transform"
+          }
           style={{
             transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
             transformOrigin: "center center",
             cursor: "inherit",
-            // Native MediaCodec paints a SurfaceView under the WebView — keep the
-            // canvas for hit-testing / letterbox geometry but don't composite it.
-            opacity: wcNative ? 0 : 1,
+            // visibility:hidden removes the element from compositing entirely —
+            // opacity:0 alone still left a layer over the hole punch on some
+            // WebViews. Pointer events stay on the viewport parent.
+            ...(wcNative
+              ? { visibility: "hidden" as const, pointerEvents: "none" as const }
+              : { opacity: 1 }),
           }}
         />
         {showRemoteCursor && connected && cursorScreen && (
@@ -3625,7 +3678,7 @@ export function ControlScreen({
                   label="RTC aud delay"
                   scope="rtc"
                   showHint={tuneHints}
-                  hint="Playout delay the phone asks NetEQ for. 0 = auto: the browser's own adaptive buffer, which is the ~150–250ms that puts RTC sound behind the picture. Like the video JB it's a MINIMUM — a low ask is a request, and NetEQ pays for one it can't meet with choppy concealment. Only affects the RTC path; DIRECT audio has no jitter buffer."
+                  hint="Playout delay the phone asks NetEQ for. Default 100ms is a stable floor under video congestion; 0 = browser auto (~150–250ms). Like the video JB it's a MINIMUM — too low and NetEQ pays with choppy concealment. Only affects the RTC path."
                   value={tune.audioJbMs}
                   min={0}
                   max={400}
@@ -3637,7 +3690,7 @@ export function ControlScreen({
                   label="RTC aud buf"
                   scope="host"
                   showHint={tuneHints}
-                  hint="The PC's own sound buffer before it encodes Opus, so it adds to whatever NetEQ then does. Lower trims real lag; too low and the worklet underruns whenever a game janks the capture thread — that's the crackle. Prime/max scale with it."
+                  hint="The PC's own sound buffer before it encodes Opus (adds to NetEQ). Default 90ms absorbs Tauri IPC + game-load jitter; 55ms underran into audible chop. Lower trims lag; too low crackles when a game janks capture. Prime/max scale with it."
                   value={tune.audioHostMs}
                   min={20}
                   max={200}
@@ -3754,10 +3807,10 @@ export function ControlScreen({
                 </div>
                 {tuneHints && (
                   <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    <b className="text-ink-dim">ON (new)</b>: raw PCM over the data channel, lean ~35ms buffer on the
-                    phone — keeps sound nearly as snappy as DIRECT video/input.{" "}
-                    <b className="text-ink-dim">OFF (classic)</b>: WebRTC Opus track (NetEQ), typically 150–250ms behind
-                    the picture after NVENC. Flip OFF if DIRECT audio crackles on a flaky link. Header shows{" "}
+                    <b className="text-ink-dim">ON</b>: Opus over a high-priority data channel → hold-based phone
+                    worklet (~65ms) — keeps sound near DIRECT video without the old fade-chop.{" "}
+                    <b className="text-ink-dim">OFF</b>: classic WebRTC Opus track (NetEQ). Flip OFF only if DIRECT
+                    still crackles on a flaky link. Header shows{" "}
                     <b className="text-ink-dim">AUD·DIRECT</b> / <b className="text-ink-dim">AUD·RTC</b>.
                   </p>
                 )}
@@ -4719,7 +4772,10 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   },
   "A-tgt": { long: "Audio buffer target", info: "What the DIRECT worklet steers toward. Grows briefly after an underrun, then eases back." },
   "A ↓": { long: "Audio download rate", info: "PCM bytes arriving per second on DIRECT. Opus on the RTC path isn't counted here." },
-  "A-underrun": { long: "Audio underruns", info: "Times the DIRECT buffer ran dry. A climbing count means the link is starving sound — try classic RTC audio." },
+  "A-underrun": {
+    long: "Audio underruns",
+    info: "Times the DIRECT buffer held the last sample (ran dry). A climbing count means the link is starving sound — raise Res/Mbps less aggressively, or flip PC sound OFF for classic RTC.",
+  },
 };
 
 function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {
@@ -4832,7 +4888,9 @@ function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps
     if (wc.queue > 3) return `Decoder backlog ${wc.queue} — phone decode too slow; lower res/fps.`;
     if ((host?.wc?.bufKB ?? 0) > 128) return "Channel backlog — network can't drain the bitrate; lower it.";
     if (wc.e2eMs > 100) return `E2E ${wc.e2eMs}ms: net+enc ${wc.netMs} · dec ${wc.decodeMs}ms — check link.`;
-    if (displayFps != null && wc.fps > 0 && displayFps < wc.fps * 0.7) {
+    // Native MediaCodec never fills the canvas/rVFC display-fps counter — a 0
+    // there is instrumentation, not a busy UI thread. Skip the false alarm.
+    if (!wc.native && displayFps != null && wc.fps > 0 && displayFps < wc.fps * 0.7) {
       return "Display behind decode — phone UI thread busy.";
     }
     return wc.native
@@ -4881,10 +4939,8 @@ function Sep() {
 }
 
 /**
- * Glass-to-glass latency for the top-bar pill. Mirrors the dense-stats estimate
- * (line ~3043): the DIRECT/wc path measures it for real (clock-synced
- * capture→decode); the RTC path approximates rtt/2 + jitter buffer + decode.
- * Returns null when neither side has reported yet (nothing to show).
+ * Glass-to-glass video latency for the top-bar pill. DIRECT/wc measures it
+ * (clock-synced capture→decode); RTC approximates rtt/2 + jitter buffer + decode.
  */
 function topBarLag(
   wcStats: WcStats | null,
@@ -4895,6 +4951,20 @@ function topBarLag(
   return null;
 }
 
+/**
+ * One-way input latency proxy: half the best data-channel clock RTT (same ICE
+ * path as control/move), else half the ICE candidate-pair RTT. Not click-to-
+ * cursor echo, but the transport half that dominates remote-input lag.
+ */
+function topBarInputLag(
+  wcStats: WcStats | null,
+  net: NetStats | null,
+): number | null {
+  if (wcStats && wcStats.clockRttMs > 0) return Math.max(1, Math.round(wcStats.clockRttMs / 2));
+  if (net && net.rttMs > 0) return Math.max(1, Math.round(net.rttMs / 2));
+  return null;
+}
+
 /** Latency colour by the same thresholds the dense-stats lag pill uses. */
 function lagColor(lag: number): string {
   if (lag <= 50) return "text-green";
@@ -4902,12 +4972,30 @@ function lagColor(lag: number): string {
   return "text-red";
 }
 
+/** Compact "vid · in" latency row under the fps line. */
+function LatencyPair({ vid, input }: { vid: number | null; input: number | null }) {
+  if (vid == null && input == null) return null;
+  return (
+    <span className="mt-0.5 flex items-center gap-1 text-[8px] leading-none tabular-nums">
+      {vid != null && (
+        <span className={lagColor(Math.max(1, vid))} title="Video glass-to-glass">
+          ~{Math.max(1, vid)}ms
+        </span>
+      )}
+      {vid != null && input != null && <span className="text-ink-faint/70">·</span>}
+      {input != null && (
+        <span className={`${lagColor(input)} opacity-90`} title="Input (one-way transport)">
+          in~{input}ms
+        </span>
+      )}
+    </span>
+  );
+}
+
 /**
- * Top-bar FPS + latency pill. Stacks the fps (top, at half the original line
- * height so the pair fits in the same panel footprint) over a small latency
- * line beneath it, neatly leading-aligned. `variant="compact"` is the inline
- * toolbar chip (Wifi icon, left border); `variant="floating"` is the
- * black/45 backdrop pill shown in immersive / collapsed-top states.
+ * Top-bar FPS + latency pill. Stacks fps over a small horizontal pair of
+ * video latency and input latency. `variant="compact"` is the inline toolbar
+ * chip; `variant="floating"` is the immersive / collapsed-top pill.
  */
 function FpsLatencyPill({
   fps,
@@ -4921,17 +5009,14 @@ function FpsLatencyPill({
   variant: "compact" | "floating";
 }) {
   const lag = topBarLag(wcStats, net);
+  const input = topBarInputLag(wcStats, net);
   if (variant === "floating") {
     return (
       <span className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-black/45 px-2.5 py-1 text-[10px] font-700 text-green backdrop-blur">
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-green" style={{ boxShadow: "0 0 6px #34d399" }} />
         <span className="flex flex-col items-start leading-none">
           <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
-          {lag != null && (
-            <span className={`mt-0.5 text-[8px] leading-none tabular-nums ${lagColor(Math.max(1, lag))}`}>
-              ~{Math.max(1, lag)}ms
-            </span>
-          )}
+          <LatencyPair vid={lag} input={input} />
         </span>
       </span>
     );
@@ -4941,11 +5026,7 @@ function FpsLatencyPill({
       <Wifi className="h-3 w-3 shrink-0" />
       <span className="flex flex-col items-start leading-none">
         <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
-        {lag != null && (
-          <span className={`mt-0.5 text-[8px] leading-none tabular-nums ${lagColor(Math.max(1, lag))}`}>
-            ~{Math.max(1, lag)}ms
-          </span>
-        )}
+        <LatencyPair vid={lag} input={input} />
       </span>
     </span>
   );

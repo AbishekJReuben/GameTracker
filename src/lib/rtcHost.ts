@@ -95,9 +95,11 @@ const WC_KEY_INTERVAL_MS = 10000;
 // carries the same audio for ~4% of that, and it is what WebRTC itself uses.
 /** Opus target bitrate — transparent for game/desktop audio at stereo 48k. */
 const AUDIO_OPUS_BPS = 128_000;
-/** Opus frame size (µs). 10ms halves the algorithmic delay of the 20ms default;
- *  at this bitrate the extra per-packet overhead is irrelevant. */
-const AUDIO_OPUS_FRAME_US = 10_000;
+/** Opus frame size (µs). 20ms (libopus default) halves the SCTP message rate vs
+ *  10ms — video saturating the shared association was starving 10ms packets into
+ *  clusters of losses the guest had to conceal (robotic DIRECT). The extra 10ms
+ *  of algorithmic delay is well under a video frame and buys far cleaner audio. */
+const AUDIO_OPUS_FRAME_US = 20_000;
 /** Sample rates libopus encodes natively. Chromium won't resample into the
  *  encoder and a decoder config must name one of these too, so a capture at any
  *  other rate (rare — WASAPI shared mode is 48k almost everywhere) uses raw PCM. */
@@ -436,15 +438,14 @@ export function startHost(opts: HostOptions): () => void {
     // RTC audio: this worklet's playout target (ms) before the Opus encoder.
     // DIRECT audio diverts upstream of the worklet, so this only shapes the
     // classic track. Prime/max are derived (see audioEnvelope).
-    audioHostMs: 55,
+    // 90ms absorbs Tauri IPC + game-load jitter that 55ms underran on (choppy RTC).
+    audioHostMs: 90,
   };
 
   /**
-   * Host worklet envelope derived from the Tune target. 8/11 and 30/11 are
-   * exactly the shipped 40 : 55 : 150 ratios, so leaving the slider at its 55ms
-   * default reproduces the long-standing envelope to the millisecond — this
-   * knob can only change behaviour when someone actually moves it. (The worklet
-   * clamps maxMs to 300, which only bites past ~110ms.)
+   * Host worklet envelope derived from the Tune target. 8/11 and 30/11 keep the
+   * same prime:target:max shape (now ~65:90:245 at the 90ms default). The
+   * worklet clamps maxMs to 400.
    */
   const audioEnvelope = (targetMs: number) => ({
     primeMs: Math.max(10, Math.round((targetMs * 8) / 11)),
@@ -978,10 +979,9 @@ export function startHost(opts: HostOptions): () => void {
     node.connect(dest);
     audioNode = node;
     // RTC path: wider than the phone DIRECT defaults — absorbs IPC jitter from
-    // the Tauri channel under game load. Defaults to 40/55/150 (a leaner 30/40
-    // experiment caused audible underrun chop): this worklet feeds the Opus
-    // track, which sits behind NetEQ's ~150ms+ anyway, so 15ms shaved here is
-    // inaudible latency-wise while the underruns it causes are very audible.
+    // the Tauri channel under game load. Default target 90ms (was 55): game load
+    // was starving the feeder into audible underrun chop on the Opus track.
+    // NetEQ sits behind this anyway, so the extra cushion is free latency-wise.
     // The Tune panel can move it ("RTC aud buf") for A/B hunting.
     try {
       node.port.postMessage({
@@ -1514,19 +1514,24 @@ export function startHost(opts: HostOptions): () => void {
     // front (no renegotiation); carries nothing until the guest opts in.
     const videoCh = pc.createDataChannel("video");
     videoCh.binaryType = "arraybuffer";
-    // DIRECT audio: raw float32 PCM. Created up front (no renegotiation); idle
-    // until the guest opts in with `{type:"amode",mode:"pcm"}`.
+    // DIRECT audio: Opus (preferred) or raw float32. Created up front (no
+    // renegotiation); idle until the guest opts in with `{type:"amode",mode:"pcm"}`.
     //
     // Ordered but UNRELIABLE (maxRetransmits: 0 → SCTP partial reliability,
-    // RFC 8831): a lost PCM chunk is skipped via FORWARD TSN instead of being
+    // RFC 8831): a lost packet is skipped via FORWARD TSN instead of being
     // retransmitted. Live audio must never wait — on a fully reliable channel a
     // single lost packet head-of-line blocked every chunk behind it for RTT+,
     // and since all channels share one SCTP association, video saturating the
-    // link under high motion turned into bursty audio delivery → underrun
-    // fade-in/fade-out chop ("robotic" sound). A skipped 10ms chunk is a gap
-    // the phone worklet's gain ramp conceals; ordering is still preserved for
-    // the messages that do arrive, so no resequencing is needed guest-side.
-    const audioCh = pc.createDataChannel("audio", { ordered: true, maxRetransmits: 0 });
+    // link under high motion turned into bursty audio delivery → underrun chop.
+    // `priority: "high"` (when the UA honours it) keeps audio ahead of the
+    // bulk video channel on the same association. A skipped 20ms Opus frame is
+    // a gap the phone worklet conceals with a held sample (not a gain fade).
+    const audioCh = pc.createDataChannel("audio", {
+      ordered: true,
+      maxRetransmits: 0,
+      // Chromium accepts RTCPriorityType; ignored harmlessly elsewhere.
+      priority: "high",
+    } as RTCDataChannelInit);
     audioCh.binaryType = "arraybuffer";
 
     // ---- WebCodecs direct-video encoder (bypasses the receiver jitter buffer).

@@ -137,3 +137,6 @@ dist
 /src-tauri/target
 src-tauri/target/release/deps/gametracker_lib.lib
 /signaling/target
+
+# Platform pre-commit entry (Unix copy of pre-commit.sh). Windows uses .cmd.
+.githooks/pre-commit

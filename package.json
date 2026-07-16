@@ -1,9 +1,11 @@
 {
   "name": "gametracker",
   "private": true,
-  "version": "3.9.44",
+  "version": "3.9.46",
   "type": "module",
   "scripts": {
+    "prepare": "node scripts/install-git-hooks.mjs",
+    "web:build": "npm run discovery:build",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",

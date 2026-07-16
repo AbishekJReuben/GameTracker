@@ -29,6 +29,14 @@ Write-Host "== [1/3] Building shared web bundle once (npm run build) ==" -Foregr
 npm run build
 if ($LASTEXITCODE -ne 0) { throw "web build failed (exit $LASTEXITCODE) - aborting before the native builds." }
 
+# The web + Quest companions (signaling/static) are built from the same src/ as
+# the APK, so build them here too — once, up front — so every release ships the
+# browser companion in lockstep with the phone app. Children get -SkipWebBuild
+# and therefore do NOT rebuild it again.
+Write-Host "== [1b/3] Building web companion bundle (npm run discovery:build) ==" -ForegroundColor Cyan
+npm run discovery:build
+if ($LASTEXITCODE -ne 0) { throw "discovery (web companion) build failed (exit $LASTEXITCODE) - aborting before the native builds." }
+
 $steps = @(
     @{ Name = 'NSIS'; Path = (Join-Path $scripts 'Build-Installer.ps1') },
     @{ Name = 'APK';  Path = (Join-Path $scripts 'Build-Apk.ps1') }

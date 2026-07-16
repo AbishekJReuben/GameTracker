@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Unix hook entry must stay LF — a CRLF shebang ("#!/bin/sh\r") fails to exec.
+.githooks/*.sh text eol=lf
+# Windows cmd/ps1 keep native line endings (cmd is happier with CRLF).
+.githooks/*.cmd text eol=crlf
+.githooks/*.ps1 text eol=crlf

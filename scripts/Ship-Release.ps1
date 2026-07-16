@@ -7,7 +7,7 @@
 
     1. bump-version.ps1 <ver>     — rewrite version in desktop + companion files
     2. sync package-lock.json
-    3. git commit (version files only, unless -IncludeWorkingTree)
+    3. git add -A + commit        — ALL working-tree changes (not just version files)
     4. annotated tag v<ver>
     5. git push <Remote> HEAD + tag   — kicks .github/workflows/release.yml
 
@@ -23,6 +23,11 @@
 .PARAMETER DryRun
   Print steps without changing files / git.
 
+.PARAMETER VersionFilesOnly
+  Legacy: stage only the version bump files (package.json, tauri configs, Cargo
+  locks). Default is to ship the entire working tree so feature work isn't left
+  uncommitted when you cut a release.
+
 .EXAMPLE
   powershell -File scripts/Ship-Release.ps1 3.9.7
 #>
@@ -32,7 +37,8 @@ param(
   [string] $Version,
   [string] $Remote = 'personal',
   [switch] $DryRun,
-  [switch] $SkipBump
+  [switch] $SkipBump,
+  [switch] $VersionFilesOnly
 )
 
 Set-StrictMode -Version Latest
@@ -79,7 +85,7 @@ if (-not $SkipBump) {
   Write-Step "Skip bump (files already at $ver)"
 }
 
-# --- 2. stage version files --------------------------------------------------
+# --- 2. stage ----------------------------------------------------------------
 $versionFiles = @(
   'package.json'
   'package-lock.json'
@@ -91,24 +97,40 @@ $versionFiles = @(
   'companion/src-tauri/Cargo.lock'
 )
 
-Write-Step "Stage version files"
-if ($DryRun) {
-  Write-Host "[dry-run] git add $($versionFiles -join ' ')"
+if ($VersionFilesOnly) {
+  Write-Step "Stage version files only"
+  if ($DryRun) {
+    Write-Host "[dry-run] git add $($versionFiles -join ' ')"
+  } else {
+    git add -- $versionFiles
+  }
 } else {
-  git add -- $versionFiles
+  Write-Step "Stage all working-tree changes"
+  if ($DryRun) {
+    Write-Host "[dry-run] git add -A"
+  } else {
+    # Entire tree: feature work + version bump ship together. Pre-commit may
+    # also rebuild/stage signaling/static when src/ is included.
+    git add -A
+  }
+}
+
+if (-not $DryRun) {
   $staged = git diff --cached --name-only
   if (-not $staged) {
-    throw "Nothing staged. Are the version files already committed at $ver?"
+    throw "Nothing staged. Working tree clean and version files already at $ver?"
   }
   Write-Host ($staged | Out-String)
 }
 
 # --- 3. commit ---------------------------------------------------------------
 Write-Step "Commit"
-$msg = "Bump version to $ver"
+$msg = "Release $ver"
 if ($DryRun) {
   Write-Host "[dry-run] git commit -m `"$msg`""
 } else {
+  # Ensure Windows uses the .cmd hook (not a leftover shebang script via WSL).
+  & node (Join-Path $PSScriptRoot 'install-git-hooks.mjs')
   git commit -m $msg
   if ($LASTEXITCODE -ne 0) { throw "git commit failed ($LASTEXITCODE)" }
 }

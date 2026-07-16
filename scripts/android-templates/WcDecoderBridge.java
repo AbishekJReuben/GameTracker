@@ -1168,16 +1168,33 @@ public final class WcDecoderBridge {
     try {
       act.getWindow().setBackgroundDrawable(
           new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+      // Some OEM themes paint the DecorView after setBackgroundDrawable — force
+      // the root view transparent too so the SurfaceView hole punch survives.
+      View decor = act.getWindow().getDecorView();
+      if (decor != null) {
+        decor.setBackgroundColor(Color.TRANSPARENT);
+      }
     } catch (Exception e) {
       jlog("window bg clear failed: " + e);
     }
     ViewGroup content = act.findViewById(android.R.id.content);
+    if (content != null) {
+      content.setBackgroundColor(Color.TRANSPARENT);
+    }
     WebView web = content == null ? null : findWebView(content);
     if (web == null) {
       jlog("compositing: no WebView found");
       return;
     }
     web.setBackgroundColor(Color.TRANSPARENT);
+    // Also clear any ColorDrawable left by Tauri/wry on the WebView itself —
+    // setBackgroundColor alone doesn't always replace a prior setBackground.
+    try {
+      web.setBackground(null);
+      web.setBackgroundColor(Color.TRANSPARENT);
+    } catch (Exception e) {
+      /* older WebView */
+    }
     if (web.getLayerType() != View.LAYER_TYPE_NONE) {
       web.setLayerType(View.LAYER_TYPE_NONE, null);
       jlog("webview layer -> NONE");
@@ -1190,8 +1207,10 @@ public final class WcDecoderBridge {
       android.graphics.drawable.Drawable bg = walk.getBackground();
       if (bg != null) {
         jlog("cleared opaque bg on " + walk.getClass().getSimpleName() + " (" + describeDrawable(bg) + ")");
-        walk.setBackgroundColor(Color.TRANSPARENT);
       }
+      // Always force transparent — a null background can still inherit an opaque
+      // theme colour on some devices; Color.TRANSPARENT is the safe punch.
+      walk.setBackgroundColor(Color.TRANSPARENT);
     }
   }
 

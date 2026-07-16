@@ -1216,14 +1216,12 @@ export class CloudConn {
             this.audioUnderruns = s.underruns ?? 0;
           }
         };
-        // Lean-but-honest envelope. The 12/18/90 experiment shaved ~17ms of
-        // latency but sat below the data channel's real burst gap (audio shares
-        // the SCTP link with video), so high-motion scenes underran every few
-        // quanta — the fade-out/fade-in chop users heard as "robotic". 20/30
-        // rides just above the typical gap; the worklet still grows adaptively
-        // toward maxMs if a given link is burstier.
+        // Hold-based DIRECT envelope. Shares SCTP with video, so the cushion has
+        // to clear a real burst gap — 40/65 sits above typical Wi-Fi/SCTP jitter
+        // without matching NetEQ's 150ms+. The worklet holds (not fades) on a
+        // brief underrun and grows toward maxMs if the link is burstier.
         node.port.postMessage({
-          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 20, targetMs: 30, maxMs: 180 },
+          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 40, targetMs: 65, maxMs: 240 },
         });
         this.audioNode = node;
         this.startAudioStatsPoll();
@@ -1389,7 +1387,7 @@ export class CloudConn {
             // The worklet always consumes interleaved f32 at the capture rate —
             // Opus changes what crosses the wire, not what gets played.
             this.audioNode.port.postMessage({
-              cfg: { channels: ch, captureRate: rate, primeMs: 20, targetMs: 30, maxMs: 180 },
+              cfg: { channels: ch, captureRate: rate, primeMs: 40, targetMs: 65, maxMs: 240 },
             });
           }
         }
@@ -1427,14 +1425,12 @@ export class CloudConn {
       const gap = audioSeqGap(this.audioLastSeq, seq);
       if (gap > 0) {
         this.audioLost += gap;
-        // Tell the worklet how much timeline just vanished (10ms per packet —
-        // AUDIO_OPUS_FRAME_US) so it can conceal the hole. WebCodecs has no
-        // FEC/PLC path, so unconcealed losses both click AND drain the jitter
-        // buffer toward an underrun — the robotic chop. Posted before decode:
-        // the decoded PCM of THIS packet reaches the worklet strictly later
-        // (decode is async), so the filler lands in the right order.
+        // Tell the worklet how much timeline just vanished (20ms per packet —
+        // host AUDIO_OPUS_FRAME_US). WebCodecs has no FEC/PLC path, so
+        // unconcealed losses drain the buffer into an underrun. Posted before
+        // decode so the filler lands ahead of this packet's PCM.
         try {
-          this.audioNode?.port.postMessage({ gap: gap * 10 });
+          this.audioNode?.port.postMessage({ gap: gap * 20 });
         } catch {
           /* node torn down */
         }
@@ -1454,7 +1450,7 @@ export class CloudConn {
             data: new Uint8Array(ab, AUDIO_HDR_BYTES),
           }),
         );
-        this.audioDecTsUs += 10_000;
+        this.audioDecTsUs += 20_000;
       } catch (e) {
         console.warn("[remote] Opus decode submit failed:", e);
       }
@@ -1842,10 +1838,9 @@ export class CloudConn {
       const perfNow = performance.now();
       for (let i = 0; i < delta; i++) this.wcTimes.push(perfNow);
       while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
-      // Approximate e2e = net+enc (at arrival) + native decode.
+      // Approximate e2e = net+enc (at arrival) + native decode — jump-clamped.
       if (this.wcNetMs > 0 && this.wcDecMs > 0) {
-        const e2e = this.wcNetMs + this.wcDecMs;
-        this.wcE2eMs = this.wcE2eMs === 0 ? e2e : this.wcE2eMs * 0.85 + e2e * 0.15;
+        this.wcE2eMs = this.smoothLatency(this.wcE2eMs, this.wcNetMs + this.wcDecMs);
       }
     }
     // Only surface a decoder error when the codec is NOT producing frames. The
@@ -1962,13 +1957,14 @@ export class CloudConn {
       }
       if (head.key) this.wcAwaitKey = false;
       const tsUs = Math.round(head.tsMs * 1000);
-      // Net+enc at arrival (e2e completed when Kotlin reports decode).
+      // Net+enc at arrival; e2e ≈ net + native decode (updated again in the poll).
       const clk = this.bestClock();
       if (clk) {
         const capturedAtGuest = head.tsMs - clk.off;
         const net = now - capturedAtGuest;
-        if (net > -50 && net < 5000) {
-          this.wcNetMs = this.wcNetMs === 0 ? net : this.wcNetMs * 0.85 + net * 0.15;
+        this.wcNetMs = this.smoothLatency(this.wcNetMs, net);
+        if (this.wcDecMs > 0) {
+          this.wcE2eMs = this.smoothLatency(this.wcE2eMs, this.wcNetMs + this.wcDecMs);
         }
       }
       if (!feedNativeDecoder(tsUs, head.key, bytes)) {
@@ -2024,8 +2020,9 @@ export class CloudConn {
         const net = meta.arrivedAt - capturedAtGuest;
         // Measured BEFORE pacing on purpose: these feed the playout target below,
         // and folding our own added delay back in would ratchet it upward.
-        if (e2e > -50 && e2e < 5000) this.wcE2eMs = this.wcE2eMs === 0 ? e2e : this.wcE2eMs * 0.85 + e2e * 0.15;
-        if (net > -50 && net < 5000) this.wcNetMs = this.wcNetMs === 0 ? net : this.wcNetMs * 0.85 + net * 0.15;
+        // Jump-clamped EWMA — raw 0.85 blend made NVENC E2E bounce every skip.
+        this.wcE2eMs = this.smoothLatency(this.wcE2eMs, e2e);
+        this.wcNetMs = this.smoothLatency(this.wcNetMs, net);
       }
     }
     const perfNow = performance.now();
@@ -2101,6 +2098,19 @@ export class CloudConn {
     let best = this.clockSamples[0];
     for (const s of this.clockSamples) if (s.rtt < best.rtt) best = s;
     return best;
+  }
+
+  /**
+   * Smooth a latency EWMA so NVENC/DIRECT HUD (and Feel pacing) don't jump when
+   * a single clock sample or skipped frame spikes. Clamp the sample toward the
+   * previous value (±18ms) then blend heavily — perceived "latency jumping"
+   * was the raw 0.85/0.15 EWMA tracking every outlier.
+   */
+  private smoothLatency(prev: number, sample: number): number {
+    if (!(sample > -50 && sample < 5000)) return prev;
+    if (prev === 0) return sample;
+    const clamped = prev + Math.max(-18, Math.min(18, sample - prev));
+    return prev * 0.92 + clamped * 0.08;
   }
 
   /**
