@@ -406,6 +406,65 @@ const save = (path, before, after, msg) => {
   }
 }
 
+// --- 4c: proguard-gametracker.pro — keep JNI-facing symbols -----------------
+// The release build type enables R8 minification and pulls in every *.pro under
+// app/ (fileTree include "**/*.pro"), so dropping this file next to the stock
+// proguard-rules.pro is enough — no gradle edit needed.
+//
+// WHY: WcDecoderBridge's methods and MainActivity.setPipWanted are reached ONLY
+// via JNI reflection from Rust (companion/src-tauri/src/{decoder,pip}.rs) and
+// via addJavascriptInterface. R8 sees no Java-side references, so a minified
+// release APK strips (or renames) them. The on-device symptom is a
+// java.lang.NoSuchMethodError coming out of JNI — e.g. "no static method
+// probeAvailable()Z" — and the phone silently losing native MediaCodec decode
+// (DIRECT falls back to WebCodecs at a fraction of the fps).
+{
+  const conf = JSON.parse(
+    readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"),
+  );
+  const pkg = String(conf.identifier || "");
+  if (!pkg) {
+    console.warn("[patch-android] no identifier — skipping proguard-gametracker.pro.");
+  } else {
+    const rulesPath = join(androidDir, "app", "proguard-gametracker.pro");
+    const content =
+      `# THIS FILE IS MANAGED BY scripts/patch-android.mjs - DO NOT EDIT.\n` +
+      `#\n` +
+      `# Keep every symbol that is reached ONLY through JNI reflection or\n` +
+      `# addJavascriptInterface. R8 sees no Java-side references to these, so a\n` +
+      `# minified release build strips or renames them; the on-device symptom is\n` +
+      `# java.lang.NoSuchMethodError out of JNI (e.g. "no static method\n` +
+      `# probeAvailable()Z") and the phone silently losing native MediaCodec\n` +
+      `# decode (DIRECT falls back to WebCodecs).\n` +
+      `\n` +
+      `# Rust decoder.rs loads this class by name and calls its static methods.\n` +
+      `-keep class ${pkg}.WcDecoderBridge { *; }\n` +
+      `# Inner classes: JsApi (the window.__GT_DECODER__ JavascriptInterface),\n` +
+      `# PendingFrame, and any future helpers.\n` +
+      `-keep class ${pkg}.WcDecoderBridge$* { *; }\n` +
+      `\n` +
+      `# Rust pip.rs resolves MainActivity by name and uses these members for the\n` +
+      `# PiP gate (the class itself is kept by the manifest; its members are not).\n` +
+      `-keepclassmembers class ${pkg}.MainActivity {\n` +
+      `    public static void setPipWanted(boolean);\n` +
+      `    public static boolean pipWanted;\n` +
+      `}\n` +
+      `\n` +
+      `# Belt-and-braces: never strip @JavascriptInterface methods anywhere.\n` +
+      `-keepclassmembers class * {\n` +
+      `    @android.webkit.JavascriptInterface <methods>;\n` +
+      `}\n`;
+    const exists = existsSync(rulesPath);
+    const before = exists ? readFileSync(rulesPath, "utf8") : "";
+    if (!exists) {
+      writeFileSync(rulesPath, content);
+      note("created proguard-gametracker.pro (JNI keep rules)");
+    } else {
+      save(rulesPath, before, content, "updated proguard-gametracker.pro (JNI keep rules)");
+    }
+  }
+}
+
 // --- 5: ApkInstallReceiver.kt — PackageInstaller status callback -------------
 // Handles the install session's status broadcast; on STATUS_PENDING_USER_ACTION it
 // launches the system's install-confirmation dialog. Required for the in-app

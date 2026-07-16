@@ -85,13 +85,23 @@ if (-not $SkipWebBuild) {
 }
 
 # --- apply Android project customizations (permission/FileProvider/cleartext) ---
-# Idempotent; the same script CI runs so local + CI builds match. Requires
-# gen/android to exist (run `npm run companion:init` once).
-if (Test-Path (Join-Path $root 'companion\src-tauri\gen\android')) {
-    Write-Host "Patching Android project (scripts\patch-android.mjs)..."
-    node (Join-Path $root 'scripts\patch-android.mjs')
-    if ($LASTEXITCODE -ne 0) { throw "patch-android.mjs failed (exit $LASTEXITCODE)" }
+# Idempotent; the same script CI runs so local + CI builds match. The gen tree
+# is scaffolded here when missing and the patch step is UNCONDITIONAL: a
+# regenerated (or freshly initialized) tree that skipped patching once shipped
+# an APK without WcDecoderBridge/MainActivity customizations — the phone's
+# decoder probe died with NoSuchMethodError and DIRECT silently fell back to
+# WebCodecs.
+if (-not (Test-Path (Join-Path $root 'companion\src-tauri\gen\android'))) {
+    Write-Host "gen\android missing — running tauri android init..."
+    Push-Location (Join-Path $root 'companion')
+    try {
+        npx tauri android init
+        if ($LASTEXITCODE -ne 0) { throw "tauri android init failed (exit $LASTEXITCODE)" }
+    } finally { Pop-Location }
 }
+Write-Host "Patching Android project (scripts\patch-android.mjs)..."
+node (Join-Path $root 'scripts\patch-android.mjs')
+if ($LASTEXITCODE -ne 0) { throw "patch-android.mjs failed (exit $LASTEXITCODE)" }
 
 # --- native Android build ---
 Push-Location (Join-Path $root 'companion')
