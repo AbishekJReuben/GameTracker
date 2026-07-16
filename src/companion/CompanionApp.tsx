@@ -280,11 +280,7 @@ export function CompanionApp() {
         <GameDetailScreen id={detailId} onClose={closeGame} />
       </ScreenErrorBoundary>
     )}
-    <div
-      className={`flex h-[100dvh] flex-col text-ink ${
-        isControlTab ? "bg-transparent" : "bg-bg-base"
-      }`}
-    >
+    <div className={`flex h-[100dvh] flex-col text-ink ${isControlTab ? "bg-black" : "bg-bg-base"}`}>
       {!isControlTab && (
         <header
           className="flex items-center justify-between border-b border-line px-4 py-3"

@@ -27,6 +27,7 @@ import {
   resetNativeDecoder,
   teardownNativeDecoder,
 } from "./nativeDecoder";
+import { hitchMaybeE2eJump, hitchMaybeFrameGap, hitchNote } from "./hitchLog";
 import { isImmersiveActive, onImmersiveActiveChange } from "./runtime";
 import { loadStreamTune, resetStreamTune, type StreamTune } from "./streamTune";
 
@@ -410,6 +411,10 @@ export class CloudConn {
   private wcByteWin: { at: number; bytes: number }[] = []; // arrival bytes (kbps window)
   private wcLastFrameAt = 0;
   private wcStallTicks = 0;
+  /** Hitch journal helpers — see hitchLog.ts. */
+  private hitchLastFramePerf = 0;
+  private hitchLastE2e = 0;
+  private hitchLastHostSkipped = -1;
   /** Playout pacing (Quality dock "Feel"): 0 = paint on decode, >0 = clock-paced. */
   private wcPaceMs = 0;
   private wcPlayQ: { frame: VideoFrame; showAt: number }[] = [];
@@ -1809,6 +1814,9 @@ export class CloudConn {
       else if (now - this.wcNativeStallAt > 3000) {
         this.wcNativeStallAt = 0;
         console.warn("[remote] native decoder produced no frames — falling back to WebCodecs");
+        hitchNote("native-stall", "MediaCodec produced 0 frames in 3s — falling back to WebCodecs", {
+          fed: this.wcFrames,
+        });
         void this.emitDecoderFallback(
           "Phone decoder produced no picture — using WebCodecs",
           `MediaCodec accepted ${this.wcFrames} frame(s) but decoded 0 in 3s.` +
@@ -1931,6 +1939,11 @@ export class CloudConn {
       this.emitEvent({ event: "wc", active: true, native: this.wcNative });
     }
     this.wcLastFrameAt = now;
+    // Hitch: arrival gap vs expected frame period (host fps target ~25ms @40).
+    const perfNow = performance.now();
+    const expectMs = this.wcPaceMs > 0 ? Math.max(16, 1000 / 40) : Math.max(16, 1000 / 40);
+    hitchMaybeFrameGap(this.hitchLastFramePerf, perfNow, expectMs);
+    this.hitchLastFramePerf = perfNow;
     // Backgrounded (NOT PiP — a PiP window counts as visible): skip decoding to
     // save battery; resync off a fresh keyframe when the app comes back.
     if (document.hidden && !head.key) {
@@ -1964,7 +1977,10 @@ export class CloudConn {
         const net = now - capturedAtGuest;
         this.wcNetMs = this.smoothLatency(this.wcNetMs, net);
         if (this.wcDecMs > 0) {
-          this.wcE2eMs = this.smoothLatency(this.wcE2eMs, this.wcNetMs + this.wcDecMs);
+          const sample = this.wcNetMs + this.wcDecMs;
+          hitchMaybeE2eJump(this.hitchLastE2e || this.wcE2eMs, sample);
+          this.hitchLastE2e = sample;
+          this.wcE2eMs = this.smoothLatency(this.wcE2eMs, sample);
         }
       }
       if (!feedNativeDecoder(tsUs, head.key, bytes)) {
@@ -2021,8 +2037,11 @@ export class CloudConn {
         // Measured BEFORE pacing on purpose: these feed the playout target below,
         // and folding our own added delay back in would ratchet it upward.
         // Jump-clamped EWMA — raw 0.85 blend made NVENC E2E bounce every skip.
+        const prevE2e = this.wcE2eMs;
         this.wcE2eMs = this.smoothLatency(this.wcE2eMs, e2e);
         this.wcNetMs = this.smoothLatency(this.wcNetMs, net);
+        hitchMaybeE2eJump(prevE2e || this.hitchLastE2e, e2e);
+        this.hitchLastE2e = e2e;
       }
     }
     const perfNow = performance.now();

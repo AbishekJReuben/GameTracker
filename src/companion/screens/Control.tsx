@@ -79,6 +79,12 @@ import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { tabAllowed } from "@/lib/setupMode";
 import { isTauri } from "@/lib/tauri";
 import { setNativeDecoderBounds } from "../nativeDecoder";
+import {
+  hitchFormat,
+  hitchNote,
+  hitchOnNotify,
+  hitchReset,
+} from "../hitchLog";
 import { isQuestBrowser } from "../device";
 import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
 import {
@@ -1076,6 +1082,8 @@ export function ControlScreen({
       net ? `rtc: ${JSON.stringify(net)}` : "rtc: null",
       audioStats ? `audio: ${JSON.stringify(audioStats)}` : "audio: null",
       hostStats ? `host: ${JSON.stringify(hostStats)}` : "host: null",
+      "",
+      hitchFormat(),
       native ? `\n${native}` : "",
     ];
     try {
@@ -1096,6 +1104,10 @@ export function ControlScreen({
   const [audioStats, setAudioStats] = useState<AudioStats | null>(null);
   const prodRef = useRef<{ frames: number; at: number } | null>(null);
   const netRef = useRef<{ bytes: number; at: number; jbDelay: number; jbCount: number; decT: number; decoded: number } | null>(null);
+  const hostSkipRef = useRef(-1);
+  const audioUnderrunRef = useRef(0);
+  const [hitchToast, setHitchToast] = useState<string | null>(null);
+  const hitchToastTimer = useRef<number | null>(null);
 
   // Multi-monitor.
   const [monitors, setMonitors] = useState<RemoteMonitor[]>([]);
@@ -1181,7 +1193,20 @@ export function ControlScreen({
   useEffect(() => {
     link.onStatus((c) => {
       setConnected(c);
-      if (!c) setHasFrame(false); // show the app-icon placeholder again on reconnect
+      if (c) {
+        hitchReset();
+        hostSkipRef.current = -1;
+        audioUnderrunRef.current = 0;
+      } else {
+        setHasFrame(false); // show the app-icon placeholder again on reconnect
+      }
+    });
+    hitchOnNotify((e) => {
+      // Brief toast so a hitch is visible without opening stats — tap Copy diag for the log.
+      const line = `[${e.kind}] ${e.detail}`;
+      setHitchToast(line);
+      if (hitchToastTimer.current) window.clearTimeout(hitchToastTimer.current);
+      hitchToastTimer.current = window.setTimeout(() => setHitchToast(null), 4500);
     });
     const unsubProgress = link.onProgress?.(setProgress);
     const bindStream = (stream: MediaStream, force = false) => {
@@ -1263,6 +1288,16 @@ export function ControlScreen({
           if (df >= 0) producedFps = Math.round((df * 1000) / (now - prev.at));
         }
         prodRef.current = { frames: cs.producedFrames, at: now };
+        // Host latest-wins skips — a burst of skips is the usual NVENC hitch source.
+        const skipped = wc?.skipped ?? 0;
+        const prevSkipped = hostSkipRef.current;
+        if (prevSkipped >= 0 && skipped > prevSkipped + 2) {
+          hitchNote("host-skip", `host skipped ${skipped - prevSkipped} frames (total ${skipped})`, {
+            delta: skipped - prevSkipped,
+            skipped,
+          });
+        }
+        hostSkipRef.current = skipped;
         setHostStats({ ...cs, producedFps, rtc, wc, audio });
         // Native Surface path never gets VideoFrame sizes — seed letterbox from host out res.
         if (wcNativeRef.current && cs.outW > 0 && cs.outH > 0) {
@@ -1294,6 +1329,7 @@ export function ControlScreen({
       while (t.length && now - t[0] > 1000) t.shift();
     });
     return () => {
+      hitchOnNotify(null);
       unsubProgress?.();
       unsubStream?.();
       unsubAudio?.();
@@ -1303,63 +1339,19 @@ export function ControlScreen({
   }, [link]);
 
   // Keep MediaCodec SurfaceView locked to the letterboxed video box (zoom/pan/resize).
+  // Video paints via SurfaceView setZOrderMediaOverlay(true) ABOVE the WebView —
+  // so we deliberately do NOT make the WebView transparent (that caused the
+  // Live/fps "smudge" where semi-opaque chrome accumulated every frame).
   useEffect(() => {
     if (!wcNative) {
       void setNativeDecoderBounds({ x: 0, y: 0, w: 0, h: 0, visible: false });
       return;
-    }
-    // Punch a transparent hole through the WebView so the Surface underlay
-    // shows. EVERY ancestor between this screen and <html> must be transparent
-    // — one opaque layer anywhere in the chain blacks out the video while the
-    // codec decodes merrily underneath (no error, no fallback: from JS's view
-    // nothing is wrong). That was literally shipping: companion.html styles
-    // `#root { background: #06070d }` inline, html/body were cleared here but
-    // #root never was, so the native path decoded into a Surface nobody could
-    // see. Walk the real DOM chain instead of naming wrappers, so the next
-    // wrapper div someone adds can't regress this.
-    //
-    // Also clear backgroundColor / backgroundImage separately — some OEM
-    // WebViews honour those over the shorthand `background`, and restoring
-    // only `background` left a solid #06070d paint over the punch.
-    type Cleared = { el: HTMLElement; bg: string; bgc: string; bgi: string };
-    const cleared: Cleared[] = [];
-    let el: HTMLElement | null = viewportRef.current;
-    while (el) {
-      cleared.push({
-        el,
-        bg: el.style.background,
-        bgc: el.style.backgroundColor,
-        bgi: el.style.backgroundImage,
-      });
-      el.style.background = "transparent";
-      el.style.backgroundColor = "transparent";
-      el.style.backgroundImage = "none";
-      el = el.parentElement;
-    }
-    // Belt-and-braces: companion.html sets these on html/body/#root.
-    for (const sel of [document.documentElement, document.body, document.getElementById("root")]) {
-      if (!(sel instanceof HTMLElement)) continue;
-      if (cleared.some((c) => c.el === sel)) continue;
-      cleared.push({
-        el: sel,
-        bg: sel.style.background,
-        bgc: sel.style.backgroundColor,
-        bgi: sel.style.backgroundImage,
-      });
-      sel.style.background = "transparent";
-      sel.style.backgroundColor = "transparent";
-      sel.style.backgroundImage = "none";
     }
     syncNativeSurface();
     const onResize = () => syncNativeSurface();
     window.addEventListener("resize", onResize);
     window.visualViewport?.addEventListener("resize", onResize);
     return () => {
-      for (const { el: e, bg, bgc, bgi } of cleared) {
-        e.style.background = bg;
-        e.style.backgroundColor = bgc;
-        e.style.backgroundImage = bgi;
-      }
       window.removeEventListener("resize", onResize);
       window.visualViewport?.removeEventListener("resize", onResize);
     };
@@ -1648,7 +1640,20 @@ export function ControlScreen({
     const id = window.setInterval(async () => {
       // Direct-video path telemetry (independent of the RTP stats below).
       setWcStats(link.wcStats?.() ?? null);
-      setAudioStats(link.audioStats?.() ?? null);
+      const aStats = link.audioStats?.() ?? null;
+      setAudioStats(aStats);
+      if (aStats && aStats.underruns > audioUnderrunRef.current) {
+        const d = aStats.underruns - audioUnderrunRef.current;
+        if (d > 0) {
+          hitchNote("audio-underrun", `audio underrun +${d} (total ${aStats.underruns}, buf ${aStats.bufMs}ms)`, {
+            delta: d,
+            underruns: aStats.underruns,
+            bufMs: aStats.bufMs,
+            mode: aStats.mode,
+          });
+        }
+        audioUnderrunRef.current = aStats.underruns;
+      }
       const s = await link.netStats().catch(() => null);
       if (!alive || !s) return;
       const prev = netRef.current;
@@ -2673,9 +2678,7 @@ export function ControlScreen({
 
   return (
     <div
-      className={`relative flex h-full w-full flex-col overflow-hidden select-none ${
-        wcNative ? "bg-transparent" : "bg-black"
-      }`}
+      className="relative flex h-full w-full flex-col overflow-hidden select-none bg-black"
       style={{
         overscrollBehavior: "none",
         touchAction: "none",
@@ -2695,10 +2698,10 @@ export function ControlScreen({
       {/* ==== top toolbar — flex sibling (shrinks video); collapsible like the bottom dock ==== */}
       {!immersive && !topCollapsed && !pipView && (
         <div
-          className="relative z-40 flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-base/95 px-2 py-1.5 backdrop-blur"
+          className="relative z-40 flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-base px-2 py-1.5"
           style={{ paddingTop: "max(0.35rem, env(safe-area-inset-top))" }}
         >
-          <div className="relative flex min-w-0 items-center gap-2 rounded-xl bg-white/[0.04] px-2 py-1">
+          <div className="relative flex min-w-0 items-center gap-2 rounded-xl bg-[#12141c] px-2 py-1">
             {onNavigate && (
               <button
                 onClick={() => setNavOpen((o) => !o)}
@@ -2901,6 +2904,8 @@ export function ControlScreen({
                   decoderMsg.text,
                   decoderMsg.detail,
                   "",
+                  hitchFormat(),
+                  "",
                   `ua: ${navigator.userAgent}`,
                   `at: ${new Date().toISOString()}`,
                 ]
@@ -2929,6 +2934,33 @@ export function ControlScreen({
               {decoderMsg.detail}
             </pre>
           )}
+        </div>
+      )}
+      {hitchToast && (
+        <div className="pointer-events-auto absolute left-2 right-2 top-14 z-[60] flex items-start gap-2 rounded-xl border border-amber/40 bg-[#12141c] px-3 py-2 shadow-float">
+          <span className="min-w-0 flex-1 font-mono text-[10px] font-700 leading-snug text-amber">{hitchToast}</span>
+          <button
+            type="button"
+            className="flex h-6 shrink-0 items-center gap-1 rounded bg-white/[0.08] px-2 text-[10px] font-800 text-white/80"
+            onClick={() => {
+              void copyToClipboard(
+                [`GameTracker hitch @ ${new Date().toISOString()}`, "", hitchFormat()].join("\n"),
+              ).then(() => {
+                setDiagCopied(true);
+                window.setTimeout(() => setDiagCopied(false), 1500);
+              });
+            }}
+            title="Copy hitch log"
+          >
+            <CopyIcon className="h-3 w-3" /> {diagCopied ? "Copied" : "Copy"}
+          </button>
+          <button
+            type="button"
+            className="grid h-6 w-6 shrink-0 place-items-center rounded bg-white/[0.08] text-white/60"
+            onClick={() => setHitchToast(null)}
+          >
+            <X className="h-3 w-3" />
+          </button>
         </div>
       )}
       {/* ---- screen viewport ---- */}
@@ -4894,7 +4926,7 @@ function bottleneckHint(host: HostStats | null, net: NetStats | null, displayFps
       return "Display behind decode — phone UI thread busy.";
     }
     return wc.native
-      ? `MediaCodec Surface (APK): no jitter buffer (~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms).`
+      ? `MediaCodec Surface overlay (opaque WebView): ~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms.`
       : `Direct path: no jitter buffer (~${Math.max(1, wc.e2eMs)}ms + host ${hostMs.toFixed(0)}ms).`;
   }
   if (!host && !net) return "Gathering stats…";
@@ -4985,7 +5017,7 @@ function LatencyPair({ vid, input }: { vid: number | null; input: number | null 
       {vid != null && input != null && <span className="text-ink-faint/70">·</span>}
       {input != null && (
         <span className={`${lagColor(input)} opacity-90`} title="Input (one-way transport)">
-          in~{input}ms
+          ~{input}ms
         </span>
       )}
     </span>
@@ -5012,7 +5044,7 @@ function FpsLatencyPill({
   const input = topBarInputLag(wcStats, net);
   if (variant === "floating") {
     return (
-      <span className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-black/45 px-2.5 py-1 text-[10px] font-700 text-green backdrop-blur">
+      <span className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-[#12141c] px-2.5 py-1 text-[10px] font-700 text-green">
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-green" style={{ boxShadow: "0 0 6px #34d399" }} />
         <span className="flex flex-col items-start leading-none">
           <span className="whitespace-nowrap tabular-nums">{fps} fps</span>
