@@ -455,17 +455,27 @@ export function startHost(opts: HostOptions): () => void {
    * Shed or restore bitrate from the video-channel backlog. Called from the
    * send path (on skip) and the capstats tick (periodic).
    */
+  // When the send path last had to skip a frame (backpressure). Ease-back holds
+  // off for a few seconds after this so the bitrate doesn't climb straight back
+  // into the overshoot that caused the skip — that climb-skip-climb sawtooth is
+  // what reads as "the stream hitches every couple of seconds" in motion scenes.
+  let lastSkipAt = 0;
+
   const adaptFromBuffer = (buffered: number, maxBuffered: number, skippedThisFrame: boolean) => {
     const tgt = targetKbps();
     if (adaptKbps <= 0) adaptKbps = tgt;
     const fill = maxBuffered > 0 ? buffered / maxBuffered : 0;
     if (skippedThisFrame || fill > 0.55) {
-      // Network can't drain — cut ~12% so the next frames fit. Floor at 1.5 Mbps /
-      // Tune min so we don't spiral into unreadable mush.
-      adaptKbps = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * 0.88));
+      // Network can't drain. A hard skip cuts deeper (~15%) than a merely-filling
+      // channel (~8%) so one visible hitch sheds enough to end the burst instead
+      // of rationing it out over several. Floor at 1.5 Mbps / Tune min so we
+      // don't spiral into unreadable mush.
+      if (skippedThisFrame) lastSkipAt = Date.now();
+      const cut = skippedThisFrame ? 0.85 : 0.92;
+      adaptKbps = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * cut));
       adaptCleanTicks = 0;
       pushAdaptBitrate();
-    } else if (fill < 0.12) {
+    } else if (fill < 0.12 && Date.now() - lastSkipAt > 3000) {
       adaptCleanTicks++;
       // ~1.2s of a drained channel → ease 5% back toward the Tune target.
       if (adaptCleanTicks >= 3 && adaptKbps < tgt) {
@@ -889,18 +899,51 @@ export function startHost(opts: HostOptions): () => void {
     });
     node.connect(dest);
     audioNode = node;
-    // RTC path: moderately wider than the phone DIRECT defaults — absorbs IPC
-    // jitter from the Tauri channel under game load. Lowered from 40/55/150 to
-    // 30/40/120 to claw back ~15ms of desktop-side audio latency; underruns
-    // still grow it adaptively toward maxMs.
+    // RTC path: wider than the phone DIRECT defaults — absorbs IPC jitter from
+    // the Tauri channel under game load. Restored to 40/55/150 (a leaner 30/40
+    // experiment caused audible underrun chop): this worklet feeds the Opus
+    // track, which sits behind NetEQ's ~150ms+ anyway, so 15ms shaved here is
+    // inaudible latency-wise while the underruns it causes are very audible.
     try {
-      node.port.postMessage({ cfg: { channels: 2, captureRate: ctx.sampleRate, primeMs: 30, targetMs: 40, maxMs: 120 } });
+      node.port.postMessage({ cfg: { channels: 2, captureRate: ctx.sampleRate, primeMs: 40, targetMs: 55, maxMs: 150 } });
     } catch {
       /* ignore */
     }
 
     let directSink: RTCDataChannel | null = null;
     let liveFmt: { sampleRate: number; channels: number } | null = null;
+
+    // The audio channel is partially reliable (maxRetransmits: 0) so the one-shot
+    // format JSON can be lost in transit. Repeat it for a short burst after a sink
+    // attaches (and after every capture-format change) so at least one copy lands.
+    // NOT forever: companion builds without cfg dedupe forward every repeat to
+    // their worklet, which resets the adaptive latency target each time — a
+    // bounded burst right when the format is announced avoids that.
+    let cfgTimer: number | null = null;
+    let cfgBurstUntil = 0;
+    const stopCfgBurst = () => {
+      if (cfgTimer !== null) {
+        window.clearInterval(cfgTimer);
+        cfgTimer = null;
+      }
+    };
+    const sendDirectCfg = () => {
+      if (!directSink || directSink.readyState !== "open" || !liveFmt || Date.now() > cfgBurstUntil) {
+        stopCfgBurst();
+        return;
+      }
+      try {
+        directSink.send(JSON.stringify({ cfg: { sampleRate: liveFmt.sampleRate, channels: liveFmt.channels } }));
+      } catch {
+        /* ignore */
+      }
+    };
+    const startCfgBurst = () => {
+      stopCfgBurst();
+      cfgBurstUntil = Date.now() + 10_000;
+      sendDirectCfg();
+      if (directSink && directSink.readyState === "open") cfgTimer = window.setInterval(sendDirectCfg, 2000);
+    };
 
     // DIRECT → data channel (copy); RTC → worklet (transfer).
     const ch = new Channel<ArrayBuffer>();
@@ -935,31 +978,20 @@ export function startHost(opts: HostOptions): () => void {
       liveFmt = { sampleRate: captureRate, channels };
       try {
         node.port.postMessage({
-          cfg: { channels, captureRate, primeMs: 30, targetMs: 40, maxMs: 120 },
+          cfg: { channels, captureRate, primeMs: 40, targetMs: 55, maxMs: 150 },
         });
       } catch {
         /* node torn down */
       }
-      if (directSink && directSink.readyState === "open") {
-        try {
-          directSink.send(JSON.stringify({ cfg: { sampleRate: captureRate, channels } }));
-        } catch {
-          /* ignore */
-        }
-      }
+      if (directSink) startCfgBurst();
     };
     return {
       track,
       start,
       setDirectSink: (sink) => {
         directSink = sink;
-        if (sink && sink.readyState === "open" && liveFmt) {
-          try {
-            sink.send(JSON.stringify({ cfg: { sampleRate: liveFmt.sampleRate, channels: liveFmt.channels } }));
-          } catch {
-            /* ignore */
-          }
-        }
+        if (sink) startCfgBurst();
+        else stopCfgBurst();
       },
       format: () => liveFmt,
     };
@@ -1171,7 +1203,17 @@ export function startHost(opts: HostOptions): () => void {
     videoCh.binaryType = "arraybuffer";
     // DIRECT audio: raw float32 PCM. Created up front (no renegotiation); idle
     // until the guest opts in with `{type:"amode",mode:"pcm"}`.
-    const audioCh = pc.createDataChannel("audio");
+    //
+    // Ordered but UNRELIABLE (maxRetransmits: 0 → SCTP partial reliability,
+    // RFC 8831): a lost PCM chunk is skipped via FORWARD TSN instead of being
+    // retransmitted. Live audio must never wait — on a fully reliable channel a
+    // single lost packet head-of-line blocked every chunk behind it for RTT+,
+    // and since all channels share one SCTP association, video saturating the
+    // link under high motion turned into bursty audio delivery → underrun
+    // fade-in/fade-out chop ("robotic" sound). A skipped 10ms chunk is a gap
+    // the phone worklet's gain ramp conceals; ordering is still preserved for
+    // the messages that do arrive, so no resequencing is needed guest-side.
+    const audioCh = pc.createDataChannel("audio", { ordered: true, maxRetransmits: 0 });
     audioCh.binaryType = "arraybuffer";
 
     // ---- WebCodecs direct-video encoder (bypasses the receiver jitter buffer).
@@ -1264,6 +1306,13 @@ export function startHost(opts: HostOptions): () => void {
     // SOFT recovery — an IDR has been requested but P-frames are still being forwarded.
     // Used by the HUD to surface "artifacting, recovering" without freezing the picture.
     let nativeRecovering = false;
+    // A recovery IDR is wanted but the channel is backed up RIGHT NOW. Requesting it
+    // mid-burst is counterproductive: the IDR costs ~2 P-frames of budget (2-frame
+    // VBV), lands on a full pipe, and gets skipped by the same backpressure that
+    // armed it — leaving the guest artifacting forever while NVENC burns budget on
+    // IDRs nobody receives. Defer the request until the channel drains instead.
+    let nativeRecoveryPending = false;
+    let nativeRecoveryPendingAt = 0; // when the deferral started (time-caps the wait)
     let nativeKeyRequestAt = 0;
     let nativeArtifactEvents = 0; // count of soft-recovery armings (HUD "artifacts")
     let nativeRecoveredEvents = 0; // count of clean IDR arrivals that closed a recovery
@@ -1278,14 +1327,21 @@ export function startHost(opts: HostOptions): () => void {
         /* not on desktop / no native encoder */
       }
     };
-    /** Arm soft recovery: request an IDR but keep P-frames flowing so the stream
-     *  never freezes. Transient artifacting is expected until the IDR lands. */
-    const armNativeRecovery = () => {
+    /** Arm soft recovery: get an IDR on the way while P-frames keep flowing so the
+     *  stream never freezes. Transient artifacting is expected until the IDR lands.
+     *  `defer` postpones the actual encoder request until the channel has drained —
+     *  used by the backpressure path so the recovery IDR isn't itself skipped. */
+    const armNativeRecovery = (defer = false) => {
       if (!nativeRecovering) {
         nativeRecovering = true;
         nativeArtifactEvents++;
       }
-      requestNativeKeyframe();
+      if (defer) {
+        if (!nativeRecoveryPending) nativeRecoveryPendingAt = performance.now();
+        nativeRecoveryPending = true;
+      } else {
+        requestNativeKeyframe();
+      }
     };
     nativeSink = (payload, key, w = 0, h = 0) => {
       if (videoCh.readyState !== "open") return;
@@ -1311,25 +1367,40 @@ export function startHost(opts: HostOptions): () => void {
       if (!key && performance.now() - wcLastKeyAt >= quality.wcKeyMs) {
         armNativeRecovery();
       }
-      // HARD gate: only set on a true reference-chain break (config/resize/partial AU).
-      if (nativeAwaitKey && !key) return;
-      if (key) {
-        // A clean IDR closes any open soft-recovery window AND the hard gate.
-        if (nativeRecovering) {
-          nativeRecoveredEvents++;
-          nativeRecovering = false;
-        }
-        nativeAwaitKey = false;
-      }
       const pace = clamp(quality.pace, 0, 100) / 100;
       const maxBuffered = quality.wcBufKB * 1024 * (1 + pace);
       const buffered = videoCh.bufferedAmount;
-      if (buffered > maxBuffered) {
-        // Backpressure: skip THIS frame (latest-wins) but do NOT gate subsequent
-        // P-frames — that was the high-motion freeze. The dropped P-frame may cause
-        // a brief artifact on the guest; arm a soft recovery IDR to clean it up.
+      // HARD gate: only set on a true reference-chain break (config/resize/partial AU).
+      if (nativeAwaitKey && !key) {
+        // Gated frames never reach the send path below, so a deferred recovery
+        // request must be able to fire from here too — otherwise a keyframe shed
+        // at the 4× ceiling would leave nobody asking for the next one until the
+        // guest's own 1s vkf timer noticed.
+        if (nativeRecoveryPending && buffered < maxBuffered * 0.5) {
+          nativeRecoveryPending = false;
+          requestNativeKeyframe();
+        }
+        return;
+      }
+      if (!key) {
+        if (buffered > maxBuffered) {
+          // Backpressure: skip THIS frame (latest-wins) but do NOT gate subsequent
+          // P-frames — that was the high-motion freeze. The dropped P-frame may cause
+          // a brief artifact on the guest; arm a DEFERRED recovery IDR to clean it up
+          // once the channel drains (an IDR requested mid-burst just feeds the burst).
+          wcSkipped++;
+          armNativeRecovery(true);
+          adaptFromBuffer(buffered, maxBuffered, true);
+          return;
+        }
+      } else if (buffered > maxBuffered * 4) {
+        // Keyframes are the recovery mechanism — dropping one wedges the guest until
+        // the next IDR, which is exactly the "stuck every couple seconds" loop. Let
+        // them jump the normal ceiling; only a truly dead channel (4× the budget,
+        // several seconds of backlog) may shed one, and then the gates stay armed so
+        // the NEXT IDR is still awaited rather than the stream resuming corrupt.
         wcSkipped++;
-        armNativeRecovery();
+        armNativeRecovery(true);
         adaptFromBuffer(buffered, maxBuffered, true);
         return;
       }
@@ -1342,6 +1413,29 @@ export function startHost(opts: HostOptions): () => void {
         // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
         nativeAwaitKey = true;
         armNativeRecovery();
+        return;
+      }
+      if (key) {
+        // The IDR is CONFIRMED on the wire (send succeeded) — only now may it close
+        // the soft-recovery window and the hard gate. Clearing these before the
+        // backpressure check (the old order) let a skipped IDR mark the stream
+        // healthy while the guest never received it: the guest kept vkf-ing, each
+        // vkf re-armed the hard gate, and the picture froze in a loop.
+        if (nativeRecovering) {
+          nativeRecoveredEvents++;
+          nativeRecovering = false;
+        }
+        nativeRecoveryPending = false;
+        nativeAwaitKey = false;
+      } else if (
+        nativeRecoveryPending &&
+        (buffered < maxBuffered * 0.5 || performance.now() - nativeRecoveryPendingAt > 600)
+      ) {
+        // The burst that deferred the recovery has drained (or hovered near-full
+        // long enough that waiting further just prolongs the artifacting) —
+        // request the IDR now; keyframes may jump the ceiling, so it WILL go out.
+        nativeRecoveryPending = false;
+        requestNativeKeyframe();
       }
     };
 
@@ -1364,6 +1458,7 @@ export function startHost(opts: HostOptions): () => void {
       nativeConfigH = 0;
       nativeAwaitKey = true;
       nativeRecovering = false;
+      nativeRecoveryPending = false;
       try {
         api.remoteSetCaptureNative(false);
       } catch {

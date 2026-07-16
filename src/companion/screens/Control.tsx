@@ -16,6 +16,8 @@ import {
   Keyboard,
   Loader2,
   X,
+  Copy as CopyIcon,
+  Check as CheckIcon,
   RotateCcw,
   LogOut,
   Gauge,
@@ -406,6 +408,30 @@ function cssCursorFor(kind: string): string {
   }
 }
 
+/** Clipboard write with a legacy fallback — navigator.clipboard needs a secure
+ *  context + focus, and some Android webviews deny it silently. */
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    /* fall through to execCommand */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 // ---------- component ----------
 export function ControlScreen({
   link,
@@ -522,8 +548,13 @@ export function ControlScreen({
   const [wcNative, setWcNative] = useState(false);
   const wcNativeRef = useRef(false);
   wcNativeRef.current = wcNative;
-  /** Transient decoder status (fallback / error) shown above the viewport. */
-  const [decoderMsg, setDecoderMsg] = useState<string | null>(null);
+  /** Transient decoder status (fallback / error) shown above the viewport.
+   *  `detail` carries the full diagnostic (Java throwable + stack from the
+   *  native bridge) — rendered scrollable with a copy-to-clipboard button so a
+   *  device-specific failure can be pasted into a bug report verbatim. */
+  const [decoderMsg, setDecoderMsg] = useState<{ text: string; detail: string } | null>(null);
+  const decoderMsgTimer = useRef<number | null>(null);
+  const [decoderCopied, setDecoderCopied] = useState(false);
 
   // ---- web picture-in-picture (browser only — the APK has native Android PiP) ----
   // Chrome Android does NOT expose the Media Session "enterpictureinpicture" action
@@ -1122,9 +1153,12 @@ export function ControlScreen({
       } else if (e.event === "decoder") {
         const state = String((e as { state?: string }).state || "");
         const reason = String((e as { reason?: string }).reason || "");
+        const detail = String((e as { detail?: string }).detail || "");
         if (state === "fallback" || state === "error") {
-          setDecoderMsg(reason || "Decoder issue — check Tune → Phone decoder");
-          window.setTimeout(() => setDecoderMsg(null), 6000);
+          setDecoderMsg({ text: reason || "Decoder issue — check Tune → Phone decoder", detail });
+          if (decoderMsgTimer.current) window.clearTimeout(decoderMsgTimer.current);
+          // With a diagnostic attached, linger long enough to read/copy it.
+          decoderMsgTimer.current = window.setTimeout(() => setDecoderMsg(null), detail ? 20000 : 6000);
         } else if (state === "native") {
           setDecoderMsg(null);
         }
@@ -2716,8 +2750,48 @@ export function ControlScreen({
       {/* ==== viewport — video only; chrome above/below shrinks this, never overlays it ==== */}
       <div className="relative min-h-0 flex-1">
       {decoderMsg && (
-        <div className="absolute left-2 right-2 top-2 z-[45] rounded-lg border border-amber/40 bg-black/85 px-3 py-2 text-[11px] font-700 text-amber shadow-float backdrop-blur">
-          {decoderMsg}
+        <div className="absolute left-2 right-2 top-2 z-[45] rounded-lg border border-amber/40 bg-black/85 px-3 py-2 text-[11px] text-amber shadow-float backdrop-blur">
+          <div className="flex items-start gap-2">
+            <span className="min-w-0 flex-1 font-700">{decoderMsg.text}</span>
+            <button
+              type="button"
+              title="Copy full error to clipboard"
+              className="flex h-6 shrink-0 items-center gap-1 rounded bg-white/[0.08] px-2 text-[10px] font-800 text-white/80 hover:bg-white/[0.15]"
+              onClick={() => {
+                // Everything a bug report needs in one paste: headline, full
+                // diagnostic, and the environment it happened in.
+                const payload = [
+                  decoderMsg.text,
+                  decoderMsg.detail,
+                  "",
+                  `ua: ${navigator.userAgent}`,
+                  `at: ${new Date().toISOString()}`,
+                ]
+                  .filter(Boolean)
+                  .join("\n");
+                void copyToClipboard(payload).then((ok) => {
+                  setDecoderCopied(ok);
+                  window.setTimeout(() => setDecoderCopied(false), 1500);
+                });
+              }}
+            >
+              {decoderCopied ? <CheckIcon className="h-3 w-3 text-green" /> : <CopyIcon className="h-3 w-3" />}
+              {decoderCopied ? "Copied" : "Copy"}
+            </button>
+            <button
+              type="button"
+              title="Dismiss"
+              className="grid h-6 w-6 shrink-0 place-items-center rounded bg-white/[0.08] text-white/60 hover:bg-white/[0.15]"
+              onClick={() => setDecoderMsg(null)}
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+          {decoderMsg.detail && (
+            <pre className="mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-white/[0.04] px-2 py-1.5 font-mono text-[9px] leading-snug text-amber/80">
+              {decoderMsg.detail}
+            </pre>
+          )}
         </div>
       )}
       {/* ---- screen viewport ---- */}
@@ -4441,7 +4515,7 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
     long: "Phone decode errors",
     info: "Times the phone's decoder reported an error and asked the PC for a keyframe. A climbing count on the WebCodecs path usually means the H.264 stream hit a reference the decoder couldn't reconcile; on the native path it's the bridge's own fault count.",
   },
-  Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound (lean ~18ms). RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
+  Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound (lean ~30ms). RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
   "A-buf": { long: "Audio playout buffer", info: "How much sound is sitting on the phone before it plays. DIRECT only — RTC uses the browser's NetEQ instead." },
   "A-tgt": { long: "Audio buffer target", info: "What the DIRECT worklet steers toward. Grows briefly after an underrun, then eases back." },
   "A ↓": { long: "Audio download rate", info: "PCM bytes arriving per second on DIRECT. Opus on the RTC path isn't counted here." },

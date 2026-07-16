@@ -87,6 +87,55 @@ mod android {
     use super::{DecoderProbe, DecoderStats};
     use jni::objects::{JClass, JObject, JString, JValue};
 
+    /// If a Java exception is pending, take it (clearing the pending state) and
+    /// render `toString()` plus the full stack trace via
+    /// `android.util.Log.getStackTraceString`. Without this, the jni crate's
+    /// error Display is the famously useless "Java exception was thrown" — the
+    /// actual throwable was being silently cleared, so a device-specific probe
+    /// failure could never be diagnosed from the phone's error toast.
+    fn take_exception_detail(env: &mut jni::JNIEnv) -> Option<String> {
+        if !env.exception_check().unwrap_or(false) {
+            return None;
+        }
+        let throwable = env.exception_occurred().ok()?;
+        // Must clear BEFORE making further JNI calls on the throwable.
+        let _ = env.exception_clear();
+        let to_string = |env: &mut jni::JNIEnv, obj: JObject| -> Option<String> {
+            if obj.is_null() {
+                return None;
+            }
+            let js: JString = obj.into();
+            env.get_string(&js).ok().map(String::from)
+        };
+        let summary = env
+            .call_method(&throwable, "toString", "()Ljava/lang/String;", &[])
+            .ok()
+            .and_then(|v| v.l().ok())
+            .and_then(|o| to_string(env, o))
+            .unwrap_or_else(|| "unknown Java exception".into());
+        let stack = env
+            .call_static_method(
+                "android/util/Log",
+                "getStackTraceString",
+                "(Ljava/lang/Throwable;)Ljava/lang/String;",
+                &[JValue::Object(&throwable)],
+            )
+            .ok()
+            .and_then(|v| v.l().ok())
+            .and_then(|o| to_string(env, o))
+            .unwrap_or_default();
+        // A stray exception from the helper calls above must not leak upward.
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        let stack: String = stack.trim().chars().take(1500).collect();
+        Some(if stack.is_empty() || stack == summary {
+            summary
+        } else {
+            format!("{summary}\n{stack}")
+        })
+    }
+
     fn with_bridge<F, T>(f: F) -> Result<T, String>
     where
         F: FnOnce(&mut jni::JNIEnv, JClass) -> Result<T, String>,
@@ -119,10 +168,16 @@ mod android {
             f(&mut env, JClass::from(class_obj))
         })();
 
-        if env.exception_check().unwrap_or(false) {
-            let _ = env.exception_clear();
+        // A pending Java exception is why most Err results happen — attach its
+        // toString() + stack so the error that reaches the phone toast (and the
+        // copy-to-clipboard payload) says WHAT threw, not just that something did.
+        match take_exception_detail(&mut env) {
+            Some(detail) => match result {
+                Err(msg) => Err(format!("{msg} — {detail}")),
+                ok => ok,
+            },
+            None => result,
         }
-        result
     }
 
     pub fn probe() -> Result<DecoderProbe, String> {

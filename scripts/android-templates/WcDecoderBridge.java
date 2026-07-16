@@ -116,16 +116,59 @@ public final class WcDecoderBridge {
     activity.runOnUiThread(() -> ensureSurfaceView(activity));
   }
 
-  /** Probe only — never throws, never returns a stale false on a transient fault. */
+  /**
+   * One-line description of a Throwable for the probe-detail channel: class,
+   * message, the top few stack frames, and the root cause. This is what ends up
+   * in the phone's error toast (with a copy-to-clipboard button), so it must be
+   * informative enough to debug a device we don't own.
+   */
+  private static String describeThrowable(Throwable t) {
+    StringBuilder sb = new StringBuilder();
+    sb.append(t.getClass().getName());
+    String m = t.getMessage();
+    if (m != null && !m.isEmpty()) sb.append(": ").append(m);
+    StackTraceElement[] st = t.getStackTrace();
+    for (int i = 0; i < Math.min(3, st.length); i++) sb.append(" @ ").append(st[i]);
+    Throwable c = t.getCause();
+    if (c != null && c != t) {
+      sb.append(" | cause ").append(c.getClass().getName());
+      if (c.getMessage() != null) sb.append(": ").append(c.getMessage());
+    }
+    return sb.toString();
+  }
+
+  /**
+   * Probe only — NEVER throws (catch Throwable, not Exception: some OEM builds
+   * raise Errors like NoClassDefFoundError / ExceptionInInitializerError out of
+   * MediaCodecList, and an Error escaping here crossed JNI as an opaque
+   * "Java exception was thrown" that told us nothing). A failed probe returns
+   * false with the reason preserved in {@link #probeDetail}.
+   */
   public static boolean probeAvailable() {
-    String name = pickDecoderName();
-    boolean ok = name != null;
-    lastProbeDetail.set(ok ? ("picked=" + name) : "no decoder found");
-    return ok;
+    try {
+      String name = pickDecoderName();
+      boolean ok = name != null;
+      if (ok) {
+        lastProbeDetail.set("picked=" + name);
+      } else {
+        // pickDecoderName may have recorded a specific failure — keep it.
+        String d = lastProbeDetail.get();
+        if (d == null || !d.startsWith("pickDecoder")) lastProbeDetail.set("no decoder found");
+      }
+      return ok;
+    } catch (Throwable t) {
+      lastProbeDetail.set("probeAvailable threw: " + describeThrowable(t));
+      return false;
+    }
   }
 
   public static boolean probeLowLatency() {
-    String name = pickDecoderName();
+    String name;
+    try {
+      name = pickDecoderName();
+    } catch (Throwable t) {
+      return false;
+    }
     if (name == null) return false;
     // IMPORTANT: probe must NOT instantiate a real MediaCodec. The previous
     // implementation called supportsKnownVendorParameter(name), which does
@@ -151,14 +194,18 @@ public final class WcDecoderBridge {
       }
       return name.toLowerCase().contains("low_latency")
           || name.toLowerCase().contains("low-latency");
-    } catch (Exception e) {
+    } catch (Throwable t) {
       return false;
     }
   }
 
   public static String probeName() {
-    String n = pickDecoderName();
-    return n == null ? "" : n;
+    try {
+      String n = pickDecoderName();
+      return n == null ? "" : n;
+    } catch (Throwable t) {
+      return "";
+    }
   }
 
   /** Diagnostic — surfaces the reason the probe returned its answer. */
@@ -886,8 +933,9 @@ public final class WcDecoderBridge {
     MediaCodecInfo[] infos;
     try {
       infos = new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos();
-    } catch (Exception e) {
-      lastProbeDetail.set("pickDecoder: MediaCodecList threw " + e.getMessage());
+    } catch (Throwable t) {
+      // Throwable, not Exception: some OEM framework builds throw Errors here.
+      lastProbeDetail.set("pickDecoder: MediaCodecList threw " + describeThrowable(t));
       return null;
     }
 
@@ -897,71 +945,78 @@ public final class WcDecoderBridge {
     String anySw = null; // software fallback (last resort)
 
     for (MediaCodecInfo info : infos) {
-      if (info.isEncoder()) continue;
-      String[] types;
+      // Throwable guard around the whole entry: one rogue codec plugin (buggy
+      // OEM builds throw Errors from the most innocent getters) must not sink
+      // the whole scan.
       try {
-        types = info.getSupportedTypes();
-      } catch (Exception e) {
-        continue;
-      }
-      boolean supports = false;
-      for (String t : types) {
-        if (MIME.equalsIgnoreCase(t)) {
-          supports = true;
-          break;
-        }
-      }
-      if (!supports) continue;
-
-      String name = info.getName();
-      String lower = name.toLowerCase();
-
-      // Skip software decoders — they're tracked separately as the absolute
-      // last resort. Don't gate on isSoftwareOnly() alone (some emulator
-      // builds only ship SW).
-      boolean looksSoftware =
-          lower.contains("sw")
-              || lower.contains("google")
-              || lower.contains("android.video.avc")
-              || lower.contains("c2.android")
-              || lower.contains("omx.google")
-              || lower.contains("avcdecoder");
-      if (looksSoftware) {
-        if (anySw == null) anySw = name;
-        continue;
-      }
-
-      // Skip aliases on Q+ — they're the same decoder under two names.
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (info.isEncoder()) continue;
+        String[] types;
         try {
-          if (info.isAlias()) continue;
-        } catch (Exception ignored) {
+          types = info.getSupportedTypes();
+        } catch (Exception e) {
+          continue;
         }
-      }
+        boolean supports = false;
+        for (String t : types) {
+          if (MIME.equalsIgnoreCase(t)) {
+            supports = true;
+            break;
+          }
+        }
+        if (!supports) continue;
 
-      // An explicit low_latency variant is the best pick — Pixel 4 ships
-      // c2.qti.avc.decoder.low_latency SEPARATELY from the base decoder and
-      // only the LL one advertises FEATURE_LowLatency (Moonlight errata #15).
-      if (lower.contains("low_latency") || lower.contains("low-latency")) {
-        if (llVariant == null) llVariant = name;
-      }
+        String name = info.getName();
+        String lower = name.toLowerCase();
 
-      try {
-        MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(MIME);
-        boolean llFeature = false;
-        if (Build.VERSION.SDK_INT >= 30) {
+        // Skip software decoders — they're tracked separately as the absolute
+        // last resort. Don't gate on isSoftwareOnly() alone (some emulator
+        // builds only ship SW).
+        boolean looksSoftware =
+            lower.contains("sw")
+                || lower.contains("google")
+                || lower.contains("android.video.avc")
+                || lower.contains("c2.android")
+                || lower.contains("omx.google")
+                || lower.contains("avcdecoder");
+        if (looksSoftware) {
+          if (anySw == null) anySw = name;
+          continue;
+        }
+
+        // Skip aliases on Q+ — they're the same decoder under two names.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
           try {
-            llFeature = caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency);
+            if (info.isAlias()) continue;
           } catch (Exception ignored) {
           }
         }
-        if (llFeature) {
-          if (llHw == null) llHw = name;
+
+        // An explicit low_latency variant is the best pick — Pixel 4 ships
+        // c2.qti.avc.decoder.low_latency SEPARATELY from the base decoder and
+        // only the LL one advertises FEATURE_LowLatency (Moonlight errata #15).
+        if (lower.contains("low_latency") || lower.contains("low-latency")) {
+          if (llVariant == null) llVariant = name;
         }
-      } catch (Exception ignored) {
-        // Buggy codec — pretend it's a generic HW decoder and move on.
+
+        try {
+          MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(MIME);
+          boolean llFeature = false;
+          if (Build.VERSION.SDK_INT >= 30) {
+            try {
+              llFeature = caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency);
+            } catch (Exception ignored) {
+            }
+          }
+          if (llFeature) {
+            if (llHw == null) llHw = name;
+          }
+        } catch (Exception ignored) {
+          // Buggy codec — pretend it's a generic HW decoder and move on.
+        }
+        if (anyHw == null) anyHw = name;
+      } catch (Throwable perCodec) {
+        continue;
       }
-      if (anyHw == null) anyHw = name;
     }
 
     if (llVariant != null) return llVariant;
@@ -973,8 +1028,8 @@ public final class WcDecoderBridge {
       MediaFormat fmt = MediaFormat.createVideoFormat(MIME, 1280, 720);
       String found = new MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(fmt);
       if (found != null) return found;
-    } catch (Exception e) {
-      lastProbeDetail.set("pickDecoder: findDecoderForFormat threw " + e.getMessage());
+    } catch (Throwable t) {
+      lastProbeDetail.set("pickDecoder: findDecoderForFormat threw " + describeThrowable(t));
     }
 
     // Absolute last resort — a software decoder is still a decoder. The DIRECT
@@ -1028,7 +1083,7 @@ public final class WcDecoderBridge {
           new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()) {
         if (info.getName().equals(name)) return info;
       }
-    } catch (Exception ignored) {
+    } catch (Throwable ignored) {
     }
     return null;
   }

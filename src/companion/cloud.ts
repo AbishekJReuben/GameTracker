@@ -365,6 +365,12 @@ export class CloudConn {
   private wcAwaitKey = true;
   private wcKfReqAt = 0;
   private wcErrors = 0;
+  /** Recent decoder-error timestamps (ms). Fallback to RTC is decided on error
+   *  RATE, not the session-lifetime count: a broken reference chain after a
+   *  host-side backpressure skip is expected and recoverable (rebuild + IDR),
+   *  and five of those spread over an hour must not permanently demote a
+   *  perfectly good DIRECT session to the jittery RTC track. */
+  private wcErrorTimes: number[] = [];
   /** Host-reported artifact/recovery counters (capstats → HUD). `-1` means "not
    *  reported yet" so the first real sample doesn't read as a regression. */
   private wcHostArtifacts = -1;
@@ -1063,6 +1069,7 @@ export class CloudConn {
     this.wcMeta.clear();
     this.wcStallTicks = 0;
     this.wcErrors = 0;
+    this.wcErrorTimes = [];
     this.chVideo = undefined;
     this.wcFlushPaceQueue();
     this.wcStopNativePoll();
@@ -1153,11 +1160,14 @@ export class CloudConn {
             this.audioUnderruns = s.underruns ?? 0;
           }
         };
-        // Lean envelope — matches near-instant DIRECT video. Lowered from
-        // 20/35/100 to 12/18/90 to shave ~17ms of phone-side audio latency
-        // (worklet grows adaptively if underruns appear, so the floor is safe).
+        // Lean-but-honest envelope. The 12/18/90 experiment shaved ~17ms of
+        // latency but sat below the data channel's real burst gap (audio shares
+        // the SCTP link with video), so high-motion scenes underran every few
+        // quanta — the fade-out/fade-in chop users heard as "robotic". 20/30
+        // rides just above the typical gap; the worklet still grows adaptively
+        // toward maxMs if a given link is burstier.
         node.port.postMessage({
-          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 12, targetMs: 18, maxMs: 90 },
+          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 20, targetMs: 30, maxMs: 120 },
         });
         this.audioNode = node;
         this.startAudioStatsPoll();
@@ -1176,6 +1186,10 @@ export class CloudConn {
       /* ignore */
     }
     this.audioNode = null;
+    // A rebuilt node starts from defaults — forget the dedupe so the next host
+    // cfg is forwarded even if the format itself didn't change.
+    this.audioCfgRate = 0;
+    this.audioCfgCh = 0;
     // Keep the AudioContext + loaded module for a fast re-opt-in.
   }
 
@@ -1197,21 +1211,34 @@ export class CloudConn {
     }
   }
 
+  /** Last format forwarded to the worklet. The host re-sends its cfg every ~2s
+   *  (the audio channel is lossy now, so the one-shot could vanish); forwarding
+   *  an identical cfg would reset the worklet's adaptive targetMs back to base
+   *  every time — deduplicate so repeats are true no-ops. */
+  private audioCfgRate = 0;
+  private audioCfgCh = 0;
+
   /** One message on the "audio" channel: JSON cfg or a float32 PCM chunk. */
   private onAudioMsg(data: unknown) {
     if (typeof data === "string") {
       try {
         const msg = JSON.parse(data) as { cfg?: { sampleRate?: number; channels?: number } };
         if (msg.cfg && this.audioNode) {
-          this.audioNode.port.postMessage({
-            cfg: {
-              channels: msg.cfg.channels ?? 2,
-              captureRate: msg.cfg.sampleRate ?? 48000,
-              primeMs: 12,
-              targetMs: 18,
-              maxMs: 90,
-            },
-          });
+          const rate = msg.cfg.sampleRate ?? 48000;
+          const ch = msg.cfg.channels ?? 2;
+          if (rate !== this.audioCfgRate || ch !== this.audioCfgCh) {
+            this.audioCfgRate = rate;
+            this.audioCfgCh = ch;
+            this.audioNode.port.postMessage({
+              cfg: {
+                channels: ch,
+                captureRate: rate,
+                primeMs: 20,
+                targetMs: 30,
+                maxMs: 120,
+              },
+            });
+          }
         }
       } catch {
         /* ignore */
@@ -1383,28 +1410,31 @@ export class CloudConn {
           this.wcNative = false;
           this.wcStopNativePoll();
           // Surface the bridge's own reason so "MediaCodec unavailable" stops
-          // being a mystery — the detail string carries which decoder was
-          // considered, what configure attempt failed, or whether the bridge
-          // even loaded. Visible in the transient toast above the viewport.
-          const detail = p.detail ? ` (${p.detail})` : "";
+          // being a mystery — `detail` carries the FULL diagnostic (which decoder
+          // was considered, the Java throwable + stack if the probe threw). The
+          // toast shows it scrollable with a copy-to-clipboard button.
           this.emitEvent({
             event: "decoder",
             state: "fallback",
-            reason: `MediaCodec unavailable — using WebCodecs${detail}`,
+            reason: "MediaCodec unavailable — using WebCodecs",
+            detail: p.detail || "",
           });
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("no native or WebCodecs decoder");
           return;
         }
-        const ok = await initNativeDecoder(w, h);
-        if (!ok) {
-          console.warn("[remote] native MediaCodec init failed — WebCodecs fallback");
+        const initErr = await initNativeDecoder(w, h);
+        if (initErr) {
+          console.warn("[remote] native MediaCodec init failed — WebCodecs fallback:", initErr);
           this.wcNative = false;
           this.wcStopNativePoll();
-          const detail = p.detail ? ` (${p.detail})` : "";
+          // Lead with the real init error (Rust now attaches the Java throwable
+          // + stack); the probe detail is secondary context.
+          const detail = p.detail ? `${initErr}\nprobe: ${p.detail}` : initErr;
           this.emitEvent({
             event: "decoder",
             state: "fallback",
-            reason: `MediaCodec failed to start — using WebCodecs${detail}`,
+            reason: "MediaCodec failed to start — using WebCodecs",
+            detail,
           });
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("native init failed");
           return;
@@ -1433,6 +1463,9 @@ export class CloudConn {
       error: (e) => {
         console.warn("[remote] wc decoder error:", e);
         this.wcErrors++;
+        const now = Date.now();
+        this.wcErrorTimes.push(now);
+        while (this.wcErrorTimes.length && now - this.wcErrorTimes[0] > 20000) this.wcErrorTimes.shift();
         if (this.wcDecoder === dec) this.wcDecoder = null;
         try {
           dec.close();
@@ -1440,7 +1473,10 @@ export class CloudConn {
           /* ignore */
         }
         this.wcAwaitKey = true;
-        if (this.wcErrors > 4) this.wcFallback("repeated decoder errors");
+        // >4 errors inside 20s = the decoder genuinely can't hold this stream —
+        // fall back. Sparser errors are transients (artifact recovery after a
+        // host backpressure skip): rebuild and resync from the next IDR instead.
+        if (this.wcErrorTimes.length > 4) this.wcFallback("repeated decoder errors");
         else this.wcRequestKeyframe();
       },
     });
@@ -1530,7 +1566,7 @@ export class CloudConn {
       this.wcLastNativeError = st.error;
       if (st.frames === 0) {
         console.warn("[remote] native decoder:", st.error);
-        this.emitEvent({ event: "decoder", state: "error", reason: st.error });
+        this.emitEvent({ event: "decoder", state: "error", reason: "Phone decoder error", detail: st.error });
       }
     } else if (!st.error) {
       // Codec cleared its error (healthy) — allow a future different error to

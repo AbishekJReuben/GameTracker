@@ -65,24 +65,28 @@ export async function probeNativeDecoder(): Promise<DecoderProbe> {
     probeCache = await invoke<DecoderProbe>("decoder_probe");
   } catch (e) {
     console.warn("[nativeDecoder] probe failed:", e);
+    // Keep the whole error (the Rust side now attaches the Java throwable's
+    // toString + stack) — the toast clamps visually and offers copy-to-clipboard,
+    // so truncating here would only destroy the part that makes it debuggable.
     probeCache = {
       available: false,
       name: "",
       lowLatency: false,
-      detail: `probe threw: ${String(e).slice(0, 160)}`,
+      detail: `probe threw: ${String(e).slice(0, 2000)}`,
     };
   }
   return probeCache;
 }
 
-export async function initNativeDecoder(width: number, height: number): Promise<boolean> {
-  if (!nativeDecoderPossible()) return false;
+/** Returns null on success, or the full error string on failure. */
+export async function initNativeDecoder(width: number, height: number): Promise<string | null> {
+  if (!nativeDecoderPossible()) return "not Tauri/companion";
   try {
     await invoke("decoder_init", { width, height });
-    return true;
+    return null;
   } catch (e) {
     console.warn("[nativeDecoder] init failed:", e);
-    return false;
+    return String(e).slice(0, 2000);
   }
 }
 
