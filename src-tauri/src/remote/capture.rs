@@ -524,6 +524,24 @@ fn native_out_size(native_w: u32, native_h: u32, max_w: u32) -> (u32, u32) {
 /// decoder, a resolution change). Consumed by the encoder thread on the next frame.
 static NATIVE_FORCE_KEY: AtomicBool = AtomicBool::new(false);
 
+/// Backpressure gate for the native H.264 path: while set, captures are NOT fed
+/// to NVENC (keyframe requests still are). The host JS sets this when the video
+/// data channel backs up, instead of dropping already-encoded frames — a dropped
+/// encoded P-frame is a reference the NEXT frames were encoded against, so every
+/// post-encode drop corrupts the picture until a recovery IDR (this was the
+/// visible artifacting that "cleared every ~4s"). Skipping BEFORE the encoder
+/// keeps the reference chain intact: the same frames go unsent either way, but
+/// what IS sent always decodes clean. Same design as libwebrtc's pre-encoder
+/// FrameDropper. Cleared on [`set_capture_native`] transitions.
+static NATIVE_ENCODE_PAUSED: AtomicBool = AtomicBool::new(false);
+/// Captures skipped pre-encode while paused (diagnostics; surfaced in stats).
+static ST_PAUSE_SKIPS: AtomicU32 = AtomicU32::new(0);
+
+/// Host JS backpressure signal — see [`NATIVE_ENCODE_PAUSED`].
+pub fn set_encode_paused(paused: bool) {
+    NATIVE_ENCODE_PAUSED.store(paused, Ordering::Relaxed);
+}
+
 /// Ask the native encoder for a self-contained keyframe on the next frame.
 ///
 /// The native path runs an effectively infinite GOP (keyframes cost bandwidth and the
@@ -567,6 +585,8 @@ static CAP_NATIVE_OK: AtomicBool = AtomicBool::new(false);
 /// point instead of waiting out the infinite GOP.
 pub fn set_capture_native(on: bool) {
     CAP_NATIVE_OK.store(on, Ordering::Relaxed);
+    // A stale pause from a torn-down session must never stall the next one.
+    NATIVE_ENCODE_PAUSED.store(false, Ordering::Relaxed);
     if on {
         request_keyframe();
     } else {
@@ -601,6 +621,10 @@ pub struct CaptureStats {
     /// composite → NVENC). Implies `native`; `capture_ms` then excludes the readback
     /// and `scale_ms` is 0 because the composite does the scaling.
     pub zero_copy: bool,
+    /// Captures skipped BEFORE the encoder because the video channel was backed
+    /// up (reference-safe backpressure). Non-zero here with a healthy link means
+    /// the phone's radio is stalling in bursts, not that bandwidth is short.
+    pub pause_skips: u32,
 }
 
 /// Read the latest host-side capture telemetry.
@@ -622,6 +646,7 @@ pub fn capture_stats() -> CaptureStats {
         running: CAP_RUNNING.load(Ordering::Relaxed),
         native: ST_NATIVE.load(Ordering::Relaxed),
         zero_copy: ST_ZEROCOPY.load(Ordering::Relaxed),
+        pause_skips: ST_PAUSE_SKIPS.load(Ordering::Relaxed),
     }
 }
 
@@ -981,7 +1006,16 @@ where
                                     Some(s) => comp.render(s, native_w, native_h, img.as_ref().map(|i| (i, d.cursor_seq()))),
                                     None => false,
                                 };
-                                if ok {
+                                // Channel backpressure: skip BEFORE the encoder so the
+                                // reference chain stays intact (see NATIVE_ENCODE_PAUSED).
+                                // Keyframe requests bypass — an IDR needs no references
+                                // and is how a stalled stream recovers.
+                                if ok
+                                    && NATIVE_ENCODE_PAUSED.load(Ordering::Relaxed)
+                                    && !NATIVE_FORCE_KEY.load(Ordering::Relaxed)
+                                {
+                                    ST_PAUSE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                                } else if ok {
                                     let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
                                     let ts_us = zc_started.elapsed().as_micros() as u64;
                                     let e0 = Instant::now();
@@ -1018,7 +1052,13 @@ where
                             // bytes of skip macroblocks).
                             if let Some((comp, enc)) = zc.as_mut() {
                                 let want_key = NATIVE_FORCE_KEY.load(Ordering::Relaxed);
-                                if want_key || zc_last_emit.elapsed() >= Duration::from_millis(700) {
+                                // The static-screen keep-alive also respects the
+                                // backpressure pause (it would only deepen the backlog);
+                                // a requested IDR still goes out.
+                                if want_key
+                                    || (!NATIVE_ENCODE_PAUSED.load(Ordering::Relaxed)
+                                        && zc_last_emit.elapsed() >= Duration::from_millis(700))
+                                {
                                     let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
                                     let ts_us = zc_started.elapsed().as_micros() as u64;
                                     if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
@@ -1248,6 +1288,16 @@ where
                     }
                 }
                 if let Some(n) = native.as_mut() {
+                    // Channel backpressure: skip BEFORE the encoder so the reference
+                    // chain stays intact (see NATIVE_ENCODE_PAUSED). Keyframe requests
+                    // and the stale keep-alive (which forces an IDR) still encode.
+                    if NATIVE_ENCODE_PAUSED.load(Ordering::Relaxed)
+                        && !NATIVE_FORCE_KEY.load(Ordering::Relaxed)
+                        && !stale
+                    {
+                        ST_PAUSE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let (nw, nh) = n.size();
                     // First frame of a session, a guest keyframe request, or the ~1s
                     // keep-alive on a static screen all need a self-contained IDR.

@@ -2229,6 +2229,16 @@ pub fn remote_request_keyframe() {
     crate::remote::capture::request_keyframe();
 }
 
+/// Backpressure gate for the native H.264 path. While set, captures are skipped
+/// BEFORE NVENC (keyframes still encode), so the reference chain stays intact —
+/// dropping already-encoded P-frames is what corrupted the picture until the
+/// next recovery IDR. Driven by the host webview from the video channel's
+/// `bufferedAmount`.
+#[tauri::command]
+pub fn remote_set_encode_paused(paused: bool) {
+    crate::remote::capture::set_encode_paused(paused);
+}
+
 /// Allow (or forbid) native H.264 frames from the capture pipeline.
 ///
 /// Only the DIRECT guest can consume pre-encoded H.264 — the WebRTC track path needs

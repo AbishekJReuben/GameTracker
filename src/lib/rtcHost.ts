@@ -73,6 +73,39 @@ interface HostOptions {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
+// ---- host stream-event journal ----------------------------------------------
+// Flight recorder for the encode/send pipeline: every event that can explain an
+// artifact or a quality drop (backpressure pauses, hard drops, IDR requests with
+// their reason, bitrate shed/probe moves, recovery arms/closes, channel faults).
+// The phone pulls it over `/api/remote/streamlog` and folds it into its
+// copy-to-clipboard diagnostics, so "why did it glitch at 12:03?" is answerable
+// from one paste instead of a live repro.
+type StreamLogEntry = { t: number; kind: string; detail: string };
+const streamLog: StreamLogEntry[] = [];
+const STREAM_LOG_MAX = 200;
+let streamLogOrigin = 0;
+
+function slog(kind: string, detail: string) {
+  if (streamLogOrigin === 0) streamLogOrigin = performance.now();
+  streamLog.push({ t: Math.round(performance.now() - streamLogOrigin), kind, detail });
+  while (streamLog.length > STREAM_LOG_MAX) streamLog.shift();
+}
+
+/** Reset at session start so `t` reads as time-since-connect. */
+function slogReset(note: string) {
+  streamLog.length = 0;
+  streamLogOrigin = performance.now();
+  slog("session", note);
+}
+
+function streamLogFormat(): string {
+  if (streamLog.length === 0) return "(no stream events recorded)";
+  return [
+    `=== host stream log (last ${streamLog.length}, t=ms since session start) ===`,
+    ...streamLog.map((e) => `+${(e.t / 1000).toFixed(3)}s [${e.kind}] ${e.detail}`),
+  ].join("\n");
+}
+
 // ---- WebCodecs direct-video path ("wc") ------------------------------------
 // H.264 candidates for the data-channel video path. Baseline first: NVENC now
 // ships Constrained Baseline so Android HW can enter low-latency mode (Moonlight
@@ -226,6 +259,9 @@ async function handleData(path: string, body?: any): Promise<unknown> {
   if (urlPath === "/api/music/hourofday") return api.mediaHourOfDay();
   if (urlPath === "/api/playlists") return api.playlistsList();
   if (urlPath === "/api/monitors") return api.remoteListMonitors();
+  // Host stream-pipeline flight recorder — the phone folds this into its
+  // copy-to-clipboard diagnostics (artifact debugging).
+  if (urlPath === "/api/remote/streamlog") return { log: streamLogFormat() };
   if (urlPath === "/media") {
     const p = params.get("path");
     return p ? api.remoteReadMedia(p) : null;
@@ -537,12 +573,24 @@ export function startHost(opts: HostOptions): () => void {
     if (adaptKbps <= 0) adaptKbps = tgt;
     const fill = maxBuffered > 0 ? buffered / maxBuffered : 0;
     const now = Date.now();
-    // Forget the ceiling gradually (~4%/10s): capacity may have returned, and a
-    // stale ceiling would otherwise cap a healthy link forever.
-    if (probeCeilKbps > 0 && now - lastCeilDecayAt > 10_000) {
-      lastCeilDecayAt = now;
-      probeCeilKbps = Math.round(probeCeilKbps * 1.04);
-      if (probeCeilKbps >= tgt) probeCeilKbps = 0; // ceiling above target = no ceiling
+    // Forget the ceiling gradually: capacity may have returned, and a stale
+    // ceiling would otherwise cap a healthy link forever. An essentially-empty
+    // channel is strong evidence the ceiling is stale — bursty phone radios
+    // (Wi-Fi power save) trip skip-cuts that have nothing to do with bandwidth,
+    // and at 4%/10s a 1.6 Mbps ceiling took ~10 minutes to climb back to a
+    // 16 Mbps target ("stream stuck blurry"). Decay 10%/3s while clean-idle.
+    if (probeCeilKbps > 0) {
+      const cleanIdle = fill < 0.05 && now - lastSkipAt > 3000;
+      const interval = cleanIdle ? 3_000 : 10_000;
+      const factor = cleanIdle ? 1.1 : 1.04;
+      if (now - lastCeilDecayAt > interval) {
+        lastCeilDecayAt = now;
+        probeCeilKbps = Math.round(probeCeilKbps * factor);
+        if (probeCeilKbps >= tgt) {
+          probeCeilKbps = 0; // ceiling above target = no ceiling
+          slog("adapt", `probe ceiling cleared (target ${tgt}k)`);
+        }
+      }
     }
     if (skippedThisFrame || fill > 0.55) {
       // Network can't drain. A hard skip cuts deeper (~15%) than a merely-filling
@@ -556,7 +604,14 @@ export function startHost(opts: HostOptions): () => void {
         lastCeilDecayAt = now;
       }
       const cut = skippedThisFrame ? 0.85 : 0.92;
-      adaptKbps = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * cut));
+      const next = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * cut));
+      if (next !== adaptKbps) {
+        slog(
+          "adapt",
+          `shed ${adaptKbps}k → ${next}k (${skippedThisFrame ? "backpressure" : "fill"} fill=${fill.toFixed(2)} ceil=${probeCeilKbps}k)`,
+        );
+      }
+      adaptKbps = next;
       adaptCleanTicks = 0;
       pushAdaptBitrate();
     } else if (fill < 0.12 && now - lastSkipAt > 3000) {
@@ -567,7 +622,13 @@ export function startHost(opts: HostOptions): () => void {
       // slack and gets caught by the fill-trim below, not by a skipped frame).
       if (adaptCleanTicks >= 3 && adaptKbps < tgt) {
         const nearCeil = probeCeilKbps > 0 && adaptKbps >= probeCeilKbps * 0.85;
-        adaptKbps = Math.min(tgt, nearCeil ? Math.round(adaptKbps * 1.01 + 10) : Math.round(adaptKbps * 1.05 + 50));
+        const next = Math.min(tgt, nearCeil ? Math.round(adaptKbps * 1.01 + 10) : Math.round(adaptKbps * 1.05 + 50));
+        // Raises happen every ~1.2s while recovering — journal only the decades
+        // so the log shows the recovery arc without drowning in steps.
+        if (Math.floor(next / 2000) !== Math.floor(adaptKbps / 2000)) {
+          slog("adapt", `raise ${adaptKbps}k → ${next}k (target ${tgt}k ceil=${probeCeilKbps}k)`);
+        }
+        adaptKbps = next;
         adaptCleanTicks = 0;
         pushAdaptBitrate();
       }
@@ -579,7 +640,9 @@ export function startHost(opts: HostOptions): () => void {
       if (fill > 0.3 && now - lastFillTrimAt > 800) {
         lastFillTrimAt = now;
         probeCeilKbps = probeCeilKbps > 0 ? Math.min(probeCeilKbps, adaptKbps) : adaptKbps;
-        adaptKbps = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * 0.97));
+        const next = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * 0.97));
+        if (next !== adaptKbps) slog("adapt", `trim ${adaptKbps}k → ${next}k (fill=${fill.toFixed(2)})`);
+        adaptKbps = next;
         pushAdaptBitrate();
       }
     }
@@ -1329,6 +1392,7 @@ export function startHost(opts: HostOptions): () => void {
   const startPeer = async () => {
     teardownPeer(); // reset any prior session
     if (!sig) return;
+    slogReset("peer session starting");
     // Access gate: the screen/audio capture and input injection stay off until the
     // guest is authorized (trusted device, correct secret, or user approval).
     let authorized = false;
@@ -1664,15 +1728,56 @@ export function startHost(opts: HostOptions): () => void {
     // seconds — the periodic wcKeyMs safety net still cleans up anything left.
     const SKIP_RECOVER_AT = 4;
     const SOFT_RECOVER_MIN_MS = 4000;
-    const requestNativeKeyframe = () => {
+    const requestNativeKeyframe = (reason = "unspecified") => {
       const now = performance.now();
       // Coalesce capture-rate calls while Rust's atomic request is still pending.
       if (now - nativeKeyRequestAt < 250) return;
       nativeKeyRequestAt = now;
+      slog("idr", `requested (${reason})`);
       try {
         void api.remoteRequestKeyframe();
       } catch {
         /* not on desktop / no native encoder */
+      }
+    };
+    // ---- reference-safe backpressure ------------------------------------
+    // Every encoded P-frame is a reference for the frames encoded after it, so
+    // dropping one host-side corrupts the picture until a recovery IDR — that
+    // was the visible artifacting that "cleared every ~4s" (SOFT_RECOVER_MIN_MS).
+    // Under backpressure the ENCODER is paused instead (Rust skips captures
+    // pre-encode; the reference chain stays intact — same design as libwebrtc's
+    // pre-encoder frame dropper), and already-encoded frames still go out.
+    // Resume is driven by a drain poller, NOT by the next frame: a paused
+    // encoder produces no frames, so nativeSink alone could never unpause.
+    let encodePaused = false;
+    let pauseEvents = 0;
+    let pausePoll: number | null = null;
+    const setEncoderPaused = (paused: boolean, buffered: number, budget: number) => {
+      if (encodePaused === paused) return;
+      encodePaused = paused;
+      if (paused) pauseEvents++;
+      slog(
+        "pause",
+        `encoder ${paused ? "paused" : "resumed"} buffered=${Math.round(buffered / 1024)}KB budget=${Math.round(budget / 1024)}KB kbps=${Math.round(adaptKbps)}`,
+      );
+      try {
+        void api.remoteSetEncodePaused(paused);
+      } catch {
+        /* not on desktop */
+      }
+      if (paused && pausePoll === null) {
+        pausePoll = window.setInterval(() => {
+          const open = videoCh.readyState === "open";
+          const b = open ? videoCh.bufferedAmount : 0;
+          if (!open || b < wcBufBudget() * 0.3) {
+            if (pausePoll !== null) window.clearInterval(pausePoll);
+            pausePoll = null;
+            setEncoderPaused(false, b, wcBufBudget());
+          }
+        }, 150);
+      } else if (!paused && pausePoll !== null) {
+        window.clearInterval(pausePoll);
+        pausePoll = null;
       }
     };
     /** Arm soft recovery: get an IDR on the way while P-frames keep flowing so the
@@ -1695,12 +1800,16 @@ export function startHost(opts: HostOptions): () => void {
         nativeRecovering = true;
         nativeArtifactEvents++;
         lastSoftRecoverAt = now;
+        slog(
+          "recover",
+          `armed #${nativeArtifactEvents} (defer=${defer} force=${force} skipsSinceKey=${skipsSinceKey} kbps=${Math.round(adaptKbps)})`,
+        );
       }
       if (defer) {
         if (!nativeRecoveryPending) nativeRecoveryPendingAt = now;
         nativeRecoveryPending = true;
       } else {
-        requestNativeKeyframe();
+        requestNativeKeyframe("recovery");
       }
       return true;
     };
@@ -1724,12 +1833,13 @@ export function startHost(opts: HostOptions): () => void {
         // A decoder configuration/resize genuinely cannot decode a P-frame sent under
         // the old SPS — HARD-gate until the IDR arrives.
         if (!key) nativeAwaitKey = true;
-        requestNativeKeyframe();
+        slog("config", `announce ${w}x${h}`);
+        requestNativeKeyframe("config/announce");
       }
       // Periodic safety-net IDR (Tune wcKeyMs). This is routine hygiene, NOT an
       // artifact event — never arm the recovering/HUD counters for it.
       if (!key && performance.now() - wcLastKeyAt >= quality.wcKeyMs) {
-        requestNativeKeyframe();
+        requestNativeKeyframe("periodic safety net");
       }
       const maxBuffered = wcBufBudget();
       const buffered = videoCh.bufferedAmount;
@@ -1741,40 +1851,47 @@ export function startHost(opts: HostOptions): () => void {
         // guest's own 1s vkf timer noticed.
         if (nativeRecoveryPending && buffered < maxBuffered * 0.5) {
           nativeRecoveryPending = false;
-          requestNativeKeyframe();
+          requestNativeKeyframe("deferred recovery (gated drain)");
         }
         return;
       }
-      if (!key) {
-        if (buffered > maxBuffered) {
-          // Backpressure: skip THIS frame (latest-wins). Do NOT arm recovery on
-          // every skip — that was the "Artifacting — recovering" spam (and an IDR
-          // hitch) before the eye could see any damage. Count the burst; one
-          // deferred IDR fires once the channel is healthy again if it was real.
-          wcSkipped++;
-          skipsSinceKey++;
-          adaptFromBuffer(buffered, maxBuffered, true);
-          return;
-        }
-      } else if (buffered > maxBuffered * 4) {
-        // Keyframes are the recovery mechanism — dropping one wedges the guest until
-        // the next IDR, which is exactly the "stuck every couple seconds" loop. Let
-        // them jump the normal ceiling; only a truly dead channel (4× the budget,
-        // several seconds of backlog) may shed one, and then the gates stay armed so
-        // the NEXT IDR is still awaited rather than the stream resuming corrupt.
+      // Reference-safe backpressure: NEVER latest-wins an already-encoded frame —
+      // every encoded P-frame is a reference for the ones after it, and each
+      // post-encode drop was a visible artifact until the next recovery IDR.
+      // Pause the ENCODER instead (pre-encode skip, chain intact) and let the
+      // reliable channel absorb the few frames already in flight. Only a truly
+      // dead channel (4× the budget, seconds of backlog) may still drop — and
+      // then it hard-gates so nothing corrupt is ever displayed.
+      if (buffered > maxBuffered * 4) {
         wcSkipped++;
         skipsSinceKey++;
+        slog(
+          "drop",
+          `${key ? "keyframe" : "P-frame"} dropped — channel dead (buffered=${Math.round(buffered / 1024)}KB, 4× budget); hard-gating until IDR`,
+        );
+        setEncoderPaused(true, buffered, maxBuffered);
+        nativeAwaitKey = true;
         armNativeRecovery(true, true);
         adaptFromBuffer(buffered, maxBuffered, true);
         return;
       }
-      adaptFromBuffer(buffered, maxBuffered, false);
+      if (!key && buffered > maxBuffered) {
+        // Backed up but alive: stop producing new frames (Rust-side pre-encode
+        // skip) and still send this one. Counts as the congestion signal for
+        // the adaptive bitrate, exactly like the old skip did.
+        setEncoderPaused(true, buffered, maxBuffered);
+        adaptFromBuffer(buffered, maxBuffered, true);
+      } else {
+        if (encodePaused && buffered < maxBuffered * 0.3) setEncoderPaused(false, buffered, maxBuffered);
+        adaptFromBuffer(buffered, maxBuffered, false);
+      }
       // Stamped on arrival rather than at capture: the host and Rust don't share a
       // clock, and now that a frame is ~30KB instead of 334KB the IPC hop it folds
       // into the measurement is small (it lands in `net+enc`, never unaccounted).
       if (!wcSendBytes(payload, key, performance.now())) {
         // Channel threw mid-frame — the guest received a partial access unit, which
         // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
+        slog("fault", `channel send threw mid-${key ? "keyframe" : "P-frame"} (partial AU) — hard gate`);
         nativeAwaitKey = true;
         armNativeRecovery(false, true);
         return;
@@ -1788,6 +1905,7 @@ export function startHost(opts: HostOptions): () => void {
         if (nativeRecovering) {
           nativeRecoveredEvents++;
           nativeRecovering = false;
+          slog("recover", `closed by IDR on wire (recovered=${nativeRecoveredEvents})`);
         }
         nativeRecoveryPending = false;
         nativeAwaitKey = false;
@@ -1803,7 +1921,7 @@ export function startHost(opts: HostOptions): () => void {
           // long enough that waiting further just prolongs the artifacting) —
           // request the IDR now; keyframes may jump the ceiling, so it WILL go out.
           nativeRecoveryPending = false;
-          requestNativeKeyframe();
+          requestNativeKeyframe("deferred recovery (drained)");
         }
       }
     };
@@ -1829,6 +1947,11 @@ export function startHost(opts: HostOptions): () => void {
       nativeRecovering = false;
       nativeRecoveryPending = false;
       skipsSinceKey = 0;
+      slog("teardown", `wc path stopped (notifyGuest=${notifyGuest} permanent=${permanent})`);
+      // Release the backpressure pause — set_capture_native(false) clears the
+      // Rust flag too, but the JS state and poller must not leak into the next
+      // session.
+      setEncoderPaused(false, 0, 1);
       try {
         api.remoteSetCaptureNative(false);
       } catch {
@@ -2171,6 +2294,7 @@ export function startHost(opts: HostOptions): () => void {
           if (authorized && now - lastVresetAt > 4000) {
             lastVresetAt = now;
             nativeAwaitKey = true;
+            slog("idr", "requested (guest vreset — decoder wedged)");
             // On the native path the canvas/generator track isn't in the picture at
             // all — the equivalent un-wedge is a fresh IDR + SPS from Rust.
             try {
@@ -2242,6 +2366,7 @@ export function startHost(opts: HostOptions): () => void {
         if (msg && msg.type === "vkf") {
           wcForceKey = true;
           nativeAwaitKey = true;
+          slog("idr", "requested (guest vkf — decoder lost sync)");
           try {
             void api.remoteRequestKeyframe();
           } catch {
@@ -2624,6 +2749,10 @@ export function startHost(opts: HostOptions): () => void {
                           artifacts: nativeArtifactEvents,
                           recovered: nativeRecoveredEvents,
                           recovering: nativeRecovering,
+                          // Reference-safe backpressure telemetry: how often the
+                          // encoder was paused instead of dropping encoded frames.
+                          paused: pauseEvents,
+                          pausedNow: encodePaused,
                         }
                       : { on: false },
                   // Audio path telemetry for the phone HUD. `codec` says whether

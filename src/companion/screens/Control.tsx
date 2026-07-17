@@ -151,6 +151,9 @@ type HostWcStats = {
   artifacts?: number;
   recovered?: number;
   recovering?: boolean;
+  /** Reference-safe backpressure: encoder pause events instead of frame drops. */
+  paused?: number;
+  pausedNow?: boolean;
 };
 type HostAudioStats = {
   mode: "pcm" | "rtc";
@@ -1087,6 +1090,8 @@ export function ControlScreen({
   };
   /** "Copy diag" feedback: flips to true for a beat after a successful copy. */
   const [diagCopied, setDiagCopied] = useState(false);
+  /** "Host log" (stream journal) copy feedback in the artifact row. */
+  const [streamLogCopied, setStreamLogCopied] = useState(false);
   const copyDiagnostics = async () => {
     // Everything a bug report needs, phone-side: the native bridge's full dump
     // (device, decoder inventory, view stack above the hole punch, lifecycle
@@ -1095,6 +1100,16 @@ export function ControlScreen({
     // raises an error toast, so this button is its only evidence channel.
     const { dumpNativeDecoderDiag } = await import("../nativeDecoder");
     const native = await dumpNativeDecoderDiag();
+    // The host's stream-pipeline flight recorder: every backpressure pause,
+    // frame drop, IDR request (with reason) and bitrate move — the "why did it
+    // artifact?" half of the story that phone-side stats can't see.
+    let hostLog = "";
+    try {
+      const r = await apiGet<{ log?: string }>("/api/remote/streamlog", 4000);
+      hostLog = r?.log ?? "";
+    } catch {
+      /* LAN mode or an old host without the endpoint */
+    }
     const lines = [
       `GameTracker Remote diagnostics @ ${new Date().toISOString()}`,
       `ua: ${navigator.userAgent}`,
@@ -1107,6 +1122,7 @@ export function ControlScreen({
       hostStats ? `host: ${JSON.stringify(hostStats)}` : "host: null",
       "",
       hitchFormat(),
+      hostLog ? `\n${hostLog}` : "",
       native ? `\n${native}` : "",
     ];
     try {
@@ -1128,6 +1144,8 @@ export function ControlScreen({
   const prodRef = useRef<{ frames: number; at: number } | null>(null);
   const netRef = useRef<{ bytes: number; at: number; jbDelay: number; jbCount: number; decT: number; decoded: number } | null>(null);
   const hostSkipRef = useRef(-1);
+  /** Cumulative encoder-pause events — hitch when they jump (radio stall, not a drop). */
+  const hostPauseRef = useRef(-1);
   const audioUnderrunRef = useRef(0);
 
   // Multi-monitor.
@@ -1217,6 +1235,7 @@ export function ControlScreen({
       if (c) {
         hitchReset();
         hostSkipRef.current = -1;
+        hostPauseRef.current = -1;
         audioUnderrunRef.current = 0;
       } else {
         setHasFrame(false); // show the app-icon placeholder again on reconnect
@@ -1305,16 +1324,29 @@ export function ControlScreen({
           if (df >= 0) producedFps = Math.round((df * 1000) / (now - prev.at));
         }
         prodRef.current = { frames: cs.producedFrames, at: now };
-        // Host latest-wins skips — a burst of skips is the usual NVENC hitch source.
+        // Hard drops (4× channel budget) still break H.264 refs — rare after the
+        // pre-encode pause fix. Soft backpressure now pauses the encoder instead.
         const skipped = wc?.skipped ?? 0;
         const prevSkipped = hostSkipRef.current;
-        if (prevSkipped >= 0 && skipped > prevSkipped + 2) {
-          hitchNote("host-skip", `host skipped ${skipped - prevSkipped} frames (total ${skipped})`, {
+        if (prevSkipped >= 0 && skipped > prevSkipped) {
+          hitchNote("host-drop", `host hard-dropped ${skipped - prevSkipped} frame(s) (total ${skipped})`, {
             delta: skipped - prevSkipped,
             skipped,
           });
         }
         hostSkipRef.current = skipped;
+        const paused = wc?.paused ?? 0;
+        const prevPaused = hostPauseRef.current;
+        if (prevPaused >= 0 && paused > prevPaused) {
+          hitchNote("host-pause", `encoder paused ×${paused - prevPaused} (total ${paused}${wc?.pausedNow ? ", still paused" : ""})`, {
+            delta: paused - prevPaused,
+            paused,
+            pausedNow: !!wc?.pausedNow,
+            adaptKbps: wc?.adaptKbps ?? 0,
+            bufKB: wc?.bufKB ?? 0,
+          });
+        }
+        hostPauseRef.current = paused;
         setHostStats({ ...cs, producedFps, rtc, wc, audio });
         // Native Surface path never gets VideoFrame sizes — seed letterbox from host out res.
         if (wcNativeRef.current && cs.outW > 0 && cs.outH > 0) {
@@ -3341,12 +3373,39 @@ export function ControlScreen({
               <button
                 type="button"
                 onClick={() => void copyDiagnostics()}
-                title="Copy diagnostics (device, decoder, stream state)"
+                title="Copy diagnostics (device, decoder, stream state, host stream log)"
                 className={`grid h-4 w-4 shrink-0 place-items-center rounded ${
                   diagCopied ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
                 }`}
               >
                 {diagCopied ? <CheckIcon className="h-2.5 w-2.5" /> : <CopyIcon className="h-2.5 w-2.5" />}
+              </button>
+              {/* Host encode/send flight recorder alone — pauses, drops, IDR reasons. */}
+              <button
+                type="button"
+                onClick={() => {
+                  void (async () => {
+                    let log = "";
+                    try {
+                      const r = await apiGet<{ log?: string }>("/api/remote/streamlog", 4000);
+                      log = r?.log ?? "(empty)";
+                    } catch {
+                      log = "(host stream log unavailable — LAN mode or old host build)";
+                    }
+                    const ok = await copyToClipboard(
+                      [`GameTracker stream log @ ${new Date().toISOString()}`, "", log, "", hitchFormat()].join("\n"),
+                    );
+                    setStreamLogCopied(ok);
+                    window.setTimeout(() => setStreamLogCopied(false), 1500);
+                  })();
+                }}
+                title="Copy host stream log (pauses, drops, IDR reasons, bitrate moves)"
+                className={`flex h-4 shrink-0 items-center gap-0.5 rounded px-1 text-[8px] font-800 ${
+                  streamLogCopied ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                }`}
+              >
+                {streamLogCopied ? <CheckIcon className="h-2.5 w-2.5" /> : <CopyIcon className="h-2.5 w-2.5" />}
+                {streamLogCopied ? "OK" : "Log"}
               </button>
               {/* Expand every cell to a full label + what it means. Off by default so
                   the dense grid stays the at-a-glance view it was designed to be. */}
@@ -3392,7 +3451,8 @@ export function ControlScreen({
             const recovered = hostStats?.wc?.recovered ?? wcStats?.recovered ?? 0;
             const guestErr = wcStats?.guestErrors ?? 0;
             const skipped = hostStats?.wc?.skipped ?? 0;
-            if (!artifacts && !recovered && !guestErr && !skipped) return null;
+            const paused = hostStats?.wc?.paused ?? 0;
+            if (!artifacts && !recovered && !guestErr && !skipped && !paused) return null;
             const recovering = wcStats?.recovering || hostStats?.wc?.recovering;
             return (
               <div className="mb-1 flex flex-wrap items-center gap-1 rounded-md bg-white/[0.04] px-1.5 py-0.5 text-[9px]">
@@ -3419,10 +3479,50 @@ export function ControlScreen({
                   <>
                     <span className="text-ink-faint">·</span>
                     <span className="tabular-nums text-ink-soft">
-                      skipped <span className="font-700">{skipped}</span>
+                      dropped <span className="font-700">{skipped}</span>
                     </span>
                   </>
                 )}
+                {paused > 0 && (
+                  <>
+                    <span className="text-ink-faint">·</span>
+                    <span
+                      className="tabular-nums text-ink-soft"
+                      title="Encoder pauses under backpressure (reference-safe — no artifact)"
+                    >
+                      paused <span className="font-700">{paused}</span>
+                      {hostStats?.wc?.pausedNow ? <span className="text-amber"> ●</span> : null}
+                    </span>
+                  </>
+                )}
+                {/* Why did it artifact? The host's stream journal is the answer —
+                    every pause, drop, IDR (with reason) and bitrate move. */}
+                <button
+                  type="button"
+                  title="Copy host stream log (pauses, drops, IDR reasons, bitrate moves)"
+                  onClick={() => {
+                    void (async () => {
+                      let log = "";
+                      try {
+                        const r = await apiGet<{ log?: string }>("/api/remote/streamlog", 4000);
+                        log = r?.log ?? "";
+                      } catch {
+                        log = "(host stream log unavailable — LAN mode or old host build)";
+                      }
+                      const ok = await copyToClipboard(
+                        [`GameTracker stream log @ ${new Date().toISOString()}`, "", log, "", hitchFormat()].join("\n"),
+                      );
+                      setStreamLogCopied(ok);
+                      window.setTimeout(() => setStreamLogCopied(false), 1500);
+                    })();
+                  }}
+                  className={`ml-auto flex h-4 shrink-0 items-center gap-1 rounded px-1.5 text-[8px] font-800 ${
+                    streamLogCopied ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                  }`}
+                >
+                  {streamLogCopied ? <CheckIcon className="h-2.5 w-2.5" /> : <CopyIcon className="h-2.5 w-2.5" />}
+                  {streamLogCopied ? "Copied" : "Host log"}
+                </button>
               </div>
             );
           })()}
@@ -3510,7 +3610,19 @@ export function ControlScreen({
                       hi={(hostStats.wc.encMs ?? 0) > (hostStats.wc.native ? 5 : 15)}
                     />
                     <StatCell k="Enc cap" v={`${hostStats.wc.kbpsMax ?? 0}k`} />
-                    <StatCell k="Skipped" v={`${hostStats.wc.skipped ?? 0}`} hi={(hostStats.wc.skipped ?? 0) > 30} />
+                    <StatCell k="Dropped" v={`${hostStats.wc.skipped ?? 0}`} hi={(hostStats.wc.skipped ?? 0) > 5} />
+                    <StatCell
+                      k="Paused"
+                      v={`${hostStats.wc.paused ?? 0}${hostStats.wc.pausedNow ? "●" : ""}`}
+                      hi={!!hostStats.wc.pausedNow}
+                    />
+                    {(hostStats.pauseSkips ?? 0) > 0 && (
+                      <StatCell
+                        k="Pre-skip"
+                        v={`${hostStats.pauseSkips}`}
+                        hi={(hostStats.pauseSkips ?? 0) > 60}
+                      />
+                    )}
                     <StatCell k="Ch buf" v={`${hostStats.wc.bufKB ?? 0} KB`} hi={(hostStats.wc.bufKB ?? 0) > 128} />
                     {(hostStats.wc.adaptKbps ?? 0) > 0 && (
                       <StatCell
@@ -4884,7 +4996,19 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
     long: "PC H.264 encode time",
     info: "Time to encode one frame on the DIRECT path. With the NVENC badge showing, the PC encodes the screen texture directly and this should be ~1-2ms at 1080p; without it the PC is going through JPEG + the browser's encoder, which costs ~35ms.",
   },
-  Skipped: { long: "Frames skipped (PC)", info: "Frames the PC dropped rather than send stale — deliberate. Climbing fast means it can't keep up; the Feel slider changes how eagerly it does this." },
+  Dropped: {
+    long: "Hard-dropped frames (PC)",
+    info: "Encoded frames the PC discarded because the video channel was ~4× over budget (seconds of backlog). Each one breaks the H.264 reference chain until a recovery IDR. Should stay near zero — normal backpressure pauses the encoder instead of dropping.",
+  },
+  Paused: {
+    long: "Encoder pause events",
+    info: "Times the PC stopped feeding NVENC because the phone couldn't drain the channel. Pausing BEFORE encode keeps the reference chain intact (no artifacting). A ● means it's paused right now. Climbing on a static desktop usually means Wi-Fi radio power-save bursts, not lack of bandwidth.",
+  },
+  "Pre-skip": {
+    long: "Captures skipped pre-encode",
+    info: "Individual capture ticks Rust discarded while the encoder was paused. Harmless — these never entered NVENC, so they can't corrupt the bitstream. High with Paused climbing = radio stalls; high with Dropped climbing = something else is wrong.",
+  },
+  Skipped: { long: "Frames skipped (PC)", info: "Legacy label — see Dropped. Frames the PC discarded rather than send into a dead channel." },
   "Ch buf": { long: "Channel backlog", info: "Data queued and unsent on the video channel. A backlog can only ever become lag." },
   "Adapt ↑": {
     long: "Adaptive bitrate",
@@ -4892,7 +5016,7 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   },
   Artifacts: {
     long: "Artifact events",
-    info: "Times the PC spent a recovery IDR after a real skip burst (≥4 dropped P-frames), not routine keyframes. Isolated skips no longer count — those were the spam before anything looked wrong. A slow climb in heavy scenes is fine; a fast spike means the link is shedding too hard.",
+    info: "Times the PC armed a recovery IDR after a true reference-chain break (hard drop, partial send, guest decode error) — not routine keyframes and not encoder pauses. Should stay near zero with the pre-encode pause path; a climb means something still broke the bitstream.",
   },
   Recovered: {
     long: "Clean recoveries",

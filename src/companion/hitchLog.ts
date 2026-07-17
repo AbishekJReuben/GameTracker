@@ -11,6 +11,8 @@ export type HitchKind =
   | "e2e-jump"
   | "decode-spike"
   | "host-skip"
+  | "host-drop"
+  | "host-pause"
   | "audio-underrun"
   | "jb-grow"
   | "native-stall"

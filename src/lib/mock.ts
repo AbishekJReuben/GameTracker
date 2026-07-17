@@ -1058,6 +1058,8 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return null as T;
     case "remote_inject":
       return undefined as T;
+    case "remote_set_encode_paused":
+      return undefined as T;
     default:
       throw new Error(`Mock invoke not implemented: ${cmd}`);
   }

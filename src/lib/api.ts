@@ -1228,6 +1228,10 @@ export const api = {
   ) => call<void>("remote_set_capture_quality", { maxW, fps, quality, content, bitrateKbps }),
   /// Ask the native encoder for a keyframe (infinite GOP, so a fresh decoder needs one).
   remoteRequestKeyframe: () => call<void>("remote_request_keyframe"),
+  /// Reference-safe backpressure: while paused, captures are skipped BEFORE NVENC
+  /// (keyframes still encode) so the H.264 reference chain never breaks. Dropping
+  /// already-encoded P-frames is what caused visible artifacting until recovery.
+  remoteSetEncodePaused: (paused: boolean) => call<void>("remote_set_encode_paused", { paused }),
   /// Allow native H.264 frames. Only DIRECT guests can take them — the RTC track path
   /// needs pixels for its canvas, so this must be false whenever DIRECT isn't up.
   /// Resolves true when this host actually has a native (NVENC) encoder.
@@ -1289,6 +1293,10 @@ export interface RemoteCaptureStats {
    * than a JPEG (~334KB).
    */
   native: boolean;
+  /** Frame never touches system RAM (duplication texture → GPU composite → NVENC). */
+  zeroCopy?: boolean;
+  /** Captures skipped BEFORE the encoder under channel backpressure (reference-safe). */
+  pauseSkips?: number;
 }
 
 export interface RemoteStatus {

@@ -150,6 +150,20 @@ public final class WcDecoderBridge {
   private static volatile long lastStartFailAt = 0L;
   /** Newest applied setBounds sequence number — stale (reordered) calls are dropped. */
   private static final AtomicLong boundsSeq = new AtomicLong(0);
+  /**
+   * The DESIRED video rect in window px — what JS asked for, before clamping.
+   * The view itself is laid out as the intersection of this with the window:
+   * Android 16 clamps an oversized TextureView asymmetrically (journal showed
+   * height pegged at the window height while width grew past it), which
+   * stretched the picture and shifted it against the DOM cursor math. We clamp
+   * deterministically ourselves and use {@link TextureView#setTransform} to map
+   * the full desired rect into the visible part, so zooming past the screen
+   * edge crops instead of squeezing. Written on the UI thread only.
+   */
+  private static volatile int desiredX;
+  private static volatile int desiredY;
+  private static volatile int desiredW;
+  private static volatile int desiredH;
 
   /**
    * Watchdog that kicks a VISIBLE TextureView when {@code onSurfaceTextureAvailable}
@@ -551,6 +565,10 @@ public final class WcDecoderBridge {
     errorRestarts.set(0);
     lastStartFailAt = 0L;
     boundsSeq.set(0);
+    // Forget the previous session's desired rect — JS re-syncs geometry right
+    // after init, and a stale zoomed rect would mis-map the first frames.
+    desiredW = 0;
+    desiredH = 0;
     Activity act = activity();
     if (act == null) throw new IllegalStateException("no activity");
     // Latch BEFORE hopping to the UI thread: a setBounds already in flight on
@@ -584,8 +602,7 @@ public final class WcDecoderBridge {
           applyVisibility(surfaceView);
           // Bitstream size may have changed while the view rect didn't (mid-
           // stream resolution bump) — recompute the contain-fit for the new aspect.
-          TextureView tv = surfaceView;
-          if (tv != null) applyContentTransform(tv, tv.getWidth(), tv.getHeight());
+          applyContentTransform(surfaceView);
           if (surfaceReady.get()) {
             // Size change while a codec is live → rebuild against the new Surface.
             if (started.get()) {
@@ -670,49 +687,79 @@ public final class WcDecoderBridge {
             ix += webLoc[0] - parentLoc[0];
             iy += webLoc[1] - parentLoc[1];
           }
+          desiredX = ix;
+          desiredY = iy;
+          desiredW = iw;
+          desiredH = ih;
+          // Lay out only the VISIBLE intersection with the parent. Android 16
+          // clamps an oversized TextureView on its own terms (height pegged to
+          // the window while width kept growing — a wrong-aspect view the
+          // buffer then stretched into); clamping ourselves keeps the layout
+          // deterministic and the buffers window-sized instead of 4700px wide.
+          int pw = parent != null && parent.getWidth() > 0 ? parent.getWidth() : Integer.MAX_VALUE;
+          int ph = parent != null && parent.getHeight() > 0 ? parent.getHeight() : Integer.MAX_VALUE;
+          int vx = Math.max(0, ix);
+          int vy = Math.max(0, iy);
+          int vw = Math.max(1, Math.min(pw, ix + iw) - vx);
+          int vh = Math.max(1, Math.min(ph, iy + ih) - vy);
           FrameLayout.LayoutParams lp =
               (FrameLayout.LayoutParams) sv.getLayoutParams();
           if (lp == null) {
-            lp = new FrameLayout.LayoutParams(iw, ih);
+            lp = new FrameLayout.LayoutParams(vw, vh);
           }
-          lp.width = iw;
-          lp.height = ih;
-          lp.leftMargin = ix;
-          lp.topMargin = iy;
+          lp.width = vw;
+          lp.height = vh;
+          lp.leftMargin = vx;
+          lp.topMargin = vy;
           lp.gravity = Gravity.TOP | Gravity.START;
           sv.setLayoutParams(lp);
-          applyContentTransform(sv, iw, ih);
+          applyContentTransform(sv, vx, vy, vw, vh);
           // NOT sv.setVisibility(visible ? ...) — see the javadoc above.
           applyVisibility(sv);
         });
   }
 
   /**
-   * Contain-fit the decoded picture inside the view. TextureView's default is
-   * to STRETCH the buffer to the view rect. The JS rect normally carries the
-   * video's own aspect (stretch == fit), but the pre-first-frame fallback is
-   * the full viewport and a reordered/stale rect can be anything — stretching
-   * to those is the "video squeezed vertically" bug. With an explicit contain
-   * transform a wrong-aspect rect letterboxes inside the (non-opaque)
-   * TextureView instead of distorting, and self-heals on the next good rect.
-   * Must run on the UI thread.
+   * Map the decoded picture into the view. TextureView's default is to STRETCH
+   * the buffer to the view rect; instead the buffer is contain-fitted (its own
+   * aspect) inside the DESIRED rect (what JS asked for, possibly larger than
+   * the window), then expressed in the coordinates of the actual, clamped
+   * view. Zooming past the screen edge therefore CROPS the picture — matching
+   * the DOM cursor math exactly — instead of squeezing it, and a wrong-aspect
+   * rect (the pre-first-frame full-viewport fallback, a stale resize)
+   * letterboxes instead of distorting. Must run on the UI thread.
    */
-  private static void applyContentTransform(TextureView sv, int viewW, int viewH) {
-    if (sv == null || viewW < 2 || viewH < 2) return;
+  private static void applyContentTransform(TextureView sv, int viewX, int viewY, int viewW, int viewH) {
+    if (sv == null || viewW < 1 || viewH < 1) return;
     int bw = width.get();
     int bh = height.get();
     if (bw < 2 || bh < 2) return;
-    float fitW = viewW;
-    float fitH = (float) viewW * bh / bw;
-    if (fitH > viewH) {
-      fitH = viewH;
-      fitW = (float) viewH * bw / bh;
+    // The rect the picture should occupy, in window px. Fall back to the view
+    // itself when no setBounds has stored a desired rect yet (early init).
+    int dx = desiredW > 1 && desiredH > 1 ? desiredX : viewX;
+    int dy = desiredW > 1 && desiredH > 1 ? desiredY : viewY;
+    int dw = desiredW > 1 && desiredH > 1 ? desiredW : viewW;
+    int dh = desiredW > 1 && desiredH > 1 ? desiredH : viewH;
+    float fitW = dw;
+    float fitH = (float) dw * bh / bw;
+    if (fitH > dh) {
+      fitH = dh;
+      fitW = (float) dh * bw / bh;
     }
+    // Contain-fit box in view-local coordinates.
+    float fx = dx + (dw - fitW) / 2f - viewX;
+    float fy = dy + (dh - fitH) / 2f - viewY;
     android.graphics.Matrix m = new android.graphics.Matrix();
     m.setScale(fitW / viewW, fitH / viewH);
-    m.postTranslate((viewW - fitW) / 2f, (viewH - fitH) / 2f);
+    m.postTranslate(fx, fy);
     sv.setTransform(m);
     sv.invalidate();
+  }
+
+  /** Recompute the content transform from the view's ACTUAL layout (post-clamp). */
+  private static void applyContentTransform(TextureView sv) {
+    if (sv == null) return;
+    applyContentTransform(sv, sv.getLeft(), sv.getTop(), sv.getWidth(), sv.getHeight());
   }
 
   public static void reset() {
@@ -1438,8 +1485,7 @@ public final class WcDecoderBridge {
             // Keep the producer buffer locked to the bitstream aspect; the view
             // scales. Don't rebuild the codec on every layout bounce (zoom/pan).
             applyBufferSize(width.get(), height.get());
-            TextureView sv = surfaceView;
-            if (sv != null) applyContentTransform(sv, sv.getWidth(), sv.getHeight());
+            applyContentTransform(surfaceView);
           }
 
           @Override
@@ -1834,11 +1880,7 @@ public final class WcDecoderBridge {
             // The codec's true output size is authoritative for the contain-fit.
             Activity act = activity();
             if (act != null) {
-              act.runOnUiThread(
-                  () -> {
-                    TextureView sv = surfaceView;
-                    if (sv != null) applyContentTransform(sv, sv.getWidth(), sv.getHeight());
-                  });
+              act.runOnUiThread(() -> applyContentTransform(surfaceView));
             }
           } catch (Exception ignored) {
           }
