@@ -33,6 +33,7 @@ import { DEFAULT_SIGNAL_URL, SIGNAL_PORT } from "@/lib/remoteConfig";
 import { useApp } from "@/store/app";
 import { useRemoteHost } from "@/store/remote";
 import type { HostLiveStats } from "@/lib/rtcHost";
+import { getHostStreamLog } from "@/lib/rtcHost";
 
 const RELEASES_URL = "https://github.com/AbishekJReuben/GameTracker/releases";
 
@@ -556,17 +557,33 @@ const CONTENT_META = [
 
 /** Live telemetry for the active peer-to-peer session, streamed from the host. */
 function LiveSessionPanel({ stats, connected }: { stats: HostLiveStats | null; connected: boolean }) {
+  const pushToast = useApp((s) => s.pushToast);
+  const [logCopied, setLogCopied] = useState(false);
   const cap = stats?.capture ?? null;
+  const d = stats?.direct;
   const cm = CONTENT_META[stats?.content ?? 0] ?? CONTENT_META[0];
   const kbps = stats?.sendKbps ?? 0;
   const bitrate = kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbps` : `${kbps} kbps`;
   const frameKB = cap ? `${(cap.frameBytes / 1024).toFixed(0)} KB` : "—";
   const cpuMs = cap ? cap.captureMs + cap.scaleMs + cap.encodeMs : 0;
+  const adapt = d?.adaptKbps ?? 0;
+  const target = d?.targetKbps ?? 0;
+  const adaptLabel =
+    d?.on && adapt > 0
+      ? adapt >= 1000
+        ? `${(adapt / 1000).toFixed(1)}→${(target / 1000).toFixed(1)}M`
+        : `${adapt}→${target}k`
+      : "—";
 
   // Plain-language read on where the pipeline is spending its time / where it's limited.
   const health = (() => {
     if (!connected || !stats) return { text: "Waiting for a phone to connect…", tone: "dim" as const };
     if (!cap || !cap.running) return { text: "Link up — starting capture…", tone: "dim" as const };
+    if (d?.recovering) return { text: "Artifact recovery in flight — waiting on an IDR.", tone: "warn" as const };
+    if (d?.pausedNow) return { text: "Encoder paused (channel backpressure) — reference-safe, not a drop.", tone: "warn" as const };
+    if (d?.on && adapt > 0 && target > 0 && adapt < target * 0.5) {
+      return { text: `Adaptive bitrate shed to ${adapt}k (target ${target}k) — phone link is constraining quality.`, tone: "warn" as const };
+    }
     if (cpuMs > 16 && stats.sendFps > 0 && stats.sendFps < cap.fps * 0.75) {
       const worst = cap.encodeMs >= cap.scaleMs && cap.encodeMs >= cap.captureMs ? "encode" : cap.scaleMs >= cap.captureMs ? "downscale" : "capture";
       return { text: `Host CPU-bound (${worst}). Lower resolution or sharpness on the phone.`, tone: "warn" as const };
@@ -575,12 +592,40 @@ function LiveSessionPanel({ stats, connected }: { stats: HostLiveStats | null; c
     return { text: "Pipeline healthy — streaming smoothly.", tone: "ok" as const };
   })();
 
+  const copyStreamLog = async () => {
+    try {
+      await navigator.clipboard.writeText(
+        [`GameTracker stream log @ ${new Date().toISOString()}`, "", getHostStreamLog()].join("\n"),
+      );
+      setLogCopied(true);
+      window.setTimeout(() => setLogCopied(false), 1500);
+      pushToast({ kind: "success", title: "Stream log copied" });
+    } catch {
+      pushToast({ kind: "info", title: "Clipboard unavailable" });
+    }
+  };
+
   return (
     <Panel panelKey="remote.live" className="p-5">
       <SectionTitle
         title="Live session"
         subtitle={connected ? "Real-time capture & link telemetry" : "Shows here once a phone connects"}
-        right={<Activity className="h-4 w-4" />}
+        right={
+          <div className="flex items-center gap-2">
+            {connected && (
+              <button
+                type="button"
+                onClick={() => void copyStreamLog()}
+                className="btn btn-ghost h-8 gap-1.5 px-2 text-[11px] font-700"
+                title="Copy host stream log (pauses, drops, IDR reasons, bitrate moves)"
+              >
+                {logCopied ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
+                {logCopied ? "Copied" : "Stream log"}
+              </button>
+            )}
+            <Activity className="h-4 w-4" />
+          </div>
+        }
       />
       <div className="mt-4 flex flex-wrap items-center gap-2">
         <span
@@ -597,6 +642,13 @@ function LiveSessionPanel({ stats, connected }: { stats: HostLiveStats | null; c
           <cm.icon className="h-3.5 w-3.5" /> {cm.label}
           <span className="text-ink-faint">· {cm.hint}</span>
         </span>
+        {d?.on && (
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-white/[0.03] px-2.5 py-1 text-xs font-700 text-ink-soft">
+            {d.native ? "DIRECT · NVENC" : "DIRECT · WebCodecs"}
+            {d.recovering ? <span className="text-amber"> · recovering</span> : null}
+            {d.pausedNow ? <span className="text-amber"> · paused</span> : null}
+          </span>
+        )}
         {cap && (
           <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-white/[0.03] px-2.5 py-1 text-xs font-700 text-ink-soft">
             <Monitor className="h-3.5 w-3.5" /> {cap.nativeW}×{cap.nativeH} → {cap.outW}×{cap.outH}
@@ -612,12 +664,31 @@ function LiveSessionPanel({ stats, connected }: { stats: HostLiveStats | null; c
           value={stats ? bitrate : "—"}
           sub={stats && stats.encoderMaxKbps > 0 ? `cap ${(stats.encoderMaxKbps / 1000).toFixed(1)} Mbps` : undefined}
         />
+        <Metric
+          icon={<Radio className="h-4 w-4" />}
+          label="Adapt bitrate"
+          value={adaptLabel}
+          sub={d?.on ? (adapt < target * 0.7 && target > 0 ? "shed under pressure" : "at/near target") : undefined}
+        />
         <Metric icon={<Timer className="h-4 w-4" />} label="Round-trip" value={stats ? `${stats.rttMs} ms` : "—"} />
         <Metric icon={<Cpu className="h-4 w-4" />} label="Host CPU / frame" value={cap ? `${cpuMs.toFixed(1)} ms` : "—"} sub={cap ? `cap ${cap.captureMs.toFixed(0)} · scl ${cap.scaleMs.toFixed(0)} · enc ${cap.encodeMs.toFixed(0)}` : undefined} />
         <Metric icon={<Wifi className="h-4 w-4" />} label="Capture" value={cap ? `${cap.captureMs.toFixed(1)} ms` : "—"} />
         <Metric icon={<Sparkles className="h-4 w-4" />} label="Downscale" value={cap ? `${cap.scaleMs.toFixed(1)} ms` : "—"} />
         <Metric icon={<Activity className="h-4 w-4" />} label="Encode" value={cap ? `${cap.encodeMs.toFixed(1)} ms` : "—"} />
         <Metric icon={<Radio className="h-4 w-4" />} label="Frame size" value={frameKB} />
+        <Metric
+          icon={<Activity className="h-4 w-4" />}
+          label="Paused"
+          value={d?.on ? `${d.paused}${d.pausedNow ? " ●" : ""}` : "—"}
+          sub={d?.on && (d.pauseSkips ?? 0) > 0 ? `pre-skip ${d.pauseSkips}` : "encoder backpressure"}
+        />
+        <Metric icon={<ArrowDownUp className="h-4 w-4" />} label="Dropped" value={d?.on ? `${d.dropped}` : "—"} sub="hard channel drops" />
+        <Metric
+          icon={<Sparkles className="h-4 w-4" />}
+          label="Artifacts"
+          value={d?.on ? `${d.artifacts}` : "—"}
+          sub={d?.on ? `cleaned ${d.recovered}${d.recovering ? " · recovering" : ""}` : undefined}
+        />
       </div>
 
       <div

@@ -34,6 +34,26 @@ export interface HostLiveStats {
   content: number;
   /** Encoder bitrate ceiling currently applied to the video sender (kbps). */
   encoderMaxKbps: number;
+  /** DIRECT (NVENC/WebCodecs) path telemetry — mirrors the phone HUD. */
+  direct?: {
+    on: boolean;
+    native: boolean;
+    adaptKbps: number;
+    targetKbps: number;
+    dropped: number;
+    paused: number;
+    pausedNow: boolean;
+    artifacts: number;
+    recovered: number;
+    recovering: boolean;
+    bufKB: number;
+    pauseSkips?: number;
+  };
+}
+
+/** Copy-pastable host stream journal (pauses, drops, IDR reasons, bitrate moves). */
+export function getHostStreamLog(): string {
+  return streamLogFormat();
 }
 
 /** What the desktop approval prompt resolves to for an untrusted device. */
@@ -2937,6 +2957,23 @@ export function startHost(opts: HostOptions): () => void {
               connState: pc?.connectionState ?? "unknown",
               content: CONTENT_NUM[quality.mode] ?? 0,
               encoderMaxKbps: Math.round(appliedCapBps / 1000),
+              direct:
+                wcSink || nativeActive
+                  ? {
+                      on: true,
+                      native: nativeActive,
+                      adaptKbps: Math.round(adaptKbps),
+                      targetKbps: targetKbps(),
+                      dropped: wcSkipped,
+                      paused: pauseEvents,
+                      pausedNow: encodePaused,
+                      artifacts: nativeArtifactEvents,
+                      recovered: nativeRecoveredEvents,
+                      recovering: nativeRecovering,
+                      bufKB: Math.round(videoCh.bufferedAmount / 1024),
+                      pauseSkips: cs?.pauseSkips,
+                    }
+                  : { on: false, native: false, adaptKbps: 0, targetKbps: targetKbps(), dropped: 0, paused: 0, pausedNow: false, artifacts: 0, recovered: 0, recovering: false, bufKB: 0 },
             });
           }
         }
