@@ -509,7 +509,13 @@ export function startHost(opts: HostOptions): () => void {
     const now = Date.now();
     if (!force && now - lastAdaptPush < 400) return;
     lastAdaptPush = now;
-    const kbps = Math.round(clamp(adaptKbps, Math.max(1500, quality.minBitrateKbps), tgt));
+    // Floor must never exceed the Tune target — clamp(x, 1500, 1000) collapses
+    // to 1000 and the shed path then "raises" to 1500 and fights itself
+    // (seen as `shed 1000k → 1500k` spam with targetKbps=1000).
+    const floor = Math.max(500, quality.minBitrateKbps);
+    const lo = Math.min(floor, tgt);
+    const hi = Math.max(lo, tgt);
+    const kbps = Math.round(clamp(adaptKbps, lo, hi));
     adaptKbps = kbps;
     try {
       api.remoteSetCaptureQuality(
@@ -546,86 +552,109 @@ export function startHost(opts: HostOptions): () => void {
   let probeCeilKbps = 0;
   let lastCeilDecayAt = Date.now();
   let lastFillTrimAt = 0;
+  /** Coalesce stacked adapt cuts — in-flight frames after a pause used to
+   *  each take 15% in the same millisecond (16M→9M in one tick). */
+  let lastShedAt = 0;
+  /** EWMA of on-wire frame sizes — budget floor tracks real frame scale. */
+  let ewmaFrameBytes = 8 * 1024;
+
+  const noteFrameBytes = (n: number) => {
+    if (n < 64) return;
+    ewmaFrameBytes = ewmaFrameBytes <= 0 ? n : ewmaFrameBytes * 0.85 + n * 0.15;
+  };
 
   /**
-   * Video-channel send budget in BYTES. The Tune `wcBufKB` is only the ceiling:
-   * a fixed byte budget converts to SECONDS of standing latency on a slow link
-   * (384 KB parked in the channel at ~2 Mbps ≈ 1.5 s — every frame arrives that
-   * late, forever, which is exactly the "stream is consistently behind" bug).
-   * So the real bound is TIME: at most ~WC_BUF_MS of the live encode bitrate may
-   * sit unsent (~2 frames at 40 fps). On fast links the KB ceiling can still bite
-   * first; on slow links time wins and standing latency stays frame-scale.
-   * Floored at 8 KB (≈1–2 P-frames) — NOT 64 KB, which alone is ~250 ms at
-   * 2 Mbps. Keyframes already jump the ceiling (4×) so a recovery IDR can always
-   * enqueue. `pace` (Feel) still widens the budget — smoothness buys staleness.
+   * Video-channel send budget in BYTES. Bound by TIME so standing latency stays
+   * frame-scale on slow links, but NEVER below ~2.5 recent frames / 32KB — a
+   * floor of 8KB at 1.5 Mbps made every normal P-frame look like congestion,
+   * pause-flapping the encoder and pinning adapt at the mush floor forever.
+   * Keyframes jump 4×. `pace` (Feel) widens the budget.
    */
-  const WC_BUF_MS = 50;
+  const WC_BUF_MS = 80;
   const wcBufBudget = () => {
     const pace = clamp(quality.pace, 0, 100) / 100;
     const capBytes = quality.wcBufKB * 1024 * (1 + pace);
     const kbps = adaptKbps > 0 ? adaptKbps : targetKbps();
     const timeBytes = (kbps * WC_BUF_MS * (1 + pace)) / 8; // kbit/s × ms / 8 = bytes
-    return Math.max(8 * 1024, Math.min(capBytes, timeBytes));
+    const floorBytes = Math.max(32 * 1024, Math.round(ewmaFrameBytes * 2.5));
+    return Math.min(capBytes, Math.max(floorBytes, timeBytes));
   };
 
-  const adaptFromBuffer = (buffered: number, maxBuffered: number, skippedThisFrame: boolean) => {
+  /** Absolute backlog that counts as "real" congestion (not one fat frame). */
+  const congestionBytes = () => Math.max(24 * 1024, Math.round(ewmaFrameBytes * 2));
+
+  const adaptFromBuffer = (buffered: number, maxBuffered: number, hardDrop: boolean) => {
     const tgt = targetKbps();
     if (adaptKbps <= 0) adaptKbps = tgt;
     const fill = maxBuffered > 0 ? buffered / maxBuffered : 0;
     const now = Date.now();
-    // Forget the ceiling gradually: capacity may have returned, and a stale
-    // ceiling would otherwise cap a healthy link forever. An essentially-empty
-    // channel is strong evidence the ceiling is stale — bursty phone radios
-    // (Wi-Fi power save) trip skip-cuts that have nothing to do with bandwidth,
-    // and at 4%/10s a 1.6 Mbps ceiling took ~10 minutes to climb back to a
-    // 16 Mbps target ("stream stuck blurry"). Decay 10%/3s while clean-idle.
+    const realBacklog = buffered >= congestionBytes();
+    // Forget the ceiling gradually. A drained channel after a few seconds with
+    // no HARD drop means the ceiling was a radio blip, not capacity — clear it
+    // so we don't crawl 1%/tick out of a false 1.5 Mbps prison.
     if (probeCeilKbps > 0) {
-      const cleanIdle = fill < 0.05 && now - lastSkipAt > 3000;
-      const interval = cleanIdle ? 3_000 : 10_000;
-      const factor = cleanIdle ? 1.1 : 1.04;
-      if (now - lastCeilDecayAt > interval) {
+      const cleanIdle = fill < 0.05 && buffered < 4096 && now - lastSkipAt > 4000;
+      if (cleanIdle) {
+        probeCeilKbps = 0;
         lastCeilDecayAt = now;
-        probeCeilKbps = Math.round(probeCeilKbps * factor);
-        if (probeCeilKbps >= tgt) {
-          probeCeilKbps = 0; // ceiling above target = no ceiling
-          slog("adapt", `probe ceiling cleared (target ${tgt}k)`);
+        slog("adapt", `probe ceiling cleared (clean idle, target ${tgt}k)`);
+      } else {
+        const interval = now - lastSkipAt > 3000 && fill < 0.12 ? 3_000 : 10_000;
+        const factor = now - lastSkipAt > 3000 && fill < 0.12 ? 1.12 : 1.04;
+        if (now - lastCeilDecayAt > interval) {
+          lastCeilDecayAt = now;
+          probeCeilKbps = Math.round(probeCeilKbps * factor);
+          if (probeCeilKbps >= tgt) {
+            probeCeilKbps = 0;
+            slog("adapt", `probe ceiling cleared (target ${tgt}k)`);
+          }
         }
       }
     }
-    if (skippedThisFrame || fill > 0.55) {
-      // Network can't drain. A hard skip cuts deeper (~15%) than a merely-filling
-      // channel (~8%) so one visible hitch sheds enough to end the burst instead
-      // of rationing it out over several. Floor at 1.5 Mbps / Tune min so we
-      // don't spiral into unreadable mush.
-      if (skippedThisFrame) {
+    if (hardDrop || (fill > 0.55 && realBacklog)) {
+      // Hard drops (4× budget / shed encoded frame) cut deeper and pin the
+      // probe ceiling. Fill-based sheds are softer and do NOT pin the ceiling —
+      // phone Wi-Fi bursts are not proof the link can't carry the Tune target.
+      if (hardDrop) {
         lastSkipAt = now;
-        // This rate broke the link — remember it as the probe ceiling.
         probeCeilKbps = probeCeilKbps > 0 ? Math.min(probeCeilKbps, adaptKbps) : adaptKbps;
         lastCeilDecayAt = now;
       }
-      const cut = skippedThisFrame ? 0.85 : 0.92;
-      const next = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * cut));
+      // One cut per half-second — stacked in-flight frames must not compound.
+      if (now - lastShedAt < 500) {
+        adaptCleanTicks = 0;
+        return;
+      }
+      lastShedAt = now;
+      const cut = hardDrop ? 0.85 : 0.94;
+      const floor = Math.max(500, quality.minBitrateKbps);
+      const lo = Math.min(floor, tgt);
+      const next = Math.max(lo, Math.round(adaptKbps * cut));
       if (next !== adaptKbps) {
         slog(
           "adapt",
-          `shed ${adaptKbps}k → ${next}k (${skippedThisFrame ? "backpressure" : "fill"} fill=${fill.toFixed(2)} ceil=${probeCeilKbps}k)`,
+          `shed ${adaptKbps}k → ${next}k (${hardDrop ? "hard-drop" : "fill"} fill=${fill.toFixed(2)} buf=${Math.round(buffered / 1024)}KB ceil=${probeCeilKbps}k)`,
         );
       }
       adaptKbps = next;
       adaptCleanTicks = 0;
       pushAdaptBitrate();
-    } else if (fill < 0.12 && now - lastSkipAt > 3000) {
+    } else if (fill < 0.12 && buffered < congestionBytes() && now - lastSkipAt > 2000) {
       adaptCleanTicks++;
-      // ~1.2s of a drained channel → ease back toward the Tune target: briskly
-      // while clearly under the known ceiling, at a crawl once near/above it
-      // (the crawl is the probe — sized so an overshoot fits in the buffer's
-      // slack and gets caught by the fill-trim below, not by a skipped frame).
-      if (adaptCleanTicks >= 3 && adaptKbps < tgt) {
-        const nearCeil = probeCeilKbps > 0 && adaptKbps >= probeCeilKbps * 0.85;
-        const next = Math.min(tgt, nearCeil ? Math.round(adaptKbps * 1.01 + 10) : Math.round(adaptKbps * 1.05 + 50));
-        // Raises happen every ~1.2s while recovering — journal only the decades
-        // so the log shows the recovery arc without drowning in steps.
-        if (Math.floor(next / 2000) !== Math.floor(adaptKbps / 2000)) {
+      // Climb back: brisk when far below target, moderate under a known ceiling,
+      // crawl only when probing just above the last hard-drop rate.
+      if (adaptCleanTicks >= 2 && adaptKbps < tgt) {
+        const nearCeil = probeCeilKbps > 0 && adaptKbps >= probeCeilKbps * 0.9;
+        const farBelow = adaptKbps < tgt * 0.5;
+        const next = Math.min(
+          tgt,
+          farBelow
+            ? Math.round(adaptKbps * 1.15 + 150)
+            : nearCeil
+              ? Math.round(adaptKbps * 1.03 + 25)
+              : Math.round(adaptKbps * 1.08 + 80),
+        );
+        if (Math.floor(next / 2000) !== Math.floor(adaptKbps / 2000) || next === tgt) {
           slog("adapt", `raise ${adaptKbps}k → ${next}k (target ${tgt}k ceil=${probeCeilKbps}k)`);
         }
         adaptKbps = next;
@@ -634,13 +663,12 @@ export function startHost(opts: HostOptions): () => void {
       }
     } else {
       adaptCleanTicks = 0;
-      // Mid-band congestion signal: the channel is accumulating (>30% full) but
-      // nothing has been skipped yet. Trim gently and invisibly NOW so the probe
-      // failure never has to become a dropped frame + artifact + recovery IDR.
-      if (fill > 0.3 && now - lastFillTrimAt > 800) {
+      // Mid-band: accumulating but not critical. Trim gently; do NOT pin ceil.
+      if (fill > 0.35 && realBacklog && now - lastFillTrimAt > 1000) {
         lastFillTrimAt = now;
-        probeCeilKbps = probeCeilKbps > 0 ? Math.min(probeCeilKbps, adaptKbps) : adaptKbps;
-        const next = Math.max(Math.max(1500, quality.minBitrateKbps), Math.round(adaptKbps * 0.97));
+        const floor = Math.max(500, quality.minBitrateKbps);
+        const lo = Math.min(floor, tgt);
+        const next = Math.max(lo, Math.round(adaptKbps * 0.97));
         if (next !== adaptKbps) slog("adapt", `trim ${adaptKbps}k → ${next}k (fill=${fill.toFixed(2)})`);
         adaptKbps = next;
         pushAdaptBitrate();
@@ -1752,10 +1780,44 @@ export function startHost(opts: HostOptions): () => void {
     let encodePaused = false;
     let pauseEvents = 0;
     let pausePoll: number | null = null;
+    let pausedAtMs = 0;
+    /** While hard-gated on an IDR, keep asking even if no frames are flowing —
+     *  otherwise a paused encoder + dropped recovery key leaves the guest frozen
+     *  until its stall watchdog tears the session down (multi-second blackouts). */
+    let awaitKeyPoll: number | null = null;
+    const clearAwaitKeyWatchdog = () => {
+      if (awaitKeyPoll !== null) {
+        window.clearInterval(awaitKeyPoll);
+        awaitKeyPoll = null;
+      }
+    };
+    const armAwaitKeyWatchdog = () => {
+      if (awaitKeyPoll !== null) return;
+      awaitKeyPoll = window.setInterval(() => {
+        if (!nativeAwaitKey) {
+          clearAwaitKeyWatchdog();
+          return;
+        }
+        // Keep the encoder unpaused enough to emit the IDR (keys bypass the
+        // Rust pause flag, but a stuck pause + empty mailbox still delays it).
+        if (encodePaused && videoCh.readyState === "open" && videoCh.bufferedAmount < wcBufBudget()) {
+          setEncoderPaused(false, videoCh.bufferedAmount, wcBufBudget());
+        }
+        requestNativeKeyframe("await-key watchdog");
+      }, 350);
+    };
+    const setNativeAwaitKey = (on: boolean) => {
+      nativeAwaitKey = on;
+      if (on) armAwaitKeyWatchdog();
+      else clearAwaitKeyWatchdog();
+    };
     const setEncoderPaused = (paused: boolean, buffered: number, budget: number) => {
       if (encodePaused === paused) return;
       encodePaused = paused;
-      if (paused) pauseEvents++;
+      if (paused) {
+        pauseEvents++;
+        pausedAtMs = performance.now();
+      }
       slog(
         "pause",
         `encoder ${paused ? "paused" : "resumed"} buffered=${Math.round(buffered / 1024)}KB budget=${Math.round(budget / 1024)}KB kbps=${Math.round(adaptKbps)}`,
@@ -1769,12 +1831,16 @@ export function startHost(opts: HostOptions): () => void {
         pausePoll = window.setInterval(() => {
           const open = videoCh.readyState === "open";
           const b = open ? videoCh.bufferedAmount : 0;
-          if (!open || b < wcBufBudget() * 0.3) {
+          const budgetNow = wcBufBudget();
+          // Hysteresis: stay paused at least ~100ms so a 4ms-RTT drain can't
+          // flap pause/resume every frame against a tight budget.
+          const held = performance.now() - pausedAtMs >= 100;
+          if (!open || (held && b < budgetNow * 0.25)) {
             if (pausePoll !== null) window.clearInterval(pausePoll);
             pausePoll = null;
-            setEncoderPaused(false, b, wcBufBudget());
+            setEncoderPaused(false, b, budgetNow);
           }
-        }, 150);
+        }, 100);
       } else if (!paused && pausePoll !== null) {
         window.clearInterval(pausePoll);
         pausePoll = null;
@@ -1832,7 +1898,7 @@ export function startHost(opts: HostOptions): () => void {
         }
         // A decoder configuration/resize genuinely cannot decode a P-frame sent under
         // the old SPS — HARD-gate until the IDR arrives.
-        if (!key) nativeAwaitKey = true;
+        if (!key) setNativeAwaitKey(true);
         slog("config", `announce ${w}x${h}`);
         requestNativeKeyframe("config/announce");
       }
@@ -1859,40 +1925,62 @@ export function startHost(opts: HostOptions): () => void {
       // every encoded P-frame is a reference for the ones after it, and each
       // post-encode drop was a visible artifact until the next recovery IDR.
       // Pause the ENCODER instead (pre-encode skip, chain intact) and let the
-      // reliable channel absorb the few frames already in flight. Only a truly
-      // dead channel (4× the budget, seconds of backlog) may still drop — and
-      // then it hard-gates so nothing corrupt is ever displayed.
-      if (buffered > maxBuffered * 4) {
+      // reliable channel absorb the few frames already in flight.
+      //
+      // CRITICAL: never hard-drop KEYFRAMES. With a tiny budget (old 8KB floor),
+      // 4× was ~32KB — smaller than a typical IDR — so recovery keys were shed,
+      // the guest stayed gated for seconds, then the stall watchdog tore the
+      // whole DIRECT session down ("stream drops then reconnects").
+      if (!key && buffered > maxBuffered * 4) {
         wcSkipped++;
         skipsSinceKey++;
         slog(
           "drop",
-          `${key ? "keyframe" : "P-frame"} dropped — channel dead (buffered=${Math.round(buffered / 1024)}KB, 4× budget); hard-gating until IDR`,
+          `P-frame dropped — channel dead (buffered=${Math.round(buffered / 1024)}KB, 4× budget); hard-gating until IDR`,
         );
         setEncoderPaused(true, buffered, maxBuffered);
-        nativeAwaitKey = true;
+        setNativeAwaitKey(true);
         armNativeRecovery(true, true);
         adaptFromBuffer(buffered, maxBuffered, true);
         return;
       }
-      if (!key && buffered > maxBuffered) {
-        // Backed up but alive: stop producing new frames (Rust-side pre-encode
-        // skip) and still send this one. Counts as the congestion signal for
-        // the adaptive bitrate, exactly like the old skip did.
+      if (key && buffered > maxBuffered * 4) {
+        // IDR must go out. Pause production so we don't pile more on top, but
+        // fall through to send — SCTP will absorb one keyframe.
+        slog(
+          "drop",
+          `keyframe allowed through dead channel (buffered=${Math.round(buffered / 1024)}KB) — pause only`,
+        );
         setEncoderPaused(true, buffered, maxBuffered);
         adaptFromBuffer(buffered, maxBuffered, true);
-      } else {
-        if (encodePaused && buffered < maxBuffered * 0.3) setEncoderPaused(false, buffered, maxBuffered);
+      }
+      // Soft backpressure: pause production, still send this frame. Do NOT treat
+      // pause as a hard drop — that was the death spiral (pause → 15% cut → ceil
+      // pin → smaller budget → more pauses → stuck at 1.5 Mbps mush). Only adapt
+      // once on entering pause, and only with the soft fill signal.
+      if (!key && buffered > maxBuffered) {
+        const entering = !encodePaused;
+        setEncoderPaused(true, buffered, maxBuffered);
+        if (entering) adaptFromBuffer(buffered, maxBuffered, false);
+      } else if (!(key && buffered > maxBuffered * 4)) {
+        if (
+          encodePaused &&
+          buffered < maxBuffered * 0.25 &&
+          performance.now() - pausedAtMs >= 100
+        ) {
+          setEncoderPaused(false, buffered, maxBuffered);
+        }
         adaptFromBuffer(buffered, maxBuffered, false);
       }
       // Stamped on arrival rather than at capture: the host and Rust don't share a
       // clock, and now that a frame is ~30KB instead of 334KB the IPC hop it folds
       // into the measurement is small (it lands in `net+enc`, never unaccounted).
+      noteFrameBytes(payload.byteLength);
       if (!wcSendBytes(payload, key, performance.now())) {
         // Channel threw mid-frame — the guest received a partial access unit, which
         // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
         slog("fault", `channel send threw mid-${key ? "keyframe" : "P-frame"} (partial AU) — hard gate`);
-        nativeAwaitKey = true;
+        setNativeAwaitKey(true);
         armNativeRecovery(false, true);
         return;
       }
@@ -1908,7 +1996,7 @@ export function startHost(opts: HostOptions): () => void {
           slog("recover", `closed by IDR on wire (recovered=${nativeRecoveredEvents})`);
         }
         nativeRecoveryPending = false;
-        nativeAwaitKey = false;
+        setNativeAwaitKey(false);
         skipsSinceKey = 0;
       } else {
         // Channel accepted a P-frame — if a skip burst just ended, one recovery IDR.
@@ -1943,6 +2031,9 @@ export function startHost(opts: HostOptions): () => void {
       nativeAnnounced = false;
       nativeConfigW = 0;
       nativeConfigH = 0;
+      // Path is stopping — gate any stray frames but don't arm the IDR watchdog
+      // (nothing will encode until DIRECT is re-opted in).
+      clearAwaitKeyWatchdog();
       nativeAwaitKey = true;
       nativeRecovering = false;
       nativeRecoveryPending = false;
@@ -2293,7 +2384,7 @@ export function startHost(opts: HostOptions): () => void {
           const now = Date.now();
           if (authorized && now - lastVresetAt > 4000) {
             lastVresetAt = now;
-            nativeAwaitKey = true;
+            setNativeAwaitKey(true);
             slog("idr", "requested (guest vreset — decoder wedged)");
             // On the native path the canvas/generator track isn't in the picture at
             // all — the equivalent un-wedge is a fresh IDR + SPS from Rust.
@@ -2365,7 +2456,7 @@ export function startHost(opts: HostOptions): () => void {
         // the whole keyframe interval staring at nothing.
         if (msg && msg.type === "vkf") {
           wcForceKey = true;
-          nativeAwaitKey = true;
+          setNativeAwaitKey(true);
           slog("idr", "requested (guest vkf — decoder lost sync)");
           try {
             void api.remoteRequestKeyframe();
@@ -2388,6 +2479,8 @@ export function startHost(opts: HostOptions): () => void {
         if (msg && msg.type === "quality") {
           if (opts.fixedMonitor != null) return; // aux quality is fixed at start
           const prevMaxW = quality.maxW;
+          const prevBitrate = quality.bitrate;
+          const prevFps = quality.fps;
           if (typeof msg.maxW === "number") quality.maxW = clamp(msg.maxW, 320, 3840);
           if (typeof msg.quality === "number") quality.jpeg = clamp(msg.quality, 20, 95);
           if (typeof msg.fps === "number") quality.fps = clamp(msg.fps, 1, 120);
@@ -2424,10 +2517,22 @@ export function startHost(opts: HostOptions): () => void {
               }
             }
           }
-          // Explicit Tune bitrate change resets the adaptive ceiling so a raise
-          // isn't stuck under a previous network-shed floor.
-          adaptKbps = targetKbps();
-          adaptCleanTicks = 0;
+          // Only reset adaptive bitrate when the user actually changed the Tune
+          // target (or res/fps). Re-asserts on connect / every slider tick used
+          // to slam adaptKbps back to 16 Mbps mid-shed, then the next fat frame
+          // shed it again — that sawtooth is what pinned Enc cap at 1500k.
+          const tgtNow = targetKbps();
+          const targetChanged =
+            quality.bitrate !== prevBitrate ||
+            quality.maxW !== prevMaxW ||
+            quality.fps !== prevFps;
+          if (targetChanged || adaptKbps <= 0) {
+            adaptKbps = tgtNow;
+            probeCeilKbps = 0;
+            adaptCleanTicks = 0;
+            lastSkipAt = 0;
+            slog("adapt", `reset to target ${adaptKbps}k (tune ${targetChanged ? "target changed" : "init"})`);
+          }
           // Native encode on/off takes effect live — the whole point is to A/B it (or
           // escape a bad picture) without reconnecting. Only meaningful while DIRECT
           // is up; wcActivate reads `quality.hostNvenc` when it isn't.
