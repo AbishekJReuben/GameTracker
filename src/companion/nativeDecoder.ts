@@ -97,6 +97,16 @@ export async function initNativeDecoder(width: number, height: number): Promise<
   }
 }
 
+/**
+ * Monotonic bounds sequence. Each `decoder_set_bounds` is its own
+ * `spawn_blocking` task on the Rust side, so a burst of updates (one per
+ * animation frame during pinch-zoom) can reach the Android UI thread out of
+ * order — the bridge uses this counter to drop stale rects instead of letting
+ * an old one land last (video frozen on stale geometry → cursor offset that
+ * grows with zoom, and the squeezed pre-first-frame full-viewport rect).
+ */
+let boundsSeq = 0;
+
 export async function setNativeDecoderBounds(opts: {
   x: number;
   y: number;
@@ -105,8 +115,9 @@ export async function setNativeDecoderBounds(opts: {
   visible: boolean;
 }): Promise<void> {
   if (!nativeDecoderPossible()) return;
+  boundsSeq += 1;
   try {
-    await invoke("decoder_set_bounds", opts);
+    await invoke("decoder_set_bounds", { ...opts, seq: boundsSeq });
   } catch {
     /* surface not ready yet */
   }

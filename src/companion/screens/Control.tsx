@@ -70,7 +70,7 @@ import {
   AppWindow,
   SlidersHorizontal,
 } from "lucide-react";
-import type { ContentMode, QualitySettings, RemoteLink } from "../links";
+import type { ContentMode, ControlMsg, QualitySettings, RemoteLink } from "../links";
 import { startGamepadBridge } from "../gamepad";
 import { apiGet } from "../link";
 import type { AudioStats, ConnectSnapshot, WcStats } from "../cloud";
@@ -82,8 +82,8 @@ import { setNativeDecoderBounds, setStreamPowerActive } from "../nativeDecoder";
 import {
   hitchFormat,
   hitchNote,
-  hitchOnNotify,
   hitchReset,
+  hitchSnapshot,
 } from "../hitchLog";
 import { isQuestBrowser } from "../device";
 import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
@@ -1129,8 +1129,6 @@ export function ControlScreen({
   const netRef = useRef<{ bytes: number; at: number; jbDelay: number; jbCount: number; decT: number; decoded: number } | null>(null);
   const hostSkipRef = useRef(-1);
   const audioUnderrunRef = useRef(0);
-  const [hitchToast, setHitchToast] = useState<string | null>(null);
-  const hitchToastTimer = useRef<number | null>(null);
 
   // Multi-monitor.
   const [monitors, setMonitors] = useState<RemoteMonitor[]>([]);
@@ -1224,13 +1222,9 @@ export function ControlScreen({
         setHasFrame(false); // show the app-icon placeholder again on reconnect
       }
     });
-    hitchOnNotify((e) => {
-      // Brief toast so a hitch is visible without opening stats — tap Copy diag for the log.
-      const line = `[${e.kind}] ${e.detail}`;
-      setHitchToast(line);
-      if (hitchToastTimer.current) window.clearTimeout(hitchToastTimer.current);
-      hitchToastTimer.current = window.setTimeout(() => setHitchToast(null), 4500);
-    });
+    // Hitches are shown inside the Stream stats HUD (HitchSection polls the
+    // journal) — the old always-on toast covered the video and outstayed its
+    // welcome on links that hitch often.
     const unsubProgress = link.onProgress?.(setProgress);
     const bindStream = (stream: MediaStream, force = false) => {
       pendingStreamRef.current = stream;
@@ -1352,7 +1346,6 @@ export function ControlScreen({
       while (t.length && now - t[0] > 1000) t.shift();
     });
     return () => {
-      hitchOnNotify(null);
       unsubProgress?.();
       unsubStream?.();
       unsubAudio?.();
@@ -2359,9 +2352,21 @@ export function ControlScreen({
   };
 
   // ----- keyboard -----
+  /**
+   * Events that must land on the PC in exactly this order, batched into ONE
+   * wire message. On the host every message becomes its own async
+   * `remote_inject` invoke, and separate invokes carry no ordering guarantee —
+   * Ctrl+C sent as three messages sometimes applied as ctrl↓ ctrl↑ c, typing a
+   * bare "c" after Ctrl was already released. One message can't be reordered
+   * against itself (the injector applies a `seq` atomically, in order).
+   */
+  const sendOrdered = (events: ControlMsg[]) => {
+    if (events.length === 0) return false;
+    return send(events.length === 1 ? events[0] : { type: "seq", events });
+  };
   const releaseMods = () => {
     if (mods.size === 0) return;
-    mods.forEach((m) => send({ type: "keyup", name: m }));
+    sendOrdered([...mods].map((m) => ({ type: "keyup", name: m })));
     setMods(new Set());
   };
   const toggleMod = (m: Mod) => {
@@ -2377,10 +2382,13 @@ export function ControlScreen({
       return next;
     });
   };
-  /** Fire a named key wrapped in any sticky modifiers, then release them. */
+  /** Fire a named key wrapped in any sticky modifiers, then release them —
+   *  the key and the releases ride one ordered message. */
   const tapKey = (name: string) => {
-    send({ type: "key", name });
-    releaseMods();
+    const evs: ControlMsg[] = [{ type: "key", name }];
+    mods.forEach((m) => evs.push({ type: "keyup", name: m }));
+    sendOrdered(evs);
+    if (mods.size > 0) setMods(new Set());
   };
 
   // Android soft keyboards report keyCode 229 / "Unidentified" on keydown, so we
@@ -2415,8 +2423,10 @@ export function ControlScreen({
     if (added) {
       if (mods.size > 0 && added.length === 1) tapKey(added.toLowerCase());
       else {
-        send({ type: "text", value: added });
-        releaseMods();
+        const evs: ControlMsg[] = [{ type: "text", value: added }];
+        mods.forEach((m) => evs.push({ type: "keyup", name: m }));
+        sendOrdered(evs);
+        if (mods.size > 0) setMods(new Set());
       }
     }
     prevVal.current = val;
@@ -2438,8 +2448,10 @@ export function ControlScreen({
     const el = kbdRef.current;
     const val = el?.value ?? "";
     if (val) {
-      send({ type: "text", value: val });
-      releaseMods();
+      const evs: ControlMsg[] = [{ type: "text", value: val }];
+      mods.forEach((m) => evs.push({ type: "keyup", name: m }));
+      sendOrdered(evs);
+      if (mods.size > 0) setMods(new Set());
     }
     resetField();
   };
@@ -2531,11 +2543,13 @@ export function ControlScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kbMode]);
 
-  /** Run a chord as an explicit hold→press→release sequence (independent of sticky). */
+  /** Run a chord as an explicit hold→press→release sequence (independent of
+   *  sticky) — one ordered wire message, so the release can never overtake the key. */
   const chord = (modKeys: Mod[], key?: string) => {
-    modKeys.forEach((m) => send({ type: "keydown", name: m }));
-    if (key) send({ type: "key", name: key });
-    [...modKeys].reverse().forEach((m) => send({ type: "keyup", name: m }));
+    const evs: ControlMsg[] = modKeys.map((m) => ({ type: "keydown", name: m }));
+    if (key) evs.push({ type: "key", name: key });
+    [...modKeys].reverse().forEach((m) => evs.push({ type: "keyup", name: m }));
+    sendOrdered(evs);
     navigator.vibrate?.(8);
   };
 
@@ -3026,33 +3040,6 @@ export function ControlScreen({
           )}
         </div>
       )}
-      {hitchToast && (
-        <div className="pointer-events-auto absolute left-2 right-2 top-14 z-[60] flex items-start gap-2 rounded-xl border border-amber/40 bg-[#12141c] px-3 py-2 shadow-float">
-          <span className="min-w-0 flex-1 font-mono text-[10px] font-700 leading-snug text-amber">{hitchToast}</span>
-          <button
-            type="button"
-            className="flex h-6 shrink-0 items-center gap-1 rounded bg-white/[0.08] px-2 text-[10px] font-800 text-white/80"
-            onClick={() => {
-              void copyToClipboard(
-                [`GameTracker hitch @ ${new Date().toISOString()}`, "", hitchFormat()].join("\n"),
-              ).then(() => {
-                setDiagCopied(true);
-                window.setTimeout(() => setDiagCopied(false), 1500);
-              });
-            }}
-            title="Copy hitch log"
-          >
-            <CopyIcon className="h-3 w-3" /> {diagCopied ? "Copied" : "Copy"}
-          </button>
-          <button
-            type="button"
-            className="grid h-6 w-6 shrink-0 place-items-center rounded bg-white/[0.08] text-white/60"
-            onClick={() => setHitchToast(null)}
-          >
-            <X className="h-3 w-3" />
-          </button>
-        </div>
-      )}
       {/* ---- screen viewport ---- */}
       <div
         ref={viewportRef}
@@ -3268,7 +3255,19 @@ export function ControlScreen({
             ...(statsCompact ? null : { scrollbarWidth: "thin" as const }),
           }}
         >
-          <div className={`flex flex-wrap items-center justify-between gap-1.5 ${statsCompact ? "" : "mb-1"}`}>
+          {/* Header sticks to the top of the scrollable HUD so the close /
+              collapse controls stay reachable however far the panel is
+              scrolled. Negative margins pull it over the container padding so
+              scrolled content can't peek above it. */}
+          <div
+            className={`flex flex-wrap items-center justify-between gap-1.5 ${
+              statsCompact
+                ? ""
+                : `sticky -top-2 z-10 -mx-2 -mt-2 mb-1 rounded-t-xl px-2 pb-1 pt-2 ${
+                    wcNative ? "bg-black" : "bg-black/75 backdrop-blur-md"
+                  }`
+            }`}
+          >
             <span className="flex flex-wrap items-center gap-1 text-[10px] font-800 text-white">
               <Gauge className="h-3 w-3 text-accent-3" /> Stream stats
               <span className={`rounded px-1 py-0.5 text-[8px] font-800 ${wcStats ? "bg-green/20 text-green" : "bg-white/[0.08] text-ink-soft"}`}>
@@ -3586,6 +3585,10 @@ export function ControlScreen({
           <div className="mt-1 rounded-md bg-white/[0.05] px-1.5 py-0.5 text-[9px] font-700 text-accent-3">
             {bottleneckHint(hostStats, net, fps, wcStats)}
           </div>
+
+          {/* Hitch journal — lives here (not a pop-over toast) so it can be
+              consulted deliberately instead of covering the video. */}
+          <HitchSection />
 
           {/* Collapsible soft-spot tuner — every streaming knob editable for A/B tests. */}
           <div className="mt-1.5 border-t border-white/[0.08] pt-1.5">
@@ -4944,6 +4947,68 @@ function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {
       <span className="shrink-0 text-ink-faint">{k}</span>
       <span className={`truncate font-700 tabular-nums ${hi ? "text-amber" : "text-white"}`}>{v}</span>
     </div>
+  );
+}
+
+/**
+ * Recent hitch-journal entries, rendered inside the Stream stats HUD (the old
+ * pop-over toast covered the video and re-fired on every hitch). Polls the
+ * ring buffer once a second while visible — far cheaper than re-rendering the
+ * whole Control screen per hitch, and this is diagnostic UI anyway.
+ */
+function HitchSection() {
+  const [, bump] = useState(0);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    const id = window.setInterval(() => bump((t) => (t + 1) & 1023), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const all = hitchSnapshot();
+  const recent = all.slice(-6).reverse();
+  return (
+    <>
+      <div className="my-1 border-t border-white/[0.08]" />
+      <div className="flex items-center justify-between gap-1.5">
+        <span className="flex items-center gap-1 text-[10px] font-800 text-white">
+          <Waves className="h-3 w-3 text-amber" /> Hitches
+          <span className="rounded bg-white/[0.08] px-1 py-0.5 text-[8px] font-800 text-ink-soft">{all.length}</span>
+        </span>
+        {all.length > 0 && (
+          <button
+            type="button"
+            title="Copy full hitch log"
+            onClick={() => {
+              void copyToClipboard(
+                [`GameTracker hitch @ ${new Date().toISOString()}`, "", hitchFormat()].join("\n"),
+              ).then((ok) => {
+                setCopied(ok);
+                window.setTimeout(() => setCopied(false), 1500);
+              });
+            }}
+            className={`flex h-4 items-center gap-1 rounded px-1.5 text-[8px] font-800 ${
+              copied ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+            }`}
+          >
+            {copied ? <CheckIcon className="h-2.5 w-2.5" /> : <CopyIcon className="h-2.5 w-2.5" />}
+            {copied ? "Copied" : "Copy"}
+          </button>
+        )}
+      </div>
+      {recent.length === 0 ? (
+        <p className="mt-0.5 text-[9px] text-ink-faint">No hitches recorded this session.</p>
+      ) : (
+        <div className="mt-0.5 space-y-px font-mono text-[9px] leading-snug text-amber/90">
+          {recent.map((e, i) => (
+            <div key={`${e.t}-${i}`} className="flex min-w-0 gap-1">
+              <span className="shrink-0 tabular-nums text-ink-dim">+{(e.t / 1000).toFixed(1)}s</span>
+              <span className="min-w-0 flex-1 truncate">
+                [{e.kind}] {e.detail}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 

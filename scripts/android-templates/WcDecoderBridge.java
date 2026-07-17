@@ -126,6 +126,30 @@ public final class WcDecoderBridge {
   private static final AtomicBoolean lowLatency = new AtomicBoolean(false);
   private static volatile double decodeMsEwma = 0.0;
   private static volatile boolean webViewHooked = false;
+  /**
+   * Async codec errors survived this session. A {@link MediaCodec.CodecException}
+   * kills the codec instance (it is typically already Released by the time
+   * {@code onError} runs) — the bridge used to leave {@code started=true} and
+   * every later feed failed with "Invalid to call at Released state" until the
+   * JS stall watchdog abandoned the whole native path. Now the codec restarts
+   * on error, bounded by {@link #ERROR_RESTART_MAX} so a hard-broken driver
+   * still ends in the WebCodecs fallback instead of an error loop.
+   */
+  private static final AtomicInteger errorRestarts = new AtomicInteger(0);
+  private static final int ERROR_RESTART_MAX = 6;
+  /**
+   * Rungs of the configure ladder to skip. An async error right after a
+   * successful start (Qualcomm's error_neg_-2147483648) means the driver
+   * ACCEPTED a low-latency config it cannot actually run — configure-time
+   * retries never see it. Each restart-on-error demotes one rung so the codec
+   * converges on a config the driver survives. Kept across inits (the device
+   * doesn't change mid-process).
+   */
+  private static final AtomicInteger fmtSkip = new AtomicInteger(0);
+  /** Last time the whole configure ladder failed — short feed-driven retry backoff. */
+  private static volatile long lastStartFailAt = 0L;
+  /** Newest applied setBounds sequence number — stale (reordered) calls are dropped. */
+  private static final AtomicLong boundsSeq = new AtomicLong(0);
 
   /**
    * Watchdog that kicks a VISIBLE TextureView when {@code onSurfaceTextureAvailable}
@@ -521,6 +545,12 @@ public final class WcDecoderBridge {
     lastError.set("");
     awaitKey.set(true);
     csdQueued.set(false);
+    // Fresh session: full error-restart budget, no start backoff, and a fresh
+    // bounds sequence (the JS counter resets on page reload; a stale Java
+    // high-water mark would silently drop every setBounds after that).
+    errorRestarts.set(0);
+    lastStartFailAt = 0L;
+    boundsSeq.set(0);
     Activity act = activity();
     if (act == null) throw new IllegalStateException("no activity");
     // Latch BEFORE hopping to the UI thread: a setBounds already in flight on
@@ -552,6 +582,10 @@ public final class WcDecoderBridge {
           hookWebView(act);
           makeCompositingTransparent(act);
           applyVisibility(surfaceView);
+          // Bitstream size may have changed while the view rect didn't (mid-
+          // stream resolution bump) — recompute the contain-fit for the new aspect.
+          TextureView tv = surfaceView;
+          if (tv != null) applyContentTransform(tv, tv.getWidth(), tv.getHeight());
           if (surfaceReady.get()) {
             // Size change while a codec is live → rebuild against the new Surface.
             if (started.get()) {
@@ -585,8 +619,17 @@ public final class WcDecoderBridge {
    * {@code visible=false} tear the Surface out from under a running codec (blank
    * screen, no error) and a stale {@code visible=true} park a dead Surface on
    * top of the WebCodecs canvas (frozen picture).
+   *
+   * {@code seq} is a monotonically increasing counter from JS. Every bounds call
+   * is its own {@code spawn_blocking} task on the Rust side, so during a pinch
+   * zoom (a bounds call per animation frame) updates can — and on real devices
+   * do — land here out of order. Applying a STALE rect last froze the video on
+   * old geometry while the DOM cursor math used fresh geometry: the "mouse
+   * offset grows with scale" bug, and (when the stale rect was the pre-first-
+   * frame full-viewport fallback) the vertically squeezed picture. Stale seq →
+   * dropped. {@code seq == 0} always applies (legacy callers).
    */
-  public static void setBounds(double x, double y, double w, double h, boolean visible) {
+  public static void setBounds(double x, double y, double w, double h, boolean visible, long seq) {
     Activity act = activity();
     if (act == null) return;
     // An empty box is JS saying "I have no geometry for you" (it pairs the zeroes
@@ -598,6 +641,11 @@ public final class WcDecoderBridge {
         () -> {
           TextureView sv = surfaceView;
           if (sv == null) return;
+          // UI thread is the serialization point — compare-and-record here.
+          if (seq != 0) {
+            if (seq <= boundsSeq.get()) return;
+            boundsSeq.set(seq);
+          }
           float dpr = act.getResources().getDisplayMetrics().density;
           // JS sends CSS pixels from getBoundingClientRect; layout params are px.
           int ix = Math.round((float) (x * dpr));
@@ -633,9 +681,38 @@ public final class WcDecoderBridge {
           lp.topMargin = iy;
           lp.gravity = Gravity.TOP | Gravity.START;
           sv.setLayoutParams(lp);
+          applyContentTransform(sv, iw, ih);
           // NOT sv.setVisibility(visible ? ...) — see the javadoc above.
           applyVisibility(sv);
         });
+  }
+
+  /**
+   * Contain-fit the decoded picture inside the view. TextureView's default is
+   * to STRETCH the buffer to the view rect. The JS rect normally carries the
+   * video's own aspect (stretch == fit), but the pre-first-frame fallback is
+   * the full viewport and a reordered/stale rect can be anything — stretching
+   * to those is the "video squeezed vertically" bug. With an explicit contain
+   * transform a wrong-aspect rect letterboxes inside the (non-opaque)
+   * TextureView instead of distorting, and self-heals on the next good rect.
+   * Must run on the UI thread.
+   */
+  private static void applyContentTransform(TextureView sv, int viewW, int viewH) {
+    if (sv == null || viewW < 2 || viewH < 2) return;
+    int bw = width.get();
+    int bh = height.get();
+    if (bw < 2 || bh < 2) return;
+    float fitW = viewW;
+    float fitH = (float) viewW * bh / bw;
+    if (fitH > viewH) {
+      fitH = viewH;
+      fitW = (float) viewH * bw / bh;
+    }
+    android.graphics.Matrix m = new android.graphics.Matrix();
+    m.setScale(fitW / viewW, fitH / viewH);
+    m.postTranslate((viewW - fitW) / 2f, (viewH - fitH) / 2f);
+    sv.setTransform(m);
+    sv.invalidate();
   }
 
   public static void reset() {
@@ -1361,6 +1438,8 @@ public final class WcDecoderBridge {
             // Keep the producer buffer locked to the bitstream aspect; the view
             // scales. Don't rebuild the codec on every layout bounce (zoom/pan).
             applyBufferSize(width.get(), height.get());
+            TextureView sv = surfaceView;
+            if (sv != null) applyContentTransform(sv, sv.getWidth(), sv.getHeight());
           }
 
           @Override
@@ -1411,14 +1490,28 @@ public final class WcDecoderBridge {
   }
 
   /**
-   * Make every layer that composites ABOVE the TextureView transparent: window
-   * background, DecorView, android.R.id.content, every wry/Tauri wrapper between
-   * the WebView and the window, and the WebView itself. One opaque layer anywhere
-   * in that chain paints over the video — the codec decodes happily (stats climb,
-   * no error) while the user stares at black. The PAGE is responsible for staying
-   * opaque outside the video box (Control.tsx paints letterbox bars) so the
-   * transparent region — and with it the Android-16 WebView redraw-accumulation
-   * "smudge" — is bounded to the video rect.
+   * Make exactly the layers that composite ABOVE the TextureView transparent —
+   * and, just as important, keep everything else OPAQUE.
+   *
+   * The TextureView draws inside the window's own view tree, so the video needs
+   * NO window translucency at all: a view's background paints before its
+   * children, so the window background, DecorView, android.R.id.content and any
+   * shared wrapper are all BEHIND the video and can stay opaque black. Only the
+   * WebView itself (drawn after its TextureView sibling) — plus any wrapper that
+   * holds the WebView but not the TextureView — must be transparent where the
+   * page is transparent.
+   *
+   * The SurfaceView-era code cleared the whole chain (window included) to
+   * transparent, and that translucent window is what fed the Android 16 WebView
+   * redraw-accumulation family of artifacts: stats text stacking over itself,
+   * translucent buttons going opaque over time, mouse-cursor sprite trails
+   * wherever no opaque pixels backed the page. With an opaque window every
+   * final pixel is fully defined each frame, so nothing can accumulate.
+   *
+   * One opaque layer ABOVE the video still paints over it — the codec decodes
+   * happily (stats climb, no error) while the user stares at black — which is
+   * why the WebView/wrapper chain is still forced transparent, and the PAGE
+   * stays opaque outside the video box (Control.tsx paints letterbox bars).
    *
    * Deliberately does NOT force a hardware LAYER on the WebView.
    * setLayerType(LAYER_TYPE_HARDWARE) flattens the WebView into an offscreen
@@ -1440,26 +1533,35 @@ public final class WcDecoderBridge {
   }
 
   private static void applyCompositingTransparency(Activity act) {
+    // Opaque window: the video composites inside it, and a translucent window
+    // is the burn-in bug farm (see javadoc). Explicitly black, not "whatever
+    // the theme says" — older builds left these transparent and this must undo
+    // that on in-place updates.
     try {
       act.getWindow().setBackgroundDrawable(
-          new android.graphics.drawable.ColorDrawable(0x00000000));
-      // Some OEM themes paint the DecorView after setBackgroundDrawable — force
-      // the root view transparent too so TextureView video shows through.
+          new android.graphics.drawable.ColorDrawable(0xFF000000));
       View decor = act.getWindow().getDecorView();
       if (decor != null) {
-        decor.setBackgroundColor(0x00000000);
+        decor.setBackgroundColor(0xFF000000);
       }
     } catch (Exception e) {
-      jlog("window bg clear failed: " + e);
+      jlog("window bg set failed: " + e);
     }
     ViewGroup content = act.findViewById(android.R.id.content);
-    if (content != null) {
-      content.setBackgroundColor(0x00000000);
-    }
     WebView web = content == null ? null : findWebView(content);
     if (web == null) {
       jlog("compositing: no WebView found");
       return;
+    }
+    // Ancestors of the TextureView paint their backgrounds BEHIND the video —
+    // they may stay opaque. Collect the chain so the walk below can tell a
+    // shared ancestor (keep opaque) from a WebView-only wrapper (must clear).
+    java.util.HashSet<View> videoAncestors = new java.util.HashSet<>();
+    for (View v = surfaceView; v != null; v = v.getParent() instanceof View ? (View) v.getParent() : null) {
+      videoAncestors.add(v);
+    }
+    if (content != null && videoAncestors.contains(content)) {
+      content.setBackgroundColor(0xFF000000);
     }
     web.setBackgroundColor(0x00000000);
     // Also clear any ColorDrawable left by Tauri/wry on the WebView itself —
@@ -1474,18 +1576,19 @@ public final class WcDecoderBridge {
       web.setLayerType(View.LAYER_TYPE_NONE, null);
       jlog("webview layer -> NONE");
     }
-    // Every wrapper between the WebView and the window: their backgrounds all
-    // draw after the punch and each one can independently blacken it.
     View walk = web;
     while (walk.getParent() instanceof View) {
       walk = (View) walk.getParent();
-      android.graphics.drawable.Drawable bg = walk.getBackground();
-      if (bg != null) {
-        jlog("cleared opaque bg on " + walk.getClass().getSimpleName() + " (" + describeDrawable(bg) + ")");
+      if (videoAncestors.contains(walk)) {
+        // Shared ancestor — its background is behind the video. Opaque black
+        // backs every page pixel outside the video box.
+        walk.setBackgroundColor(0xFF000000);
+      } else {
+        // Holds the WebView but not the video: draws over the TextureView, so
+        // its background must be transparent or it blacks the picture.
+        jlog("cleared bg on WebView wrapper " + walk.getClass().getSimpleName());
+        walk.setBackgroundColor(0x00000000);
       }
-      // Always force transparent — a null background can still inherit an opaque
-      // theme colour on some devices; transparent is the safe punch.
-      walk.setBackgroundColor(0x00000000);
     }
   }
 
@@ -1503,6 +1606,10 @@ public final class WcDecoderBridge {
 
   private static synchronized void startCodecLocked() {
     if (started.get()) return;
+    // Feed-driven retries (submit() kicks a start on every AU while down) must
+    // not hammer a driver that just rejected the whole ladder — that storm is
+    // the "configure/start attempt N failed" wall in the 3.9.x journals.
+    if (lastStartFailAt != 0 && SystemClock.elapsedRealtime() - lastStartFailAt < 400) return;
     Surface s = surface;
     int w = width.get();
     int h = height.get();
@@ -1531,7 +1638,9 @@ public final class WcDecoderBridge {
     List<MediaFormat> attempts = buildFormatLadder(w, h, name);
     Exception lastEx = null;
     MediaCodec c = null;
-    for (int i = 0; i < attempts.size(); i++) {
+    // Async-error demotion: skip the rungs that already blew up at runtime.
+    int firstTry = Math.min(Math.max(0, fmtSkip.get()), attempts.size() - 1);
+    for (int i = firstTry; i < attempts.size(); i++) {
       MediaFormat fmt = attempts.get(i);
       try {
         c = createCodecByName(name);
@@ -1567,6 +1676,7 @@ public final class WcDecoderBridge {
         // which the JS poll surfaces as a "decoder error" toast even though the
         // codec is now running fine.
         lastError.set("");
+        lastStartFailAt = 0L;
         jlog(
             "MediaCodec started name="
                 + name
@@ -1593,6 +1703,7 @@ public final class WcDecoderBridge {
     }
     lastError.set(lastEx == null ? "all configure attempts failed" : String.valueOf(lastEx.getMessage()));
     lastProbeDetail.set("startCodec: all attempts failed (" + attempts.size() + ")");
+    lastStartFailAt = SystemClock.elapsedRealtime();
     jlog("all codec configure attempts failed: " + (lastEx == null ? "?" : lastEx.getMessage()));
   }
 
@@ -1663,9 +1774,12 @@ public final class WcDecoderBridge {
             frames.incrementAndGet();
             // Codec is producing frames → any prior error is stale. Clear it so
             // statsError() stops reporting a configure-time failure that the
-            // progressive ladder already recovered from.
+            // progressive ladder already recovered from. Also refund the
+            // error-restart budget: a decoder that recovers into real output
+            // should never age out of restarts over a long session.
             String le = lastError.get();
             if (le != null && !le.isEmpty()) lastError.set("");
+            if (errorRestarts.get() != 0) errorRestarts.set(0);
           } catch (Exception e) {
             lastError.set(String.valueOf(e.getMessage()));
           }
@@ -1677,16 +1791,54 @@ public final class WcDecoderBridge {
           awaitKey.set(true);
           csdQueued.set(false);
           jlog("codec onError: " + e.getDiagnosticInfo());
+          // This codec instance is dead — release it and start a fresh one,
+          // one rung further down the format ladder (see fmtSkip). Without
+          // this the bridge kept feeding a Released codec forever.
+          started.set(false);
+          fmtSkip.incrementAndGet();
+          int n = errorRestarts.incrementAndGet();
+          Activity act = activity();
+          if (act == null) return;
+          if (n > ERROR_RESTART_MAX) {
+            jlog("codec error-restart budget exhausted (" + ERROR_RESTART_MAX + ") — stopping (JS watchdog will fall back)");
+            act.runOnUiThread(WcDecoderBridge::stopCodecLocked);
+            return;
+          }
+          act.runOnUiThread(
+              () -> {
+                stopCodecLocked();
+                if (wanted.get() && surfaceReady.get() && width.get() > 0) startCodecLocked();
+              });
         }
 
         @Override
         public void onOutputFormatChanged(MediaCodec codec, MediaFormat format) {
           try {
-            if (format.containsKey(MediaFormat.KEY_WIDTH)) {
-              width.set(format.getInteger(MediaFormat.KEY_WIDTH));
+            // Prefer the crop rect: KEY_WIDTH/HEIGHT are the CODED size, which
+            // includes alignment padding (1080p decodes as 1088 rows on many
+            // drivers) — feeding that into the aspect math squeezes the picture.
+            int ow = format.containsKey(MediaFormat.KEY_WIDTH)
+                ? format.getInteger(MediaFormat.KEY_WIDTH)
+                : 0;
+            int oh = format.containsKey(MediaFormat.KEY_HEIGHT)
+                ? format.getInteger(MediaFormat.KEY_HEIGHT)
+                : 0;
+            if (format.containsKey("crop-left") && format.containsKey("crop-right")) {
+              ow = format.getInteger("crop-right") - format.getInteger("crop-left") + 1;
             }
-            if (format.containsKey(MediaFormat.KEY_HEIGHT)) {
-              height.set(format.getInteger(MediaFormat.KEY_HEIGHT));
+            if (format.containsKey("crop-top") && format.containsKey("crop-bottom")) {
+              oh = format.getInteger("crop-bottom") - format.getInteger("crop-top") + 1;
+            }
+            if (ow > 0) width.set(ow);
+            if (oh > 0) height.set(oh);
+            // The codec's true output size is authoritative for the contain-fit.
+            Activity act = activity();
+            if (act != null) {
+              act.runOnUiThread(
+                  () -> {
+                    TextureView sv = surfaceView;
+                    if (sv != null) applyContentTransform(sv, sv.getWidth(), sv.getHeight());
+                  });
             }
           } catch (Exception ignored) {
           }

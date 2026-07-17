@@ -56,6 +56,11 @@ pub async fn decoder_init(width: i32, height: i32) -> Result<(), String> {
         .map_err(|e| format!("decoder_init panicked: {e}"))?
 }
 
+/// `seq` is a monotonically increasing counter from JS. Each call here is its
+/// own `spawn_blocking` task, so bursts (a bounds update per animation frame
+/// during pinch-zoom) can reach the Java UI thread out of order — the bridge
+/// drops any update whose `seq` is older than the newest applied. 0 = no
+/// ordering (always applied).
 #[tauri::command]
 pub async fn decoder_set_bounds(
     x: f64,
@@ -63,8 +68,9 @@ pub async fn decoder_set_bounds(
     w: f64,
     h: f64,
     visible: bool,
+    seq: u64,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || decoder_set_bounds_impl(x, y, w, h, visible))
+    tauri::async_runtime::spawn_blocking(move || decoder_set_bounds_impl(x, y, w, h, visible, seq))
         .await
         .map_err(|e| format!("decoder_set_bounds panicked: {e}"))?
 }
@@ -266,18 +272,19 @@ mod android {
         })
     }
 
-    pub fn set_bounds(x: f64, y: f64, w: f64, h: f64, visible: bool) -> Result<(), String> {
+    pub fn set_bounds(x: f64, y: f64, w: f64, h: f64, visible: bool, seq: u64) -> Result<(), String> {
         with_bridge(|env, class| {
             env.call_static_method(
                 &class,
                 "setBounds",
-                "(DDDDZ)V",
+                "(DDDDZJ)V",
                 &[
                     JValue::Double(x),
                     JValue::Double(y),
                     JValue::Double(w),
                     JValue::Double(h),
                     JValue::Bool(u8::from(visible)),
+                    JValue::Long(seq as i64),
                 ],
             )
             .map_err(|e| format!("setBounds: {e}"))?;
@@ -412,8 +419,15 @@ fn decoder_init_impl(width: i32, height: i32) -> Result<(), String> {
     android::init(width, height)
 }
 #[cfg(target_os = "android")]
-fn decoder_set_bounds_impl(x: f64, y: f64, w: f64, h: f64, visible: bool) -> Result<(), String> {
-    android::set_bounds(x, y, w, h, visible)
+fn decoder_set_bounds_impl(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    visible: bool,
+    seq: u64,
+) -> Result<(), String> {
+    android::set_bounds(x, y, w, h, visible, seq)
 }
 #[cfg(target_os = "android")]
 fn decoder_reset_impl() -> Result<(), String> {
@@ -456,6 +470,7 @@ fn decoder_set_bounds_impl(
     _w: f64,
     _h: f64,
     _visible: bool,
+    _seq: u64,
 ) -> Result<(), String> {
     Ok(())
 }

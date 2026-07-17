@@ -37,7 +37,13 @@ export type ControlMsg =
       rt: number;
     }
   | { type: "gamepadprobe" }
-  | { type: "gamepadstop" };
+  | { type: "gamepadstop" }
+  /** Apply several events atomically, in order, on the PC. Multi-part chords
+   *  (Ctrl+C = keydown → key → keyup) must ride ONE wire message: on the host
+   *  each message becomes its own async `remote_inject` invoke, and separate
+   *  invokes carry no ordering guarantee — the keyup sometimes landed before
+   *  the key, typing a bare "c" after Ctrl was already released. */
+  | { type: "seq"; events: ControlMsg[] };
 
 /** Content-optimization mode: tune the pipeline for crisp text or smooth video. */
 export type ContentMode = "auto" | "text" | "video";

@@ -48,6 +48,12 @@ pub enum ControlEvent {
     Gamepad(crate::remote::gamepad::GamepadState),
     /// Release the virtual controller to neutral and unplug it.
     Gamepadstop,
+    /// Apply several events atomically, in order. Multi-part gestures (Ctrl+C =
+    /// keydown ctrl → key c → keyup ctrl) used to arrive as separate Tauri
+    /// invokes, and invoke dispatch does not guarantee ordering — sometimes the
+    /// keyup landed before the key and the PC saw a bare "c" typed after Ctrl
+    /// was released. One wire message can't be reordered against itself.
+    Seq { events: Vec<ControlEvent> },
 }
 
 fn button_for(name: &Option<String>) -> Button {
@@ -276,6 +282,12 @@ impl Controller {
             }
             ControlEvent::Gamepadstop => {
                 crate::remote::gamepad::stop();
+                Ok(())
+            }
+            ControlEvent::Seq { events } => {
+                for e in events {
+                    self.apply(e);
+                }
                 Ok(())
             }
         };
