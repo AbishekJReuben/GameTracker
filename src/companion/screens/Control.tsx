@@ -5029,11 +5029,11 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound (lean ~30ms). RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
   "A-codec": {
     long: "DIRECT audio wire format",
-    info: "Opus (~128kbps) is what you want. PCM f32 is the uncompressed fallback at ~3.1Mbps — 24× more data, enough to back the channel up and make the sound robotic. It's used when the PC's capture rate isn't one Opus supports (not 48/24/16/12/8kHz), when this device can't decode Opus, or when the encoder faulted mid-session.",
+    info: "Opus (~128kbps) is what you want. PCM f32 is the uncompressed fallback at ~3.1Mbps — enough to back the channel up and make the sound robotic. The host now resamples odd capture rates (e.g. 44.1k) to 48k so Opus stays on; f32 only means this device can't decode Opus or the encoder faulted mid-session.",
   },
   "A-loss": {
     long: "Opus packets lost",
-    info: "Audio rides an unreliable channel on purpose — a lost packet is skipped instead of stalling everything behind it, and Opus in-band FEC reconstructs most of them inaudibly. A slow climb under load is normal and healthy; a fast one means the link is genuinely saturated.",
+    info: "Audio rides an unreliable channel on purpose — a lost packet is skipped instead of stalling everything behind it. WebCodecs can't use Opus in-band FEC, so gaps are filled with a short hold on the phone. A slow climb under load is normal; a fast one means the link is saturated.",
   },
   "A-drop": {
     long: "Audio chunks dropped by the PC",

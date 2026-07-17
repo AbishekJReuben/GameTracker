@@ -124,10 +124,10 @@ class GtPcmFeeder extends AudioWorkletProcessor {
   }
 
   /**
-   * Synthesize `gapMs` of filler (capped at 60ms) from a decaying hold of the
-   * last buffered sample, with a soft attack so the leading seam doesn't click.
-   * Unlike a fade-to-silence hole, this keeps buffer level up so one loss
-   * doesn't cascade into an underrun.
+   * Synthesize `gapMs` of filler (capped at 60ms) from a hold of the last
+   * buffered sample, with a soft attack so the leading seam doesn't click.
+   * Keep gain near full — the old decaying hold (0.85→0.5) pumped amplitude on
+   * every lost Opus frame and read as robotic chop under video load.
    */
   conceal(gapMs) {
     if (this.priming || this.avail < this.channels || !(gapMs > 0)) return;
@@ -140,10 +140,8 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     const fill = new Float32Array(frames * ch);
     const attack = Math.min(48, frames);
     for (let i = 0; i < frames; i++) {
-      // Soft attack, then gentle decay — never reaches 0 before the next packet
-      // is expected (gap is typically one 20ms Opus frame).
       const a = i < attack ? i / attack : 1;
-      const g = a * (0.85 - 0.35 * (i / frames));
+      const g = a * 0.97; // soft attack, then near-full hold (no decay pump)
       for (let c = 0; c < ch; c++) fill[i * ch + c] = tail[c] * g;
     }
     this.chunks.push(fill);

@@ -89,6 +89,14 @@ export type ConnectDetail = {
   lastEventAgoMs: number;
 };
 
+/** One step in the connect journal (t = ms since this connect attempt started). */
+export type ConnectHistEntry = {
+  t: number;
+  phase: ConnectPhase;
+  job: string;
+  event?: string;
+};
+
 export type ConnectSnapshot = {
   phase: ConnectPhase;
   status: Status;
@@ -97,7 +105,38 @@ export type ConnectSnapshot = {
   iceState?: RTCIceConnectionState;
   job: string;
   detail: ConnectDetail;
+  /** Phase / event trail for stuck-connect debugging (copy-to-clipboard). */
+  history: ConnectHistEntry[];
 };
+
+/** Format a connect snapshot (+ history) for clipboard paste when stuck. */
+export function formatConnectDiag(snapshot: ConnectSnapshot): string {
+  const d = snapshot.detail;
+  const lines = [
+    `GameTracker connect diag @ ${new Date().toISOString()}`,
+    `ua: ${typeof navigator !== "undefined" ? navigator.userAgent : "?"}`,
+    `phase=${snapshot.phase} status=${snapshot.status} attempt=${snapshot.attempt} backoffMs=${snapshot.backoffMs}`,
+    `job: ${snapshot.job}`,
+    d
+      ? [
+          `sig=${d.sig} pc=${d.pc} ice=${d.ice} gather=${d.gather} sdp=${d.sdp}`,
+          `channels c/d/v=${d.chCtl}/${d.chData}/${d.chVid}`,
+          `offers=${d.offers} candIn=${d.candIn} phaseMs=${d.phaseMs}`,
+          `auth=${d.authState} sent×${d.authSent} ageMs=${d.authAgeMs} secret=${d.hasSecret} sid=${d.sid ?? "—"}`,
+          `lastEvent: ${d.lastEvent} (${d.lastEventAgoMs}ms ago)`,
+        ].join("\n")
+      : "(no detail)",
+    "",
+    `=== phase history (last ${snapshot.history?.length ?? 0}, t=ms since connect) ===`,
+    ...(snapshot.history?.length
+      ? snapshot.history.map(
+          (h) =>
+            `+${(h.t / 1000).toFixed(3)}s [${h.phase}]${h.event ? ` ${h.event}` : ""} — ${h.job}`,
+        )
+      : ["(empty)"]),
+  ];
+  return lines.join("\n");
+}
 
 /** Identity + optional secret key the host uses to authorize this device. */
 export interface AuthInfo {
@@ -453,6 +492,9 @@ export class CloudConn {
   private authStallSince = 0;
   private lastEvent = "created";
   private lastEventAt = Date.now();
+  /** Connect attempt journal — phase changes + notable events for copy-diag. */
+  private connectHist: ConnectHistEntry[] = [];
+  private connectHistOrigin = 0;
   /** 1s UI ticker so phase age / channel states stay live while connecting. */
   private progressTickTimer: number | null = null;
   /** Drop WebCodecs while Quest ImmersiveScreen needs the RTC `<video>` track. */
@@ -462,6 +504,24 @@ export class CloudConn {
   private noteEvent(what: string) {
     this.lastEvent = what;
     this.lastEventAt = Date.now();
+    this.pushConnectHist(undefined, what);
+  }
+
+  private pushConnectHist(phase?: ConnectPhase, event?: string) {
+    if (!this.connectHistOrigin) this.connectHistOrigin = Date.now();
+    this.connectHist.push({
+      t: Date.now() - this.connectHistOrigin,
+      phase: phase ?? this.progressPhase,
+      job: this.progressJob,
+      event,
+    });
+    while (this.connectHist.length > 100) this.connectHist.shift();
+  }
+
+  private resetConnectHist(note: string) {
+    this.connectHist = [];
+    this.connectHistOrigin = Date.now();
+    this.pushConnectHist(this.progressPhase, note);
   }
 
   constructor(
@@ -636,13 +696,16 @@ export class CloudConn {
         lastEvent: this.lastEvent,
         lastEventAgoMs: now - this.lastEventAt,
       },
+      history: this.connectHist.slice(),
     };
   }
 
   private setProgress(phase: ConnectPhase, job: string) {
-    if (phase !== this.progressPhase) this.phaseChangedAt = Date.now();
+    const changed = phase !== this.progressPhase;
+    if (changed) this.phaseChangedAt = Date.now();
     this.progressPhase = phase;
     this.progressJob = job;
+    if (changed) this.pushConnectHist(phase);
     this.emitProgress();
   }
 
@@ -700,6 +763,7 @@ export class CloudConn {
     this.closed = false;
     this.denied = false;
     this.reconnectAttempt = 0;
+    this.resetConnectHist("connect() start");
     this.setProgress("idle", "Starting connection…");
     this.startWatchdog();
     this.startProgressTicker();

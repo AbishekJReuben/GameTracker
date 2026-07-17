@@ -155,12 +155,42 @@ const AUDIO_OPUS_BPS = 128_000;
 const AUDIO_OPUS_FRAME_US = 20_000;
 /** Sample rates libopus encodes natively. Chromium won't resample into the
  *  encoder and a decoder config must name one of these too, so a capture at any
- *  other rate (rare — WASAPI shared mode is 48k almost everywhere) uses raw PCM. */
+ *  other rate (common: WASAPI 44.1k) used to fall back to raw f32 (~3.1 Mbps)
+ *  and recreate the backlog→burst robotic path. We now resample TO 48k before
+ *  Opus so DIRECT stays compressed regardless of the endpoint mix rate. */
 const AUDIO_OPUS_RATES = [8000, 12000, 16000, 24000, 48000];
+/** Wire rate for DIRECT Opus when capture isn't Opus-native (e.g. 44.1k → 48k). */
+const AUDIO_OPUS_WIRE_RATE = 48000;
 /** Never leave more than this much wall-clock audio queued in the channel.
  *  SCTP has no "drop the stale stuff" knob, so refusing to enqueue is the only
  *  backpressure available — and stale audio is worthless by definition. */
 const AUDIO_MAX_BUF_MS = 250;
+
+/** Linear resample interleaved float32 PCM (ch channels) from srcRate → dstRate. */
+function resampleInterleavedF32(
+  src: Float32Array,
+  channels: number,
+  srcRate: number,
+  dstRate: number,
+): Float32Array {
+  if (srcRate === dstRate || src.length < channels) return src;
+  const srcFrames = Math.floor(src.length / channels);
+  const dstFrames = Math.max(1, Math.round((srcFrames * dstRate) / srcRate));
+  const out = new Float32Array(dstFrames * channels);
+  const step = srcRate / dstRate;
+  for (let i = 0; i < dstFrames; i++) {
+    const srcPos = i * step;
+    const i0 = Math.min(srcFrames - 1, Math.floor(srcPos));
+    const i1 = Math.min(srcFrames - 1, i0 + 1);
+    const frac = srcPos - i0;
+    for (let c = 0; c < channels; c++) {
+      const a = src[i0 * channels + c] || 0;
+      const b = src[i1 * channels + c] || 0;
+      out[i * channels + c] = a + (b - a) * frac;
+    }
+  }
+  return out;
+}
 
 const CONTENT_NUM: Record<string, number> = { auto: 0, text: 1, video: 2 };
 /** Video-track content hint + bitrate-degradation preference per content mode. */
@@ -1135,6 +1165,9 @@ export function startHost(opts: HostOptions): () => void {
      *  encoder wasn't built for is garbage, so this forces a rebuild. */
     let audioEncRate = 0;
     let audioEncCh = 0;
+    /** Capture rate feeding the encoder — may differ from audioEncRate when we
+     *  resample 44.1k (etc.) up to 48k for Opus. 0 = no resample. */
+    let audioSrcRate = 0;
     let audioSeq = 0;
     let audioTsUs = 0;
     /** Chunks refused because the channel was already full (HUD "A-drop"). */
@@ -1205,6 +1238,7 @@ export function startHost(opts: HostOptions): () => void {
       audioEnc = null;
       audioEncRate = 0;
       audioEncCh = 0;
+      audioSrcRate = 0;
       if (!enc) return;
       try {
         if (enc.state !== "closed") enc.close();
@@ -1222,13 +1256,15 @@ export function startHost(opts: HostOptions): () => void {
       startCfgBurst();
     };
 
-    /** Build the Opus encoder for the live capture format. Null ⇒ use raw PCM. */
-    const buildOpusEncoder = async (rate: number, channels: number): Promise<AudioEncoder | null> => {
+    /** Build the Opus encoder. Always at an Opus-native rate — non-native capture
+     *  (44.1k) is resampled in encodeDirectAudio so we never fall back to the
+     *  ~3.1 Mbps raw path that caused robotic DIRECT. */
+    const buildOpusEncoder = async (wireRate: number, channels: number): Promise<AudioEncoder | null> => {
       if (typeof AudioEncoder === "undefined" || typeof AudioData === "undefined") return null;
-      if (!AUDIO_OPUS_RATES.includes(rate)) return null;
+      if (!AUDIO_OPUS_RATES.includes(wireRate)) return null;
       const cfg = {
         codec: "opus",
-        sampleRate: rate,
+        sampleRate: wireRate,
         numberOfChannels: channels,
         bitrate: AUDIO_OPUS_BPS,
         opus: {
@@ -1268,23 +1304,25 @@ export function startHost(opts: HostOptions): () => void {
       const enc = audioEnc;
       const fmt = liveFmt;
       if (!enc || !fmt || enc.state !== "configured") return false;
-      // The capture format moved out from under the encoder (device change) —
-      // degrade to raw rather than encode AudioData it wasn't built for. The
-      // next `start()` re-negotiates Opus at the new rate.
-      if (fmt.sampleRate !== audioEncRate || fmt.channels !== audioEncCh) return false;
-      const src = new Float32Array(ab);
-      const frames = Math.floor(src.length / fmt.channels);
-      if (frames <= 0) return true; // empty chunk — nothing to do, stay on Opus
+      // Capture format moved — degrade; next start() re-negotiates.
+      if (fmt.sampleRate !== audioSrcRate || fmt.channels !== audioEncCh) return false;
+      let src = new Float32Array(ab);
+      const ch = fmt.channels;
+      if (audioSrcRate !== audioEncRate) {
+        src = new Float32Array(resampleInterleavedF32(src, ch, audioSrcRate, audioEncRate));
+      }
+      const frames = Math.floor(src.length / ch);
+      if (frames <= 0) return true;
       try {
         const ad = new AudioData({
-          format: "f32", // Rust ships interleaved float32
-          sampleRate: fmt.sampleRate,
+          format: "f32",
+          sampleRate: audioEncRate,
           numberOfFrames: frames,
-          numberOfChannels: fmt.channels,
+          numberOfChannels: ch,
           timestamp: audioTsUs,
-          data: src.subarray(0, frames * fmt.channels),
+          data: src.subarray(0, frames * ch),
         });
-        audioTsUs += Math.round((frames * 1_000_000) / fmt.sampleRate);
+        audioTsUs += Math.round((frames * 1_000_000) / audioEncRate);
         enc.encode(ad);
         ad.close();
         return true;
@@ -1303,30 +1341,42 @@ export function startHost(opts: HostOptions): () => void {
       guestAudioCodecs = codecs;
       const fmt = liveFmt;
       if (!codecs.includes("opus") || !fmt) {
-        // No Opus (or the capture format isn't known yet — `start()` re-runs us).
         closeAudioEncoder();
         audioCodec = "f32";
         return audioCodec;
       }
-      // Already encoding this exact format — nothing to do.
-      if (audioEnc && audioCodec === "opus" && audioEncRate === fmt.sampleRate && audioEncCh === fmt.channels) {
+      // Wire at capture rate when Opus-native; otherwise resample to 48k.
+      const wireRate = AUDIO_OPUS_RATES.includes(fmt.sampleRate)
+        ? fmt.sampleRate
+        : AUDIO_OPUS_WIRE_RATE;
+      // Already encoding this exact capture→wire mapping — nothing to do.
+      if (
+        audioEnc &&
+        audioCodec === "opus" &&
+        audioSrcRate === fmt.sampleRate &&
+        audioEncRate === wireRate &&
+        audioEncCh === fmt.channels
+      ) {
         return audioCodec;
       }
-      const enc = await buildOpusEncoder(fmt.sampleRate, fmt.channels);
+      const enc = await buildOpusEncoder(wireRate, fmt.channels);
       closeAudioEncoder();
       if (!enc) {
         audioCodec = "f32";
         return audioCodec;
       }
       audioEnc = enc;
-      audioEncRate = fmt.sampleRate;
+      audioSrcRate = fmt.sampleRate;
+      audioEncRate = wireRate;
       audioEncCh = fmt.channels;
       audioSeq = 0;
       audioTsUs = 0;
       audioCodec = "opus";
+      const resampleNote =
+        wireRate !== fmt.sampleRate ? ` (resample ${fmt.sampleRate}→${wireRate}Hz)` : "";
       console.info(
         `[remote] DIRECT audio via Opus @ ${Math.round(AUDIO_OPUS_BPS / 1000)}kbps ` +
-          `(${fmt.sampleRate}Hz ×${fmt.channels}) — was ${Math.round((fmt.sampleRate * fmt.channels * 4 * 8) / 1000)}kbps raw`,
+          `(${wireRate}Hz ×${fmt.channels})${resampleNote} — was ${Math.round((fmt.sampleRate * fmt.channels * 4 * 8) / 1000)}kbps raw`,
       );
       return audioCodec;
     };
@@ -1351,9 +1401,12 @@ export function startHost(opts: HostOptions): () => void {
         return;
       }
       try {
+        // Announce the WIRE rate the guest must decode/play — after Opus resample
+        // that may be 48k even when WASAPI captured at 44.1k.
+        const rate = audioCodec === "opus" && audioEncRate > 0 ? audioEncRate : liveFmt.sampleRate;
         directSink.send(
           JSON.stringify({
-            cfg: { sampleRate: liveFmt.sampleRate, channels: liveFmt.channels, codec: audioCodec },
+            cfg: { sampleRate: rate, channels: liveFmt.channels, codec: audioCodec },
           }),
         );
       } catch {
@@ -1429,6 +1482,7 @@ export function startHost(opts: HostOptions): () => void {
           audioCodec = "f32";
           audioSeq = 0;
           audioTsUs = 0;
+          audioSrcRate = 0;
         }
       },
       setDirectCodec,

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { Check, ChevronDown, ChevronUp, Loader2, RotateCcw, Wrench } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, Copy, Loader2, RotateCcw, Wrench } from "lucide-react";
 import type { ConnectDetail, ConnectPhase, ConnectSnapshot } from "./cloud";
+import { formatConnectDiag } from "./cloud";
 import { resetStreamTune } from "./streamTune";
 
 const STEPS: { id: ConnectPhase; label: string }[] = [
@@ -75,6 +76,27 @@ function fmtAge(ms: number): string {
   return `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`;
 }
 
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
 function DiagRow({ k, v, warn }: { k: string; v: string; warn?: boolean }) {
   return (
     <div className="flex items-baseline justify-between gap-2">
@@ -90,7 +112,15 @@ function DiagRow({ k, v, warn }: { k: string; v: string; warn?: boolean }) {
  * layer is wedged (signaling socket vs ICE vs data channels vs auth handshake).
  * Collapsed by default; auto-expands once the current stage has stalled.
  */
-function DiagPanel({ snapshot }: { snapshot: ConnectSnapshot }) {
+function DiagPanel({
+  snapshot,
+  copied,
+  onCopy,
+}: {
+  snapshot: ConnectSnapshot;
+  copied: boolean;
+  onCopy: () => void;
+}) {
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
   const d = snapshot.detail;
   if (!d) return null;
@@ -98,17 +128,30 @@ function DiagPanel({ snapshot }: { snapshot: ConnectSnapshot }) {
   const open = userToggle ?? stalled;
   return (
     <div className="mt-3">
-      <button
-        type="button"
-        onClick={() => setUserToggle(!open)}
-        className="flex w-full items-center justify-between rounded-lg px-1 py-1 text-[11px] font-700 text-ink-faint"
-      >
-        <span className="flex items-center gap-1.5">
-          <Wrench className="h-3 w-3" /> Diagnostics
-          {stalled && !open && <span className="rounded bg-amber/20 px-1 py-0.5 text-[9px] text-amber">stalling</span>}
-        </span>
-        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-      </button>
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => setUserToggle(!open)}
+          className="flex min-w-0 flex-1 items-center justify-between rounded-lg px-1 py-1 text-[11px] font-700 text-ink-faint"
+        >
+          <span className="flex items-center gap-1.5">
+            <Wrench className="h-3 w-3" /> Diagnostics
+            {stalled && !open && <span className="rounded bg-amber/20 px-1 py-0.5 text-[9px] text-amber">stalling</span>}
+          </span>
+          {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+        </button>
+        <button
+          type="button"
+          onClick={onCopy}
+          title="Copy connection log (phases, ICE, auth, history)"
+          className={`flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[9px] font-800 ${
+            copied ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+          }`}
+        >
+          <Copy className="h-3 w-3" />
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
       {open && (
         <div className="mt-1 space-y-1 rounded-xl border border-line bg-white/[0.03] px-2.5 py-2 text-[10px] leading-snug">
           <DiagRow k="Stage" v={`${snapshot.phase} · ${fmtAge(d.phaseMs)}`} warn={stalled} />
@@ -129,6 +172,9 @@ function DiagPanel({ snapshot }: { snapshot: ConnectSnapshot }) {
           <DiagRow k="Permanent key" v={d.hasSecret ? "saved" : "none"} />
           {d.sid && <DiagRow k="Session" v={d.sid} />}
           <DiagRow k="Last event" v={`${d.lastEvent} · ${fmtAge(d.lastEventAgoMs)} ago`} />
+          {(snapshot.history?.length ?? 0) > 0 && (
+            <DiagRow k="History" v={`${snapshot.history.length} steps (in Copy)`} />
+          )}
         </div>
       )}
     </div>
@@ -148,6 +194,7 @@ export function ConnectionProgress({
   onResetDefaults?: () => void;
 }) {
   const [countdown, setCountdown] = useState(snapshot.backoffMs);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     setCountdown(snapshot.backoffMs);
@@ -166,6 +213,12 @@ export function ConnectionProgress({
   const handleReset = () => {
     resetStreamTune();
     onResetDefaults?.();
+  };
+  const handleCopy = () => {
+    void copyText(formatConnectDiag(snapshot)).then((ok) => {
+      setCopied(ok);
+      window.setTimeout(() => setCopied(false), 1500);
+    });
   };
 
   if (compact) {
@@ -210,15 +263,27 @@ export function ConnectionProgress({
             {snapshot.detail.authSent > 1 ? `×${snapshot.detail.authSent}` : ""} · {fmtAge(snapshot.detail.phaseMs)}
           </div>
         )}
-        {stalled && (
+        <div className="flex flex-wrap items-center justify-center gap-1.5 pt-0.5">
           <button
             type="button"
-            onClick={handleReset}
-            className="mt-0.5 flex items-center gap-1 rounded-full bg-white/10 px-2.5 py-1 text-[10px] font-700 text-white/90"
+            onClick={handleCopy}
+            className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-700 ${
+              copied ? "bg-emerald-500/30 text-emerald-100" : "bg-white/10 text-white/90"
+            }`}
           >
-            <RotateCcw className="h-3 w-3" /> Reset stream defaults
+            <Copy className="h-3 w-3" />
+            {copied ? "Copied" : "Copy connect log"}
           </button>
-        )}
+          {stalled && (
+            <button
+              type="button"
+              onClick={handleReset}
+              className="flex items-center gap-1 rounded-full bg-white/10 px-2.5 py-1 text-[10px] font-700 text-white/90"
+            >
+              <RotateCcw className="h-3 w-3" /> Reset stream defaults
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -231,7 +296,18 @@ export function ConnectionProgress({
         ) : (
           <Loader2 className="h-4 w-4 animate-spin text-accent-3" />
         )}
-        <span className="font-600 text-ink-soft">{snapshot.job}</span>
+        <span className="min-w-0 flex-1 font-600 text-ink-soft">{snapshot.job}</span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          title="Copy connection log (phases, ICE, auth, history)"
+          className={`flex h-7 shrink-0 items-center gap-1 rounded-lg px-2 text-[10px] font-800 ${
+            copied ? "bg-green/25 text-green" : "bg-white/[0.06] text-ink-dim"
+          }`}
+        >
+          <Copy className="h-3 w-3" />
+          {copied ? "Copied" : "Copy log"}
+        </button>
       </div>
 
       {snapshot.phase === "reconnecting" && snapshot.attempt > 0 && (
@@ -291,7 +367,7 @@ export function ConnectionProgress({
         </ol>
       )}
 
-      <DiagPanel snapshot={snapshot} />
+      <DiagPanel snapshot={snapshot} copied={copied} onCopy={handleCopy} />
 
       {stalled && (
         <button
