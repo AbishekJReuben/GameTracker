@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 
-import { AUDIO_HDR_BYTES, audioPacket, audioSeqGap, audioSeqOf, isOpusPacket } from "./audioWire";
+import {
+  AUDIO_HDR_BYTES,
+  StreamingAudioResampler,
+  audioPacket,
+  audioSeqGap,
+  audioSeqOf,
+  isOpusPacket,
+} from "./audioWire";
 
 /** A framed Opus packet with `payload` bytes after the header. */
 function framed(seq: number, payload: number[]): ArrayBuffer {
@@ -71,5 +78,21 @@ describe("audioWire", () => {
       expect(audioSeqGap(50_000, 0)).toBe(0);
       expect(audioSeqGap(50_000, 1)).toBe(0);
     });
+  });
+
+  it("keeps resample phase continuous across capture packet boundaries", () => {
+    const src = Float32Array.from({ length: 441 }, (_, i) => Math.sin((i * Math.PI) / 31));
+    const whole = new StreamingAudioResampler(1, 44100, 48000).process(src);
+    const splitResampler = new StreamingAudioResampler(1, 44100, 48000);
+    const a = splitResampler.process(src.subarray(0, 200));
+    const b = splitResampler.process(src.subarray(200));
+    const split = new Float32Array(a.length + b.length);
+    split.set(a);
+    split.set(b, a.length);
+
+    expect(split.length).toBe(whole.length);
+    for (let i = 0; i < whole.length; i++) {
+      expect(split[i]).toBeCloseTo(whole[i], 5);
+    }
   });
 });

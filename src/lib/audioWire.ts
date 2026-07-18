@@ -75,3 +75,55 @@ export function audioSeqGap(prev: number, seq: number, maxGap = 1000): number {
   const gap = (seq - prev - 1) >>> 0;
   return gap > 0 && gap < maxGap ? gap : 0;
 }
+
+/**
+ * Stateful linear resampler for interleaved PCM. Keeping the fractional source
+ * position and the prior tail across WASAPI packets avoids a discontinuity at
+ * every chunk boundary (the old one-shot resampler restarted at phase zero).
+ */
+export class StreamingAudioResampler {
+  private pos = 0;
+  private tail: Float32Array | null = null;
+
+  constructor(
+    private readonly channels: number,
+    private readonly srcRate: number,
+    private readonly dstRate: number,
+  ) {}
+
+  process(src: Float32Array<ArrayBuffer>): Float32Array<ArrayBuffer> {
+    const ch = this.channels;
+    const srcFrames = Math.floor(src.length / ch);
+    if (ch < 1 || srcFrames < 1 || this.srcRate === this.dstRate) return src;
+
+    const prefix = this.tail ? 1 : 0;
+    const frames = srcFrames + prefix;
+    if (frames < 2) {
+      this.tail = src.slice(0, ch);
+      return new Float32Array(0);
+    }
+
+    const sample = (frame: number, channel: number) => {
+      if (prefix && frame === 0) return this.tail![channel] || 0;
+      return src[(frame - prefix) * ch + channel] || 0;
+    };
+    const step = this.srcRate / this.dstRate;
+    const outFrames = Math.max(0, Math.ceil((frames - 1 - this.pos) / step));
+    const out = new Float32Array(outFrames * ch);
+    let written = 0;
+    while (this.pos < frames - 1) {
+      const i0 = Math.floor(this.pos);
+      const frac = this.pos - i0;
+      for (let c = 0; c < ch; c++) {
+        const a = sample(i0, c);
+        const b = sample(i0 + 1, c);
+        out[written * ch + c] = a + (b - a) * frac;
+      }
+      written++;
+      this.pos += step;
+    }
+    this.pos -= frames - 1;
+    this.tail = src.slice((srcFrames - 1) * ch, srcFrames * ch);
+    return written === outFrames ? out : out.slice(0, written * ch);
+  }
+}

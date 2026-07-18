@@ -62,8 +62,13 @@ type SignalMsg =
   // renegotiation of the *current* session (apply in place, keep auth+decoder)
   // apart from a brand-new session (full rebuild). Absent on legacy hosts.
   | { type: "offer"; sdp: string; sid?: string }
-  | { type: "answer"; sdp: string }
-  | { type: "candidate"; candidate: RTCIceCandidateInit }
+  | { type: "answer"; sdp: string; sid?: string }
+  | { type: "candidate"; candidate: RTCIceCandidateInit; sid?: string }
+  // A fresh guest signaling incarnation asks the host for an offer explicitly.
+  // Unlike peer-joined, this is never echoed by the server when only the host
+  // socket reconnects, so it distinguishes a new phone peer from a healthy
+  // session that merely survived a signaling blip.
+  | { type: "ready"; nonce: string }
   | { type: "ping" };
 
 /** Thin wrapper over the signaling WebSocket for one room. */
@@ -156,8 +161,8 @@ export class Signaling {
 }
 
 /** Wire a peer connection's ICE candidates out through signaling. */
-export function pipeIce(pc: RTCPeerConnection, sig: Signaling) {
+export function pipeIce(pc: RTCPeerConnection, sig: Signaling, sid?: string) {
   pc.onicecandidate = (e) => {
-    if (e.candidate) sig.send({ type: "candidate", candidate: e.candidate.toJSON() });
+    if (e.candidate) sig.send({ type: "candidate", candidate: e.candidate.toJSON(), sid });
   };
 }

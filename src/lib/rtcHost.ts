@@ -15,7 +15,7 @@ import { Channel } from "@tauri-apps/api/core";
 import { api, type RemoteCaptureStats } from "./api";
 import { Signaling, defaultIceServers, pipeIce, type IceServer } from "./rtc";
 import { auxMonitorRoom } from "./remoteConfig";
-import { AUDIO_HDR_BYTES, audioPacket } from "./audioWire";
+import { AUDIO_HDR_BYTES, StreamingAudioResampler, audioPacket } from "./audioWire";
 // Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
 import audioFeederWorkletUrl from "./audioFeeder.worklet.js?url";
 
@@ -165,32 +165,6 @@ const AUDIO_OPUS_WIRE_RATE = 48000;
  *  SCTP has no "drop the stale stuff" knob, so refusing to enqueue is the only
  *  backpressure available — and stale audio is worthless by definition. */
 const AUDIO_MAX_BUF_MS = 250;
-
-/** Linear resample interleaved float32 PCM (ch channels) from srcRate → dstRate. */
-function resampleInterleavedF32(
-  src: Float32Array,
-  channels: number,
-  srcRate: number,
-  dstRate: number,
-): Float32Array {
-  if (srcRate === dstRate || src.length < channels) return src;
-  const srcFrames = Math.floor(src.length / channels);
-  const dstFrames = Math.max(1, Math.round((srcFrames * dstRate) / srcRate));
-  const out = new Float32Array(dstFrames * channels);
-  const step = srcRate / dstRate;
-  for (let i = 0; i < dstFrames; i++) {
-    const srcPos = i * step;
-    const i0 = Math.min(srcFrames - 1, Math.floor(srcPos));
-    const i1 = Math.min(srcFrames - 1, i0 + 1);
-    const frac = srcPos - i0;
-    for (let c = 0; c < channels; c++) {
-      const a = src[i0 * channels + c] || 0;
-      const b = src[i1 * channels + c] || 0;
-      out[i * channels + c] = a + (b - a) * frac;
-    }
-  }
-  return out;
-}
 
 const CONTENT_NUM: Record<string, number> = { auto: 0, text: 1, video: 2 };
 /** Video-track content hint + bitrate-degradation preference per content mode. */
@@ -480,6 +454,12 @@ export function startHost(opts: HostOptions): () => void {
    * NOT set this (no peer-left), so healthy sessions survive our own socket blips.
    */
   let guestNeedsOffer = true;
+  let activeSessionId: string | undefined;
+  let peerStartPending = false;
+  let lastOfferSentAt = 0;
+  let lastGuestJoinNonce = "";
+  /** Guest trickle candidates may beat its answer; queue until SDP is installed. */
+  let pendingGuestCandidates: { candidate: RTCIceCandidateInit; sid?: string }[] = [];
   /** Pop-out monitor hosts spawned from the primary (monitor index → stop). */
   const auxStops = new Map<number, () => void>();
 
@@ -504,7 +484,7 @@ export function startHost(opts: HostOptions): () => void {
   const quality = {
     maxW: 1600,
     jpeg: 70,
-    fps: opts.fps ?? 30,
+    fps: opts.fps ?? 60,
     mode: "auto" as string,
     bitrate: 0,
     jpegCap: 72,
@@ -545,7 +525,7 @@ export function startHost(opts: HostOptions): () => void {
   // back toward the Tune target when the channel drains. VIDEO ONLY — never touches
   // input. `adaptKbps` is what Rust actually encodes at; `quality.bitrate` is the cap.
   let adaptKbps = 0;
-  let adaptCleanTicks = 0;
+  let adaptCleanSince = 0;
   let lastAdaptPush = 0;
 
   /** Target ceiling from the Tune panel (or auto curve). */
@@ -672,7 +652,7 @@ export function startHost(opts: HostOptions): () => void {
       }
       // One cut per half-second — stacked in-flight frames must not compound.
       if (now - lastShedAt < 500) {
-        adaptCleanTicks = 0;
+        adaptCleanSince = 0;
         return;
       }
       lastShedAt = now;
@@ -687,32 +667,35 @@ export function startHost(opts: HostOptions): () => void {
         );
       }
       adaptKbps = next;
-      adaptCleanTicks = 0;
+      adaptCleanSince = 0;
       pushAdaptBitrate();
     } else if (fill < 0.12 && buffered < congestionBytes() && now - lastSkipAt > 2000) {
-      adaptCleanTicks++;
-      // Climb back: brisk when far below target, moderate under a known ceiling,
-      // crawl only when probing just above the last hard-drop rate.
-      if (adaptCleanTicks >= 2 && adaptKbps < tgt) {
+      if (adaptCleanSince === 0) adaptCleanSince = now;
+      // Buffer callbacks run once per frame. The old "two clean ticks" ramp was
+      // therefore 33ms at 60fps and jumped 11→16 Mbps in under a second, straight
+      // back into pause. Make recovery wall-clock based so every target fps
+      // converges at the same deliberate rate.
+      const farBelow = adaptKbps < tgt * 0.5;
+      const raiseEvery = farBelow ? 700 : 1200;
+      if (now - adaptCleanSince >= raiseEvery && adaptKbps < tgt) {
         const nearCeil = probeCeilKbps > 0 && adaptKbps >= probeCeilKbps * 0.9;
-        const farBelow = adaptKbps < tgt * 0.5;
         const next = Math.min(
           tgt,
           farBelow
-            ? Math.round(adaptKbps * 1.15 + 150)
+            ? Math.round(adaptKbps * 1.1 + 100)
             : nearCeil
-              ? Math.round(adaptKbps * 1.03 + 25)
-              : Math.round(adaptKbps * 1.08 + 80),
+              ? Math.round(adaptKbps * 1.02 + 25)
+              : Math.round(adaptKbps * 1.05 + 50),
         );
         if (Math.floor(next / 2000) !== Math.floor(adaptKbps / 2000) || next === tgt) {
           slog("adapt", `raise ${adaptKbps}k → ${next}k (target ${tgt}k ceil=${probeCeilKbps}k)`);
         }
         adaptKbps = next;
-        adaptCleanTicks = 0;
+        adaptCleanSince = now;
         pushAdaptBitrate();
       }
     } else {
-      adaptCleanTicks = 0;
+      adaptCleanSince = 0;
       // Mid-band: accumulating but not critical. Trim gently; do NOT pin ceil.
       if (fill > 0.35 && realBacklog && now - lastFillTrimAt > 1000) {
         lastFillTrimAt = now;
@@ -884,6 +867,9 @@ export function startHost(opts: HostOptions): () => void {
     dataCh = null;
     pc?.close();
     pc = null;
+    activeSessionId = undefined;
+    lastOfferSentAt = 0;
+    pendingGuestCandidates = [];
     lastTextField = false;
     lastCursorKind = "";
     opts.onClients?.(0);
@@ -1168,6 +1154,7 @@ export function startHost(opts: HostOptions): () => void {
     /** Capture rate feeding the encoder — may differ from audioEncRate when we
      *  resample 44.1k (etc.) up to 48k for Opus. 0 = no resample. */
     let audioSrcRate = 0;
+    let audioResampler: StreamingAudioResampler | null = null;
     let audioSeq = 0;
     let audioTsUs = 0;
     /** Chunks refused because the channel was already full (HUD "A-drop"). */
@@ -1239,6 +1226,7 @@ export function startHost(opts: HostOptions): () => void {
       audioEncRate = 0;
       audioEncCh = 0;
       audioSrcRate = 0;
+      audioResampler = null;
       if (!enc) return;
       try {
         if (enc.state !== "closed") enc.close();
@@ -1309,7 +1297,10 @@ export function startHost(opts: HostOptions): () => void {
       let src = new Float32Array(ab);
       const ch = fmt.channels;
       if (audioSrcRate !== audioEncRate) {
-        src = new Float32Array(resampleInterleavedF32(src, ch, audioSrcRate, audioEncRate));
+        if (!audioResampler) {
+          audioResampler = new StreamingAudioResampler(ch, audioSrcRate, audioEncRate);
+        }
+        src = audioResampler.process(src);
       }
       const frames = Math.floor(src.length / ch);
       if (frames <= 0) return true;
@@ -1369,6 +1360,10 @@ export function startHost(opts: HostOptions): () => void {
       audioSrcRate = fmt.sampleRate;
       audioEncRate = wireRate;
       audioEncCh = fmt.channels;
+      audioResampler =
+        fmt.sampleRate === wireRate
+          ? null
+          : new StreamingAudioResampler(fmt.channels, fmt.sampleRate, wireRate);
       audioSeq = 0;
       audioTsUs = 0;
       audioCodec = "opus";
@@ -1381,8 +1376,8 @@ export function startHost(opts: HostOptions): () => void {
       return audioCodec;
     };
 
-    // The audio channel is partially reliable (maxRetransmits: 0) so the one-shot
-    // format JSON can be lost in transit. Repeat it for a short burst after a sink
+    // The audio channel has a bounded packet lifetime, so an old one-shot format
+    // can still expire. Repeat it for a short burst after a sink
     // attaches (and after every capture-format change) so at least one copy lands.
     // NOT forever: companion builds without cfg dedupe forward every repeat to
     // their worklet, which resets the adaptive latency target each time — a
@@ -1607,6 +1602,7 @@ export function startHost(opts: HostOptions): () => void {
     // Unique id for THIS peer session. Sent with every offer so the guest can tell
     // an in-place ICE restart (re-route the same live session) from a fresh session.
     const sessionId = Math.random().toString(36).slice(2);
+    activeSessionId = sessionId;
     let iceRestartTimer: number | null = null;
     let deadTimer: number | null = null;
     let restartAttempts = 0;
@@ -1639,7 +1635,7 @@ export function startHost(opts: HostOptions): () => void {
       }
     };
 
-    pipeIce(pc, sig);
+    pipeIce(pc, sig, sessionId);
     pc.onconnectionstatechange = () => {
       const st = pc?.connectionState;
       if (st === "connected") {
@@ -1704,18 +1700,14 @@ export function startHost(opts: HostOptions): () => void {
     // DIRECT audio: Opus (preferred) or raw float32. Created up front (no
     // renegotiation); idle until the guest opts in with `{type:"amode",mode:"pcm"}`.
     //
-    // Ordered but UNRELIABLE (maxRetransmits: 0 → SCTP partial reliability,
-    // RFC 8831): a lost packet is skipped via FORWARD TSN instead of being
-    // retransmitted. Live audio must never wait — on a fully reliable channel a
-    // single lost packet head-of-line blocked every chunk behind it for RTT+,
-    // and since all channels share one SCTP association, video saturating the
-    // link under high motion turned into bursty audio delivery → underrun chop.
-    // `priority: "high"` (when the UA honours it) keeps audio ahead of the
-    // bulk video channel on the same association. A skipped 20ms Opus frame is
-    // a gap the phone worklet conceals with a held sample (not a gain fade).
+    // Ordered + time-bounded reliability: most Wi-Fi losses recover inside an
+    // RTT, while a packet can head-of-line block newer sound for at most 60ms.
+    // Keeping order also preserves compatibility with legacy headerless raw PCM.
+    // This avoids the zero-retransmit loss clusters that made concealment robotic
+    // without accepting the unbounded stalls of a fully reliable channel.
     const audioCh = pc.createDataChannel("audio", {
       ordered: true,
-      maxRetransmits: 0,
+      maxPacketLifeTime: 60,
       // Chromium accepts RTCPriorityType; ignored harmlessly elsewhere.
       priority: "high",
     } as RTCDataChannelInit);
@@ -1902,22 +1894,33 @@ export function startHost(opts: HostOptions): () => void {
         /* not on desktop */
       }
       if (paused && pausePoll === null) {
+        videoCh.bufferedAmountLowThreshold = Math.round(wcBufBudget() * 0.35);
         pausePoll = window.setInterval(() => {
           const open = videoCh.readyState === "open";
           const b = open ? videoCh.bufferedAmount : 0;
           const budgetNow = wcBufBudget();
-          // Hysteresis: stay paused at least ~100ms so a 4ms-RTT drain can't
-          // flap pause/resume every frame against a tight budget.
-          const held = performance.now() - pausedAtMs >= 100;
-          if (!open || (held && b < budgetNow * 0.25)) {
+          const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, quality.fps)));
+          const held = performance.now() - pausedAtMs >= minHoldMs;
+          if (!open || (held && b < budgetNow * 0.35)) {
             if (pausePoll !== null) window.clearInterval(pausePoll);
             pausePoll = null;
             setEncoderPaused(false, b, budgetNow);
           }
-        }, 100);
+        }, 25);
       } else if (!paused && pausePoll !== null) {
         window.clearInterval(pausePoll);
         pausePoll = null;
+      }
+    };
+    videoCh.onbufferedamountlow = () => {
+      if (!encodePaused) return;
+      const budgetNow = wcBufBudget();
+      const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, quality.fps)));
+      if (
+        performance.now() - pausedAtMs >= minHoldMs &&
+        videoCh.bufferedAmount < budgetNow * 0.35
+      ) {
+        setEncoderPaused(false, videoCh.bufferedAmount, budgetNow);
       }
     };
     /** Arm soft recovery: get an IDR on the way while P-frames keep flowing so the
@@ -2032,15 +2035,20 @@ export function startHost(opts: HostOptions): () => void {
       // pause as a hard drop — that was the death spiral (pause → 15% cut → ceil
       // pin → smaller budget → more pauses → stuck at 1.5 Mbps mush). Only adapt
       // once on entering pause, and only with the soft fill signal.
-      if (!key && buffered > maxBuffered) {
+      // Let the adaptive shed signal act before stopping production. One budget
+      // is ~80ms of wire data; pausing exactly there made normal Wi-Fi batching
+      // discard half the capture cadence. The 1.5× gate remains bounded and the
+      // hard 4× reference-break protection below is unchanged.
+      if (!key && buffered > maxBuffered * 1.5) {
         const entering = !encodePaused;
         setEncoderPaused(true, buffered, maxBuffered);
         if (entering) adaptFromBuffer(buffered, maxBuffered, false);
       } else if (!(key && buffered > maxBuffered * 4)) {
+        const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, quality.fps)));
         if (
           encodePaused &&
-          buffered < maxBuffered * 0.25 &&
-          performance.now() - pausedAtMs >= 100
+          buffered < maxBuffered * 0.35 &&
+          performance.now() - pausedAtMs >= minHoldMs
         ) {
           setEncoderPaused(false, buffered, maxBuffered);
         }
@@ -2603,7 +2611,7 @@ export function startHost(opts: HostOptions): () => void {
           if (targetChanged || adaptKbps <= 0) {
             adaptKbps = tgtNow;
             probeCeilKbps = 0;
-            adaptCleanTicks = 0;
+            adaptCleanSince = 0;
             lastSkipAt = 0;
             slog("adapt", `reset to target ${adaptKbps}k (tune ${targetChanged ? "target changed" : "init"})`);
           }
@@ -3037,6 +3045,22 @@ export function startHost(opts: HostOptions): () => void {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     sig.send({ type: "offer", sdp: offer.sdp ?? "", sid: sessionId });
+    lastOfferSentAt = Date.now();
+    guestNeedsOffer = false;
+  };
+
+  /** Coalesce peer-joined + ready arriving back-to-back into one offer. */
+  const requestPeerStart = () => {
+    if (stopped || peerStartPending) return;
+    peerStartPending = true;
+    void startPeer()
+      .catch((e) => {
+        guestNeedsOffer = true;
+        console.warn("[remote] peer offer failed:", e);
+      })
+      .finally(() => {
+        peerStartPending = false;
+      });
   };
 
   // Keep a signaling socket alive for the whole host lifetime, reconnecting with
@@ -3071,21 +3095,51 @@ export function startHost(opts: HostOptions): () => void {
           pc?.connectionState === "connected" &&
           Date.now() - lastGuestMsg < 8000;
         if (!liveSession) {
-          guestNeedsOffer = false;
-          await startPeer();
+          requestPeerStart();
+        }
+      } else if (m.type === "ready") {
+        // A new guest socket can replace its predecessor while the old P2P link
+        // still reports connected and has a recent ping. peer-joined is therefore
+        // ambiguous; ready's per-join nonce is the authoritative fresh-offer ask.
+        if (m.nonce !== lastGuestJoinNonce) {
+          lastGuestJoinNonce = m.nonce;
+          guestNeedsOffer = true;
+          const offerAlreadyInFlight =
+            peerStartPending ||
+            (pc?.signalingState === "have-local-offer" && Date.now() - lastOfferSentAt < 5000);
+          if (!offerAlreadyInFlight) requestPeerStart();
         }
       } else if (m.type === "answer" && pc) {
+        if (m.sid && activeSessionId && m.sid !== activeSessionId) return;
         // Munge the guest's answer so the video encoder starts near its working
         // bitrate instead of ramping up from Chromium's ~300kbps default.
         await pc.setRemoteDescription({
           type: "answer",
           sdp: boostStartBitrate(m.sdp, quality.startBitrateKbps, Math.min(quality.minBitrateKbps, 4000)),
         });
-      } else if (m.type === "candidate" && pc) {
-        try {
-          await pc.addIceCandidate(m.candidate);
-        } catch {
-          /* ignore */
+        const keep: typeof pendingGuestCandidates = [];
+        for (const item of pendingGuestCandidates) {
+          if (item.sid && activeSessionId && item.sid !== activeSessionId) continue;
+          try {
+            await pc.addIceCandidate(item.candidate);
+          } catch {
+            keep.push(item);
+          }
+        }
+        pendingGuestCandidates = keep;
+      } else if (m.type === "candidate") {
+        const item = { candidate: m.candidate, sid: m.sid };
+        if (
+          pc?.remoteDescription &&
+          (!m.sid || !activeSessionId || m.sid === activeSessionId)
+        ) {
+          try {
+            await pc.addIceCandidate(m.candidate);
+          } catch {
+            pendingGuestCandidates.push(item);
+          }
+        } else {
+          pendingGuestCandidates.push(item);
         }
       } else if (m.type === "peer-left") {
         // Guest signaling socket closed. Always mark that the next join needs a

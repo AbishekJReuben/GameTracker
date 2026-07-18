@@ -4064,8 +4064,8 @@ export function ControlScreen({
                 </div>
                 {tuneHints && (
                   <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    <b className="text-ink-dim">ON</b>: Opus over a high-priority data channel → hold-based phone
-                    worklet (~65ms) — keeps sound near DIRECT video without the old fade-chop.{" "}
+                    <b className="text-ink-dim">ON</b>: Opus over a high-priority, time-bounded data channel →
+                    adaptive phone worklet (~65ms) with smooth gap repair.{" "}
                     <b className="text-ink-dim">OFF</b>: classic WebRTC Opus track (NetEQ). Flip OFF only if DIRECT
                     still crackles on a flaky link. Header shows{" "}
                     <b className="text-ink-dim">AUD·DIRECT</b> / <b className="text-ink-dim">AUD·RTC</b>.
@@ -5026,18 +5026,18 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
     long: "Phone decode errors",
     info: "Times the phone's decoder reported an error and asked the PC for a keyframe. A climbing count on the WebCodecs path usually means the H.264 stream hit a reference the decoder couldn't reconcile; on the native path it's the bridge's own fault count.",
   },
-  Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound (lean ~30ms). RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
+  Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound with a ~65ms adaptive target. RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
   "A-codec": {
     long: "DIRECT audio wire format",
     info: "Opus (~128kbps) is what you want. PCM f32 is the uncompressed fallback at ~3.1Mbps — enough to back the channel up and make the sound robotic. The host now resamples odd capture rates (e.g. 44.1k) to 48k so Opus stays on; f32 only means this device can't decode Opus or the encoder faulted mid-session.",
   },
   "A-loss": {
     long: "Opus packets lost",
-    info: "Audio rides an unreliable channel on purpose — a lost packet is skipped instead of stalling everything behind it. WebCodecs can't use Opus in-band FEC, so gaps are filled with a short hold on the phone. A slow climb under load is normal; a fast one means the link is saturated.",
+    info: "Audio uses time-bounded retransmission: short Wi-Fi losses can recover, but an old packet expires instead of stalling live sound indefinitely. Remaining gaps are bridged smoothly on the phone. A rising count means the link is saturated.",
   },
   "A-drop": {
     long: "Audio chunks dropped by the PC",
-    info: "The PC refuses to queue more than ~250ms of audio into the channel: stale sound is worthless, and an unbounded queue is exactly what made DIRECT audio robotic (it once reached 1.9MB — five seconds — arriving in bursts). Anything above zero means the link couldn't carry even the audio at that moment.",
+    info: "The PC keeps the audio queue bounded: raw fallback is capped tightly and compressed Opus gets a small congestion cushion. Stale sound is never allowed to grow without limit. Anything above zero means the link could not carry audio at that moment.",
   },
   "A-buf": { long: "Audio playout buffer", info: "How much sound is sitting on the phone before it plays. DIRECT only — RTC uses the browser's NetEQ instead." },
   "A-ch": {

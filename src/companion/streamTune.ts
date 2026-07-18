@@ -71,8 +71,8 @@ export type StreamTune = {
    */
   preferNativeDecode: boolean;
   /**
-   * PC sound path. ON = DIRECT: Opus (or raw f32) over the high-priority audio
-   * data channel → hold-based phone worklet (~65ms target). OFF = RTC: WebRTC
+   * PC sound path. ON = DIRECT: Opus (or raw f32) over the high-priority,
+   * time-bounded audio channel → adaptive phone worklet (~65ms target). OFF = RTC: WebRTC
    * Opus track (NetEQ + host worklet). Flip OFF if DIRECT crackles on a bad link.
    */
   preferDirectAudio: boolean;
@@ -95,7 +95,7 @@ export type StreamTune = {
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
   maxW: 1920,
   jpeg: 72,
-  fps: 40,
+  fps: 60,
   bitrateKbps: 16000,
   contentMode: "text",
   jpegCap: 72,
@@ -142,6 +142,7 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
   const rawHost = Number(r.audioHostMs);
   const rawBuf = Number(r.wcBufKB);
   const rawQueue = Number(r.wcQueueMax);
+  const rawFps = Number(r.fps);
   const audioHostMs = clamp(
     rawHost === 55 ? d.audioHostMs : rawHost || d.audioHostMs,
     20,
@@ -152,7 +153,9 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
   return {
     maxW: clamp(Number(r.maxW) || d.maxW, 320, 3840),
     jpeg: clamp(Number(r.jpeg) || d.jpeg, 20, 95),
-    fps: clamp(Number(r.fps) || d.fps, 10, 60),
+    // The native NVENC/MediaCodec path is comfortably inside a 16ms budget;
+    // migrate the former shipped 40fps value so existing installs benefit too.
+    fps: clamp(rawFps === 40 ? d.fps : rawFps || d.fps, 10, 60),
     bitrateKbps: clamp(Number(r.bitrateKbps) || d.bitrateKbps, 500, 40000),
     contentMode: asMode(r.contentMode),
     jpegCap: clamp(Number(r.jpegCap) || d.jpegCap, 40, 95),

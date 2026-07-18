@@ -8,17 +8,18 @@
  * thread missed audio deadlines and the phone heard crackling. Keep ALL audio
  * work in here — the main thread only forwards chunks.
  *
- * Playout model (v2 — "hold, don't fade"):
+ * Playout model (v3 — continuous, bounded concealment):
  *  - PRIME before (re)starting so delivery bursts are absorbed.
  *  - Streaming linear resampler at `captureRate / sampleRate`, nudged ±0.25%
  *    toward TARGET (tighter than ±0.4% — less stretchy "robotic" pitch hunt).
- *  - On underrun: HOLD the last sample at full gain. The old fade-out/fade-in
- *    on every brief gap is what users heard as choppy/robotic DIRECT audio —
- *    amplitude pumping on a 10–30ms cadence. A held sample clicks far less
- *    than a gain envelope, and keeps NetEQ-/worklet-fed RTC from pumping too.
+ *  - On a known packet gap: interpolate from the previous sample toward the
+ *    next real packet with a smoothstep bridge. This avoids both gain pumping
+ *    and the pitched buzz caused by repeating one sample.
+ *  - On a true buffer underrun: decay the last sample very slowly until audio
+ *    resumes; never synthesize a full-amplitude constant tone.
  *  - TARGET grows on each underrun up to `maxMs`; eases back after ~8s clean.
- *  - Seq-gap concealment fills holes with a short crossfaded hold (not a fade
- *    to silence) so losses don't drain the buffer into another underrun.
+ *  - Seq-gap concealment is capped at 60ms so a damaged link cannot manufacture
+ *    an unbounded stretch of synthetic audio.
  *
  * Buffer envelope is configurable via `{cfg:{primeMs,targetMs,maxMs}}` so the
  * host's RTC feeder (wider, absorbs IPC jitter) and the phone's DIRECT feeder
@@ -55,10 +56,15 @@ class GtPcmFeeder extends AudioWorkletProcessor {
     this.underruns = 0;
     /** Consecutive quanta spent holding (for slow re-prime only when truly dry). */
     this.holdQuanta = 0;
+    this.pendingGapMs = 0;
     this.port.onmessage = (e) => {
       const d = e.data;
       if (d instanceof ArrayBuffer) {
         const f32 = new Float32Array(d);
+        if (this.pendingGapMs > 0) {
+          this.bridgeGap(f32, this.pendingGapMs);
+          this.pendingGapMs = 0;
+        }
         this.chunks.push(f32);
         this.avail += f32.length;
         // Runaway-latency guard: past target+headroom, trim back to target in one
@@ -68,11 +74,9 @@ class GtPcmFeeder extends AudioWorkletProcessor {
         return;
       }
       if (d && typeof d.gap === "number") {
-        // Conceal a known upstream loss (dropped Opus packets — the DIRECT
-        // channel is lossy by design and WebCodecs' AudioDecoder has no
-        // FEC/PLC hook). Fill with a crossfaded hold so level stays up and
-        // the next real packet joins without a gain pump.
-        this.conceal(d.gap);
+        // Wait for the next real packet so the gap can bridge toward its first
+        // sample. Repeating a constant sample creates an audible pitched buzz.
+        this.pendingGapMs = Math.min(60, this.pendingGapMs + Math.max(0, d.gap));
         return;
       }
       if (d && d.cfg) {
@@ -81,9 +85,9 @@ class GtPcmFeeder extends AudioWorkletProcessor {
         if (typeof d.cfg.primeMs === "number") this.primeMs = Math.max(10, Math.min(160, d.cfg.primeMs));
         if (typeof d.cfg.targetMs === "number") {
           // Only reset the LIVE target when the base actually changes: cfg may be
-          // re-sent periodically (the DIRECT channel is lossy, so the host repeats
-          // it), and clamping targetMs back down on every repeat would erase the
-          // adaptive underrun growth right when it's needed.
+          // re-sent periodically (the DIRECT channel is time-bounded, so an old
+          // config can still expire), and clamping targetMs back down on every
+          // repeat would erase the adaptive underrun growth right when it's needed.
           const base = Math.max(20, Math.min(250, d.cfg.targetMs));
           if (base !== this.baseTargetMs) {
             this.baseTargetMs = base;
@@ -124,25 +128,23 @@ class GtPcmFeeder extends AudioWorkletProcessor {
   }
 
   /**
-   * Synthesize `gapMs` of filler (capped at 60ms) from a hold of the last
-   * buffered sample, with a soft attack so the leading seam doesn't click.
-   * Keep gain near full — the old decaying hold (0.85→0.5) pumped amplitude on
-   * every lost Opus frame and read as robotic chop under video load.
+   * Bridge a known gap between the last buffered sample and the next packet.
+   * Smoothstep gives both joins zero slope and avoids the pitched constant hold.
    */
-  conceal(gapMs) {
-    if (this.priming || this.avail < this.channels || !(gapMs > 0)) return;
+  bridgeGap(next, gapMs) {
+    if (this.priming || !(gapMs > 0) || next.length < this.channels) return;
     const frames = Math.round((this.captureRate * Math.min(gapMs, 60)) / 1000);
     if (frames <= 0) return;
     const ch = this.channels;
     const tailChunk = this.chunks[this.chunks.length - 1];
-    const tail = new Float32Array(ch);
-    for (let c = 0; c < ch; c++) tail[c] = tailChunk[tailChunk.length - ch + c] || 0;
     const fill = new Float32Array(frames * ch);
-    const attack = Math.min(48, frames);
     for (let i = 0; i < frames; i++) {
-      const a = i < attack ? i / attack : 1;
-      const g = a * 0.97; // soft attack, then near-full hold (no decay pump)
-      for (let c = 0; c < ch; c++) fill[i * ch + c] = tail[c] * g;
+      const x = (i + 1) / (frames + 1);
+      const t = x * x * (3 - 2 * x);
+      for (let c = 0; c < ch; c++) {
+        const a = tailChunk ? tailChunk[tailChunk.length - ch + c] || 0 : this.f1[c] || 0;
+        fill[i * ch + c] = a + ((next[c] || 0) - a) * t;
+      }
     }
     this.chunks.push(fill);
     this.avail += fill.length;
@@ -224,8 +226,8 @@ class GtPcmFeeder extends AudioWorkletProcessor {
         this.phase -= 1;
         this.f0.set(this.f1);
         if (!this.readFrameInto(this.f1)) {
-          // Hold last frame at full level — no fade-out. That's the new approach.
-          this.f1.set(this.f0);
+          // Decay smoothly instead of emitting a constant buzz while dry.
+          for (let c = 0; c < this.channels; c++) this.f1[c] = this.f0[c] * 0.999;
           holding = true;
         }
       }

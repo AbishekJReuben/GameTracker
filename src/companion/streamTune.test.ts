@@ -39,10 +39,11 @@ describe("normalizeStreamTune", () => {
   });
 
   describe("RTC audio knobs", () => {
-    it("defaults a tune saved before they existed to auto NetEQ + the shipped host buffer", () => {
+    it("migrates a tune saved before the current audio and fps defaults", () => {
       const t = normalizeStreamTune({ maxW: 1920, fps: 40 });
-      expect(t.audioJbMs).toBe(0); // 0 = leave the browser's adaptive buffer alone
-      expect(t.audioHostMs).toBe(55); // the long-standing 40/55/150 envelope
+      expect(t.fps).toBe(60);
+      expect(t.audioJbMs).toBe(STREAM_TUNE_DEFAULTS.audioJbMs);
+      expect(t.audioHostMs).toBe(STREAM_TUNE_DEFAULTS.audioHostMs);
     });
 
     it("keeps an explicit 0 for audioJbMs instead of falling back to the default", () => {

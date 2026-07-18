@@ -197,7 +197,7 @@ export type AudioStats = {
   kbps: number;
   /** DIRECT wire format: Opus (~128kbps) or raw interleaved float32 (~3.1Mbps). */
   codec?: "opus" | "f32";
-  /** Opus packets lost in flight (the audio channel is unreliable by design). */
+  /** Opus sequence gaps after the channel's bounded retransmit window expires. */
   lost?: number;
 };
 
@@ -332,7 +332,11 @@ export class CloudConn {
   private backoff = BACKOFF_MIN;
   private hbTimer: number | null = null;
   private lastPong = 0;
+  /** Do not race a full peer rebuild against an in-place ICE restart. */
+  private iceRecoveryUntil = 0;
   private offerTimer: number | null = null;
+  /** Trickle candidates may precede their offer. Hold them until SDP is ready. */
+  private pendingIceCandidates: { candidate: RTCIceCandidateInit; sid?: string }[] = [];
   // Auth + resilience state.
   private authed = false; // host approved this device (streaming allowed)
   private denied = false; // host rejected us — stop auto-reconnecting
@@ -800,19 +804,30 @@ export class CloudConn {
     this.clearOfferTimeout();
     this.pc?.close();
     this.pc = null;
+    this.currentSid = undefined;
+    this.pendingIceCandidates = [];
     this.sig?.close();
 
     const sig = new Signaling(this.signalUrl, this.code, "guest");
+    const joinNonce = Math.random().toString(36).slice(2);
     this.sig = sig;
     sig.onMessage(async (m) => {
       if (this.sig !== sig || this.closed) return; // stale socket from a prior attempt
       if (m.type === "offer") await this.onOffer(m.sdp, (m as { sid?: string }).sid);
-      else if (m.type === "candidate" && this.pc) {
+      else if (m.type === "candidate") {
         this.candidatesIn++;
-        try {
-          await this.pc.addIceCandidate(m.candidate);
-        } catch {
-          /* ignore */
+        const item = { candidate: m.candidate, sid: m.sid };
+        if (
+          this.pc?.remoteDescription &&
+          (!m.sid || !this.currentSid || m.sid === this.currentSid)
+        ) {
+          try {
+            await this.pc.addIceCandidate(m.candidate);
+          } catch {
+            this.pendingIceCandidates.push(item);
+          }
+        } else {
+          this.pendingIceCandidates.push(item);
         }
       } else if (m.type === "peer-left") {
         // The host's *signaling* socket closed — not the P2P session. While the
@@ -853,6 +868,10 @@ export class CloudConn {
 
     try {
       await sig.connect();
+      // This is emitted only by a genuinely fresh guest socket. It removes the
+      // ambiguity in peer-joined, which the host also receives when only its own
+      // signaling socket reconnects around an otherwise healthy peer session.
+      sig.send({ type: "ready", nonce: joinNonce });
       this.setProgress("waiting_offer", "Waiting for your PC…");
       this.armOfferTimeout();
     } catch (e) {
@@ -925,11 +944,15 @@ export class CloudConn {
     // pc is gone/closed) do we fall through to a clean rebuild below.
     if (sid && sid === this.currentSid && this.pc && this.pc.connectionState !== "closed" && this.sig) {
       try {
+        this.iceRecoveryUntil = Date.now() + 10_000;
+        this.lastPong = Date.now();
         await this.pc.setRemoteDescription({ type: "offer", sdp });
+        await this.flushIceCandidates(sid);
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
-        this.sig.send({ type: "answer", sdp: answer.sdp ?? "" });
+        this.sig.send({ type: "answer", sdp: answer.sdp ?? "", sid });
         this.noteEvent("answer sent (ICE restart)");
+        this.sendHeartbeatPing();
         return;
       } catch {
         /* renegotiation failed — fall through and rebuild the session cleanly */
@@ -967,7 +990,7 @@ export class CloudConn {
     this.chAudio = undefined;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
-    pipeIce(pc, this.sig!);
+    pipeIce(pc, this.sig!, sid);
     // Guard every handler against firing for a superseded connection. The peer
     // reaching "connected" only means the transport is up — we stay in "pending"
     // (authenticating) until the host sends {event:"auth", state:"ok"}.
@@ -981,8 +1004,11 @@ export class CloudConn {
       if (this.pc !== pc) return;
       this.iceState = pc.iceConnectionState;
       if (pc.iceConnectionState === "checking") {
+        this.iceRecoveryUntil = Date.now() + 10_000;
+        this.lastPong = Date.now();
         this.setProgress("negotiating", "Finding network path (ICE)…");
       } else if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+        this.iceRecoveryUntil = 0;
         this.emitProgress();
       }
       if (pc.iceConnectionState === "failed" && !this.closed) {
@@ -1057,9 +1083,10 @@ export class CloudConn {
       }
     };
     await this.pc.setRemoteDescription({ type: "offer", sdp });
+    await this.flushIceCandidates(sid);
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-    this.sig!.send({ type: "answer", sdp: answer.sdp ?? "" });
+    this.sig!.send({ type: "answer", sdp: answer.sdp ?? "", sid });
     this.noteEvent("answer sent");
     // We have a live PC now; the signaling handshake is done. Further recovery is
     // driven by the PC's own state + the data-channel heartbeat, so drop the
@@ -1074,13 +1101,7 @@ export class CloudConn {
     this.lastPong = Date.now();
     // Immediate first ping: seeds the clock-sync samples so the wc path's
     // end-to-end latency reading is meaningful within a second of connecting.
-    if (this.chData?.readyState === "open") {
-      try {
-        this.chData.send(JSON.stringify({ ping: Date.now() }));
-      } catch {
-        /* ignore */
-      }
-    }
+    this.sendHeartbeatPing();
     this.hbTimer = window.setInterval(() => {
       if (this.closed) return;
       // Backgrounded: timers are throttled and pongs may sit unprocessed, so a
@@ -1091,20 +1112,47 @@ export class CloudConn {
         return;
       }
       if (Date.now() - this.lastPong > HEARTBEAT_DEAD_MS) {
+        // The host owns ICE restarts. Do not launch a second, destructive peer
+        // rebuild while its new candidate pair is still checking.
+        if (Date.now() < this.iceRecoveryUntil) {
+          this.sendHeartbeatPing();
+          return;
+        }
         this.stopHeartbeat();
         this.setProgress("reconnecting", "Link timed out — reconnecting…");
         this.emit("disconnected");
         this.scheduleReconnect();
         return;
       }
-      if (this.chData?.readyState === "open") {
-        try {
-          this.chData.send(JSON.stringify({ ping: Date.now() }));
-        } catch {
-          /* ignore */
-        }
-      }
+      this.sendHeartbeatPing();
     }, HEARTBEAT_MS);
+  }
+
+  private sendHeartbeatPing() {
+    if (this.chData?.readyState !== "open") return;
+    try {
+      this.chData.send(JSON.stringify({ ping: Date.now() }));
+    } catch {
+      /* channel is being replaced */
+    }
+  }
+
+  private async flushIceCandidates(sid?: string) {
+    const pc = this.pc;
+    if (!pc?.remoteDescription || this.pendingIceCandidates.length === 0) return;
+    const keep: { candidate: RTCIceCandidateInit; sid?: string }[] = [];
+    for (const item of this.pendingIceCandidates) {
+      if (item.sid && sid && item.sid !== sid) {
+        keep.push(item);
+        continue;
+      }
+      try {
+        await pc.addIceCandidate(item.candidate);
+      } catch {
+        keep.push(item);
+      }
+    }
+    this.pendingIceCandidates = keep;
   }
 
   private stopHeartbeat() {
@@ -1340,7 +1388,7 @@ export class CloudConn {
   }
 
   /** Last format forwarded to the worklet. The host re-sends its cfg every ~2s
-   *  (the audio channel is lossy now, so the one-shot could vanish); forwarding
+   *  (time-bounded delivery can still expire an old one-shot); forwarding
    *  an identical cfg would reset the worklet's adaptive targetMs back to base
    *  every time — deduplicate so repeats are true no-ops. */
   private audioCfgRate = 0;
@@ -1350,8 +1398,8 @@ export class CloudConn {
    *  header; raw f32 is headerless, exactly as older hosts sent it. */
   private audioWireCodec: "opus" | "f32" = "f32";
   private audioDec: AudioDecoder | null = null;
-  /** Opus packets dropped in flight (seq gaps) — the audio channel is lossy by
-   *  design, so a gap is expected under load, not an error. HUD "A-loss". */
+  /** Opus packets that missed the bounded delivery window (seq gaps). An
+   *  occasional gap is recoverable; a rising count indicates congestion. */
   private audioLost = 0;
   private audioLastSeq = -1;
   /** Format the live Opus decoder was configured for (cfg-change detection). */
@@ -2563,6 +2611,12 @@ export class CloudConn {
     if (typeof msg.pong === "number") {
       const now = Date.now();
       this.lastPong = now;
+      // A pong may have been queued on the previous candidate pair. It proves
+      // the data channel was recently alive, but must not cancel protection for
+      // a replacement route that is still in ICE checking.
+      if (this.iceState === "connected" || this.iceState === "completed") {
+        this.iceRecoveryUntil = 0;
+      }
       // Clock sync: `t` is the host's perf clock at pong time; midpoint of our
       // send/receive maps it onto our Date clock (best sample = lowest RTT).
       const t = (msg as { t?: number }).t;
