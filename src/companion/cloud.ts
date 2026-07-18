@@ -13,7 +13,13 @@
  * the phone reattaches automatically when the PC comes back — no re-pairing needed.
  */
 
-import { Signaling, defaultIceServers, pipeIce, type IceServer } from "@/lib/rtc";
+import {
+  Signaling,
+  defaultIceServers,
+  gatheredLocalSdp,
+  pipeIce,
+  type IceServer,
+} from "@/lib/rtc";
 import { AUDIO_HDR_BYTES, audioSeqGap, audioSeqOf, isOpusPacket } from "@/lib/audioWire";
 import audioFeederWorkletUrl from "@/lib/audioFeeder.worklet.js?url";
 import {
@@ -824,7 +830,7 @@ export class CloudConn {
           try {
             await this.pc.addIceCandidate(m.candidate);
           } catch {
-            this.pendingIceCandidates.push(item);
+            /* stale/malformed candidate; a retry cannot change its ICE ufrag */
           }
         } else {
           this.pendingIceCandidates.push(item);
@@ -950,7 +956,7 @@ export class CloudConn {
         await this.flushIceCandidates(sid);
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
-        this.sig.send({ type: "answer", sdp: answer.sdp ?? "", sid });
+        this.sig.send({ type: "answer", sdp: await gatheredLocalSdp(this.pc), sid });
         this.noteEvent("answer sent (ICE restart)");
         this.sendHeartbeatPing();
         return;
@@ -1086,7 +1092,7 @@ export class CloudConn {
     await this.flushIceCandidates(sid);
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-    this.sig!.send({ type: "answer", sdp: answer.sdp ?? "", sid });
+    this.sig!.send({ type: "answer", sdp: await gatheredLocalSdp(this.pc), sid });
     this.noteEvent("answer sent");
     // We have a live PC now; the signaling handshake is done. Further recovery is
     // driven by the PC's own state + the data-channel heartbeat, so drop the
@@ -1140,19 +1146,18 @@ export class CloudConn {
   private async flushIceCandidates(sid?: string) {
     const pc = this.pc;
     if (!pc?.remoteDescription || this.pendingIceCandidates.length === 0) return;
-    const keep: { candidate: RTCIceCandidateInit; sid?: string }[] = [];
-    for (const item of this.pendingIceCandidates) {
+    const pending = this.pendingIceCandidates;
+    this.pendingIceCandidates = [];
+    for (const item of pending) {
       if (item.sid && sid && item.sid !== sid) {
-        keep.push(item);
         continue;
       }
       try {
         await pc.addIceCandidate(item.candidate);
       } catch {
-        keep.push(item);
+        /* stale/malformed candidate; do not poison later ICE restarts */
       }
     }
-    this.pendingIceCandidates = keep;
   }
 
   private stopHeartbeat() {

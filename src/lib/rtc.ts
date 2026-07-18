@@ -49,7 +49,7 @@ export function defaultIceServers(extra?: IceServer[]): RTCIceServer[] {
   return extra && extra.length ? [...base, ...(extra as RTCIceServer[])] : base;
 }
 
-type SignalMsg =
+export type SignalMsg =
   | { type: "peer-joined"; role?: string }
   | { type: "peer-left" }
   | { type: "room-full" }
@@ -74,10 +74,17 @@ type SignalMsg =
 /** Thin wrapper over the signaling WebSocket for one room. */
 export class Signaling {
   private ws: WebSocket | null = null;
-  private handlers: ((m: SignalMsg) => void)[] = [];
+  private handlers: ((m: SignalMsg) => void | Promise<void>)[] = [];
   private openResolvers: (() => void)[] = [];
   private closeHandlers: (() => void)[] = [];
   private pingTimer: number | null = null;
+  /**
+   * WebSocket invokes async message callbacks without awaiting them. SDP and ICE
+   * messages are order-dependent, so serialize their handlers explicitly: a
+   * candidate that follows an offer must never race setRemoteDescription(), and
+   * an answer must finish before later candidates are applied.
+   */
+  private messageChain: Promise<void> = Promise.resolve();
 
   constructor(private url: string, private room: string, private role: Role) {}
 
@@ -88,7 +95,14 @@ export class Signaling {
     this.ws.onmessage = (ev) => {
       try {
         const m = JSON.parse(typeof ev.data === "string" ? ev.data : "") as SignalMsg;
-        this.handlers.forEach((h) => h(m));
+        this.messageChain = this.messageChain
+          .then(async () => {
+            for (const handler of [...this.handlers]) await handler(m);
+          })
+          .catch((error) => {
+            // Keep the chain usable after one malformed/stale negotiation message.
+            console.warn("[remote] signaling message failed:", error);
+          });
       } catch {
         /* ignore non-JSON */
       }
@@ -128,7 +142,7 @@ export class Signaling {
     }
   }
 
-  onMessage(h: (m: SignalMsg) => void) {
+  onMessage(h: (m: SignalMsg) => void | Promise<void>) {
     this.handlers.push(h);
   }
 
@@ -165,4 +179,34 @@ export function pipeIce(pc: RTCPeerConnection, sig: Signaling, sid?: string) {
   pc.onicecandidate = (e) => {
     if (e.candidate) sig.send({ type: "candidate", candidate: e.candidate.toJSON(), sid });
   };
+}
+
+/**
+ * Give the ICE agent a short bounded window to place pooled/fast STUN candidates
+ * into `localDescription`, then return that current SDP snapshot. Trickle ICE
+ * continues normally after the deadline. Sending the original createOffer()/
+ * createAnswer() object can omit candidates gathered during setLocalDescription.
+ */
+export async function gatheredLocalSdp(
+  pc: RTCPeerConnection,
+  maxWaitMs = 250,
+): Promise<string> {
+  if (pc.iceGatheringState !== "complete" && maxWaitMs > 0) {
+    await new Promise<void>((resolve) => {
+      let timer = 0;
+      const finish = () => {
+        pc.removeEventListener("icegatheringstatechange", onGathering);
+        if (timer) window.clearTimeout(timer);
+        resolve();
+      };
+      const onGathering = () => {
+        if (pc.iceGatheringState === "complete") finish();
+      };
+      pc.addEventListener("icegatheringstatechange", onGathering);
+      timer = window.setTimeout(finish, maxWaitMs);
+      // Gathering may have completed between the first check and listener setup.
+      onGathering();
+    });
+  }
+  return pc.localDescription?.sdp ?? "";
 }

@@ -13,7 +13,7 @@
 
 import { Channel } from "@tauri-apps/api/core";
 import { api, type RemoteCaptureStats } from "./api";
-import { Signaling, defaultIceServers, pipeIce, type IceServer } from "./rtc";
+import { Signaling, defaultIceServers, gatheredLocalSdp, pipeIce, type IceServer } from "./rtc";
 import { auxMonitorRoom } from "./remoteConfig";
 import { AUDIO_HDR_BYTES, StreamingAudioResampler, audioPacket } from "./audioWire";
 // Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
@@ -1629,7 +1629,7 @@ export function startHost(opts: HostOptions): () => void {
         const offer = await myPc.createOffer({ iceRestart: true });
         if (pc !== myPc) return; // superseded while awaiting
         await myPc.setLocalDescription(offer);
-        sig.send({ type: "offer", sdp: offer.sdp ?? "", sid: sessionId });
+        sig.send({ type: "offer", sdp: await gatheredLocalSdp(myPc), sid: sessionId });
       } catch (e) {
         console.warn("[remote] ICE restart failed:", e);
       }
@@ -3044,7 +3044,7 @@ export function startHost(opts: HostOptions): () => void {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    sig.send({ type: "offer", sdp: offer.sdp ?? "", sid: sessionId });
+    sig.send({ type: "offer", sdp: await gatheredLocalSdp(pc), sid: sessionId });
     lastOfferSentAt = Date.now();
     guestNeedsOffer = false;
   };
@@ -3117,16 +3117,16 @@ export function startHost(opts: HostOptions): () => void {
           type: "answer",
           sdp: boostStartBitrate(m.sdp, quality.startBitrateKbps, Math.min(quality.minBitrateKbps, 4000)),
         });
-        const keep: typeof pendingGuestCandidates = [];
-        for (const item of pendingGuestCandidates) {
+        const pending = pendingGuestCandidates;
+        pendingGuestCandidates = [];
+        for (const item of pending) {
           if (item.sid && activeSessionId && item.sid !== activeSessionId) continue;
           try {
             await pc.addIceCandidate(item.candidate);
           } catch {
-            keep.push(item);
+            /* stale/malformed candidate; do not poison the next negotiation */
           }
         }
-        pendingGuestCandidates = keep;
       } else if (m.type === "candidate") {
         const item = { candidate: m.candidate, sid: m.sid };
         if (
@@ -3136,7 +3136,7 @@ export function startHost(opts: HostOptions): () => void {
           try {
             await pc.addIceCandidate(m.candidate);
           } catch {
-            pendingGuestCandidates.push(item);
+            /* stale/malformed candidate; a retry cannot change its ICE ufrag */
           }
         } else {
           pendingGuestCandidates.push(item);
