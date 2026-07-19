@@ -481,6 +481,7 @@ pub fn run() {
             commands::remote_stop_audio,
             commands::remote_textfield_active,
             commands::remote_cursor_kind,
+            commands::remote_cursor_position,
             commands::remote_capture_stats,
             commands::remote_list_monitors,
             commands::remote_read_media,

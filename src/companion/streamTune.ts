@@ -17,6 +17,9 @@ export type StreamTune = {
   /** Intermediate JPEG sharpness before H.264 (host caps via jpegCap). */
   jpeg: number;
   fps: number;
+  /** Balance congestion across frame rate and per-frame quality instead of
+   * collapsing bitrate/detail at the first radio stall. */
+  adaptiveFps: boolean;
   /** Target send bitrate (kbps). */
   bitrateKbps: number;
   contentMode: ContentMode;
@@ -96,6 +99,7 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   maxW: 1920,
   jpeg: 72,
   fps: 60,
+  adaptiveFps: true,
   bitrateKbps: 16000,
   contentMode: "text",
   jpegCap: 72,
@@ -156,6 +160,7 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     // The native NVENC/MediaCodec path is comfortably inside a 16ms budget;
     // migrate the former shipped 40fps value so existing installs benefit too.
     fps: clamp(rawFps === 40 ? d.fps : rawFps || d.fps, 10, 60),
+    adaptiveFps: r.adaptiveFps !== false,
     bitrateKbps: clamp(Number(r.bitrateKbps) || d.bitrateKbps, 500, 40000),
     contentMode: asMode(r.contentMode),
     jpegCap: clamp(Number(r.jpegCap) || d.jpegCap, 40, 95),
@@ -249,6 +254,7 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.maxW !== d.maxW ||
     t.jpeg !== d.jpeg ||
     t.fps !== d.fps ||
+    t.adaptiveFps !== d.adaptiveFps ||
     t.bitrateKbps !== d.bitrateKbps ||
     t.contentMode !== d.contentMode ||
     t.jpegCap !== d.jpegCap ||

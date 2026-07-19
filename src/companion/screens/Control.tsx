@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence, useReducedMotion } from "motion/react";
 import {
   MousePointer2,
@@ -200,8 +201,7 @@ type NetStats = {
 // ---------- tuning constants ----------
 const TAP_MS = 260; // max press time still counted as a tap
 const TAP_SLOP = 12; // max finger travel (px) still counted as a tap
-const DOUBLE_MS = 320; // window to chain a double-tap (→ double click / drag)
-const LONGPRESS_MS = 550; // hold to fire a right-click
+const LONGPRESS_MS = 550; // stationary hold before left-button-down
 const SCROLL_STEP = 20; // finger px per wheel notch
 const MIN_ZOOM = 0.25; // 25% — match toolbar / pin scale floor
 const MAX_ZOOM = 10; // 1000%
@@ -680,23 +680,33 @@ export function ControlScreen({
     };
   }, [pipSupported]);
 
-  // Drop the canvas capture when the stream goes away, so a reconnect re-taps the
-  // (new) canvas instead of feeding the mini window a dead track.
+  // The canvas element survives reconnects, so keep its capture track alive while
+  // PiP is open. Stopping it on every transient disconnect froze the mini window.
   useEffect(() => {
-    if (connected) return;
-    pipStreamRef.current?.getTracks().forEach((t) => t.stop());
-    pipStreamRef.current = null;
-    if (pipVideoRef.current) pipVideoRef.current.srcObject = null;
-  }, [connected]);
+    return () => {
+      pipStreamRef.current?.getTracks().forEach((t) => t.stop());
+      pipStreamRef.current = null;
+      if (pipVideoRef.current) pipVideoRef.current.srcObject = null;
+    };
+  }, []);
   // Android PiP: the OS shrinks the whole webview into a mini floating window.
   // There is no direct signal inside the webview, but the PiP window is far
   // smaller than any phone layout — hide ALL chrome and show pure video there.
   const [pipView, setPipView] = useState(false);
   useEffect(() => {
-    const check = () => setPipView(window.innerWidth <= 550 && window.innerHeight <= 350);
+    const check = () => setPipView(
+      (window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__ === true ||
+      (window.innerWidth <= 550 && window.innerHeight <= 350),
+    );
+    const onPip = (event: Event) =>
+      setPipView(!!(event as CustomEvent<{ active?: boolean }>).detail?.active);
     check();
     window.addEventListener("resize", check);
-    return () => window.removeEventListener("resize", check);
+    window.addEventListener("gt:pip", onPip);
+    return () => {
+      window.removeEventListener("resize", check);
+      window.removeEventListener("gt:pip", onPip);
+    };
   }, []);
   const [mode, setMode] = useState<Mode>(() => (isQuestBrowser() ? "touch" : "trackpad"));
   // Expanded bottom panel (null = collapsed). It pushes the viewport up, never overlaps.
@@ -736,17 +746,24 @@ export function ControlScreen({
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
-    const update = () => {
+    let raf = 0;
+    let keyboardWasOpen = false;
+    const commit = () => {
+      raf = 0;
       const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
       // Ignore sub-100px noise (address bar, rounding) — only real keyboards.
       const nextInset = covered > 100 ? Math.round(covered) : 0;
       setKbInset((prev) => (nextInset === prev ? prev : nextInset));
 
       if (nextInset > 0) {
-        // Kill any document scroll the IME applied, then pin to the visible band.
-        window.scrollTo(0, 0);
-        document.documentElement.scrollTop = 0;
-        document.body.scrollTop = 0;
+        // Reset document pan once as the IME opens. Repeating scrollTo on every
+        // pointer-driven viewport event causes a one-frame resize/flicker.
+        if (!keyboardWasOpen) {
+          window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+          document.documentElement.scrollTop = 0;
+          document.body.scrollTop = 0;
+        }
+        keyboardWasOpen = true;
         const next = {
           top: Math.round(vv.offsetTop),
           left: Math.round(vv.offsetLeft),
@@ -763,23 +780,34 @@ export function ControlScreen({
             : next,
         );
       } else {
+        keyboardWasOpen = false;
         setVvPin((prev) => (prev ? null : prev));
       }
     };
+    const update = () => {
+      if (!raf) raf = requestAnimationFrame(commit);
+    };
     vv.addEventListener("resize", update);
     vv.addEventListener("scroll", update);
-    window.addEventListener("scroll", update, { passive: true });
     update();
     return () => {
+      if (raf) cancelAnimationFrame(raf);
       vv.removeEventListener("resize", update);
       vv.removeEventListener("scroll", update);
-      window.removeEventListener("scroll", update);
     };
   }, []);
   const [kbMode, setKbMode] = useState<KbMode>("direct");
   const [pcTextField, setPcTextField] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [sensitivity, setSensitivity] = useState(1.6);
+  const [rotationHoldMs, setRotationHoldMs] = useState(() => {
+    const saved = Number(localStorage.getItem("gt.remote.rotationHoldMs"));
+    return Number.isFinite(saved) && saved >= 400 ? saved : 1200;
+  });
+  useEffect(() => {
+    localStorage.setItem("gt.remote.rotationHoldMs", String(rotationHoldMs));
+    if (isTauri()) invoke("set_rotation_hold_ms", { value: Math.round(rotationHoldMs) }).catch(() => {});
+  }, [rotationHoldMs]);
   const [dragLock, setDragLock] = useState(false);
   const [mods, setMods] = useState<Set<Mod>>(new Set());
   const autoKbdRef = useRef(false); // guards the once-per-focus auto keyboard pop
@@ -1165,6 +1193,7 @@ export function ControlScreen({
       maxW: tune.maxW,
       quality: tune.jpeg,
       fps: tune.fps,
+      adaptiveFps: tune.adaptiveFps,
       bitrate: tune.bitrateKbps,
       mode: tune.contentMode,
       jpegCap: tune.jpegCap,
@@ -1237,8 +1266,6 @@ export function ControlScreen({
         hostSkipRef.current = -1;
         hostPauseRef.current = -1;
         audioUnderrunRef.current = 0;
-      } else {
-        setHasFrame(false); // show the app-icon placeholder again on reconnect
       }
     });
     // Hitches are shown inside the Stream stats HUD (HitchSection polls the
@@ -1272,7 +1299,13 @@ export function ControlScreen({
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     const unsubEvent = link.onEvent((e) => {
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
-      else if (e.event === "cursor") setCursorKind(String((e as { kind?: string }).kind || "arrow"));
+      else if (e.event === "cursor") {
+        const cur = e as { kind?: string; x?: number; y?: number };
+        setCursorKind(String(cur.kind || "arrow"));
+        if (Number.isFinite(cur.x) && Number.isFinite(cur.y)) {
+          followHostCursor(cur.x!, cur.y!);
+        }
+      }
       else if (e.event === "gamepad") setPadAvailable(!!(e as { available?: boolean }).available);
       else if (e.event === "wc") {
         // Direct-video path toggled: swap the render surface (canvas ↔ video).
@@ -2061,6 +2094,28 @@ export function ControlScreen({
     queueMove(cursorRef.current.x, cursorRef.current.y);
   };
 
+  /** Mirror cursor movement made physically on the PC. This updates the local
+   * overlay and zoom crop but deliberately sends nothing back to the host. */
+  const followHostCursor = (nx: number, ny: number) => {
+    if (pts.current.size > 0) return; // local touch owns the cursor mid-gesture
+    cursorRef.current = { x: clamp(nx, 0, 1), y: clamp(ny, 0, 1) };
+    const l = liveLayout();
+    const media = mediaEl();
+    if (l && media && zoomRef.current > 1.01) {
+      const s = normToViewport(viewportRef.current, media, cursorRef.current.x, cursorRef.current.y);
+      if (s) {
+        let px = panRef.current.x;
+        let py = panRef.current.y;
+        if (s.x < FOLLOW_MARGIN) px += FOLLOW_MARGIN - s.x;
+        else if (s.x > l.cw - FOLLOW_MARGIN) px -= s.x - (l.cw - FOLLOW_MARGIN);
+        if (s.y < FOLLOW_MARGIN) py += FOLLOW_MARGIN - s.y;
+        else if (s.y > l.ch - FOLLOW_MARGIN) py -= s.y - (l.ch - FOLLOW_MARGIN);
+        panRef.current = clampPan(l, zoomRef.current, px, py);
+      }
+    }
+    commitView();
+  };
+
   const applyZoom = (nextZoom: number, focalX: number, focalY: number) => {
     const l = liveLayout();
     if (!l) return;
@@ -2093,8 +2148,6 @@ export function ControlScreen({
   const downT = useRef(0);
   const maxMove = useRef(0);
   const downCount = useRef(0);
-  const lastTapUp = useRef(0);
-  const armedDrag = useRef(false);
   const touchPressed = useRef(false);
   const longTimer = useRef<number | null>(null);
 
@@ -2186,7 +2239,6 @@ export function ControlScreen({
       maxMove.current = 0;
       downCount.current = 1;
       touchPressed.current = false;
-      armedDrag.current = false;
       // Mouse-like devices are always absolute (surface touchpad / desktop mouse).
       const abs = isMouseLike(e) || mode === "touch";
       gesture.current = abs ? "touchdrag" : "cursor";
@@ -2203,22 +2255,30 @@ export function ControlScreen({
       } else if (dragLock) {
         send({ type: "down", button: "left" });
         gesture.current = "dragging";
-      } else {
-        armedDrag.current = now - lastTapUp.current < DOUBLE_MS; // double-tap-drag
       }
 
-      // Long-press → right click (touch / laser only — mouse has a real RMB).
+      // Stationary hold → left-button down; two-finger tap → right click.
       clearLong();
-      if (!isMouseLike(e) && gesture.current !== "dragging" && !armedDrag.current) {
+      if (!isMouseLike(e) && gesture.current !== "dragging") {
         longTimer.current = window.setTimeout(() => {
           if (pts.current.size === 1 && maxMove.current < TAP_SLOP) {
-            gesture.current = "none"; // consume the gesture; no click on release
-            sendRightClick(); // haptic fires only if the click reached the PC
+            gesture.current = "dragging";
+            touchPressed.current = true;
+            send({ type: "down", button: "left" });
+            setDragging(true);
+            navigator.vibrate?.(18);
           }
         }, LONGPRESS_MS);
       }
     } else if (pts.current.size === 2) {
       clearLong();
+      // A second finger changes the gesture to right-click/scroll/pinch. If it
+      // arrived after a long-hold, release that left button first.
+      if (touchPressed.current) {
+        send({ type: "up", button: "left" });
+        touchPressed.current = false;
+        setDragging(false);
+      }
       stopEdgePan(); // two-finger gesture (pinch/scroll) — no cursor edge-pan
       downCount.current = 2;
       gesture.current = "two";
@@ -2285,18 +2345,10 @@ export function ControlScreen({
     // Absolute path: touch mode, or mouse/pen/surface touchpad (OS cursor is absolute).
     if (isMouseLike(e) || mode === "touch") {
       moveAbsFromClient(e.clientX, e.clientY);
-      if (!isMouseLike(e) && travel > TAP_SLOP && !touchPressed.current) {
-        send({ type: "down", button: "left" });
-        touchPressed.current = true;
-      }
       return;
     }
 
     // Trackpad: relative cursor movement (phone finger).
-    if (armedDrag.current && gesture.current !== "dragging" && travel > TAP_SLOP) {
-      gesture.current = "dragging";
-      send({ type: "down", button: "left" });
-    }
     const l = liveLayout();
     if (!l) return;
     const speed = sensitivity / (l.dispW * zoomRef.current);
@@ -2349,7 +2401,6 @@ export function ControlScreen({
         if (twoMode.current === "undecided" && wasTap && downCount.current === 2) sendRightClick();
       } else if (g === "cursor" && wasTap && downCount.current === 1) {
         send({ type: "click", button: "left" });
-        lastTapUp.current = now; // enables double-tap-drag & native double-click
       }
 
       // Quest: latch keyboard on click the same way the Keyboard icon does — stay
@@ -2366,8 +2417,8 @@ export function ControlScreen({
       gesture.current = "none";
       twoMode.current = "undecided";
       prevMid.current = null;
-      armedDrag.current = false;
       touchPressed.current = false;
+      setDragging(false);
       downCount.current = 0;
       stopEdgePan(); // finger lifted — stop nudging the cursor
     } else if (pts.current.size === 1) {
@@ -3174,11 +3225,10 @@ export function ControlScreen({
               className="pointer-events-none absolute inset-0 grid place-items-center bg-black"
             >
               <motion.div
-                className="flex flex-col items-center gap-4"
-                animate={{ scale: [1, 1.05, 1], opacity: [0.75, 1, 0.75] }}
+                className="flex items-center rounded-full bg-white/[0.06] px-3 py-1.5"
+                animate={{ opacity: [0.65, 1, 0.65] }}
                 transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
               >
-                <img src="/app-icon.png" alt="" className="h-24 w-24 rounded-3xl shadow-glow" />
                 <span className="flex items-center gap-2 text-xs font-700 text-ink-dim">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waking your screen…
                 </span>
@@ -3212,15 +3262,15 @@ export function ControlScreen({
       {/* ---- collapsed top / immersive restore chips (same pattern as bottom Controls) ---- */}
       {(immersive || topCollapsed) && !pipView && (
         <div
-          className="absolute left-2 right-2 z-40 flex items-center justify-between gap-1.5"
+          className="pointer-events-none absolute left-2 right-2 z-40 flex items-center justify-between gap-1.5"
           // Edge-flush on purpose: the stream itself paints under the notch, so the
           // floating pills sit at the true top edge (no safe-area offset).
           style={{ top: "0.375rem" }}
         >
-          <div className="flex items-center gap-1.5">
+          <div className="pointer-events-auto flex items-center gap-1.5">
             {connected && <FpsLatencyPill fps={fps} wcStats={wcStats} net={net} variant="floating" />}
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="pointer-events-auto flex items-center gap-1.5">
             <ZoomChip
               zoom={zoom}
               open={zoomOpen}
@@ -3984,6 +4034,25 @@ export function ControlScreen({
                 )}
                 <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
                   <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    Adaptive FPS <ScopeTag scope="host" />
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => patchTune({ adaptiveFps: !tune.adaptiveFps })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
+                      tune.adaptiveFps ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tune.adaptiveFps ? "ON" : "OFF"}
+                  </button>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    Shares network pressure between frame rate and per-frame detail, so motion eases before the picture becomes heavily compressed.
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
                     Direct (WebCodecs) <ScopeTag scope="direct" />
                   </span>
                   <button
@@ -4185,7 +4254,7 @@ export function ControlScreen({
       {/* ---- collapsed-dock helpers: stay visible while typing (Controls must not vanish) ---- */}
       {(immersive || dockCollapsed) && !pipView && (
         <div
-          className="absolute bottom-2 left-2 right-2 z-40 flex items-center justify-between"
+          className="pointer-events-none absolute bottom-2 left-2 right-2 z-40 flex items-center justify-between"
           style={{ marginBottom: "env(safe-area-inset-bottom)" }}
         >
           <motion.button
@@ -4193,7 +4262,7 @@ export function ControlScreen({
             animate={{ scale: 1, opacity: 1 }}
             whileTap={{ scale: 0.9 }}
             onClick={() => (typing ? stopTyping() : startTyping())}
-            className={`grid h-11 w-11 place-items-center rounded-full border shadow-float backdrop-blur ${
+            className={`pointer-events-auto grid h-11 w-11 place-items-center rounded-full border shadow-float backdrop-blur ${
               typing ? "border-accent-3/50 bg-accent-3/30 text-white" : "border-white/15 bg-black/45 text-white/90"
             }`}
             title={typing ? "Stop typing" : "Keyboard"}
@@ -4206,7 +4275,7 @@ export function ControlScreen({
               if (immersive) setImmersive(false);
               else setDockCollapsed(false);
             }}
-            className={`ml-auto flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-700 text-white/90 ${wcNative ? "bg-[#0b0d14]" : "bg-black/45 backdrop-blur"}`}
+            className={`pointer-events-auto ml-auto flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-700 text-white/90 ${wcNative ? "bg-[#0b0d14]" : "bg-black/45 backdrop-blur"}`}
             title="Show controls"
           >
             <ChevronUp className="h-4 w-4" /> Controls
@@ -4341,7 +4410,7 @@ export function ControlScreen({
                 />
               </div>
               <div
-                className="flex min-w-0 flex-1 items-end gap-1.5 overflow-x-auto py-2 pr-2"
+                className="flex min-w-0 flex-1 items-end gap-1.5 overflow-x-auto py-1 pr-2"
                 style={{ zoom: toolbarScaleOf(chrome, "mouse") }}
               >
               <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
@@ -4404,22 +4473,16 @@ export function ControlScreen({
                 <ChevronDown className="h-4 w-4" />
               </IcoBtn>
               <Sep />
-              <div className="flex shrink-0 flex-col items-center gap-0.5 pr-1" title="Pointer speed">
-                <div className="flex items-center gap-1.5">
-                  <Gauge className="h-3.5 w-3.5 text-ink-dim" />
-                  <input
-                    type="range"
-                    min="0.6"
-                    max="3.5"
-                    step="0.1"
-                    value={sensitivity}
-                    onChange={(e) => setSensitivity(parseFloat(e.target.value))}
-                    className="w-24 accent-accent-3"
-                  />
-                  <span className="w-7 text-[10px] font-700 text-white">{sensitivity.toFixed(1)}×</span>
-                </div>
-                <span className="text-[8px] font-700 leading-none text-ink-dim">Speed</span>
-              </div>
+              <QSlider
+                icon={<Gauge className="h-3.5 w-3.5" />}
+                label="Speed"
+                min={0.6}
+                max={3.5}
+                step={0.1}
+                value={sensitivity}
+                fmt={(v) => `${v.toFixed(1)}×`}
+                onChange={setSensitivity}
+              />
               </div>
             </div>
           )}
@@ -4443,7 +4506,7 @@ export function ControlScreen({
                 />
                 </div>
                 <div
-                  className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
+                  className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-1.5 pr-2"
                   style={{ zoom: toolbarScaleOf(chrome, "keys") }}
                 >
                 <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
@@ -4479,7 +4542,7 @@ export function ControlScreen({
                 />
               </div>
               <div
-                className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
+                className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-1.5 pr-2"
                 style={{ zoom: toolbarScaleOf(chrome, "shortcuts") }}
               >
               <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
@@ -4589,7 +4652,7 @@ export function ControlScreen({
                 />
               </div>
               <div
-                className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto py-2 pr-2"
+                className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-1 pr-2"
                 style={{ zoom: toolbarScaleOf(chrome, "quality") }}
               >
               <div className="flex shrink-0 rounded-lg bg-white/[0.05] p-0.5">
@@ -4614,6 +4677,16 @@ export function ControlScreen({
                 value={tune.pace}
                 fmt={(v) => (v === 0 ? "Resp" : v === 100 ? "Smth" : `${v}`)}
                 onChange={(v) => patchTune({ pace: v })}
+              />
+              <QSlider
+                icon={<RotateCcw className="h-3.5 w-3.5" />}
+                label="Rotate"
+                min={400}
+                max={3000}
+                step={100}
+                value={rotationHoldMs}
+                fmt={(v) => `${(v / 1000).toFixed(1)}s`}
+                onChange={setRotationHoldMs}
               />
               <Sep />
               <IcoBtn active={showStats} title="Performance stats" onClick={() => setShowStats((s) => !s)}><Gauge className="h-4 w-4" /></IcoBtn>
@@ -4649,7 +4722,7 @@ export function ControlScreen({
                 />
                 </div>
                 <div
-                  className="flex min-w-0 flex-1 origin-left items-center gap-1.5 overflow-x-auto py-2.5 pr-2"
+                  className="flex min-w-0 flex-1 origin-left items-center gap-1.5 overflow-x-auto py-1.5 pr-2"
                   style={{ zoom: toolbarScaleOf(chrome, "game") }}
                 >
                 <PinModeToggle active={pinMode} onClick={() => setPinMode((v) => !v)} />
@@ -4758,7 +4831,7 @@ export function ControlScreen({
                 />
               </div>
               <div
-                className="flex min-w-0 flex-1 flex-col gap-2 py-2.5 pr-3"
+                className="flex min-w-0 flex-1 flex-col gap-1.5 py-1.5 pr-3"
                 style={{ zoom: toolbarScaleOf(chrome, "gamepad") }}
               >
               <div className="flex flex-wrap items-center gap-2">
@@ -4794,7 +4867,7 @@ export function ControlScreen({
 
           {/* always-visible icon tab strip — kept compact so the row still clears
               the curve after the container's edge padding eats into the width. */}
-          <div className="flex items-center gap-0.5 py-1">
+          <div className="flex items-center gap-0.5 py-0.5">
             <Tab active={panel === "mouse"} onClick={() => openPanel("mouse")} title="Mouse"><MousePointer2 className="h-4 w-4" /></Tab>
             <Tab active={panel === "keys"} onClick={() => openPanel("keys")} title="Special keys"><Command className="h-4 w-4" /></Tab>
             <Tab active={panel === "game"} onClick={() => openPanel("game")} title="Game keys"><Crosshair className="h-4 w-4" /></Tab>
@@ -6144,16 +6217,74 @@ function Tab({ onClick, active, title, children }: { onClick: () => void; active
 }
 /** Compact labelled slider for the single-row quality panel. */
 function QSlider({ icon, label, min, max, step, value, fmt, onChange }: { icon: React.ReactNode; label: string; min: number; max: number; step: number; value: number; fmt: (v: number) => string; onChange: (v: number) => void }) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ bottom: number; left: number } | null>(null);
+  useEffect(() => {
+    if (!open) {
+      setPos(null);
+      return;
+    }
+    const place = () => {
+      const r = rootRef.current?.getBoundingClientRect();
+      if (!r) return;
+      setPos({
+        bottom: Math.max(8, window.innerHeight - r.top + 6),
+        left: Math.min(Math.max(8, r.left - 8), Math.max(8, window.innerWidth - 60)),
+      });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
   return (
-    <div className="flex w-[4.75rem] shrink-0 flex-col gap-0.5">
-      <div className="flex items-center justify-between text-[9px] font-700 leading-none text-ink-dim">
-        <span className="flex items-center gap-0.5">
-          {icon}
-          {label}
-        </span>
-        <span className="text-white">{fmt(value)}</span>
-      </div>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(parseInt(e.target.value, 10))} className="w-full accent-accent-3" />
+    <div ref={rootRef} className="relative shrink-0">
+      <button
+        type="button"
+        onPointerDown={(e) => e.preventDefault()}
+        onClick={() => setOpen((v) => !v)}
+        title={`${label}: ${fmt(value)}`}
+        className={`flex h-8 min-w-10 flex-col items-center justify-center rounded-lg px-1 text-[8px] font-700 leading-none ${open ? "bg-accent-3 text-white" : "bg-white/[0.04] text-ink-dim"}`}
+      >
+        {icon}
+        <span className="mt-0.5 max-w-11 truncate">{label}</span>
+      </button>
+      {typeof document !== "undefined" && createPortal(
+        <AnimatePresence>
+          {open && pos && (
+            <motion.div
+              initial={{ opacity: 0, y: 6, scale: 0.92 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 6, scale: 0.92 }}
+              className="fixed z-[100] flex flex-col items-center gap-1.5 rounded-2xl border border-white/15 bg-black/90 px-2.5 py-2 shadow-float backdrop-blur-md"
+              style={{ bottom: pos.bottom, left: pos.left }}
+            >
+              <span className="text-[9px] font-800 text-ink-dim">{label}</span>
+              <span className="text-[10px] font-800 tabular-nums text-white">{fmt(value)}</span>
+              <div className="relative flex h-28 w-10 items-center justify-center">
+                <input
+                  type="range"
+                  min={min}
+                  max={max}
+                  step={step}
+                  value={value}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onChange={(e) => onChange(Number(e.target.value))}
+                  onInput={(e) => onChange(Number((e.target as HTMLInputElement).value))}
+                  className="h-2 w-24 cursor-pointer accent-accent-3"
+                  style={{ transform: "rotate(-90deg)" }}
+                  aria-label={label}
+                />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>,
+        document.body,
+      )}
     </div>
   );
 }

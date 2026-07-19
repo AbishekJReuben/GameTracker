@@ -313,8 +313,10 @@ const save = (path, before, after, msg) => {
       `import android.graphics.Rect\n` +
       `import android.os.Build\n` +
       `import android.os.Bundle\n` +
+      `import android.os.SystemClock\n` +
       `import android.util.Rational\n` +
       `import android.webkit.WebView\n` +
+      `import android.view.OrientationEventListener\n` +
       `import android.view.WindowManager\n` +
       `import androidx.activity.enableEdgeToEdge\n` +
       `import androidx.annotation.RequiresApi\n` +
@@ -329,6 +331,7 @@ const save = (path, before, after, msg) => {
       `     *  then shrinks it into a floating 16:9 mini window (YouTube/AnyDesk\n` +
       `     *  style) instead of plain backgrounding. */\n` +
       `    @JvmField var pipWanted = false\n` +
+      `    @JvmField var rotationHoldMs = 1200L\n` +
       `    private var current: WeakReference<MainActivity>? = null\n\n` +
       `    /** JNI entry point: flips the gate AND refreshes the live activity's PiP\n` +
       `     *  params, so Android 12+'s auto-enter (the SEAMLESS system-animated\n` +
@@ -339,7 +342,17 @@ const save = (path, before, after, msg) => {
       `      val act = current?.get() ?: return\n` +
       `      act.runOnUiThread { act.updatePipParams() }\n` +
       `    }\n` +
+      `    @JvmStatic\n` +
+      `    fun setRotationHoldMs(value: Long) {\n` +
+      `      rotationHoldMs = value.coerceIn(400L, 3000L)\n` +
+      `    }\n` +
       `  }\n\n` +
+      `  private var appWebView: WebView? = null\n` +
+      `  private var imeVisible = false\n` +
+      `  private var lastImeBottom = -1\n` +
+      `  private var rotationCandidate = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED\n` +
+      `  private var rotationCandidateSince = 0L\n` +
+      `  private lateinit var orientationListener: OrientationEventListener\n\n` +
       `  override fun onCreate(savedInstanceState: Bundle?) {\n` +
       `    enableEdgeToEdge()\n` +
       `    super.onCreate(savedInstanceState)\n` +
@@ -351,7 +364,32 @@ const save = (path, before, after, msg) => {
       `    // Follow the physical sensor in all four orientations, IGNORING the\n` +
       `    // system auto-rotate lock — holding the phone sideways for a moment\n` +
       `    // rotates the remote screen even with rotation lock on.\n` +
-      `    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR\n` +
+      `    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED\n` +
+      `    orientationListener = object : OrientationEventListener(this) {\n` +
+      `      override fun onOrientationChanged(angle: Int) {\n` +
+      `        if (angle == ORIENTATION_UNKNOWN || isInPictureInPictureMode) return\n` +
+      `        // A narrow 25-degree cardinal window rejects shaky transition angles.\n` +
+      `        val next = when {\n` +
+      `          angle >= 335 || angle <= 25 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT\n` +
+      `          angle in 65..115 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE\n` +
+      `          angle in 155..205 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT\n` +
+      `          angle in 245..295 -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE\n` +
+      `          else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED\n` +
+      `        }\n` +
+      `        if (next == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {\n` +
+      `          rotationCandidate = next\n` +
+      `          return\n` +
+      `        }\n` +
+      `        val now = SystemClock.elapsedRealtime()\n` +
+      `        if (next != rotationCandidate) {\n` +
+      `          rotationCandidate = next\n` +
+      `          rotationCandidateSince = now\n` +
+      `        } else if (requestedOrientation != next && now - rotationCandidateSince >= rotationHoldMs) {\n` +
+      `          requestedOrientation = next\n` +
+      `        }\n` +
+      `      }\n` +
+      `    }\n` +
+      `    if (orientationListener.canDetectOrientation()) orientationListener.enable()\n` +
       `    hideSystemBars()\n` +
       `    updatePipParams()\n` +
       `    // Keyboard must SHRINK the webview, never pan the window. With\n` +
@@ -368,7 +406,11 @@ const save = (path, before, after, msg) => {
       `    val content = findViewById<android.view.View>(android.R.id.content)\n` +
       `    ViewCompat.setOnApplyWindowInsetsListener(content) { v, insets ->\n` +
       `      val ime = insets.getInsets(WindowInsetsCompat.Type.ime())\n` +
-      `      v.setPadding(0, 0, 0, ime.bottom)\n` +
+      `      imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())\n` +
+      `      if (ime.bottom != lastImeBottom) {\n` +
+      `        lastImeBottom = ime.bottom\n` +
+      `        v.setPadding(0, 0, 0, ime.bottom)\n` +
+      `      }\n` +
       `      insets\n` +
       `    }\n` +
       `  }\n\n` +
@@ -381,12 +423,13 @@ const save = (path, before, after, msg) => {
       `   *  phone re-requests keyframes forever. */\n` +
       `  override fun onWebViewCreate(webView: WebView) {\n` +
       `    super.onWebViewCreate(webView)\n` +
+      `    appWebView = webView\n` +
       `    WcDecoderBridge.installJsInterface(webView)\n` +
       `  }\n\n` +
       `  override fun onWindowFocusChanged(hasFocus: Boolean) {\n` +
       `    super.onWindowFocusChanged(hasFocus)\n` +
       `    // Re-hide after the bars are transiently shown (keyboard, app resume).\n` +
-      `    if (hasFocus) hideSystemBars()\n` +
+      `    if (hasFocus && !imeVisible) hideSystemBars()\n` +
       `  }\n\n` +
       `  /** Does this device actually have PiP? (Go/TV/OEM builds may not.) NOTE: no\n` +
       `   *  SDK_INT check in here — lint can't see version guards through a helper,\n` +
@@ -460,7 +503,14 @@ const save = (path, before, after, msg) => {
       `    newConfig: Configuration\n` +
       `  ) {\n` +
       `    super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)\n` +
+      `    val active = if (isInPictureInPictureMode) "true" else "false"\n` +
+      `    appWebView?.evaluateJavascript("window.__GT_PIP_ACTIVE__=" + active + ";window.dispatchEvent(new CustomEvent('gt:pip',{detail:{active:" + active + "}}));", null)\n` +
       `    if (!isInPictureInPictureMode) hideSystemBars()\n` +
+      `  }\n\n` +
+      `  override fun onDestroy() {\n` +
+      `    if (::orientationListener.isInitialized) orientationListener.disable()\n` +
+      `    appWebView = null\n` +
+      `    super.onDestroy()\n` +
       `  }\n\n` +
       `  private fun hideSystemBars() {\n` +
       `    val controller = WindowInsetsControllerCompat(window, window.decorView)\n` +

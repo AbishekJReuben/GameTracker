@@ -2065,7 +2065,7 @@ export class CloudConn {
     this.hitchLastFramePerf = perfNow;
     // Backgrounded (NOT PiP — a PiP window counts as visible): skip decoding to
     // save battery; resync off a fresh keyframe when the app comes back.
-    if (document.hidden && !head.key) {
+    if (document.hidden && !(window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__ && !head.key) {
       this.wcAwaitKey = true;
       return;
     }
@@ -2438,7 +2438,7 @@ export class CloudConn {
       // still requires full authorization.
       if (transportUp) this.lastHealthyAt = Date.now();
       // Backgrounded: timers throttle and getStats is meaningless — skip checks.
-      if (document.hidden) return;
+      if (document.hidden && !(window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__) return;
       // Hard reset — the ultimate backstop: if the transport hasn't been "connected"
       // for the reset window, force a clean rebuild. Bypasses the `connecting` guard
       // so a PC wedged in "disconnected"/"connecting" (never firing "failed")
@@ -2487,7 +2487,7 @@ export class CloudConn {
       if (this.wcRequestedAt && !this.wcActive && Date.now() - this.wcRequestedAt > 6000) {
         this.wcFallback("no direct-video frames after opt-in");
       }
-      if (this.wcActive && this.sinkActive && !document.hidden) {
+      if (this.wcActive && this.sinkActive && (!document.hidden || (window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__)) {
         if (Date.now() - this.wcLastFrameAt > WATCHDOG_MS * 1.5) {
           this.wcStallTicks++;
           if (this.wcStallTicks === 2) this.wcRequestKeyframe();

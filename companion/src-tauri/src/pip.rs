@@ -16,6 +16,39 @@ pub async fn set_pip_enabled(enabled: bool) -> Result<(), String> {
         .map_err(|e| format!("pip task panicked: {e}"))?
 }
 
+#[tauri::command]
+pub async fn set_rotation_hold_ms(value: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || set_rotation_hold_impl(value))
+        .await
+        .map_err(|e| format!("rotation task panicked: {e}"))?
+}
+
+#[cfg(target_os = "android")]
+fn set_rotation_hold_impl(value: u64) -> Result<(), String> {
+    use jni::objects::{JClass, JObject, JValue};
+    let ctx = crate::update::tao_android_context()?;
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.java_vm.cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let context = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
+    let result = (|| -> Result<(), String> {
+        let loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .map_err(|e| format!("getClassLoader: {e}"))?.l().map_err(|e| e.to_string())?;
+        let name: JObject = env.new_string("com.chilloutgames.gametracker.companion.MainActivity")
+            .map_err(|e| e.to_string())?.into();
+        let class_obj = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])
+            .map_err(|e| format!("loadClass: {e}"))?.l().map_err(|e| e.to_string())?;
+        let class = JClass::from(class_obj);
+        env.call_static_method(&class, "setRotationHoldMs", "(J)V", &[JValue::Long(value.clamp(400, 3000) as i64)])
+            .map_err(|e| format!("setRotationHoldMs: {e}"))?;
+        Ok(())
+    })();
+    if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
+    result
+}
+
+#[cfg(not(target_os = "android"))]
+fn set_rotation_hold_impl(_value: u64) -> Result<(), String> { Ok(()) }
+
 #[cfg(target_os = "android")]
 fn set_pip_impl(enabled: bool) -> Result<(), String> {
     use jni::objects::{JClass, JObject, JValue};

@@ -436,6 +436,7 @@ export function startHost(opts: HostOptions): () => void {
   let focusTimer: number | null = null;
   let lastTextField = false;
   let lastCursorKind = "";
+  let lastCursorPos: [number, number] | null = null;
   let sigBackoff = 1000;
   let sigRetry: number | null = null;
   // Set when the signaling server evicted us because ANOTHER host joined our
@@ -485,6 +486,7 @@ export function startHost(opts: HostOptions): () => void {
     maxW: 1600,
     jpeg: 70,
     fps: opts.fps ?? 60,
+    adaptiveFps: true,
     mode: "auto" as string,
     bitrate: 0,
     jpegCap: 72,
@@ -525,6 +527,7 @@ export function startHost(opts: HostOptions): () => void {
   // back toward the Tune target when the channel drains. VIDEO ONLY — never touches
   // input. `adaptKbps` is what Rust actually encodes at; `quality.bitrate` is the cap.
   let adaptKbps = 0;
+  let adaptFps = quality.fps;
   let adaptCleanSince = 0;
   let lastAdaptPush = 0;
 
@@ -550,7 +553,7 @@ export function startHost(opts: HostOptions): () => void {
     try {
       api.remoteSetCaptureQuality(
         quality.maxW,
-        quality.fps,
+        Math.round(adaptFps),
         jpegForRtc(quality.jpeg, quality.jpegCap),
         CONTENT_NUM[quality.mode] ?? 0,
         kbps,
@@ -656,7 +659,14 @@ export function startHost(opts: HostOptions): () => void {
         return;
       }
       lastShedAt = now;
-      const cut = hardDrop ? 0.85 : 0.94;
+      const minAdaptiveFps = Math.max(20, Math.round(quality.fps * 0.45));
+      const canEaseFps = quality.adaptiveFps && adaptFps > minAdaptiveFps;
+      if (canEaseFps) {
+        const nextFps = Math.max(minAdaptiveFps, adaptFps - (hardDrop ? 5 : 2));
+        if (nextFps !== adaptFps) slog("adapt", `fps ${adaptFps} → ${nextFps} (${hardDrop ? "hard-drop" : "fill"})`);
+        adaptFps = nextFps;
+      }
+      const cut = canEaseFps ? 0.97 : hardDrop ? 0.85 : 0.94;
       const floor = Math.max(500, quality.minBitrateKbps);
       const lo = Math.min(floor, tgt);
       const next = Math.max(lo, Math.round(adaptKbps * cut));
@@ -677,6 +687,13 @@ export function startHost(opts: HostOptions): () => void {
       // converges at the same deliberate rate.
       const farBelow = adaptKbps < tgt * 0.5;
       const raiseEvery = farBelow ? 700 : 1200;
+      if (quality.adaptiveFps && adaptFps < quality.fps && adaptKbps >= tgt * 0.7 && now - adaptCleanSince >= 1400) {
+        adaptFps = Math.min(quality.fps, adaptFps + 2);
+        adaptCleanSince = now;
+        slog("adapt", `fps restore → ${adaptFps}`);
+        pushAdaptBitrate(true);
+        return;
+      }
       if (now - adaptCleanSince >= raiseEvery && adaptKbps < tgt) {
         const nearCeil = probeCeilKbps > 0 && adaptKbps >= probeCeilKbps * 0.9;
         const next = Math.min(
@@ -751,7 +768,7 @@ export function startHost(opts: HostOptions): () => void {
     const p = sender.getParameters();
     if (!p.encodings || p.encodings.length === 0) p.encodings = [{}];
     p.encodings[0].maxBitrate = capBps;
-    p.encodings[0].maxFramerate = quality.fps;
+    p.encodings[0].maxFramerate = Math.round(adaptFps);
     // Chromium accepts minBitrate on encodings even though it isn't in the W3C
     // IDL — floor BWE so screen share can't collapse to ~200kbps. Best-effort.
     const minBps = Math.min(Math.round(capBps * 0.25), 3_000_000);
@@ -819,9 +836,11 @@ export function startHost(opts: HostOptions): () => void {
           dataCh.send(JSON.stringify({ event: "focus", textField: true }));
         }
         const kind = await api.remoteCursorKind();
-        if (kind !== lastCursorKind) {
+        const pos = await api.remoteCursorPosition();
+        if (kind !== lastCursorKind || (pos && (!lastCursorPos || Math.abs(pos[0] - lastCursorPos[0]) > 0.0005 || Math.abs(pos[1] - lastCursorPos[1]) > 0.0005))) {
           lastCursorKind = kind;
-          dataCh.send(JSON.stringify({ event: "cursor", kind }));
+          lastCursorPos = pos;
+          dataCh.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1] }));
         }
       } catch {
         /* ignore */
@@ -872,6 +891,7 @@ export function startHost(opts: HostOptions): () => void {
     pendingGuestCandidates = [];
     lastTextField = false;
     lastCursorKind = "";
+    lastCursorPos = null;
     opts.onClients?.(0);
     opts.onStats?.(null);
   };
@@ -1899,7 +1919,7 @@ export function startHost(opts: HostOptions): () => void {
           const open = videoCh.readyState === "open";
           const b = open ? videoCh.bufferedAmount : 0;
           const budgetNow = wcBufBudget();
-          const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, quality.fps)));
+          const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, adaptFps)));
           const held = performance.now() - pausedAtMs >= minHoldMs;
           if (!open || (held && b < budgetNow * 0.35)) {
             if (pausePoll !== null) window.clearInterval(pausePoll);
@@ -1915,7 +1935,7 @@ export function startHost(opts: HostOptions): () => void {
     videoCh.onbufferedamountlow = () => {
       if (!encodePaused) return;
       const budgetNow = wcBufBudget();
-      const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, quality.fps)));
+      const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, adaptFps)));
       if (
         performance.now() - pausedAtMs >= minHoldMs &&
         videoCh.bufferedAmount < budgetNow * 0.35
@@ -2044,7 +2064,7 @@ export function startHost(opts: HostOptions): () => void {
         setEncoderPaused(true, buffered, maxBuffered);
         if (entering) adaptFromBuffer(buffered, maxBuffered, false);
       } else if (!(key && buffered > maxBuffered * 4)) {
-        const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, quality.fps)));
+        const minHoldMs = Math.max(16, Math.ceil(1000 / Math.max(1, adaptFps)));
         if (
           encodePaused &&
           buffered < maxBuffered * 0.35 &&
@@ -2158,14 +2178,14 @@ export function startHost(opts: HostOptions): () => void {
       const bps = wcTargetBps();
       // (Re)configure on size/bitrate/fps changes. Cheap (no encoder rebuild) and
       // the next frame is forced to a keyframe so the guest resyncs instantly.
-      if (w !== wcW || h !== wcH || bps !== wcBps || quality.fps !== wcFps) {
+      if (w !== wcW || h !== wcH || bps !== wcBps || Math.round(adaptFps) !== wcFps) {
         try {
           enc.configure({
             codec: wcCodec,
             width: w,
             height: h,
             bitrate: bps,
-            framerate: quality.fps,
+            framerate: Math.round(adaptFps),
             latencyMode: "realtime",
             hardwareAcceleration: wcHw,
             avc: { format: "annexb" },
@@ -2187,7 +2207,7 @@ export function startHost(opts: HostOptions): () => void {
         wcW = w;
         wcH = h;
         wcBps = bps;
-        wcFps = quality.fps;
+        wcFps = Math.round(adaptFps);
         wcForceKey = true;
         try {
           videoCh.send(JSON.stringify({ codec: wcCodec, w, h }));
@@ -2566,6 +2586,7 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.maxW === "number") quality.maxW = clamp(msg.maxW, 320, 3840);
           if (typeof msg.quality === "number") quality.jpeg = clamp(msg.quality, 20, 95);
           if (typeof msg.fps === "number") quality.fps = clamp(msg.fps, 1, 120);
+          if (typeof msg.adaptiveFps === "boolean") quality.adaptiveFps = msg.adaptiveFps;
           if (typeof msg.bitrate === "number") quality.bitrate = msg.bitrate <= 0 ? 0 : clamp(msg.bitrate, 500, 40000);
           if (msg.mode === "auto" || msg.mode === "text" || msg.mode === "video") quality.mode = msg.mode;
           if (typeof msg.jpegCap === "number") quality.jpegCap = clamp(msg.jpegCap, 40, 95);
@@ -2610,6 +2631,7 @@ export function startHost(opts: HostOptions): () => void {
             quality.fps !== prevFps;
           if (targetChanged || adaptKbps <= 0) {
             adaptKbps = tgtNow;
+            adaptFps = quality.fps;
             probeCeilKbps = 0;
             adaptCleanSince = 0;
             lastSkipAt = 0;
@@ -2642,7 +2664,7 @@ export function startHost(opts: HostOptions): () => void {
           try {
             api.remoteSetCaptureQuality(
               quality.maxW,
-              quality.fps,
+              Math.round(adaptFps),
               jpegForRtc(quality.jpeg, quality.jpegCap),
               CONTENT_NUM[quality.mode] ?? 0,
               // The native encoder needs a real bitrate, not a JPEG quality. Prefer
@@ -2836,9 +2858,11 @@ export function startHost(opts: HostOptions): () => void {
         // follows the PC (hand over links, I-beam over text, resize arrows…).
         try {
           const kind = await api.remoteCursorKind();
-          if (kind !== lastCursorKind) {
+          const pos = await api.remoteCursorPosition();
+          if (kind !== lastCursorKind || (pos && (!lastCursorPos || Math.abs(pos[0] - lastCursorPos[0]) > 0.0005 || Math.abs(pos[1] - lastCursorPos[1]) > 0.0005))) {
             lastCursorKind = kind;
-            if (data.readyState === "open") data.send(JSON.stringify({ event: "cursor", kind }));
+            lastCursorPos = pos;
+            if (data.readyState === "open") data.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1] }));
           }
         } catch {
           /* ignore */

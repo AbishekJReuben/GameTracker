@@ -23,6 +23,7 @@ pub fn run() {
             update::install_permission_status,
             update::open_install_settings,
             pip::set_pip_enabled,
+            pip::set_rotation_hold_ms,
             decoder::decoder_probe,
             decoder::decoder_init,
             decoder::decoder_set_bounds,

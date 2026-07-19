@@ -55,6 +55,7 @@ export type QualitySettings = {
   maxW: number;
   quality: number;
   fps: number;
+  adaptiveFps?: boolean;
   mode?: ContentMode;
   bitrate?: number;
   /** Host: jpegForRtc cap (default 72). */

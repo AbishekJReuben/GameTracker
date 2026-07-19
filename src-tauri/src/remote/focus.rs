@@ -101,3 +101,30 @@ pub fn foreground_cursor_kind() -> &'static str {
 pub fn foreground_cursor_kind() -> &'static str {
     "arrow"
 }
+
+/// Current system cursor position normalized to the monitor being streamed.
+/// This lets a zoomed phone viewport follow mouse movement performed locally on
+/// the PC instead of leaving the real cursor outside the cropped area.
+#[cfg(windows)]
+pub fn foreground_cursor_position() -> Option<[f32; 2]> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let (mx, my, mw, mh) =
+        crate::remote::capture::monitor_bounds(crate::remote::capture::selected_monitor())?;
+    if mw == 0 || mh == 0 {
+        return None;
+    }
+    unsafe {
+        let mut p = POINT::default();
+        GetCursorPos(&mut p).ok()?;
+        Some([
+            ((p.x - mx) as f32 / mw as f32).clamp(0.0, 1.0),
+            ((p.y - my) as f32 / mh as f32).clamp(0.0, 1.0),
+        ])
+    }
+}
+
+#[cfg(not(windows))]
+pub fn foreground_cursor_position() -> Option<[f32; 2]> {
+    None
+}

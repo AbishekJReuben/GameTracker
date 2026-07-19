@@ -2396,6 +2396,11 @@ pub fn remote_cursor_kind() -> String {
     crate::remote::focus::foreground_cursor_kind().to_string()
 }
 
+#[tauri::command]
+pub fn remote_cursor_position() -> Option<[f32; 2]> {
+    crate::remote::focus::foreground_cursor_position()
+}
+
 /// Latest host capture-pipeline telemetry (capture/scale/encode ms, produced fps,
 /// frame size, resolution), so the phone's debug HUD can pinpoint the bottleneck.
 #[tauri::command]
