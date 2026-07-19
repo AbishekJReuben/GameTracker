@@ -635,7 +635,14 @@ pub async fn fetch_app_info(
                     &info.genre_tags,
                     info.cover_path.as_deref(),
                 )?;
-                games::set_media(&pool, &id, &info.screenshots, None, info.website.as_deref(), None)?;
+                games::set_media(
+                    &pool,
+                    &id,
+                    &info.screenshots,
+                    None,
+                    info.website.as_deref(),
+                    None,
+                )?;
                 if let Some(json) = info.info_json.as_deref() {
                     games::set_info_json(&pool, &id, json)?;
                 }
@@ -847,7 +854,11 @@ pub fn apps_overview(state: State<AppState>) -> AppResult<AppsOverview> {
 }
 
 #[tauri::command]
-pub fn heatmap(state: State<AppState>, days: i64, kind: Option<String>) -> AppResult<Vec<DayValue>> {
+pub fn heatmap(
+    state: State<AppState>,
+    days: i64,
+    kind: Option<String>,
+) -> AppResult<Vec<DayValue>> {
     stats::heatmap(&state.pool, days.clamp(7, 400), kind.as_deref())
 }
 
@@ -862,7 +873,11 @@ pub fn catalog_analytics(state: State<AppState>) -> AppResult<CatalogAnalytics> 
 }
 
 #[tauri::command]
-pub fn insights(state: State<AppState>, year: Option<i64>, kind: Option<String>) -> AppResult<Insights> {
+pub fn insights(
+    state: State<AppState>,
+    year: Option<i64>,
+    kind: Option<String>,
+) -> AppResult<Insights> {
     let y = year.unwrap_or_else(|| chrono::Local::now().year() as i64);
     stats::insights(&state.pool, y, kind.as_deref())
 }
@@ -898,7 +913,10 @@ pub fn merge_tags(state: State<AppState>, sources: Vec<String>, target: String) 
 // ---------- suggestions ----------
 
 #[tauri::command]
-pub fn suggest_games(state: State<AppState>, refresh: Option<bool>) -> AppResult<SuggestionsResult> {
+pub fn suggest_games(
+    state: State<AppState>,
+    refresh: Option<bool>,
+) -> AppResult<SuggestionsResult> {
     suggestions::generate(&state.pool, refresh.unwrap_or(false))
 }
 
@@ -950,12 +968,22 @@ pub fn add_suggested_game(state: State<AppState>, input: AddSuggestionInput) -> 
     games::get(&state.pool, &id)?.ok_or_else(|| AppError::msg("Game not found"))
 }
 
-fn try_download_steam_cover(appid: u64, media_dir: &std::path::Path, game_id: &str) -> Option<String> {
+fn try_download_steam_cover(
+    appid: u64,
+    media_dir: &std::path::Path,
+    game_id: &str,
+) -> Option<String> {
     let url = metadata::steam_cover_url(appid);
-    let resp = ureq::get(&url).timeout(std::time::Duration::from_secs(12)).call().ok()?;
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(12))
+        .call()
+        .ok()?;
     let mut buf = Vec::new();
     use std::io::Read;
-    resp.into_reader().take(12_000_000).read_to_end(&mut buf).ok()?;
+    resp.into_reader()
+        .take(12_000_000)
+        .read_to_end(&mut buf)
+        .ok()?;
     if buf.len() < 1024 {
         return None;
     }
@@ -974,7 +1002,11 @@ pub fn tracking_state(state: State<AppState>) -> TrackingState {
 
 #[tauri::command]
 pub fn set_paused(state: State<AppState>, paused: bool) -> AppResult<()> {
-    settings::set(&state.pool, "tracking_paused", if paused { "true" } else { "false" })
+    settings::set(
+        &state.pool,
+        "tracking_paused",
+        if paused { "true" } else { "false" },
+    )
 }
 
 // ---------- system monitor ----------
@@ -995,7 +1027,10 @@ pub fn system_history(state: State<AppState>, minutes: i64) -> AppResult<system:
 }
 
 #[tauri::command]
-pub fn system_app_history(state: State<AppState>, minutes: i64) -> AppResult<system::AppUsageHistory> {
+pub fn system_app_history(
+    state: State<AppState>,
+    minutes: i64,
+) -> AppResult<system::AppUsageHistory> {
     system::app_history(&state.pool, &state.sys, minutes)
 }
 
@@ -1045,7 +1080,11 @@ pub async fn fetch_metacritic_reviews(
                 metadata::resolve_metacritic_slug(&game.display_name)
                     .ok_or_else(|| AppError::msg("Could not find this game on Metacritic."))?
             }
-        } else if let Some(s) = game.metacritic_slug.as_ref().filter(|s| !s.trim().is_empty()) {
+        } else if let Some(s) = game
+            .metacritic_slug
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+        {
             if metadata::metacritic_slug_valid(s, &game.display_name) {
                 s.clone()
             } else {
@@ -1170,8 +1209,9 @@ pub fn launch_game(state: State<AppState>, id: String) -> AppResult<()> {
     if game.kind != "game" {
         return Err(AppError::msg("Only games can be launched."));
     }
-    let exe = util::first_existing_exe(&game.exe_paths)
-        .ok_or_else(|| AppError::msg("Executable not found. The file may have been moved or deleted."))?;
+    let exe = util::first_existing_exe(&game.exe_paths).ok_or_else(|| {
+        AppError::msg("Executable not found. The file may have been moved or deleted.")
+    })?;
 
     #[cfg(windows)]
     {
@@ -1359,13 +1399,7 @@ pub fn steam_import(
         let progress = |ev: crate::steam::SteamSyncProgress| {
             let _ = app.emit("steam://progress", &ev);
         };
-        match crate::steam::import_games(
-            &pool,
-            &app_ids,
-            playtime,
-            achievements,
-            Some(&progress),
-        ) {
+        match crate::steam::import_games(&pool, &app_ids, playtime, achievements, Some(&progress)) {
             Ok((result, imported)) => {
                 for game in imported {
                     enrich_game_async(
@@ -1574,7 +1608,10 @@ pub fn media_overview(state: State<AppState>) -> AppResult<crate::db::music::Mus
 }
 
 #[tauri::command]
-pub fn media_heatmap(state: State<AppState>, days: Option<i64>) -> AppResult<Vec<crate::db::stats::DayValue>> {
+pub fn media_heatmap(
+    state: State<AppState>,
+    days: Option<i64>,
+) -> AppResult<Vec<crate::db::stats::DayValue>> {
     crate::db::music::heatmap(&state.pool, days.unwrap_or(140).clamp(7, 800))
 }
 
@@ -1584,7 +1621,10 @@ pub fn media_hour_of_day(state: State<AppState>) -> AppResult<Vec<i64>> {
 }
 
 #[tauri::command]
-pub fn media_top(state: State<AppState>, limit: Option<i64>) -> AppResult<crate::db::music::MusicTop> {
+pub fn media_top(
+    state: State<AppState>,
+    limit: Option<i64>,
+) -> AppResult<crate::db::music::MusicTop> {
     crate::db::music::top(&state.pool, limit.unwrap_or(10))
 }
 
@@ -1603,7 +1643,10 @@ pub fn media_timeline(
 }
 
 #[tauri::command]
-pub fn media_recent(state: State<AppState>, limit: Option<i64>) -> AppResult<Vec<crate::db::media::MediaPlayDto>> {
+pub fn media_recent(
+    state: State<AppState>,
+    limit: Option<i64>,
+) -> AppResult<Vec<crate::db::media::MediaPlayDto>> {
     crate::db::media::recent(&state.pool, limit.unwrap_or(12).clamp(1, 100))
 }
 
@@ -1661,7 +1704,10 @@ pub fn playlists_list(state: State<AppState>) -> AppResult<Vec<crate::db::playli
 }
 
 #[tauri::command]
-pub fn playlist_get(state: State<AppState>, id: String) -> AppResult<Option<crate::db::playlists::PlaylistDto>> {
+pub fn playlist_get(
+    state: State<AppState>,
+    id: String,
+) -> AppResult<Option<crate::db::playlists::PlaylistDto>> {
     crate::db::playlists::get(&state.pool, &id)
 }
 
@@ -1738,7 +1784,14 @@ pub fn backfill_metacritic(app: tauri::AppHandle, state: State<AppState>) -> App
             if let Some(meta) = meta {
                 if meta.metacritic.is_some() {
                     let _ = games::apply_metadata(
-                        &pool, &game.id, None, None, meta.metacritic, None, &[], None,
+                        &pool,
+                        &game.id,
+                        None,
+                        None,
+                        meta.metacritic,
+                        None,
+                        &[],
+                        None,
                     );
                     updated += 1;
                 }
@@ -1813,8 +1866,16 @@ pub fn remote_status(state: State<AppState>) -> RemoteStatus {
 /// listener; disabling shuts down and turns cloud off. Persisted across restarts.
 #[tauri::command]
 pub fn remote_set_enabled(state: State<AppState>, enabled: bool) -> AppResult<RemoteStatus> {
-    settings::set(&state.pool, "remote_enabled", if enabled { "true" } else { "false" })?;
-    settings::set(&state.pool, "remote_cloud_enabled", if enabled { "true" } else { "false" })?;
+    settings::set(
+        &state.pool,
+        "remote_enabled",
+        if enabled { "true" } else { "false" },
+    )?;
+    settings::set(
+        &state.pool,
+        "remote_cloud_enabled",
+        if enabled { "true" } else { "false" },
+    )?;
     state.remote.enabled.store(enabled, Ordering::SeqCst);
     // Cloud host runs in the desktop webview (RemoteHostManager) gated on this flag.
     state.remote.cloud_enabled.store(enabled, Ordering::SeqCst);
@@ -1845,7 +1906,11 @@ pub fn remote_set_enabled(state: State<AppState>, enabled: bool) -> AppResult<Re
 /// opt-in; the secure desktop is restored when remote is disabled or on exit.
 #[tauri::command]
 pub fn remote_set_show_uac(state: State<AppState>, enabled: bool) -> AppResult<RemoteStatus> {
-    settings::set(&state.pool, "remote_show_uac", if enabled { "true" } else { "false" })?;
+    settings::set(
+        &state.pool,
+        "remote_show_uac",
+        if enabled { "true" } else { "false" },
+    )?;
     // Only actually touch the registry while remote is on; otherwise just persist
     // the preference (it's applied when remote is enabled / on next launch).
     let remote_on = state.remote.enabled.load(Ordering::SeqCst);
@@ -1872,7 +1937,11 @@ pub fn remote_set_cloud(
     enabled: bool,
     signal_url: String,
 ) -> AppResult<RemoteStatus> {
-    settings::set(&state.pool, "remote_cloud_enabled", if enabled { "true" } else { "false" })?;
+    settings::set(
+        &state.pool,
+        "remote_cloud_enabled",
+        if enabled { "true" } else { "false" },
+    )?;
     settings::set(&state.pool, "remote_signal_url", signal_url.trim())?;
     state.remote.cloud_enabled.store(enabled, Ordering::SeqCst);
     // Deliberately do NOT rotate the code here — it must stay stable so the phone
@@ -2076,7 +2145,10 @@ pub fn remote_check_auth(
     if read_trusted(&state.pool).iter().any(|d| d.id == device_id) {
         return "permanent".into();
     }
-    if read_temp_pruned(&state.pool).iter().any(|g| g.id == device_id) {
+    if read_temp_pruned(&state.pool)
+        .iter()
+        .any(|g| g.id == device_id)
+    {
         return "temporary".into();
     }
     "none".into()
@@ -2152,7 +2224,9 @@ pub fn remote_gamepad_available() -> bool {
 /// Process-wide delta encoder for the cloud (WebRTC) screen path. There is at most
 /// one cloud viewer, so a single shared encoder is enough.
 static CLOUD_ENC: once_cell::sync::Lazy<parking_lot::Mutex<crate::remote::capture::TileEncoder>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(crate::remote::capture::TileEncoder::new()));
+    once_cell::sync::Lazy::new(|| {
+        parking_lot::Mutex::new(crate::remote::capture::TileEncoder::new())
+    });
 
 /// Capture the selected monitor as a **delta** frame (only changed tiles, plus a
 /// periodic keyframe) and return it base64-encoded for the WebRTC screen channel.
@@ -2339,7 +2413,10 @@ pub fn remote_list_monitors() -> Vec<crate::remote::capture::MonitorInfo> {
 /// path where artwork can't be served over HTTP. Path-checked: the file must live
 /// under `media_dir`, and oversized files are refused, so nothing else leaks.
 #[tauri::command]
-pub async fn remote_read_media(state: State<'_, AppState>, path: String) -> Result<Option<String>, ()> {
+pub async fn remote_read_media(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Option<String>, ()> {
     let media_dir = state.media_dir.clone();
     let out = run_blocking(move || {
         let base = match media_dir.canonicalize() {
@@ -2395,4 +2472,334 @@ pub async fn remote_read_media(state: State<'_, AppState>, path: String) -> Resu
     .await
     .unwrap_or(None);
     Ok(out)
+}
+
+// ============================ shared clipboard ==============================
+
+use crate::db::clipboard::{self as clip_store, ClipInput, ClipItem};
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipDeviceInfo {
+    pub device_id: String,
+    pub device_name: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipAddInput {
+    pub kind: String,
+    pub text: Option<String>,
+    /// Base64 (raw or data-URL) image bytes for `kind == "image"`.
+    pub image_base64: Option<String>,
+    pub mime: Option<String>,
+    pub source: Option<String>,
+    // These are present only when APPLYING a remote item (so it keeps its identity
+    // and isn't re-uploaded). Absent → a fresh local capture.
+    pub id: Option<String>,
+    pub created_utc: Option<String>,
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
+    pub pinned: Option<bool>,
+}
+
+fn decode_b64(s: &str) -> AppResult<Vec<u8>> {
+    let s = s.rsplit_once(',').map(|(_, b)| b).unwrap_or(s);
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .map_err(|e| AppError::msg(e.to_string()))
+}
+
+/// Normalize arbitrary image bytes to PNG (best-effort; falls back to raw bytes).
+fn to_png(raw: &[u8]) -> Vec<u8> {
+    match image::load_from_memory(raw) {
+        Ok(img) => {
+            let mut png = Vec::new();
+            if img
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .is_ok()
+            {
+                return png;
+            }
+            raw.to_vec()
+        }
+        Err(_) => raw.to_vec(),
+    }
+}
+
+#[tauri::command]
+pub fn clipboard_device_info(state: State<AppState>) -> AppResult<ClipDeviceInfo> {
+    Ok(ClipDeviceInfo {
+        device_id: crate::clipboard::device_id(&state.pool),
+        device_name: crate::clipboard::device_name(),
+    })
+}
+
+#[tauri::command]
+pub fn clipboard_list(
+    state: State<AppState>,
+    before_utc: Option<String>,
+    limit: Option<i64>,
+) -> AppResult<Vec<ClipItem>> {
+    clip_store::list(&state.pool, before_utc.as_deref(), limit.unwrap_or(50))
+}
+
+#[tauri::command]
+pub fn clipboard_pinned(state: State<AppState>) -> AppResult<Vec<ClipItem>> {
+    clip_store::list_pinned(&state.pool)
+}
+
+#[tauri::command]
+pub fn clipboard_unsynced(state: State<AppState>, limit: Option<i64>) -> AppResult<Vec<ClipItem>> {
+    clip_store::list_unsynced(&state.pool, limit.unwrap_or(100))
+}
+
+#[tauri::command]
+pub fn clipboard_mark_synced(state: State<AppState>, id: String) -> AppResult<()> {
+    clip_store::mark_synced(&state.pool, &id)
+}
+
+/// Add an item. When `remote` is true the input carries an existing identity and
+/// is applied WITHOUT re-emitting the sync signal (it already lives on the relay).
+#[tauri::command]
+pub fn clipboard_add(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    input: ClipAddInput,
+    remote: Option<bool>,
+) -> AppResult<ClipItem> {
+    let remote = remote.unwrap_or(false);
+    let id = input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let created_utc = input
+        .created_utc
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let device_id = input
+        .device_id
+        .unwrap_or_else(|| crate::clipboard::device_id(&state.pool));
+    let device_name = input
+        .device_name
+        .or_else(|| Some(crate::clipboard::device_name()));
+    let source = input.source.unwrap_or_else(|| {
+        if remote {
+            "android".into()
+        } else {
+            "manual".into()
+        }
+    });
+
+    let (image_path, thumb_path, mime, size) = if input.kind == "image" {
+        let raw = decode_b64(input.image_base64.as_deref().unwrap_or_default())?;
+        let png = to_png(&raw);
+        let (ip, tp, sz) = crate::clipboard::save_image(&state.media_dir, &id, &png)?;
+        (Some(ip), Some(tp), Some("image/png".to_string()), sz)
+    } else {
+        let size = input.text.as_ref().map(|t| t.len() as i64).unwrap_or(0);
+        (
+            None,
+            None,
+            input.mime.clone().or(Some("text/plain".into())),
+            size,
+        )
+    };
+
+    let item = ClipInput {
+        id,
+        kind: input.kind,
+        text: input.text,
+        image_path,
+        thumb_path,
+        mime,
+        size,
+        created_utc,
+        device_id,
+        device_name,
+        source,
+        pinned: input.pinned.unwrap_or(false),
+        synced: remote, // remote items are already on the relay
+    };
+
+    if remote {
+        clip_store::upsert(&state.pool, &item)?;
+        let saved = clip_store::get(&state.pool, &item.id)?
+            .ok_or_else(|| AppError::msg("clip item vanished after insert"))?;
+        let _ = app.emit("clipboard://changed", ());
+        let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+        Ok(saved)
+    } else {
+        crate::clipboard::add_local(&app, &state.pool, item)
+    }
+}
+
+#[tauri::command]
+pub fn clipboard_delete(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+    propagate: Option<bool>,
+) -> AppResult<()> {
+    let (img, thumb) = clip_store::tombstone(&state.pool, &id)?;
+    crate::clipboard::remove_files([img, thumb]);
+    if propagate.unwrap_or(true) {
+        let _ = app.emit("clipboard://delete", &id);
+    }
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clipboard_set_pinned(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+    pinned: bool,
+) -> AppResult<()> {
+    clip_store::set_pinned(&state.pool, &id, pinned)?;
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clipboard_copy(state: State<AppState>, id: String) -> AppResult<()> {
+    if let Some(item) = clip_store::get(&state.pool, &id)? {
+        crate::clipboard::copy_to_os(&state.pool, &item)?;
+    }
+    Ok(())
+}
+
+/// Base64 of a stored image's bytes, for the JS sync client to encrypt + upload.
+#[tauri::command]
+pub fn clipboard_image_b64(state: State<AppState>, id: String) -> AppResult<Option<String>> {
+    let Some(item) = clip_store::get(&state.pool, &id)? else {
+        return Ok(None);
+    };
+    let Some(path) = item.image_path else {
+        return Ok(None);
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+#[tauri::command]
+pub fn clipboard_clear_all(state: State<AppState>, app: tauri::AppHandle) -> AppResult<()> {
+    // Publish one tombstone per live item before removing the local rows. The
+    // relay is a permanent store, so skipping this would make cleared history
+    // reappear on the next catch-up.
+    let ids = clip_store::live_ids(&state.pool)?;
+    for id in &ids {
+        let _ = app.emit("clipboard://delete", id);
+    }
+    let files = clip_store::clear_all(&state.pool)?;
+    crate::clipboard::remove_files(files.into_iter().map(Some));
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(())
+}
+
+/// Write the three clipboard toggles and reconcile the watcher + overlay window.
+#[tauri::command]
+pub fn clipboard_configure(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    enabled: bool,
+    overlay: bool,
+    auto_capture: bool,
+) -> AppResult<()> {
+    settings::set(
+        &state.pool,
+        "clipboard_enabled",
+        if enabled { "true" } else { "false" },
+    )?;
+    settings::set(
+        &state.pool,
+        "clipboard_overlay_enabled",
+        if overlay { "true" } else { "false" },
+    )?;
+    settings::set(
+        &state.pool,
+        "clipboard_auto_capture",
+        if auto_capture { "true" } else { "false" },
+    )?;
+    crate::clipboard::apply_settings(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clipboard_overlay_set_pos(state: State<AppState>, x: f64, y: f64) -> AppResult<()> {
+    settings::set(
+        &state.pool,
+        "clipboard_overlay_pos",
+        &format!("{},{}", x.round(), y.round()),
+    )
+}
+
+fn sarvam_key() -> Option<String> {
+    std::env::var("SARVAM_API_KEY")
+        .ok()
+        .or_else(|| option_env!("SARVAM_API_KEY").map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Transcribe short (≤30s) audio via Sarvam's speech-to-text REST API. The key is
+/// baked from `.env` `SARVAM_API_KEY` at compile time (like RAWG/YouTube).
+#[tauri::command]
+pub async fn speech_to_text(
+    audio_base64: String,
+    mime: Option<String>,
+    language: Option<String>,
+) -> AppResult<String> {
+    run_blocking(move || {
+        let key = sarvam_key().ok_or_else(|| AppError::msg("Sarvam API key not configured"))?;
+        let bytes = decode_b64(&audio_base64)?;
+        let mime = mime.unwrap_or_else(|| "audio/wav".into());
+        let boundary = format!("----gtclip{}", uuid::Uuid::new_v4().simple());
+
+        let mut body: Vec<u8> = Vec::new();
+        let mut field = |name: &str, value: &str, body: &mut Vec<u8>| {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        };
+        field("model", "saaras:v3", &mut body);
+        field("mode", "transcribe", &mut body);
+        if let Some(lang) = language.as_deref() {
+            field("language_code", lang, &mut body);
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\nContent-Type: {mime}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&bytes);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let resp = ureq::post("https://api.sarvam.ai/speech-to-text")
+            .set("api-subscription-key", &key)
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send_bytes(&body)
+            .map_err(|e| AppError::msg(format!("Sarvam request failed: {e}")))?;
+        let json: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| AppError::msg(e.to_string()))?;
+        let text = json
+            .get("transcript")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(text)
+    })
+    .await
 }

@@ -48,6 +48,7 @@ const ENV_KEYS: &[&str] = &[
     "YOUTUBE_API_KEY",
     "STEAMGRIDDB_API_KEY",
     "STEAM_WEB_API_KEY",
+    "SARVAM_API_KEY",
 ];
 
 fn export_env_from_dotenv() {
@@ -74,7 +75,9 @@ fn export_env_from_dotenv() {
     for key in ENV_KEYS {
         // An explicit process env var (e.g. CI) overrides the .env file.
         println!("cargo:rerun-if-env-changed={key}");
-        let val = std::env::var(key).ok().or_else(|| values.get(*key).cloned());
+        let val = std::env::var(key)
+            .ok()
+            .or_else(|| values.get(*key).cloned());
         if let Some(val) = val.filter(|s| !s.trim().is_empty()) {
             println!("cargo:rustc-env={key}={val}");
         }
@@ -85,9 +88,8 @@ fn main() {
     export_env_from_dotenv();
     #[cfg(windows)]
     {
-        let attrs = tauri_build::Attributes::new().windows_attributes(
-            tauri_build::WindowsAttributes::new().app_manifest(APP_MANIFEST),
-        );
+        let attrs = tauri_build::Attributes::new()
+            .windows_attributes(tauri_build::WindowsAttributes::new().app_manifest(APP_MANIFEST));
         tauri_build::try_build(attrs).expect("failed to run tauri-build");
     }
     #[cfg(not(windows))]

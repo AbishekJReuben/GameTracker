@@ -38,7 +38,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // Default signaling server (WebRTC rendezvous). Kept in sync with
     // DEFAULT_SIGNAL_URL in src/lib/remoteConfig.ts. Self-hosted on this PC and
     // exposed via a Cloudflare Tunnel; the phone connects here, then P2P takes over.
-    ("remote_signal_url", "wss://discovery.chilloutgamestudio.com"),
+    (
+        "remote_signal_url",
+        "wss://discovery.chilloutgamestudio.com",
+    ),
     // Secret "permanent key" (code 2): a phone that supplies it is auto-trusted.
     // Empty by default → generated + persisted on first launch (see lib.rs setup).
     ("remote_secret_code", ""),
@@ -50,6 +53,21 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // controllable from the phone. Opt-in (lowers local security); restored on
     // disable/exit. See remote/uac.rs.
     ("remote_show_uac", "false"),
+    // Shared clipboard: a floating widget + a permanent, E2E-encrypted history
+    // synced across desktop + Android. Off by default; enabling walks permissions.
+    // The encryption key and relay space derive from `remote_secret_code` (shared
+    // with the remote feature), so both devices converge without a separate pairing.
+    // See src/clipboard/ and src/db/clipboard.rs.
+    ("clipboard_enabled", "false"),
+    ("clipboard_overlay_enabled", "false"),
+    // Desktop-only native auto-capture (Win32 clipboard listener). On by default so
+    // that, once the feature is enabled, copies flow in without any extra tap.
+    ("clipboard_auto_capture", "true"),
+    ("clipboard_stt_enabled", "false"),
+    // Persisted overlay bubble position ("x,y") and a stable per-install device id
+    // (generated on first use). Empty until set.
+    ("clipboard_overlay_pos", ""),
+    ("clipboard_device_id", ""),
 ];
 
 fn default_for(key: &str) -> Option<&'static str> {
@@ -96,9 +114,7 @@ pub fn all(pool: &DbPool) -> AppResult<HashMap<String, String>> {
         .collect();
     let conn = pool.get()?;
     let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (k, v) = row?;
         map.insert(k, v);

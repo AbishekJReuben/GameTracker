@@ -17,10 +17,13 @@
 //! Deploy it anywhere that runs a container or a binary (Fly.io, Railway, a VPS).
 //! It listens on `$PORT` (default 8080). No state is persisted; rooms are ephemeral.
 
+mod clip;
+
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Path as AxumPath, Query, State,
     },
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
@@ -31,15 +34,17 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tower_http::services::{ServeDir, ServeFile};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone)]
 struct AppState {
     rooms: Arc<Mutex<HashMap<String, Vec<Peer>>>>,
     next_id: Arc<AtomicU64>,
+    /// Persistent, E2E-encrypted shared-clipboard store (the /clip namespace).
+    clip: Arc<clip::ClipState>,
 }
 
 struct Peer {
@@ -62,6 +67,7 @@ async fn main() {
     let state = AppState {
         rooms: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
+        clip: clip::ClipState::new(&clip_data_dir()),
     };
 
     // Host both discovery clients from signaling/static:
@@ -77,6 +83,12 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
+        // Shared-clipboard namespace: WS for metadata + a blob endpoint for images.
+        .route("/clip/ws", get(clip_ws_handler))
+        .route(
+            "/clip/blob/:clip/:item",
+            get(clip_blob_get).put(clip_blob_put),
+        )
         .route("/quest", {
             let p = quest.clone();
             get(move || serve_html(p.clone()))
@@ -142,6 +154,60 @@ fn quest_static_dir() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string()
 }
 
+/// Where the shared-clipboard store lives: `CLIP_DATA_DIR` env override,
+/// `<exe dir>/clip-data`, else `./clip-data`.
+fn clip_data_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("CLIP_DATA_DIR") {
+        return PathBuf::from(d);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("clip-data");
+        }
+    }
+    PathBuf::from("clip-data")
+}
+
+#[derive(Deserialize)]
+struct ClipJoin {
+    clip: String,
+}
+
+async fn clip_ws_handler(
+    ws: WebSocketUpgrade,
+    Query(q): Query<ClipJoin>,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let clip_id = q.clip;
+    ws.on_upgrade(move |socket| clip::handle(socket, clip_id, s.clip.clone()))
+}
+
+async fn clip_blob_get(
+    AxumPath((clip_id, item)): AxumPath<(String, String)>,
+    State(s): State<AppState>,
+) -> Response {
+    match s.clip.read_blob(&clip_id, &item) {
+        Some(bytes) => {
+            ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+async fn clip_blob_put(
+    AxumPath((clip_id, item)): AxumPath<(String, String)>,
+    State(s): State<AppState>,
+    body: Bytes,
+) -> Response {
+    if body.len() > clip::MAX_BLOB {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "too large").into_response();
+    }
+    match s.clip.write_blob(&clip_id, &item, &body) {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "write failed").into_response(),
+    }
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(q): Query<JoinQuery>,
@@ -175,7 +241,9 @@ async fn handle(socket: WebSocket, q: JoinQuery, state: AppState) {
         // flagged (so its cleanup won't emit a spurious peer-left) and sent a Close.
         for stale in peers.iter().filter(|p| p.role == role) {
             stale.evicted.store(true, Ordering::SeqCst);
-            let _ = stale.tx.send(Message::Text("{\"type\":\"replaced\"}".to_string().into()));
+            let _ = stale
+                .tx
+                .send(Message::Text("{\"type\":\"replaced\"}".to_string().into()));
             let _ = stale.tx.send(Message::Close(None));
         }
         peers.retain(|p| p.role != role);

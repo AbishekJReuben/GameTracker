@@ -6,6 +6,7 @@
 //! The one native command it exposes is the in-app updater (see `update.rs`),
 //! since Tauri's updater plugin doesn't support Android.
 
+mod clipboard;
 mod decoder;
 mod pip;
 mod update;
@@ -30,6 +31,15 @@ pub fn run() {
             decoder::decoder_get_stats,
             decoder::decoder_dump_diag,
             decoder::stream_active,
+            clipboard::clipboard_service_start,
+            clipboard::clipboard_overlay_status,
+            clipboard::clipboard_request_overlay,
+            clipboard::clipboard_battery_status,
+            clipboard::clipboard_request_battery,
+            clipboard::clipboard_notif_status,
+            clipboard::clipboard_request_notif,
+            clipboard::clipboard_read,
+            clipboard::clipboard_write,
         ])
         .run(tauri::generate_context!())
         .expect("error while running GameTracker Remote");

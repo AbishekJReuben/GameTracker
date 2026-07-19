@@ -1,4 +1,5 @@
 mod autostart;
+mod clipboard;
 mod commands;
 mod content_audit;
 mod content_repair;
@@ -6,21 +7,21 @@ mod db;
 mod detect;
 mod embed;
 mod error;
+mod gog;
+mod gog_auth;
+mod hltb;
 mod icons;
 mod importer;
-mod hltb;
-mod suggestions;
+mod launcher_catalog;
 mod metadata;
 #[cfg(windows)]
 mod registry;
 mod remote;
 mod state;
-mod gog;
-mod gog_auth;
-mod launcher_catalog;
 mod steam;
 mod steam_emu;
 mod steam_openid;
+mod suggestions;
 mod system;
 mod tracking;
 mod tray;
@@ -206,8 +207,12 @@ pub fn run() {
 
             apply_pending_restore(&data_dir, &db_path);
 
-            let pool = db::init_pool(&db_path)
-                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            let pool = db::init_pool(&db_path).map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
             seed_install_mode(&pool);
 
             let shared = Arc::new(TrackingShared::new());
@@ -233,7 +238,10 @@ pub fn run() {
                 }
             }
             // Same for the secret permanent key (code 2) — stable across restarts.
-            match db::settings::get(&pool, "remote_secret_code").ok().flatten() {
+            match db::settings::get(&pool, "remote_secret_code")
+                .ok()
+                .flatten()
+            {
                 Some(secret) if !secret.is_empty() => *remote_shared.secret.lock() = secret,
                 _ => {
                     let secret = remote_shared.secret.lock().clone();
@@ -253,7 +261,9 @@ pub fn run() {
 
             // If the remote server was left enabled, start it on launch.
             if db::settings::get_bool(&pool, "remote_enabled").unwrap_or(false) {
-                remote_shared.enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+                remote_shared
+                    .enabled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 remote::start(remote::ApiState {
                     pool: pool.clone(),
                     tracking: shared.clone(),
@@ -280,7 +290,17 @@ pub fn run() {
                 }
             });
 
-            tracking::spawn(handle.clone(), pool.clone(), shared, sys_shared.clone(), media_dir);
+            tracking::spawn(
+                handle.clone(),
+                pool.clone(),
+                shared,
+                sys_shared.clone(),
+                media_dir,
+            );
+
+            // Shared clipboard: start the native capture listener + floating
+            // overlay if the feature was left enabled (off by default).
+            clipboard::apply_settings(handle);
 
             // Keep the elevated logon task pointed at this install folder (survives
             // reinstalls / custom install paths without requiring a Settings toggle).
@@ -467,6 +487,20 @@ pub fn run() {
             commands::remote_inject,
             commands::remote_inject_on,
             commands::remote_gamepad_available,
+            commands::clipboard_device_info,
+            commands::clipboard_list,
+            commands::clipboard_pinned,
+            commands::clipboard_unsynced,
+            commands::clipboard_mark_synced,
+            commands::clipboard_add,
+            commands::clipboard_delete,
+            commands::clipboard_set_pinned,
+            commands::clipboard_copy,
+            commands::clipboard_image_b64,
+            commands::clipboard_clear_all,
+            commands::clipboard_configure,
+            commands::clipboard_overlay_set_pos,
+            commands::speech_to_text,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tracker")
@@ -509,7 +543,10 @@ fn tray_tooltip(st: &tracking::TrackingState) -> String {
         return format!("Playing {name} · {} today", fmt(st.today_active_seconds));
     }
     if let (Some(name), true) = (&st.app_name, st.app_is_active) {
-        return format!("Using {name} · {} apps today", fmt(st.app_today_active_seconds));
+        return format!(
+            "Using {name} · {} apps today",
+            fmt(st.app_today_active_seconds)
+        );
     }
     format!("Tracker · {} today", fmt(st.today_active_seconds))
 }

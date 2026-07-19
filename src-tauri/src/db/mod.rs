@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod foreground;
 pub mod games;
 pub mod media;
@@ -423,6 +424,38 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 22;
     }
 
+    if version < 23 {
+        // Shared clipboard history (text + images), synced end-to-end across
+        // devices and kept permanently until deleted. Images live as files under
+        // media_dir/clipboard/ with a thumbnail; only metadata + text live here.
+        // `synced` marks whether the item has been pushed to the relay yet (so the
+        // JS sync client can find its backlog after a reconnect).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE clipboard_items (
+                id          TEXT PRIMARY KEY,
+                kind        TEXT NOT NULL DEFAULT 'text',
+                text        TEXT,
+                image_path  TEXT,
+                thumb_path  TEXT,
+                mime        TEXT,
+                size        INTEGER NOT NULL DEFAULT 0,
+                created_utc TEXT NOT NULL,
+                device_id   TEXT NOT NULL DEFAULT '',
+                device_name TEXT,
+                source      TEXT NOT NULL DEFAULT 'desktop',
+                pinned      INTEGER NOT NULL DEFAULT 0,
+                deleted     INTEGER NOT NULL DEFAULT 0,
+                synced      INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_clip_created ON clipboard_items(created_utc);
+            CREATE INDEX idx_clip_pinned ON clipboard_items(pinned);
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 23;")?;
+        version = 23;
+    }
+
     let _ = version;
     Ok(())
 }
@@ -442,8 +475,9 @@ fn reclassify_smtc_plays(conn: &rusqlite::Connection) -> AppResult<()> {
         .unwrap_or_default();
 
     let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, source_app, artist, album FROM media_plays WHERE source = 'smtc'")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, source_app, artist, album FROM media_plays WHERE source = 'smtc'",
+        )?;
         let mapped = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,

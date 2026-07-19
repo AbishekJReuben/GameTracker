@@ -10,6 +10,7 @@ import {
   MonitorSmartphone,
   Cpu,
   Settings as SettingsIcon,
+  ClipboardList,
   LogOut,
   Globe,
   Loader2,
@@ -37,6 +38,7 @@ import { MusicScreen } from "./screens/MusicView";
 import { ControlScreen } from "./screens/Control";
 import { SystemScreen } from "./screens/System";
 import { SettingsScreen } from "./screens/Settings";
+import ClipboardScreen from "./screens/Clipboard";
 import { GameDetailScreen } from "./screens/GameDetail";
 import { useOpenGame, closeGame } from "./ui";
 import { ScreenErrorBoundary } from "./ErrorBoundary";
@@ -44,7 +46,7 @@ import { PageTransitionFX } from "./PageTransitionFX";
 import { checkForUpdate, type UpdateInfo } from "./update";
 import { UpdatePanel } from "./UpdatePanel";
 
-type Tab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
+type Tab = "stats" | "library" | "timeline" | "collection" | "music" | "clipboard" | "control" | "system" | "settings";
 type Phase = "boot" | "pairing" | "autoconnecting" | "connected" | "paused";
 
 const LS_CODE = "gt.remote.code"; // remembered code → auto-connect on launch
@@ -71,6 +73,7 @@ const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "timeline", label: "Time", icon: Clock },
   { id: "collection", label: "Wins", icon: Trophy },
   { id: "music", label: "Music", icon: Headphones },
+  { id: "clipboard", label: "Clips", icon: ClipboardList },
   { id: "control", label: "Remote", icon: MonitorSmartphone },
   { id: "system", label: "System", icon: Cpu },
   { id: "settings", label: "More", icon: SettingsIcon },
@@ -299,7 +302,7 @@ export function CompanionApp() {
         </header>
       )}
 
-      <main className={`min-h-0 flex-1 ${isControlTab || tab === "library" || tab === "timeline" ? "" : "overflow-y-auto"}`}>
+      <main className={`min-h-0 flex-1 ${isControlTab || tab === "library" || tab === "timeline" || tab === "clipboard" ? "" : "overflow-y-auto"}`}>
         {/* Keyed by tab so a crash in one screen is isolated and cleared when you
             switch tabs — a screen error shows a retry card instead of a blank app. */}
         <ScreenErrorBoundary key={tab} label={tab}>
@@ -308,6 +311,7 @@ export function CompanionApp() {
           {tab === "timeline" && <TimelineScreen />}
           {tab === "collection" && <CollectionsScreen />}
           {tab === "music" && <MusicScreen />}
+          {tab === "clipboard" && <ClipboardScreen />}
           {tab === "system" && <SystemScreen />}
           {tab === "settings" && (
             <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} />

@@ -51,6 +51,7 @@ import { runCsvImport } from "@/lib/bulkTasks";
 import { ContentAuditPanel } from "@/components/ContentAuditPanel";
 import { MetacriticBackfill } from "@/components/MetacriticBackfill";
 import { LauncherSyncSection } from "@/components/LauncherSyncSection";
+import { ClipboardSettings } from "@/features/clipboard/ClipboardSettings";
 
 const ACCENTS: { id: AccentTheme; label: string; colors: [string, string, string] }[] = [
   { id: "aurora", label: "Aurora", colors: ["#7c5cff", "#3b82f6", "#22d3ee"] },
@@ -205,6 +206,12 @@ export default function SettingsPage() {
           </SettingRow>
         </div>
       ),
+    },
+    {
+      id: "clipboard",
+      title: "Shared clipboard",
+      subtitle: "A floating widget + a synced, encrypted history across your devices",
+      content: <ClipboardSettings />,
     },
     {
       id: "appearance",

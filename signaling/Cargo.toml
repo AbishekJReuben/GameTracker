@@ -13,6 +13,10 @@ axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Persistent, E2E-encrypted shared-clipboard store (the /clip namespace). The
+# server only ever sees ciphertext + small metadata; image blobs live as files.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Serves the built discovery clients (companion + quest under signaling/static)
 # so phones and the Meta Quest headset can open them over the same Cloudflare
 # HTTPS tunnel — WebXR requires a secure context.

@@ -31,6 +31,9 @@ import CollectionPage from "./routes/Collection";
 import TagsPage from "./routes/Tags";
 import SuggestedPage from "./routes/Suggested";
 import SettingsPage from "./routes/Settings";
+import ClipboardPage from "./routes/Clipboard";
+import ClipboardOverlay from "./features/clipboard/ClipboardOverlay";
+import { ClipSyncEngine } from "./features/clipboard/ClipSyncEngine";
 
 let didLanding = false;
 
@@ -81,6 +84,7 @@ function AppShell() {
       <JukeboxEngine />
       <JukeboxFloater />
       <RemoteHostManager />
+      <ClipSyncEngine />
       <RemoteApprovalModal />
       <GameModal />
       <DropZone />
@@ -117,6 +121,8 @@ export default function App() {
 
   return (
     <Routes>
+      {/* Bare, transparent floating overlay window — no app shell. */}
+      <Route path="/clip-overlay" element={<ClipboardOverlay />} />
       <Route element={<AppShell />}>
         <Route path="/" element={<Dashboard />} />
         <Route path="/library" element={<LibraryPage />} />
@@ -134,6 +140,7 @@ export default function App() {
         <Route path="/tags" element={<TagsPage />} />
         <Route path="/suggested" element={<SuggestedPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        <Route path="/clipboard" element={<ClipboardPage />} />
       </Route>
     </Routes>
   );

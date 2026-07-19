@@ -78,7 +78,19 @@ const save = (path, before, after, msg) => {
   // Wi-Fi low-latency lock while a remote session streams (WcDecoderBridge
   // .setStreamActive): WifiLock.acquire needs WAKE_LOCK; creating the lock off
   // WifiManager wants ACCESS_WIFI_STATE. Both are normal-level (no prompt).
-  for (const p of ["android.permission.WAKE_LOCK", "android.permission.ACCESS_WIFI_STATE"]) {
+  for (const p of [
+    "android.permission.WAKE_LOCK",
+    "android.permission.ACCESS_WIFI_STATE",
+    // Shared clipboard: overlay bubble, indefinite foreground service (specialUse
+    // has no 6h cap), notifications, boot restart, Doze exemption, connectivity.
+    "android.permission.SYSTEM_ALERT_WINDOW",
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+    "android.permission.POST_NOTIFICATIONS",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
+    "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+    "android.permission.ACCESS_NETWORK_STATE",
+  ]) {
     if (!m.includes(p)) {
       const perm = `    <uses-permission android:name="${p}" />${eol}`;
       if (/android\.permission\.INTERNET/.test(m)) {
@@ -147,7 +159,51 @@ const save = (path, before, after, msg) => {
     m = m.replace(/([ \t]*<application\b)/, `${queries}$1`);
   }
 
-  save(manifestPath, before, m, "patched AndroidManifest.xml (permission/FileProvider/receiver/queries)");
+  // Shared-clipboard overlay + sync foreground service. `specialUse` avoids the
+  // 6h/24h dataSync cap so it can run indefinitely.
+  if (!m.includes(".ClipboardService")) {
+    const svc =
+      `        <service${eol}` +
+      `          android:name=".ClipboardService"${eol}` +
+      `          android:exported="false"${eol}` +
+      `          android:foregroundServiceType="specialUse">${eol}` +
+      `          <property${eol}` +
+      `            android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"${eol}` +
+      `            android:value="shared clipboard overlay and sync" />${eol}` +
+      `        </service>${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${svc}$1`);
+  }
+
+  // Boot receiver — restart the service after a reboot / app update.
+  if (!m.includes(".ClipboardBootReceiver")) {
+    const rec =
+      `        <receiver${eol}` +
+      `          android:name=".ClipboardBootReceiver"${eol}` +
+      `          android:exported="true">${eol}` +
+      `          <intent-filter>${eol}` +
+      `            <action android:name="android.intent.action.BOOT_COMPLETED" />${eol}` +
+      `            <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />${eol}` +
+      `          </intent-filter>${eol}` +
+      `        </receiver>${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${rec}$1`);
+  }
+
+  // Share-sheet target: "Share → GameTracker" adds text/images to the clipboard.
+  if (!m.includes("android.intent.action.SEND")) {
+    const filter =
+      `${eol}            <intent-filter>${eol}` +
+      `                <action android:name="android.intent.action.SEND" />${eol}` +
+      `                <category android:name="android.intent.category.DEFAULT" />${eol}` +
+      `                <data android:mimeType="text/plain" />${eol}` +
+      `                <data android:mimeType="image/*" />${eol}` +
+      `            </intent-filter>${eol}        `;
+    const act = m.match(/(<activity\b[^>]*?MainActivity[\s\S]*?)(<\/activity>)/);
+    if (act) {
+      m = m.replace(act[0], `${act[1]}${filter}${act[2]}`);
+    }
+  }
+
+  save(manifestPath, before, m, "patched AndroidManifest.xml (permission/FileProvider/receiver/queries/clipboard)");
 }
 
 // --- 2b: res/xml/file_paths.xml ---------------------------------------------
@@ -189,7 +245,7 @@ const save = (path, before, after, msg) => {
   }
 }
 
-// --- 3: cleartext in the release build --------------------------------------
+// --- 3: cleartext in the release build + clipboard WebSocket ----------------
 {
   const before = readFileSync(gradlePath, "utf8");
   const eol = before.includes("\r\n") ? "\r\n" : "\n";
@@ -212,7 +268,16 @@ const save = (path, before, after, msg) => {
       g = g.slice(0, start) + inject + g.slice(start);
     }
   }
-  save(gradlePath, before, g, "set usesCleartextTraffic in defaultConfig");
+  // The native foreground service owns the always-on receive socket. OkHttp's
+  // WebSocket runs callbacks off the main thread and does not poll or hold a
+  // wakelock while idle.
+  if (!g.includes("com.squareup.okhttp3:okhttp")) {
+    g = g.replace(
+      /dependencies\s*\{\r?\n/,
+      `$&    implementation("com.squareup.okhttp3:okhttp:4.12.0")${eol}`,
+    );
+  }
+  save(gradlePath, before, g, "set release networking and native clipboard WebSocket dependency");
 }
 
 // --- 4: MainActivity.kt — immersive full-screen ------------------------------
@@ -498,6 +563,12 @@ const save = (path, before, after, msg) => {
       `    public static boolean pipWanted;\n` +
       `}\n` +
       `\n` +
+      `# Shared clipboard: ClipboardBridge statics are called from Rust over JNI;\n` +
+      `# the service + boot receiver are referenced only via the manifest.\n` +
+      `-keep class ${pkg}.ClipboardBridge { *; }\n` +
+      `-keep class ${pkg}.ClipboardService { *; }\n` +
+      `-keep class ${pkg}.ClipboardBootReceiver { *; }\n` +
+      `\n` +
       `# Belt-and-braces: never strip @JavascriptInterface methods anywhere.\n` +
       `-keepclassmembers class * {\n` +
       `    @android.webkit.JavascriptInterface <methods>;\n` +
@@ -568,6 +639,39 @@ const save = (path, before, after, msg) => {
       note("created ApkInstallReceiver.kt");
     } else {
       save(receiverPath, before, content, "updated ApkInstallReceiver.kt");
+    }
+  }
+}
+
+// --- 6: shared-clipboard native components -----------------------------------
+// ClipboardBridge (JNI-reached statics), ClipboardService (overlay + FGS), and
+// ClipboardBootReceiver, written from scripts/android-templates with the app
+// package substituted. Idempotent.
+{
+  const conf = JSON.parse(
+    readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"),
+  );
+  const pkg = String(conf.identifier || "");
+  if (!pkg) {
+    console.warn("[patch-android] no identifier — skipping clipboard components.");
+  } else {
+    for (const name of ["ClipboardBridge", "ClipboardService", "ClipboardBootReceiver"]) {
+      const templatePath = join(root, "scripts", "android-templates", `${name}.java`);
+      if (!existsSync(templatePath)) {
+        console.warn(`[patch-android] ${templatePath} missing — skipping ${name}.`);
+        continue;
+      }
+      const dest = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), `${name}.java`);
+      const content = readFileSync(templatePath, "utf8").replace(/__PACKAGE__/g, pkg);
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note(`created ${name}.java`);
+      } else {
+        save(dest, before, content, `updated ${name}.java`);
+      }
     }
   }
 }
