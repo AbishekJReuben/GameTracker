@@ -2238,6 +2238,17 @@ export function ControlScreen({
       if (e.button !== 0) return;
     }
 
+    // While the soft keyboard is up (our ghost input holds focus), a tap on the
+    // video/trackpad would otherwise blur that input — collapsing the keyboard
+    // and triggering a VisualViewport resize round-trip that flickers the whole
+    // screen and shoves the viewport (the reported "tap anywhere while typing
+    // resizes once" bug). Cancelling the default keeps the ghost input focused
+    // so the keyboard stays put; pointer capture + the gesture below still run.
+    // (Mouse-like devices are excluded — they don't drive the soft keyboard.)
+    if (!isMouseLike(e) && document.activeElement === kbdRef.current) {
+      e.preventDefault();
+    }
+
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
     const now = performance.now();
     pts.current.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY });
