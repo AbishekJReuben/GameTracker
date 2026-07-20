@@ -13,7 +13,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU64, Ordering};
 use tauri::AppHandle;
 use windows::core::w;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -49,9 +49,30 @@ static HWND_PTR: AtomicIsize = AtomicIsize::new(0);
 /// Suppress capture for a short window after we set the clipboard ourselves
 /// (quick-copy), so a copy doesn't loop back in as a "new" item.
 static IGNORE_UNTIL: AtomicI64 = AtomicI64::new(0);
+/// Hash of the last content we captured (text or image). Windows fires
+/// `WM_CLIPBOARDUPDATE` several times for a single copy (an app sets CF_DIB,
+/// CF_DIBV5 and CF_BITMAP in separate calls), so without this an image copy
+/// lands as two or three identical rows. 0 means "nothing captured yet".
+static LAST_HASH: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Stable hash of a captured payload, namespaced by kind so an image and a text
+/// item that happen to collide never dedupe each other. Never returns 0 (that
+/// value is reserved for "nothing captured yet").
+fn content_hash(kind: &str, bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut h);
+    bytes.hash(&mut h);
+    let v = h.finish();
+    if v == 0 {
+        1
+    } else {
+        v
+    }
 }
 
 /// Ignore the next clipboard update (called right before we SetClipboardData).
@@ -185,6 +206,12 @@ unsafe fn handle_update(hwnd: HWND) {
 
     // An image copy wins over its text alternative (many apps offer both).
     if let Some(png) = png {
+        // Skip Windows' repeated updates for the same copy (CF_DIB/CF_DIBV5/…),
+        // which otherwise land as duplicate rows.
+        let hash = content_hash("image", &png);
+        if LAST_HASH.load(Ordering::SeqCst) == hash {
+            return;
+        }
         let id = uuid::Uuid::new_v4().to_string();
         if let Ok((image_path, thumb_path, size)) =
             crate::clipboard::save_image(&ctx.media_dir, &id, &png)
@@ -205,6 +232,7 @@ unsafe fn handle_update(hwnd: HWND) {
                 synced: false,
             };
             let _ = crate::clipboard::add_local(&ctx.app, &ctx.pool, input);
+            LAST_HASH.store(hash, Ordering::SeqCst);
         }
         return;
     }
@@ -214,9 +242,15 @@ unsafe fn handle_update(hwnd: HWND) {
         if text.is_empty() {
             return;
         }
-        // De-dupe consecutive identical copies.
+        // De-dupe consecutive identical copies (in-memory guard for rapid
+        // re-fires, plus the DB check so it also holds across a restart).
+        let hash = content_hash("text", text.as_bytes());
+        if LAST_HASH.load(Ordering::SeqCst) == hash {
+            return;
+        }
         if let Ok(Some(last)) = store::latest_text(&ctx.pool) {
             if last == text {
+                LAST_HASH.store(hash, Ordering::SeqCst);
                 return;
             }
         }
@@ -238,6 +272,7 @@ unsafe fn handle_update(hwnd: HWND) {
             synced: false,
         };
         let _ = crate::clipboard::add_local(&ctx.app, &ctx.pool, input);
+        LAST_HASH.store(hash, Ordering::SeqCst);
     }
 }
 

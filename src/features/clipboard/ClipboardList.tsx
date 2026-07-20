@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Copy, Share2, Trash2, Pin, PinOff, Check, Type, Image as ImageIcon, X } from "lucide-react";
+import { Copy, Share2, Trash2, Pin, PinOff, Check, Type, Image as ImageIcon, X, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { relativeTime } from "@/lib/format";
 import { clipAssetUrl, type ClipItem } from "@/lib/clip";
@@ -53,6 +53,9 @@ export function ClipRow({
 }) {
   const [copied, setCopied] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [clamped, setClamped] = useState(false);
+  const textRef = useRef<HTMLParagraphElement>(null);
 
   const doCopy = () => {
     haptic();
@@ -62,6 +65,19 @@ export function ClipRow({
   };
 
   const thumb = clipAssetUrl(item.thumbPath ?? item.imagePath);
+  const full = clipAssetUrl(item.imagePath ?? item.thumbPath);
+  const isImage = item.kind === "image";
+  const collapsedLines = compact ? 3 : 5;
+
+  // Detect whether the collapsed text actually overflows, so the "Show more"
+  // affordance only appears when there's genuinely more to reveal.
+  useLayoutEffect(() => {
+    if (isImage || expanded) return;
+    const el = textRef.current;
+    if (el) setClamped(el.scrollHeight - el.clientHeight > 2);
+  }, [item.text, isImage, expanded, compact]);
+
+  const canExpand = isImage || clamped || expanded;
 
   return (
     <motion.div
@@ -71,43 +87,78 @@ export function ClipRow({
       exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.15 } }}
       transition={{ type: "spring", stiffness: 420, damping: 32 }}
       whileHover={{ y: -1 }}
-      style={{ contentVisibility: "auto", containIntrinsicSize: "0 76px" } as React.CSSProperties}
       className={cn(
-        "group relative flex items-start gap-3 rounded-2xl border border-white/[0.06] bg-white/[0.03]",
+        "group relative flex flex-col gap-1.5 rounded-2xl border border-white/[0.06] bg-white/[0.03]",
         "px-3 py-2.5 backdrop-blur-sm transition-colors hover:border-white/10 hover:bg-white/[0.05]",
       )}
     >
-      {/* preview */}
+      {/* content — the primary element */}
       <button
         onClick={doCopy}
-        className="flex min-w-0 flex-1 items-start gap-3 text-left"
-        title="Copy"
+        className="block min-w-0 text-left"
+        title="Click to copy"
       >
-        <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white/[0.05] text-accent-3">
-          {item.kind === "image" ? <ImageIcon className="h-4 w-4" /> : <Type className="h-4 w-4" />}
-        </span>
-        <span className="min-w-0 flex-1">
-          {item.kind === "image" && thumb ? (
-            <img
-              src={thumb}
-              loading="lazy"
-              className="max-h-24 w-auto max-w-full rounded-lg border border-white/10 object-cover"
-            />
-          ) : (
-            <span className={cn("block break-words text-sm text-ink-soft", compact ? "line-clamp-2" : "line-clamp-4")}>
-              {item.text || "(empty)"}
-            </span>
-          )}
-          <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] font-600 uppercase tracking-wide text-ink-faint">
-            {item.deviceName && <span className="rounded bg-white/[0.05] px-1.5 py-0.5">{item.deviceName}</span>}
-            <span>{relativeTime(item.createdUtc)}</span>
-            {item.kind === "image" && item.size > 0 && <span>{Math.round(item.size / 1024)} KB</span>}
-          </span>
-        </span>
+        {isImage ? (
+          <img
+            src={(expanded ? full : thumb) ?? undefined}
+            loading="lazy"
+            className={cn(
+              "w-auto max-w-full rounded-lg border border-white/10 object-contain transition-all",
+              expanded ? "max-h-[52vh]" : "max-h-32",
+            )}
+          />
+        ) : (
+          <p
+            ref={textRef}
+            className={cn(
+              "m-0 whitespace-pre-wrap break-words text-[13.5px] leading-relaxed text-ink",
+              expanded ? "max-h-[52vh] overflow-y-auto pr-1" : "overflow-hidden",
+            )}
+            style={
+              expanded
+                ? undefined
+                : ({
+                    display: "-webkit-box",
+                    WebkitBoxOrient: "vertical",
+                    WebkitLineClamp: collapsedLines,
+                  } as React.CSSProperties)
+            }
+          >
+            {item.text || "(empty)"}
+          </p>
+        )}
       </button>
 
-      {/* actions */}
-      <div className="flex shrink-0 items-center gap-0.5">
+      {/* footer: expand affordance + muted metadata + actions */}
+      <div className="flex items-center gap-2">
+        {canExpand ? (
+          <button
+            onClick={() => setExpanded((v) => !v)}
+            className="flex shrink-0 items-center gap-0.5 rounded-md px-1 py-0.5 text-[10px] font-700 uppercase tracking-wide text-accent-3 hover:bg-white/[0.06]"
+            title={expanded ? "Show less" : "Show full content"}
+          >
+            <ChevronDown className={cn("h-3 w-3 transition-transform", expanded && "rotate-180")} />
+            {expanded ? "Less" : isImage ? "View" : "More"}
+          </button>
+        ) : (
+          <span className="shrink-0 text-ink-faint" title={isImage ? "Image" : "Text"}>
+            {isImage ? <ImageIcon className="h-3 w-3" /> : <Type className="h-3 w-3" />}
+          </span>
+        )}
+        <span className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden text-[10px] text-ink-faint">
+          {item.deviceName && <span className="truncate">{item.deviceName}</span>}
+          <span className="text-white/15">·</span>
+          <span className="shrink-0">{relativeTime(item.createdUtc)}</span>
+          {isImage && item.size > 0 && (
+            <>
+              <span className="text-white/15">·</span>
+              <span className="shrink-0">{Math.round(item.size / 1024)} KB</span>
+            </>
+          )}
+        </span>
+
+        {/* actions */}
+        <div className="flex shrink-0 items-center gap-0.5">
         {item.pinned && (
           <span className="mr-0.5 text-accent-2" title="Pinned">
             <Pin className="h-3.5 w-3.5 fill-current" />
@@ -158,6 +209,7 @@ export function ClipRow({
             </motion.div>
           )}
         </AnimatePresence>
+        </div>
       </div>
     </motion.div>
   );

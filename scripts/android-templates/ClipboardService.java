@@ -1,5 +1,6 @@
 package __PACKAGE__;
 
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -13,10 +14,15 @@ import android.content.pm.ServiceInfo;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -81,6 +87,7 @@ public class ClipboardService extends Service {
   private View bubble;
   private WindowManager.LayoutParams bubbleLp;
   private View panel;
+  private LinearLayout panelList; // the row container inside the panel's ScrollView
   private WindowManager.LayoutParams panelLp;
   private final Handler main = new Handler(Looper.getMainLooper());
   private OkHttpClient http;
@@ -89,6 +96,12 @@ public class ClipboardService extends Service {
   private boolean stopping;
   private String deviceId = "";
   private String socketUrl = "";
+  private ConnectivityManager cm;
+  private ConnectivityManager.NetworkCallback netCallback;
+  // Cap the reconnect backoff low: the user needs near-real-time sync (a dropped
+  // link must recover within ~10s), so we never let the exponential backoff grow
+  // past this. The connectivity callback also short-circuits it on network return.
+  private static final long MAX_RECONNECT_MS = 8_000;
 
   /** Decrypted items, newest first. Synced on `this` (touched from the WS thread
    *  and read on the UI thread). Text only — image blobs are skipped in the panel
@@ -255,7 +268,52 @@ public class ClipboardService extends Service {
           .retryOnConnectionFailure(true)
           .build();
     }
+    registerNetworkCallback();
     connectSocket();
+  }
+
+  /** Reconnect the instant the network comes back (WiFi⇄cellular switch, tunnel
+   *  re-established, airplane-mode off) instead of waiting out the backoff timer.
+   *  This is what keeps background sync feeling real-time across network changes. */
+  private void registerNetworkCallback() {
+    if (netCallback != null) return;
+    cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+    if (cm == null) return;
+    netCallback = new ConnectivityManager.NetworkCallback() {
+      @Override public void onAvailable(Network network) {
+        forceReconnect();
+      }
+      @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+        if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+          forceReconnect();
+        }
+      }
+    };
+    try {
+      NetworkRequest req = new NetworkRequest.Builder()
+          .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+          .build();
+      cm.registerNetworkCallback(req, netCallback);
+    } catch (Exception ignored) {
+      netCallback = null;
+    }
+  }
+
+  /** Drop any stale socket and reconnect now, resetting the backoff. Safe to call
+   *  from the connectivity callback thread — the actual connect hops to `main`. */
+  private void forceReconnect() {
+    if (stopping) return;
+    reconnectMs = 1000;
+    main.removeCallbacks(reconnect);
+    main.post(() -> {
+      if (stopping) return;
+      WebSocket s = socket;
+      socket = null;
+      if (s != null) {
+        try { s.cancel(); } catch (Exception ignored) {}
+      }
+      connectSocket();
+    });
   }
 
   private void connectSocket() {
@@ -287,7 +345,7 @@ public class ClipboardService extends Service {
   private void scheduleReconnect() {
     if (stopping) return;
     long delay = reconnectMs;
-    reconnectMs = Math.min(reconnectMs * 2, 60_000);
+    reconnectMs = Math.min(reconnectMs * 2, MAX_RECONNECT_MS);
     main.removeCallbacks(reconnect);
     main.postDelayed(reconnect, delay);
   }
@@ -647,6 +705,7 @@ public class ClipboardService extends Service {
     scroll.setVerticalScrollBarEnabled(false);
     LinearLayout list = new LinearLayout(this);
     list.setOrientation(LinearLayout.VERTICAL);
+    panelList = list;
     LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
     scrollLp.topMargin = dp(6);
@@ -721,6 +780,19 @@ public class ClipboardService extends Service {
     panel = root;
     try {
       wm.addView(root, panelLp);
+      // Grow the panel out of the bubble's corner: pivot toward the bubble side
+      // so it visually unfolds from the pin rather than popping in flat.
+      final boolean panelRightOfBubble = panelX >= bubbleLp.x;
+      root.setPivotX(panelRightOfBubble ? 0f : widthPx);
+      root.setPivotY(dp(24));
+      root.setScaleX(0.82f);
+      root.setScaleY(0.82f);
+      root.setAlpha(0f);
+      root.animate()
+          .scaleX(1f).scaleY(1f).alpha(1f)
+          .setDuration(210)
+          .setInterpolator(new android.view.animation.OvershootInterpolator(0.9f))
+          .start();
     } catch (Exception ignored) {
       panel = null;
     }
@@ -729,21 +801,27 @@ public class ClipboardService extends Service {
 
   private void hidePanel() {
     if (panel == null || wm == null) return;
-    try {
-      wm.removeView(panel);
-    } catch (Exception ignored) {
-    }
-    panel = null;
+    final View p = panel;
+    panel = null; // clear immediately so a re-tap toggles cleanly
+    panelList = null;
+    p.animate()
+        .scaleX(0.85f).scaleY(0.85f).alpha(0f)
+        .setDuration(140)
+        .setInterpolator(new android.view.animation.AccelerateInterpolator())
+        .withEndAction(() -> {
+          try {
+            if (wm != null) wm.removeView(p);
+          } catch (Exception ignored) {
+          }
+        })
+        .start();
   }
 
   /** If the panel is open, rebuild its list to reflect new/deleted items. */
   private void refreshPanelIfOpen() {
-    if (panel == null) return;
-    ScrollView scroll = (ScrollView) ((LinearLayout) panel).getChildAt(1);
-    if (scroll == null || scroll.getChildCount() == 0) return;
-    LinearLayout list = (LinearLayout) scroll.getChildAt(0);
-    list.removeAllViews();
-    renderList(list);
+    if (panel == null || panelList == null) return;
+    panelList.removeAllViews();
+    renderList(panelList);
   }
 
   /** Populate the list with the current items. Each row taps to copy. */
@@ -763,6 +841,7 @@ public class ClipboardService extends Service {
       return;
     }
     long now = System.currentTimeMillis();
+    final int collapsedLines = 6;
     for (ClipEntry e : snapshot) {
       LinearLayout row = new LinearLayout(this);
       row.setOrientation(LinearLayout.VERTICAL);
@@ -770,31 +849,48 @@ public class ClipboardService extends Service {
       rowBg.setColor(0x14FFFFFF);
       rowBg.setCornerRadius(dp(12));
       row.setBackground(rowBg);
-      row.setPadding(dp(10), dp(8), dp(10), dp(8));
+      row.setPadding(dp(11), dp(9), dp(11), dp(9));
       LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
           LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
       rowLp.bottomMargin = dp(6);
 
-      TextView body = new TextView(this);
-      body.setText(truncate(e.text, 140));
-      body.setTextColor(0xFFE2E8F0);
-      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-      body.setMaxLines(2);
+      // The content is the primary element: larger, brighter, up to 6 lines.
+      // The full text is always kept on the view (via a tag) so a long-press can
+      // reveal it in full — nothing is lost to truncation.
+      final TextView body = new TextView(this);
+      final String fullText = e.text == null ? "" : e.text;
+      body.setText(fullText);
+      body.setTextColor(0xFFF1F5F9);
+      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+      body.setMaxLines(collapsedLines);
       body.setEllipsize(android.text.TextUtils.TruncateAt.END);
+      body.setLineSpacing(dp(1), 1f);
       row.addView(body);
 
-      TextView meta = new TextView(this);
-      meta.setText(relativeTime(e.createdAtMs, now));
+      // Footer: muted meta + a "long-press to expand" hint (only when clamped).
+      final TextView meta = new TextView(this);
+      final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
+      meta.setText(relativeTime(e.createdAtMs, now) + (longText ? "  ·  hold to expand" : ""));
       meta.setTextColor(0xFF64748B);
       meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
       LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
           LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-      metaLp.topMargin = dp(3);
+      metaLp.topMargin = dp(4);
       row.addView(meta, metaLp);
 
+      final boolean[] expanded = {false};
       row.setOnClickListener((v) -> {
-        setOsClipboard(e.text);
+        setOsClipboard(fullText);
         toast("Copied");
+      });
+      // Long-press toggles full content in place (no truncation), so even long
+      // pastes are fully viewable without opening the app.
+      row.setOnLongClickListener((v) -> {
+        expanded[0] = !expanded[0];
+        body.setMaxLines(expanded[0] ? Integer.MAX_VALUE : collapsedLines);
+        meta.setText(relativeTime(e.createdAtMs, now)
+            + (expanded[0] ? "  ·  hold to collapse" : (longText ? "  ·  hold to expand" : "")));
+        return true;
       });
       list.addView(row, rowLp);
     }
@@ -841,12 +937,6 @@ public class ClipboardService extends Service {
     }
   }
 
-  private static String truncate(String s, int max) {
-    if (s == null) return "";
-    String one = s.replaceAll("\\s+", " ").trim();
-    if (one.length() <= max) return one;
-    return one.substring(0, max) + "…";
-  }
 
   private static String relativeTime(long then, long now) {
     long sec = Math.max(0, (now - then) / 1000);
@@ -875,11 +965,41 @@ public class ClipboardService extends Service {
     }
   }
 
+  /** Swiping the app out of Recents kills the task; without this the background
+   *  sync would silently die after the very first pairing. Schedule a near-term
+   *  restart so the service (and its socket) comes back on its own. */
+  @Override
+  public void onTaskRemoved(Intent rootIntent) {
+    super.onTaskRemoved(rootIntent);
+    if (stopping) return;
+    try {
+      Intent restart = new Intent(getApplicationContext(), ClipboardService.class);
+      restart.setAction(ACTION_START);
+      int flags = PendingIntent.FLAG_ONE_SHOT
+          | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0);
+      // getForegroundService uses startForegroundService semantics so the restart
+      // is allowed to call startForeground() — plain startService would throw when
+      // launched from the background on Android 8+.
+      PendingIntent pi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+          ? PendingIntent.getForegroundService(this, 42, restart, flags)
+          : PendingIntent.getService(this, 42, restart, flags);
+      AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+      if (am != null) {
+        am.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1500, pi);
+      }
+    } catch (Exception ignored) {
+    }
+  }
+
   @Override
   public void onDestroy() {
     super.onDestroy();
     stopping = true;
     main.removeCallbacks(reconnect);
+    if (cm != null && netCallback != null) {
+      try { cm.unregisterNetworkCallback(netCallback); } catch (Exception ignored) {}
+    }
+    netCallback = null;
     if (socket != null) socket.cancel();
     socket = null;
     if (http != null) http.dispatcher().executorService().shutdown();
