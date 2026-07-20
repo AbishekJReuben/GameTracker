@@ -55,6 +55,13 @@ class ClipSyncManager {
   private pingTimer?: ReturnType<typeof setInterval>;
   private unlisteners: UnlistenFn[] = [];
   private onChange?: () => void;
+  // Diagnostic surface — surfaced by diagnostics() so the user can copy a full
+  // report from Settings instead of staring at "Turning on…".
+  private startedAt: number | null = null;
+  private lastWsState: "none" | "connecting" | "open" | "closed" = "none";
+  private lastError: string | null = null;
+  private lastEvent: string | null = null;
+  private reconnects = 0;
 
   /** Start (idempotent). Reads secret/signal URL from settings; no-op if the
    *  feature is off or no secret is configured yet. */
@@ -84,6 +91,10 @@ class ClipSyncManager {
     }
     this.lastRev = Number(localStorage.getItem(`gt.clip.rev.${this.clipId}`) || 0);
     this.started = true;
+    this.startedAt = Date.now();
+    this.reconnects = 0;
+    this.lastError = null;
+    this.lastEvent = "started";
 
     this.unlisteners.push(
       await listen<ClipItem>("clipboard://item", (e) => void this.uploadItem(e.payload)),
@@ -117,16 +128,22 @@ class ClipSyncManager {
   private connect(): void {
     if (!this.started) return;
     const url = `${this.wsBase}/clip/ws?clip=${this.clipId}&device=${encodeURIComponent(this.deviceId)}`;
+    this.lastWsState = "connecting";
     let ws: WebSocket;
     try {
       ws = new WebSocket(url);
-    } catch {
+    } catch (e) {
+      this.lastError = `WebSocket ctor threw: ${e instanceof Error ? e.message : String(e)}`;
+      this.lastWsState = "closed";
       this.scheduleReconnect();
       return;
     }
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = 1000;
+      this.lastWsState = "open";
+      this.lastError = null;
+      this.lastEvent = "connected";
       ws.send(JSON.stringify({ t: "hello", since: this.lastRev }));
       clearInterval(this.pingTimer);
       this.pingTimer = setInterval(() => {
@@ -136,12 +153,20 @@ class ClipSyncManager {
     ws.onmessage = (ev) => {
       try {
         void this.handleMsg(JSON.parse(ev.data as string) as Notice);
-      } catch {
-        /* ignore malformed */
+      } catch (e) {
+        this.lastError = `malformed message: ${e instanceof Error ? e.message : String(e)}`;
       }
     };
-    ws.onclose = () => this.scheduleReconnect();
+    ws.onclose = (ev) => {
+      this.lastWsState = "closed";
+      this.lastEvent = `closed (code=${ev.code}, reason="${ev.reason || ""}")`;
+      this.scheduleReconnect();
+    };
     ws.onerror = () => {
+      // The browser gives no detail on WS error; pair this with the close code
+      // that follows. Common cause: the relay URL is wrong/unreachable, or the
+      // signaling server isn't running.
+      this.lastError = "WebSocket error (relay unreachable or wrong URL?)";
       try {
         ws.close();
       } catch {
@@ -153,6 +178,7 @@ class ClipSyncManager {
   private scheduleReconnect(): void {
     clearInterval(this.pingTimer);
     if (!this.started) return;
+    this.reconnects++;
     clearTimeout(this.retryTimer);
     this.retryTimer = setTimeout(() => this.connect(), this.backoff);
     this.backoff = Math.min(this.backoff * 2, 30000);
@@ -321,6 +347,25 @@ class ClipSyncManager {
     } catch {
       return null;
     }
+  }
+
+  /** Snapshot of the sync engine state for the Settings "Copy logs" report. */
+  diagnostics(): Record<string, string> {
+    const uptimeMs = this.startedAt ? Date.now() - this.startedAt : 0;
+    return {
+      started: String(this.started),
+      uptimeSec: String(Math.round(uptimeMs / 1000)),
+      wsState: this.lastWsState,
+      relayUrl: this.wsBase || "(not configured)",
+      clipId: this.clipId || "(not derived)",
+      deviceId: this.deviceId || "(unknown)",
+      hasKey: String(!!this.key),
+      lastRev: String(this.lastRev),
+      reconnects: String(this.reconnects),
+      backoffMs: String(this.backoff),
+      lastEvent: this.lastEvent ?? "(none)",
+      lastError: this.lastError ?? "(none)",
+    };
   }
 }
 

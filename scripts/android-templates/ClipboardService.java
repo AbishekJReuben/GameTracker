@@ -24,6 +24,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -31,7 +32,12 @@ import android.widget.TextView;
 import android.widget.Toast;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
+import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
@@ -171,6 +177,58 @@ public class ClipboardService extends Service {
     } catch (Exception ignored) {
       return null;
     }
+  }
+
+  /** Encrypt text → base64(`iv(12) || ciphertext+tag`), mirroring clipboardCrypto.ts.
+   *  Returns null on any failure. */
+  private String encryptText(String plain) {
+    if (cryptoKey == null || plain == null) return null;
+    try {
+      byte[] iv = new byte[12];
+      new SecureRandom().nextBytes(iv);
+      Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+      c.init(Cipher.ENCRYPT_MODE, cryptoKey, new GCMParameterSpec(128, iv));
+      byte[] ct = c.doFinal(plain.getBytes(StandardCharsets.UTF_8));
+      byte[] out = new byte[12 + ct.length];
+      System.arraycopy(iv, 0, out, 0, 12);
+      System.arraycopy(ct, 0, out, 12, ct.length);
+      return android.util.Base64.encodeToString(out, android.util.Base64.NO_WRAP);
+    } catch (Exception ignored) {
+      return null;
+    }
+  }
+
+  /** Send a text item to the relay over the open WebSocket. Mirrors the JS add
+   *  payload exactly (the relay upserts + broadcasts to other devices). No-op if
+   *  the socket isn't open or encryption failed. */
+  private void sendTextItem(String text) {
+    if (socket == null || text == null || text.isEmpty()) return;
+    String cipher = encryptText(text);
+    if (cipher == null) return;
+    String id = UUID.randomUUID().toString();
+    String now = isoNow();
+    try {
+      JSONObject item = new JSONObject();
+      item.put("itemId", id);
+      item.put("deviceId", deviceId);
+      item.put("deviceName", android.os.Build.MODEL);
+      item.put("kind", "text");
+      item.put("mime", "text/plain");
+      item.put("size", text.length());
+      item.put("createdUtc", now);
+      item.put("pinned", false);
+      item.put("textCipher", cipher);
+      item.put("hasBlob", false);
+      JSONObject msg = new JSONObject();
+      msg.put("t", "add");
+      msg.put("item", item);
+      socket.send(msg.toString());
+    } catch (Exception ignored) {
+    }
+  }
+
+  private static String isoNow() {
+    return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).format(new Date());
   }
 
   // ---- sync socket ----------------------------------------------------------
@@ -537,6 +595,53 @@ public class ClipboardService extends Service {
     header.addView(close, new LinearLayout.LayoutParams(dp(40), dp(28)));
     root.addView(header);
 
+    // Composer: type-to-sync. Lets you push a clip from the bubble without
+    // switching apps — text is encrypted natively and sent over the WS.
+    final EditText composer = new EditText(this);
+    composer.setHint("Type to sync to your PC…");
+    composer.setHintTextColor(0xFF64748B);
+    composer.setTextColor(0xFFE2E8F0);
+    composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+    composer.setMaxLines(3);
+    GradientDrawable fieldBg = new GradientDrawable();
+    fieldBg.setColor(0x14FFFFFF);
+    fieldBg.setCornerRadius(dp(10));
+    composer.setBackground(fieldBg);
+    composer.setPadding(dp(10), dp(7), dp(10), dp(7));
+    LinearLayout.LayoutParams composerLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    composerLp.topMargin = dp(8);
+    root.addView(composer, composerLp);
+
+    // Send button row.
+    LinearLayout sendRow = new LinearLayout(this);
+    sendRow.setOrientation(LinearLayout.HORIZONTAL);
+    sendRow.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+    LinearLayout.LayoutParams sendRowLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    sendRowLp.topMargin = dp(4);
+    final Button sendBtn = new Button(this);
+    sendBtn.setText("Send");
+    styleBtn(sendBtn, true);
+    LinearLayout.LayoutParams sendBtnLp = new LinearLayout.LayoutParams(dp(84), dp(32));
+    sendBtn.setOnClickListener((v) -> {
+      String t = composer.getText().toString().trim();
+      if (t.isEmpty()) return;
+      sendTextItem(t);
+      // Optimistic local insert so the panel reflects it immediately (the
+      // relay broadcasts it back to other devices; our own deviceId filter
+      // prevents the webview from double-adding).
+      synchronized (this) {
+        items.add(0, new ClipEntry(UUID.randomUUID().toString(), t, System.currentTimeMillis()));
+        while (items.size() > MAX_ITEMS) items.remove(items.size() - 1);
+      }
+      composer.setText("");
+      refreshPanelIfOpen();
+      toast("Sent");
+    });
+    sendRow.addView(sendBtn, sendBtnLp);
+    root.addView(sendRow, sendRowLp);
+
     // Scrollable list of recent items.
     ScrollView scroll = new ScrollView(this);
     scroll.setVerticalScrollBarEnabled(false);
@@ -559,9 +664,10 @@ public class ClipboardService extends Service {
         widthPx,
         heightPx,
         type,
-        // Watch outside touches so tapping anywhere off the panel dismisses it.
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-            | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+        // NOT_FOCUSABLE would prevent the EditText from receiving keystrokes, so
+        // we drop it here. WATCH_OUTSIDE_TOUCH still dismisses the panel on tap
+        // outside, and NOT_TOUCH_MODAL lets the rest of the screen work.
+        WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
             | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
         PixelFormat.TRANSLUCENT);
     panelLp.gravity = Gravity.TOP | Gravity.START;

@@ -299,8 +299,12 @@ pub fn run() {
             );
 
             // Shared clipboard: start the native capture listener + floating
-            // overlay if the feature was left enabled (off by default).
-            clipboard::apply_settings(handle);
+            // overlay if the feature was left enabled (off by default). Runs in
+            // the setup hook (main thread) — safe to build the window here, the
+            // pump is not blocked by a command. Errors land in the diagnostics log.
+            if let Err(e) = clipboard::apply_settings(handle) {
+                clipboard::log(format!("startup apply_settings failed: {e}"));
+            }
 
             // Keep the elevated logon task pointed at this install folder (survives
             // reinstalls / custom install paths without requiring a Settings toggle).
@@ -500,6 +504,7 @@ pub fn run() {
             commands::clipboard_image_b64,
             commands::clipboard_clear_all,
             commands::clipboard_configure,
+            commands::clipboard_diagnostics,
             commands::clipboard_overlay_set_pos,
             commands::speech_to_text,
         ])

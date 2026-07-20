@@ -66,6 +66,8 @@ export const clip = {
   clearAll: () => invoke<void>("clipboard_clear_all"),
   configure: (enabled: boolean, overlay: boolean, autoCapture: boolean) =>
     invoke<void>("clipboard_configure", { enabled, overlay, autoCapture }),
+  /** Rust-side runtime log (watcher + overlay window + apply_settings). */
+  diagnostics: () => invoke<string[]>("clipboard_diagnostics"),
   overlaySetPos: (x: number, y: number) =>
     invoke<void>("clipboard_overlay_set_pos", { x, y }),
   speechToText: (audioBase64: string, mime?: string, language?: string) =>

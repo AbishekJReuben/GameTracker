@@ -1,13 +1,36 @@
 import { useState } from "react";
 import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { ClipboardList, Layers, Zap, Mic } from "lucide-react";
+import { ClipboardList, Layers, Zap, Mic, Stethoscope, Check } from "lucide-react";
 import { api } from "@/lib/api";
 import { clip } from "@/lib/clip";
 import { clipSync } from "@/lib/clipboardSync";
 import { useSettings } from "@/lib/queries";
 import { Toggle } from "@/components/ui";
 import { ClipboardIntro } from "./ClipboardIntro";
+
+/** Build a single diagnostics report (Rust runtime log + JS sync state). */
+async function buildClipReport(): Promise<string> {
+  const lines: string[] = [];
+  lines.push("=== GameTracker shared-clipboard diagnostics ===");
+  lines.push(`Generated: ${new Date().toISOString()}`);
+  lines.push(`App: ${typeof window !== "undefined" ? window.location.href : "(no window)"}`);
+  lines.push("");
+  lines.push("--- Rust runtime log (watcher + overlay window + apply_settings) ---");
+  try {
+    const rust = await clip.diagnostics();
+    if (rust.length === 0) lines.push("(empty — feature was never toggled on this session)");
+    else lines.push(...rust);
+  } catch (e) {
+    lines.push(`(failed to read Rust log: ${e instanceof Error ? e.message : String(e)})`);
+  }
+  lines.push("");
+  lines.push("--- Sync engine state (webview) ---");
+  for (const [k, v] of Object.entries(clipSync.diagnostics())) {
+    lines.push(`${k}: ${v}`);
+  }
+  return lines.join("\n");
+}
 
 function Row({
   icon,
@@ -37,6 +60,7 @@ export function ClipboardSettings() {
   const { data: settings } = useSettings();
   const qc = useQueryClient();
   const [intro, setIntro] = useState(false);
+  const [copiedLogs, setCopiedLogs] = useState(false);
 
   const enabled = settings?.clipboard_enabled === "true";
   const overlay = settings?.clipboard_overlay_enabled === "true";
@@ -50,14 +74,24 @@ export function ClipboardSettings() {
       setIntro(true);
       return;
     }
-    await clip.configure(on, overlay, auto);
-    if (on) await clipSync.restart();
-    else clipSync.stop();
+    try {
+      await clip.configure(on, overlay, auto);
+      if (on) await clipSync.restart();
+      else clipSync.stop();
+    } catch (e) {
+      console.error("[clipboard] configure failed", e);
+      alert(`Couldn't change the clipboard settings: ${e instanceof Error ? e.message : String(e)}`);
+    }
     refresh();
   };
 
   const setOverlay = async (v: boolean) => {
-    await clip.configure(enabled, v, auto);
+    try {
+      await clip.configure(enabled, v, auto);
+    } catch (e) {
+      console.error("[clipboard] overlay toggle failed", e);
+      alert(`Couldn't toggle the floating widget: ${e instanceof Error ? e.message : String(e)}`);
+    }
     refresh();
   };
   const setAuto = async (v: boolean) => {
@@ -67,6 +101,17 @@ export function ClipboardSettings() {
   const setStt = async (v: boolean) => {
     await api.setSetting("clipboard_stt_enabled", v ? "true" : "false");
     refresh();
+  };
+
+  const copyLogs = async () => {
+    try {
+      const report = await buildClipReport();
+      await navigator.clipboard.writeText(report);
+      setCopiedLogs(true);
+      setTimeout(() => setCopiedLogs(false), 1500);
+    } catch (e) {
+      alert(`Couldn't copy: ${e instanceof Error ? e.message : String(e)}`);
+    }
   };
 
   return (
@@ -89,6 +134,26 @@ export function ClipboardSettings() {
           </Row>
           <Row icon={<Mic className="h-4 w-4" />} title="Voice to text" desc="Add a mic button that transcribes speech (Sarvam).">
             <Toggle checked={stt} onChange={setStt} />
+          </Row>
+          <Row
+            icon={<Stethoscope className="h-4 w-4" />}
+            title="Diagnostics"
+            desc="Copy the watcher, overlay, and sync-engine state to debug issues."
+          >
+            <button
+              type="button"
+              onClick={copyLogs}
+              className="btn btn-subtle flex items-center gap-1.5 px-3 py-1.5 text-xs"
+              title="Copy a diagnostics report"
+            >
+              {copiedLogs ? (
+                <>
+                  <Check className="h-3.5 w-3.5 text-emerald-400" /> Copied
+                </>
+              ) : (
+                "Copy logs"
+              )}
+            </button>
           </Row>
         </>
       )}

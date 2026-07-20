@@ -2707,31 +2707,58 @@ pub fn clipboard_clear_all(state: State<AppState>, app: tauri::AppHandle) -> App
 }
 
 /// Write the three clipboard toggles and reconcile the watcher + overlay window.
+///
+/// ASYNC + DEFERRED on purpose. Building the floating overlay window
+/// (`WebviewWindowBuilder::build()`) must run on the Tauri main thread because
+/// WebView2 controller init pumps the Win32 message loop — but it CANNOT run
+/// inside a synchronous command, because that command is itself occupying the
+/// main thread, so `build()` would deadlock waiting for a pump it is blocking
+/// (the classic Tauri v2 Windows hang, see wry#583). The settings writes are
+/// fast SQLite and stay inline; the window/watcher reconciliation is queued onto
+/// the main thread via `apply_settings_deferred`, which returns immediately and
+/// runs after this command yields. Errors from the deferred path are written to
+/// the diagnostics log (and surfaced via `clipboard_diagnostics`).
 #[tauri::command]
-pub fn clipboard_configure(
-    state: State<AppState>,
+pub async fn clipboard_configure(
+    state: State<'_, AppState>,
     app: tauri::AppHandle,
     enabled: bool,
     overlay: bool,
     auto_capture: bool,
 ) -> AppResult<()> {
+    // Settings writes — synchronous, sub-millisecond SQLite. Cloned out of State
+    // (not 'static) and run inline so a failure rejects the invoke before we
+    // touch the window.
+    let pool = state.pool.clone();
     settings::set(
-        &state.pool,
+        &pool,
         "clipboard_enabled",
         if enabled { "true" } else { "false" },
     )?;
     settings::set(
-        &state.pool,
+        &pool,
         "clipboard_overlay_enabled",
         if overlay { "true" } else { "false" },
     )?;
     settings::set(
-        &state.pool,
+        &pool,
         "clipboard_auto_capture",
         if auto_capture { "true" } else { "false" },
     )?;
-    crate::clipboard::apply_settings(&app);
+    crate::clipboard::log(format!(
+        "clipboard_configure: toggles written (enabled={enabled}, overlay={overlay}, auto={auto_capture}); deferring apply_settings to main thread"
+    ));
+    // Reconcile watcher + overlay on the main thread, AFTER this command returns
+    // so the message pump is free to build the WebView2 child window.
+    crate::clipboard::apply_settings_deferred(app);
     Ok(())
+}
+
+/// Snapshot of the desktop clipboard runtime log (watcher / overlay / sync
+/// handoff) for the Settings panel's "Copy logs" diagnostics button.
+#[tauri::command]
+pub fn clipboard_diagnostics(_state: State<AppState>) -> AppResult<Vec<String>> {
+    Ok(crate::clipboard::diagnostics())
 }
 
 #[tauri::command]

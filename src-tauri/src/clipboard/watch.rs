@@ -59,14 +59,16 @@ pub fn ignore_next() {
     IGNORE_UNTIL.store(now_ms() + 1500, Ordering::SeqCst);
 }
 
-/// Start (or refresh) the listener thread. Safe to call repeatedly.
+/// Start (or refresh) the listener thread. Safe to call repeatedly. Returns Ok on
+/// successful handoff (the thread itself may still fail later — that's logged via
+/// `crate::clipboard::log` from inside `run_message_loop`).
 pub fn start(
     app: AppHandle,
     pool: crate::db::DbPool,
     media_dir: PathBuf,
     device_id: String,
     device_name: String,
-) {
+) -> crate::error::AppResult<()> {
     *WATCH.lock() = Some(Ctx {
         app,
         pool,
@@ -75,12 +77,13 @@ pub fn start(
         device_name,
     });
     if RUNNING.swap(true, Ordering::SeqCst) {
-        return; // already looping; new context picked up on the next update
+        return Ok(()); // already looping; new context picked up on the next update
     }
     std::thread::spawn(|| {
         unsafe { run_message_loop() };
         RUNNING.store(false, Ordering::SeqCst);
     });
+    Ok(())
 }
 
 /// Stop the listener (posts WM_CLOSE to the message-only window).
@@ -95,9 +98,13 @@ pub fn stop() {
 }
 
 unsafe fn run_message_loop() {
+    crate::clipboard::log("watch: listener thread started");
     let hinstance: HINSTANCE = match GetModuleHandleW(None) {
         Ok(h) => HINSTANCE(h.0),
-        Err(_) => return,
+        Err(e) => {
+            crate::clipboard::log(format!("watch: GetModuleHandleW failed: {e}"));
+            return;
+        }
     };
     let class_name = w!("GTClipboardWatch");
     let wc = WNDCLASSW {
@@ -107,7 +114,7 @@ unsafe fn run_message_loop() {
         ..Default::default()
     };
     // Ignore the return: a second registration of the same class fails harmlessly.
-    RegisterClassW(&wc);
+    let _ = RegisterClassW(&wc);
 
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
@@ -125,16 +132,27 @@ unsafe fn run_message_loop() {
     );
     let hwnd = match hwnd {
         Ok(h) => h,
-        Err(_) => return,
+        Err(e) => {
+            crate::clipboard::log(format!("watch: CreateWindowExW failed: {e}"));
+            return;
+        }
     };
     HWND_PTR.store(hwnd.0 as isize, Ordering::SeqCst);
-    let _ = AddClipboardFormatListener(hwnd);
+    match AddClipboardFormatListener(hwnd) {
+        Ok(()) => crate::clipboard::log("watch: AddClipboardFormatListener ok"),
+        Err(e) => {
+            crate::clipboard::log(format!("watch: AddClipboardFormatListener FAILED: {e}"));
+            // Without the listener we'll never receive updates, but a healthy
+            // message loop is still required for a clean shutdown.
+        }
+    }
 
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    crate::clipboard::log("watch: message loop exited");
 
     let _ = RemoveClipboardFormatListener(hwnd);
     let _ = DestroyWindow(hwnd);

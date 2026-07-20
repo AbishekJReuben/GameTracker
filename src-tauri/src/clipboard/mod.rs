@@ -21,9 +21,33 @@ use crate::db::clipboard::{self as store, ClipInput, ClipItem};
 use crate::error::AppResult;
 use crate::state::AppState;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const OVERLAY_LABEL: &str = "clipboard-overlay";
+
+/// A small ring buffer of the most recent clipboard-runtime events/errors so the
+/// Settings panel's "Copy logs" button can hand the user a self-contained report
+/// instead of "it doesn't work." Cheap (Mutex<Vec<String>>, capped at 200 lines).
+pub const LOG_MAX: usize = 200;
+static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Append one line to the clipboard diagnostics log. Best-effort — a poisoned
+/// lock is silently dropped (logging must never itself crash the feature).
+pub fn log(line: impl Into<String>) {
+    if let Ok(mut buf) = LOG.lock() {
+        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+        buf.push(format!("[{stamp}] {}", line.into()));
+        while (buf.len()) > LOG_MAX {
+            buf.remove(0);
+        }
+    }
+}
+
+/// Snapshot of the diagnostics log (oldest first), for the Settings panel.
+pub fn diagnostics() -> Vec<String> {
+    LOG.lock().map(|b| b.clone()).unwrap_or_default()
+}
 
 /// A stable per-install id so items can be attributed to a device and de-duped
 /// across the relay. Generated + persisted on first use.
@@ -87,47 +111,75 @@ pub fn remove_files<I: IntoIterator<Item = Option<String>>>(paths: I) {
 }
 
 /// Reconcile the native watcher + overlay window with the current settings.
-/// Called on launch and after any clipboard setting changes.
-pub fn apply_settings(app: &AppHandle) {
+/// Called on launch and after any clipboard setting changes. Returns the first
+/// error encountered so callers (notably `clipboard_configure`) can surface it
+/// instead of hanging the UI on "Turning on…". Every step is logged so the
+/// diagnostics report explains what happened.
+pub fn apply_settings(app: &AppHandle) -> AppResult<()> {
     let Some(state) = app.try_state::<AppState>() else {
-        return;
+        log("apply_settings: AppState unavailable");
+        return Ok(());
     };
     let pool = &state.pool;
     let enabled = crate::db::settings::get_bool(pool, "clipboard_enabled").unwrap_or(false);
     let auto = crate::db::settings::get_bool(pool, "clipboard_auto_capture").unwrap_or(true);
     let overlay = crate::db::settings::get_bool(pool, "clipboard_overlay_enabled").unwrap_or(false);
+    log(format!(
+        "apply_settings: enabled={enabled} overlay={overlay} auto={auto} (windows={})",
+        cfg!(windows)
+    ));
 
     // Native capture (Windows only).
     #[cfg(windows)]
     {
         if enabled && auto {
             let did = device_id(pool);
-            watch::start(
+            log(format!("watch::start (device={})", did));
+            // watch::start spawns its own thread and returns fast; it cannot block us.
+            if let Err(e) = watch::start(
                 app.clone(),
                 pool.clone(),
                 state.media_dir.clone(),
                 did,
                 device_name(),
-            );
+            ) {
+                log(format!("watch::start FAILED: {e}"));
+                return Err(e);
+            }
+            log("watch::start ok");
         } else {
             watch::stop();
+            log("watch::stop");
         }
     }
     #[cfg(not(windows))]
     let _ = auto;
 
-    // Floating overlay window.
+    // Floating overlay window. IMPORTANT: building a WebView window must happen
+    // on the Tauri main thread (it pumps the Win32 message loop for WebView2
+    // controller init). If `apply_settings` is ever called from a sync command,
+    // `build()` deadlocks the main thread — see `clipboard_configure` which now
+    // defers this via `run_on_main_thread`.
     if enabled && overlay {
-        open_overlay(app);
+        match open_overlay(app) {
+            Ok(()) => log("open_overlay ok"),
+            Err(e) => {
+                log(format!("open_overlay FAILED: {e}"));
+                return Err(e);
+            }
+        }
     } else {
         close_overlay(app);
+        log("close_overlay");
     }
+    Ok(())
 }
 
-/// Create the always-on-top floating overlay window (idempotent).
-pub fn open_overlay(app: &AppHandle) {
+/// Create the always-on-top floating overlay window (idempotent). MUST run on the
+/// Tauri main thread (WebView2 controller init needs the message pump).
+pub fn open_overlay(app: &AppHandle) -> AppResult<()> {
     if app.get_webview_window(OVERLAY_LABEL).is_some() {
-        return;
+        return Ok(());
     }
     let (x, y) = overlay_pos(app);
     let mut builder = WebviewWindowBuilder::new(
@@ -148,13 +200,34 @@ pub fn open_overlay(app: &AppHandle) {
     if let (Some(x), Some(y)) = (x, y) {
         builder = builder.position(x, y);
     }
-    let _ = builder.build();
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|e| crate::error::AppError::msg(format!("overlay window build failed: {e}")))
 }
 
 /// Close the overlay window if present.
 pub fn close_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = w.close();
+    }
+}
+
+/// Schedule `apply_settings` to run on the Tauri main thread WITHOUT blocking the
+/// caller. Used by `clipboard_configure` (an async command) so the Win32/WebView2
+/// message pump stays free while the window is built — calling `apply_settings`
+/// inline from a sync command deadlocks `WebviewWindowBuilder::build()` on Windows.
+pub fn apply_settings_deferred(app: AppHandle) {
+    // `run_on_main_thread` borrows `app` to schedule the closure, so the closure
+    // needs its own (cloned) handle to call `apply_settings` with once it runs.
+    // A failure to *schedule* (rare: app shutting down) is logged but not fatal.
+    let app2 = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || {
+        if let Err(e) = apply_settings(&app2) {
+            log(format!("deferred apply_settings failed: {e}"));
+        }
+    }) {
+        log(format!("run_on_main_thread schedule failed: {e}"));
     }
 }
 
