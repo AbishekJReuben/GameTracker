@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone)]
@@ -106,6 +107,11 @@ async fn main() {
             get(move || serve_html(p.clone()))
         })
         .with_state(state)
+        // The desktop app (http://tauri.localhost) and Android companion webview
+        // fetch /health and /clip/blob/* cross-origin; without CORS headers those
+        // fetches are blocked and image sync + health probes fail silently. The
+        // relay only ever holds ciphertext, so a permissive policy is safe.
+        .layer(CorsLayer::permissive())
         .fallback_service(serve);
 
     let port: u16 = std::env::var("PORT")

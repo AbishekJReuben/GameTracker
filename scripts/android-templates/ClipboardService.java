@@ -287,22 +287,35 @@ public class ClipboardService extends Service {
 
   // ---- sync socket ----------------------------------------------------------
 
-  /** Keep one idle push socket alive. History/decryption stays lazy in the UI. */
+  /** Keep one idle push socket alive. History/decryption stays lazy in the UI.
+   *  Called from every onStartCommand — the webview re-invokes startService
+   *  whenever it learns the secret, so this must APPLY config changes: if the
+   *  computed socket URL differs from the live socket's (new secret/relay, or we
+   *  started unconfigured and the config just arrived), drop the old socket and
+   *  reconnect with the new one instead of silently keeping the stale session. */
   private void startSync() {
     android.content.SharedPreferences p =
         getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE);
     String secret = p.getString("secret", "");
     deviceId = p.getString("deviceId", "");
     String base = p.getString("signalUrl", "");
-    if (secret == null || secret.isEmpty() || base == null || base.isEmpty()) return;
+    if (secret == null || secret.isEmpty() || base == null || base.isEmpty()) {
+      // Unconfigured (first boot before pairing). Keep the service alive; the
+      // webview will call startService again with real prefs and we re-enter here.
+      main.post(this::refreshStatusIfOpen);
+      return;
+    }
+    String newUrl;
     try {
       while (base.endsWith("/")) base = base.substring(0, base.length() - 1);
-      socketUrl = base + "/clip/ws?clip=" + clipId(secret)
+      newUrl = base + "/clip/ws?clip=" + clipId(secret)
           + "&device=" + android.net.Uri.encode(deviceId + "-native");
     } catch (Exception ignored) {
       return;
     }
     stopping = false;
+    boolean urlChanged = !newUrl.equals(socketUrl);
+    socketUrl = newUrl;
     if (http == null) {
       http = new OkHttpClient.Builder()
           .pingInterval(30, TimeUnit.SECONDS)
@@ -310,7 +323,12 @@ public class ClipboardService extends Service {
           .build();
     }
     registerNetworkCallback();
-    connectSocket();
+    if (urlChanged && socket != null) {
+      // Config changed under a live (or half-open) socket — replace it now.
+      forceReconnect();
+    } else {
+      connectSocket();
+    }
   }
 
   /** Reconnect the instant the network comes back (WiFi⇄cellular switch, tunnel

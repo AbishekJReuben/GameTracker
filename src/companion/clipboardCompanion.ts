@@ -60,6 +60,9 @@ let activeSecret = "";
 // Filled in by the store's init() — the live-secret path (host pushed a secret
 // post-approval) calls this to (re)derive the key + relay space and connect.
 let startWithSecret: ((secret: string) => Promise<void>) | null = null;
+// Last error from provisioning the native Android service (surfaced in
+// diagnostics so a JNI/bridge failure is visible instead of silent).
+let nativeStartError = "";
 
 function sortItems(map: Map<string, ClipItem>): ClipItem[] {
   return [...map.values()]
@@ -222,6 +225,27 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     started = true;
     set({ ready: true, deviceId });
     connect();
+
+    // Provision + (re)start the native Android foreground service with this
+    // config. This is THE auto-start path: the host pushes the secret on every
+    // approved connect, so the background service always ends up configured
+    // (hasKey/relayHost set) without the user ever visiting the Clipboard screen.
+    // Previously only the "Turn on floating widget" button did this, which left
+    // the service running with empty prefs — connected to nothing, silently.
+    if (isTauri()) {
+      try {
+        await invoke("clipboard_service_start", {
+          enabled: true,
+          secret,
+          deviceId,
+          signalUrl: wsBase,
+        });
+        nativeStartError = "";
+      } catch (e) {
+        nativeStartError = e instanceof Error ? e.message : String(e);
+        console.warn("clipboard: native service provisioning failed:", nativeStartError);
+      }
+    }
   };
 
   const addLocal = async (item: ClipItem, cipherPayload: object) => {
@@ -427,6 +451,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
           hasKey: !!key,
           lastRev,
           backoffMs: backoff,
+          nativeStartError: nativeStartError || "(none)",
         },
         nativeService: JSON.parse(snapStr)
       };

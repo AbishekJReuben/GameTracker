@@ -372,3 +372,99 @@ pub async fn handle(socket: WebSocket, clip_id: String, state: Arc<ClipState>) {
     state.remove_sub(&clip_id, peer);
     send_task.abort();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_state(tag: &str) -> Arc<ClipState> {
+        let dir = std::env::temp_dir().join(format!(
+            "gt-clip-test-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ClipState::new(&dir)
+    }
+
+    fn text_item(id: &str, device: &str) -> serde_json::Value {
+        json!({
+            "itemId": id,
+            "deviceId": device,
+            "deviceName": "Test",
+            "kind": "text",
+            "mime": "text/plain",
+            "size": 5,
+            "createdUtc": "2026-07-20T00:00:00.000Z",
+            "pinned": false,
+            "textCipher": "AAAA",
+            "hasBlob": false,
+        })
+    }
+
+    #[test]
+    fn upsert_assigns_monotonic_revs_and_replays_since() {
+        let s = temp_state("upsert");
+        let n1 = s.upsert("clip1", &text_item("a", "dev1")).unwrap();
+        let n2 = s.upsert("clip1", &text_item("b", "dev2")).unwrap();
+        let r1 = n1.get("rev").unwrap().as_i64().unwrap();
+        let r2 = n2.get("rev").unwrap().as_i64().unwrap();
+        assert!(r2 > r1, "revs must be monotonic");
+
+        // hello since=0 replays both, oldest first.
+        let all = s.items_since("clip1", 0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].get("itemId").unwrap().as_str().unwrap(), "a");
+        // since=r1 replays only the newer one.
+        let newer = s.items_since("clip1", r1);
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].get("itemId").unwrap().as_str().unwrap(), "b");
+        // Other clip spaces see nothing.
+        assert!(s.items_since("other", 0).is_empty());
+    }
+
+    #[test]
+    fn re_upsert_same_item_bumps_rev_not_count() {
+        let s = temp_state("reupsert");
+        let n1 = s.upsert("c", &text_item("a", "d")).unwrap();
+        let n2 = s.upsert("c", &text_item("a", "d")).unwrap();
+        assert!(n2.get("rev").unwrap().as_i64() > n1.get("rev").unwrap().as_i64());
+        assert_eq!(s.items_since("c", 0).len(), 1);
+    }
+
+    #[test]
+    fn delete_marks_and_clears_cipher() {
+        let s = temp_state("delete");
+        s.upsert("c", &text_item("a", "d")).unwrap();
+        let n = s.set_deleted("c", "a").unwrap();
+        assert!(n.get("deleted").unwrap().as_bool().unwrap());
+        let replay = s.items_since("c", 0);
+        assert_eq!(replay.len(), 1);
+        assert!(replay[0].get("deleted").unwrap().as_bool().unwrap());
+        assert!(replay[0].get("textCipher").unwrap().is_null());
+        // Deleting a nonexistent item is a no-op (no broadcast).
+        assert!(s.set_deleted("c", "nope").is_none());
+    }
+
+    #[test]
+    fn pin_roundtrip() {
+        let s = temp_state("pin");
+        s.upsert("c", &text_item("a", "d")).unwrap();
+        let n = s.set_pinned("c", "a", true).unwrap();
+        assert!(n.get("pinned").unwrap().as_bool().unwrap());
+        let replay = s.items_since("c", 0);
+        assert!(replay[0].get("pinned").unwrap().as_bool().unwrap());
+        assert!(s.set_pinned("c", "nope", true).is_none());
+    }
+
+    #[test]
+    fn blob_write_read_and_path_sanitizing() {
+        let s = temp_state("blob");
+        s.write_blob("clipA", "item1", b"cipherbytes").unwrap();
+        assert_eq!(s.read_blob("clipA", "item1").unwrap(), b"cipherbytes");
+        assert!(s.read_blob("clipA", "missing").is_none());
+        // Path traversal characters are stripped, not honored.
+        s.write_blob("../evil", "..\\item", b"x").unwrap();
+        assert!(s.read_blob("evil", "item").is_some());
+    }
+}

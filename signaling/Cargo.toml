@@ -20,7 +20,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Serves the built discovery clients (companion + quest under signaling/static)
 # so phones and the Meta Quest headset can open them over the same Cloudflare
 # HTTPS tunnel — WebXR requires a secure context.
-tower-http = { version = "0.5", features = ["fs"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
 
 [profile.release]
 opt-level = "s"
