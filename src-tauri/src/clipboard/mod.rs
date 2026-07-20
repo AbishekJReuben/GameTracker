@@ -262,6 +262,8 @@ pub fn add_local(
     // Sync signal (JS encrypts + uploads) + UI refresh.
     let _ = app.emit("clipboard://item", &saved);
     let _ = app.emit_to(OVERLAY_LABEL, "clipboard://item", &saved);
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(OVERLAY_LABEL, "clipboard://changed", ());
     Ok(saved)
 }
 

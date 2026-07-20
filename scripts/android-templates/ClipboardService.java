@@ -88,6 +88,8 @@ public class ClipboardService extends Service {
   private WindowManager.LayoutParams bubbleLp;
   private View panel;
   private LinearLayout panelList; // the row container inside the panel's ScrollView
+  private TextView panelStatusText; // status label in floating panel header
+  private boolean socketConnected;
   private WindowManager.LayoutParams panelLp;
   private final Handler main = new Handler(Looper.getMainLooper());
   private OkHttpClient http;
@@ -102,6 +104,25 @@ public class ClipboardService extends Service {
   // link must recover within ~10s), so we never let the exponential backoff grow
   // past this. The connectivity callback also short-circuits it on network return.
   private static final long MAX_RECONNECT_MS = 8_000;
+
+  private String getSyncStatusText() {
+    if (cryptoKey == null) return "Set key in app";
+    if (socketConnected) return "Synced";
+    return "Connecting…";
+  }
+
+  private int getSyncStatusColor() {
+    if (cryptoKey == null) return 0xFF94A3B8;
+    if (socketConnected) return 0xFF34D399;
+    return 0xFFFBBF24;
+  }
+
+  private void refreshStatusIfOpen() {
+    if (panelStatusText != null) {
+      panelStatusText.setText(getSyncStatusText());
+      panelStatusText.setTextColor(getSyncStatusColor());
+    }
+  }
 
   /** Decrypted items, newest first. Synced on `this` (touched from the WS thread
    *  and read on the UI thread). Text only — image blobs are skipped in the panel
@@ -151,6 +172,7 @@ public class ClipboardService extends Service {
       String secret = p.getString("secret", "");
       if (secret == null || secret.isEmpty()) {
         cryptoKey = null;
+        main.post(this::refreshStatusIfOpen);
         return;
       }
       byte[] ikm = secret.getBytes(StandardCharsets.UTF_8);
@@ -166,6 +188,7 @@ public class ClipboardService extends Service {
     } catch (Exception ignored) {
       cryptoKey = null;
     }
+    main.post(this::refreshStatusIfOpen);
   }
 
   private static byte[] hmacSha256(byte[] key, byte[] msg) throws Exception {
@@ -220,11 +243,12 @@ public class ClipboardService extends Service {
     if (cipher == null) return;
     String id = UUID.randomUUID().toString();
     String now = isoNow();
+    String nativeDeviceId = (deviceId == null ? "" : deviceId) + "-native";
     try {
       JSONObject item = new JSONObject();
       item.put("itemId", id);
-      item.put("deviceId", deviceId);
-      item.put("deviceName", android.os.Build.MODEL);
+      item.put("deviceId", nativeDeviceId);
+      item.put("deviceName", android.os.Build.MODEL + " (Overlay)");
       item.put("kind", "text");
       item.put("mime", "text/plain");
       item.put("size", text.length());
@@ -321,6 +345,8 @@ public class ClipboardService extends Service {
     socket = http.newWebSocket(new Request.Builder().url(socketUrl).build(), new WebSocketListener() {
       @Override public void onOpen(WebSocket ws, Response response) {
         reconnectMs = 1000;
+        socketConnected = true;
+        main.post(ClipboardService.this::refreshStatusIfOpen);
         long rev = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
             .getLong("nativeRev", 0);
         ws.send("{\"t\":\"hello\",\"since\":" + rev + "}");
@@ -332,11 +358,15 @@ public class ClipboardService extends Service {
 
       @Override public void onClosed(WebSocket ws, int code, String reason) {
         socket = null;
+        socketConnected = false;
+        main.post(ClipboardService.this::refreshStatusIfOpen);
         scheduleReconnect();
       }
 
       @Override public void onFailure(WebSocket ws, Throwable error, Response response) {
         socket = null;
+        socketConnected = false;
+        main.post(ClipboardService.this::refreshStatusIfOpen);
         scheduleReconnect();
       }
     });
@@ -373,8 +403,9 @@ public class ClipboardService extends Service {
         }
         return;
       }
-      // Skip our own items (the webview already added them locally).
-      if (deviceId.equals(v.optString("deviceId"))) return;
+      // Skip echo of native service's own items.
+      String nativeDeviceId = (deviceId == null ? "" : deviceId) + "-native";
+      if (nativeDeviceId.equals(v.optString("deviceId"))) return;
       // Skip images (no preview in the native panel; the app shows them).
       if ("image".equals(v.optString("kind"))) {
         main.post(this::showNewItemAttention);
@@ -633,6 +664,18 @@ public class ClipboardService extends Service {
     title.setTextColor(Color.WHITE);
     title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
     title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+
+    TextView statusView = new TextView(this);
+    statusView.setText(getSyncStatusText());
+    statusView.setTextColor(getSyncStatusColor());
+    statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+    panelStatusText = statusView;
+
+    LinearLayout titleTextWrap = new LinearLayout(this);
+    titleTextWrap.setOrientation(LinearLayout.VERTICAL);
+    titleTextWrap.addView(title);
+    titleTextWrap.addView(statusView);
+
     LinearLayout titleWrap = new LinearLayout(this);
     titleWrap.setOrientation(LinearLayout.HORIZONTAL);
     titleWrap.setGravity(Gravity.CENTER_VERTICAL);
@@ -642,7 +685,7 @@ public class ClipboardService extends Service {
     LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(18), dp(18));
     iconLp.rightMargin = dp(6);
     titleWrap.addView(icon, iconLp);
-    titleWrap.addView(title);
+    titleWrap.addView(titleTextWrap);
     header.addView(titleWrap, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
     Button close = new Button(this);
     close.setText("✕");
@@ -656,7 +699,7 @@ public class ClipboardService extends Service {
     // Composer: type-to-sync. Lets you push a clip from the bubble without
     // switching apps — text is encrypted natively and sent over the WS.
     final EditText composer = new EditText(this);
-    composer.setHint("Type to sync to your PC…");
+    composer.setHint("Type, paste text or an image…");
     composer.setHintTextColor(0xFF64748B);
     composer.setTextColor(0xFFE2E8F0);
     composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
@@ -679,7 +722,7 @@ public class ClipboardService extends Service {
         LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
     sendRowLp.topMargin = dp(4);
     final Button sendBtn = new Button(this);
-    sendBtn.setText("Send");
+    sendBtn.setText("Add");
     styleBtn(sendBtn, true);
     LinearLayout.LayoutParams sendBtnLp = new LinearLayout.LayoutParams(dp(84), dp(32));
     sendBtn.setOnClickListener((v) -> {
@@ -804,6 +847,7 @@ public class ClipboardService extends Service {
     final View p = panel;
     panel = null; // clear immediately so a re-tap toggles cleanly
     panelList = null;
+    panelStatusText = null;
     p.animate()
         .scaleX(0.85f).scaleY(0.85f).alpha(0f)
         .setDuration(140)
@@ -832,7 +876,7 @@ public class ClipboardService extends Service {
     }
     if (snapshot.isEmpty()) {
       TextView empty = new TextView(this);
-      empty.setText("Nothing here yet.\nCopy something on your PC and it appears here.");
+      empty.setText("Nothing here yet\nCopy on your PC and it appears here, or add something above.");
       empty.setTextColor(0xFF94A3B8);
       empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
       empty.setLineSpacing(dp(2), 1f);

@@ -80,12 +80,15 @@ export default function ClipboardOverlay() {
     invoke<Record<string, string>>("get_settings")
       .then((s) => setSttEnabled(s.clipboard_stt_enabled === "true"))
       .catch(() => {});
-    const un = listen("clipboard://item", () => {
+    const triggerPulse = () => {
       setPulse(true);
       setTimeout(() => setPulse(false), 1400);
-    });
+    };
+    const unItem = listen("clipboard://item", triggerPulse);
+    const unChanged = listen("clipboard://changed", triggerPulse);
     return () => {
-      un.then((f) => f());
+      unItem.then((f) => f());
+      unChanged.then((f) => f());
       if (root && prevRootBg !== "") root.style.background = prevRootBg;
     };
   }, []);

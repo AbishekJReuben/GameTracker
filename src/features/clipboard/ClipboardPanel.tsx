@@ -21,9 +21,11 @@ export function ClipboardPanel({
 
   useEffect(() => {
     s.load();
-    const un = listen("clipboard://changed", () => s.refresh());
+    const unChanged = listen("clipboard://changed", () => s.refresh());
+    const unItem = listen("clipboard://item", () => s.refresh());
     return () => {
-      un.then((f) => f());
+      unChanged.then((f) => f());
+      unItem.then((f) => f());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
