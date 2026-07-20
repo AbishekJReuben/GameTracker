@@ -33,7 +33,12 @@ export default function ClipboardPage() {
       }
     >
       {enabled ? (
-        <Panel panelKey="clipboard.page" games={[]} className="flex h-[calc(100vh-13rem)] min-h-[420px] flex-col p-3">
+        <Panel
+          panelKey="clipboard.page"
+          games={[]}
+          className="flex min-h-[60vh] flex-col p-3"
+          bodyClassName="flex min-h-0 flex-1 flex-col"
+        >
           <ClipboardPanel sttEnabled={stt} />
         </Panel>
       ) : (

@@ -22,6 +22,7 @@ export function Panel({
   shell = "card",
   glow = false,
   className,
+  bodyClassName,
   children,
   ...rest
 }: {
@@ -35,6 +36,11 @@ export function Panel({
   shell?: PanelShell;
   glow?: boolean;
   className?: string;
+  /** Optional class for the inner content wrapper (the `relative z-10` div that
+   *  holds children above the marquee backdrop). Useful when a panel needs a
+   *  proper flex height chain — e.g. the Clipboard page passes flex/min-h-0 so
+   *  its inner scroll area actually scrolls instead of being clipped. */
+  bodyClassName?: string;
   children: ReactNode;
 } & React.HTMLAttributes<HTMLDivElement>) {
   const ctx: PanelArtContext = { games, game, sessions, images, art };
@@ -50,7 +56,7 @@ export function Panel({
   const body = (
     <>
       {backdrop}
-      <div className="relative z-10">{children}</div>
+      <div className={cn("relative z-10", bodyClassName)}>{children}</div>
     </>
   );
 

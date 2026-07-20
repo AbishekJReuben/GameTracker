@@ -1109,3 +1109,72 @@ not regress):**
 - **Curved-edge dock padding** uses `max(1.25rem, env(safe-area-inset-*))` on the
   Control bottom bar and the companion tab strip — Android reports 0 for curves.
 
+---
+
+## 14. Shared clipboard + Android floating dock (v3.9.x) — `/clipboard`, relay, native overlay
+
+A **shared, end-to-end-encrypted clipboard** mirrors copy/paste across the desktop
+and every paired phone/VR headset. The desktop side is a normal Tauri feature
+(`src/features/clipboard/**`, `src/store/clipboard.ts`, Rust in
+`src-tauri/src/db/clipboard.rs` + `src-tauri/src/commands.rs::clipboard_*`). The
+**relay** is a tiny dumb store in the signaling crate (`signaling/src/clip.rs`):
+every device of one user shares a `clipId` (a SHA-256 of their
+`remote_secret_code` — the server never sees the secret), the relay keeps their
+ciphertext items forever, and image blobs live as on-disk files served over HTTP.
+Transport: one WebSocket per device at `/clip/ws?clip=<clipId>&device=<id>`;
+image ciphertext moves over HTTP (`/clip/blob/<clipId>/<itemId>`) so a big paste
+never blocks the metadata channel.
+
+### The Android floating dock (`scripts/android-templates/ClipboardService.java`)
+
+A **`specialUse` foreground service** draws a draggable overlay bubble on every
+app (`SYSTEM_ALERT_WINDOW`) and stays connected via a native OkHttp WebSocket even
+when the Activity/webview is destroyed — so history keeps syncing without the app
+open. Tapping the bubble opens a side **dock panel** (compose, search, filter,
+history). Templates live in `scripts/android-templates/` and are written into
+`gen/android` by `scripts/patch-android.mjs` (idempotent — `__PACKAGE__` is
+substituted for the app identifier).
+
+**Invariants — do NOT regress these:**
+
+- **Always sort after insert (`sortItemsLocked`).** `items.add(0, …)` was the old
+  pattern and it was wrong: async image thumbnails and catch-up replays land out
+  of order, so the latest clip sometimes appeared mid-list. Every insert path
+  (WS `handleNotice`, `fetchImageThumb`, `sendImageItem`, the composer's Add
+  button) MUST call `sortItemsLocked()` after the add. Sort is **pinned-first,
+  then newest→oldest by `createdAtMs`**. `trimItemsLocked` never evicts pinned.
+- **`parseIsoMs` handles fractional seconds.** The JS/desktop sides emit
+  `2026-07-20T10:51:50.565Z`; the parser tries `…SSS` first, then the bare
+  seconds form. `setLenient(false)` so a malformed timestamp falls back to
+  `now` rather than silently mis-bucketing.
+- **Full history with lazy rendering.** `hello since=0` requests the entire
+  backlog (capped at `MAX_ITEMS = 300` in memory; text is cheap, image thumbnails
+  are downscaled to `THUMB_MAX_PX`). The dock only renders the first `renderLimit`
+  rows (start = `RENDER_PAGE = 30`); a scroll listener grows `renderLimit` by one
+  page as the user approaches the bottom. Reset `renderLimit = RENDER_PAGE`
+  whenever the search or All/Text/Images filter changes. **Don't reintroduce a
+  server-side paging endpoint** — the relay streams the full history on
+  `since=0`, and the native cap + lazy window already keep memory bounded.
+- **Pin / Share on every row.** Each dock row carries a 📌/📍 pin toggle and a ↗
+  share button (parity with the desktop `ClipboardList` Pin/Share). `togglePin`
+  flips the flag, re-sorts, and sends `{t:"pin", itemId, pinned}` over the WS
+  (the relay just flips + re-broadcasts — see `clip.rs::set_pinned`). `shareEntry`
+  shares text via `ACTION_SEND`; for images it re-fetches the full ciphertext
+  blob, decrypts, writes to cache, and shares via `FileProvider` (the dock only
+  holds a downscaled thumbnail).
+- **Three image-input paths, all wired.** (1) **Paste** — read the OS clipboard
+  image (`pasteImageFromClipboard`). (2) **Upload** — a transparent proxy
+  Activity `ClipboardPickActivity` launches the system Photo Picker (services
+  can't receive an Activity result), hands the URI back via
+  `ACTION_UPLOAD_IMAGE`, and the service reads+syncs the bytes. (3) **Keyboard
+  paste** — `EditText.setOnReceiveContentListener` (API 31+) so Gboard's image
+  paste works in the floating composer (returns `null` to consume images so
+  EditText doesn't try to insert them as text).
+- **`ClipboardPickActivity` must stay registered.** It's declared in
+  `patch-android.mjs` with `@android:style/Theme.Translucent.NoTitleBar`, kept by
+  proguard, and written from `scripts/android-templates/ClipboardPickActivity.java`.
+  Without it, the Upload button crashes with `ActivityNotFoundException`.
+- **Foreground service restart.** `START_STICKY` + `ClipboardBootReceiver` +
+  `onTaskRemoved` AlarmManager restart bring the service back after a kill /
+  reboot / swiping the app out of Recents. Don't remove any of these.
+

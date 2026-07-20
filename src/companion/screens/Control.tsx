@@ -201,8 +201,8 @@ type NetStats = {
 // ---------- tuning constants ----------
 const TAP_MS = 260; // max press time still counted as a tap
 const TAP_SLOP = 12; // max finger travel (px) still counted as a tap
-const TWO_FINGER_TAP_MS = 400; // two-finger taps are inherently slower (fingers land apart in time)
-const TWO_FINGER_TAP_SLOP = 18; // and jitter more — give a little more slack than single-finger
+const TWO_FINGER_TAP_MS = 450; // two-finger taps are inherently slower (fingers land apart in time)
+const TWO_FINGER_TAP_SLOP = 24; // and jitter more — give a little more slack than single-finger
 const LONGPRESS_MS = 550; // stationary hold before left-button-down
 const SCROLL_STEP = 20; // finger px per wheel notch
 const MIN_ZOOM = 0.25; // 25% — match toolbar / pin scale floor
@@ -2421,19 +2421,33 @@ export function ControlScreen({
       // landing ~150ms apart) routinely failed on TAP_MS alone.
       const twoWasTap =
         twoMaxMove.current < TWO_FINGER_TAP_SLOP && now - twoDownT.current < TWO_FINGER_TAP_MS;
+      // Two-finger right-click fires when BOTH fingers are lifted (downCount === 2),
+      // the gesture never became pinch/scroll, and the centroid didn't wander.
+      // This MUST NOT depend on `gesture.current === "two"`: the first finger to
+      // lift drops us into the `size === 1` branch which resets gesture to
+      // "cursor"/"touchdrag" — so by the time the last finger lifts, gesture is no
+      // longer "two". The downCount check (a high-water mark only reset when all
+      // fingers are up) is what reliably catches a two-finger tap regardless of
+      // lift order. This applies to BOTH touch and trackpad modes.
+      const twoFingerTap = downCount.current === 2 && twoWasTap && twoMode.current === "undecided";
       const primaryClick =
         e.button === 0 &&
-        g !== "two" &&
+        !twoFingerTap &&
         (wasTap || g === "dragging" || g === "touchdrag" || g === "cursor");
 
-      if (mode === "touch") {
+      // Two-finger tap → right click takes precedence (otherwise a trackpad-mode
+      // user who lifted finger 1 first would see gesture reset to "cursor" and
+      // the bare single-finger `wasTap` would fire a LEFT click instead).
+      if (twoFingerTap) {
+        // Safety: if a long-press / dragLock had armed a left-button-down before
+        // finger two landed, release it so we don't leave the PC holding LMB.
+        if (touchPressed.current) send({ type: "up", button: "left" });
+        sendRightClick();
+      } else if (mode === "touch") {
         if (touchPressed.current) send({ type: "up", button: "left" });
         else if (wasTap && downCount.current === 1) send({ type: "click", button: "left" });
-        if (downCount.current === 2 && twoWasTap && twoMode.current === "undecided") sendRightClick();
       } else if (g === "dragging") {
         send({ type: "up", button: "left" });
-      } else if (g === "two") {
-        if (twoMode.current === "undecided" && twoWasTap && downCount.current === 2) sendRightClick();
       } else if (g === "cursor" && wasTap && downCount.current === 1) {
         send({ type: "click", button: "left" });
       }

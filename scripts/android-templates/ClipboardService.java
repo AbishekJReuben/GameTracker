@@ -8,6 +8,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -22,6 +23,7 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -40,6 +42,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import androidx.core.content.FileProvider;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -88,12 +91,19 @@ import org.json.JSONObject;
 public class ClipboardService extends Service {
   public static final String ACTION_START = "__PACKAGE__.CLIP_START";
   public static final String ACTION_STOP = "__PACKAGE__.CLIP_STOP";
+  /** Service action: a content URI for an image the user just picked via the
+   *  {@code ClipboardPickActivity} proxy (services can't open the photo picker
+   *  themselves — no Activity result callback). Reads + syncs the bytes. */
+  public static final String ACTION_UPLOAD_IMAGE = "__PACKAGE__.CLIP_UPLOAD_IMAGE";
   private static final String CHANNEL = "gt_clipboard";
   private static final int NOTIF_ID = 0x6C69; // "li"
-  // Keep a healthy backlog so old history is browsable in the dock (was 12, which
-  // made "old history can't be viewed"). Text rows are cheap; images are kept as
-  // small downscaled thumbnails (see thumbs), so memory stays bounded.
-  private static final int MAX_ITEMS = 100;
+  // Keep a large backlog so the full history is browsable in the dock (lazy-rendered
+  // on scroll — see renderLimit). Text rows are cheap; images are kept as small
+  // downscaled thumbnails (see thumbs), so memory stays bounded even at this size.
+  private static final int MAX_ITEMS = 300;
+  // How many rows to render at once; grows as the user scrolls (see dock scroll
+  // listener) so a 300-item history doesn't inflate hundreds of views up front.
+  private static final int RENDER_PAGE = 30;
   // Longest edge (px) of a decoded image thumbnail — keeps the dock light even
   // with many images. Full images are viewed by opening the app.
   private static final int THUMB_MAX_PX = 240;
@@ -173,6 +183,9 @@ public class ClipboardService extends Service {
     final String text;
     final long createdAtMs;
     final String deviceId;
+    boolean pinned;      // toggled by the pin button / relay pin notices
+    boolean pendingDelete; // armed by a first tap on ✕ (two-tap confirm)
+    String mime = "image/png"; // for images (used when sharing)
     ClipEntry(String id, String kind, String text, long createdAtMs, String deviceId) {
       this.id = id;
       this.kind = kind;
@@ -182,6 +195,18 @@ public class ClipboardService extends Service {
     }
   }
   private final ArrayList<ClipEntry> items = new ArrayList<>();
+
+  /** Keep `items` in display order: pinned first, then newest→oldest by timestamp.
+   *  Called after every insert so the latest clip is ALWAYS at the top even when
+   *  async image thumbnails or catch-up replays arrive out of order (the old code
+   *  relied on insertion order, which let a late-decoding image or a racing notice
+   *  land mid-list). Caller holds `this`. */
+  private void sortItemsLocked() {
+    java.util.Collections.sort(items, (a, b) -> {
+      if (a.pinned != b.pinned) return a.pinned ? -1 : 1;
+      return Long.compare(b.createdAtMs, a.createdAtMs);
+    });
+  }
 
   // Crypto — derived once per service start from the persisted secret.
   private SecretKey cryptoKey;
@@ -202,8 +227,45 @@ public class ClipboardService extends Service {
     startForegroundNotif();
     deriveCryptoKey();
     showBubble();
+    // A gallery upload coming in from ClipboardPickActivity — handle it before the
+    // usual connect cycle so the bytes are read + sent even if config is unchanged.
+    if (ACTION_UPLOAD_IMAGE.equals(action) && intent != null) {
+      final Uri uri = (Uri) intent.getParcelableExtra(Intent.EXTRA_STREAM);
+      if (uri != null) handleUploadImage(uri);
+    }
     startSync();
     return START_STICKY;
+  }
+
+  /** Read the picked image's bytes (granting ourselves read access via the
+   *  ContentResolver) and forward them through the same encrypt+upload path the
+   *  clipboard-paste button uses. Runs on a background thread (ContentResolver
+   *  reads + encrypt are blocking). Best-effort. */
+  private void handleUploadImage(Uri uri) {
+    final ContentResolver cr = getContentResolver();
+    try {
+      // Hand the URI read permission forward to ourselves (the picker Activity
+      // already granted it on start, but re-flagging is harmless + future-safe).
+      try {
+        cr.takePersistableUriPermission(uri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+      } catch (SecurityException ignored) {
+        // Not persistable — we still have one-shot read access from the intent.
+      }
+      String mime = cr.getType(uri);
+      if (mime == null) mime = "image/*";
+      final String fmime = mime.startsWith("image/") ? mime : "image/*";
+      new Thread(() -> {
+        byte[] raw = readAll(uri);
+        if (raw == null || raw.length == 0) {
+          main.post(() -> toast("Couldn't read the image"));
+          return;
+        }
+        sendImageItem(raw, fmime);
+      }).start();
+    } catch (Exception e) {
+      toast("Couldn't upload image");
+    }
   }
 
   /** Derive the AES key from the persisted secret. Mirrors clipboardCrypto.ts
@@ -476,8 +538,8 @@ public class ClipboardService extends Service {
             .edit().putLong("nativeRev", rev).apply();
       }
       if (!"item".equals(v.optString("t"))) return;
+      String id = v.optString("itemId", "");
       if (v.optBoolean("deleted", false)) {
-        String id = v.optString("itemId", "");
         if (!id.isEmpty()) {
           synchronized (this) {
             for (int i = items.size() - 1; i >= 0; i--) {
@@ -488,18 +550,29 @@ public class ClipboardService extends Service {
         }
         return;
       }
+      // A bare pin update (relay sends {t:item, itemId, pinned} with no content).
+      if (!v.has("kind") && v.has("pinned")) {
+        boolean pin = v.optBoolean("pinned", false);
+        synchronized (this) {
+          for (ClipEntry e : items) if (id.equals(e.id)) e.pinned = pin;
+          sortItemsLocked();
+        }
+        main.post(this::refreshPanelIfOpen);
+        return;
+      }
       // Skip echo of native service's own items.
       String nativeDeviceId = (deviceId == null ? "" : deviceId) + "-native";
       if (nativeDeviceId.equals(v.optString("deviceId"))) return;
-      String id = v.optString("itemId", "");
       long created = parseIsoMs(v.optString("createdUtc", ""));
       String dev = v.optString("deviceId", "");
+      boolean pinned = v.optBoolean("pinned", false);
       if ("image".equals(v.optString("kind"))) {
-        // Images now render as thumbnails in the dock. Fetch the ciphertext blob,
-        // decrypt, and decode a downscaled bitmap on the WS thread (already off the
-        // UI thread). Insert a placeholder row immediately so ordering/history is
-        // right even before the bitmap lands.
-        if (v.optBoolean("hasBlob", false)) fetchImageThumb(id, created, dev);
+        // Images render as thumbnails: fetch the ciphertext blob, decrypt, decode a
+        // downscaled bitmap on the WS thread. sortItemsLocked keeps ordering right
+        // even though the bitmap lands asynchronously.
+        if (v.optBoolean("hasBlob", false)) {
+          fetchImageThumb(id, created, dev, v.optString("mime", "image/png"), pinned);
+        }
         return;
       }
       String cipher = v.optString("textCipher", "");
@@ -510,7 +583,10 @@ public class ClipboardService extends Service {
         for (int i = items.size() - 1; i >= 0; i--) {
           if (id.equals(items.get(i).id)) items.remove(i);
         }
-        items.add(0, new ClipEntry(id, "text", plain, created, dev));
+        ClipEntry e = new ClipEntry(id, "text", plain, created, dev);
+        e.pinned = pinned;
+        items.add(e);
+        sortItemsLocked();
         trimItemsLocked();
       }
       main.post(this::showNewItemAttention);
@@ -519,11 +595,13 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Evict past MAX_ITEMS, dropping any cached thumbnail for removed image rows so
-   *  the bitmap cache can't outgrow the list. Caller holds `this`. */
+  /** Evict past MAX_ITEMS (oldest, unpinned first), dropping the cached thumbnail so
+   *  the bitmap cache can't outgrow the list. Pinned items are never evicted. Caller
+   *  holds `this`. (items is already sorted pinned-first, newest-first.) */
   private void trimItemsLocked() {
-    while (items.size() > MAX_ITEMS) {
-      ClipEntry gone = items.remove(items.size() - 1);
+    for (int i = items.size() - 1; i >= 0 && items.size() > MAX_ITEMS; i--) {
+      if (items.get(i).pinned) continue;
+      ClipEntry gone = items.remove(i);
       Bitmap b = thumbs.remove(gone.id);
       if (b != null) b.recycle();
     }
@@ -531,7 +609,7 @@ public class ClipboardService extends Service {
 
   /** Download → decrypt → downscale one image blob, then insert its row. Runs on the
    *  OkHttp callback thread (already a background thread). Best-effort. */
-  private void fetchImageThumb(String id, long created, String dev) {
+  private void fetchImageThumb(String id, long created, String dev, String mime, boolean pinned) {
     if (http == null || clipSpace.isEmpty() || httpBase.isEmpty()) return;
     // Already have it? Just make sure the row exists.
     synchronized (this) {
@@ -554,7 +632,11 @@ public class ClipboardService extends Service {
                 if (id.equals(items.get(i).id)) items.remove(i);
               }
               thumbs.put(id, bmp);
-              items.add(0, new ClipEntry(id, "image", null, created, dev));
+              ClipEntry e = new ClipEntry(id, "image", null, created, dev);
+              e.pinned = pinned;
+              e.mime = mime == null ? "image/png" : mime;
+              items.add(e);
+              sortItemsLocked();
               trimItemsLocked();
             }
             main.post(ClipboardService.this::showNewItemAttention);
@@ -613,20 +695,26 @@ public class ClipboardService extends Service {
     return out.toString();
   }
 
-  /** Parse an RFC3339/ISO-8601 timestamp to epoch ms (best-effort; 0 on failure). */
+  /** Parse an RFC3339/ISO-8601 UTC timestamp (e.g. 2026-07-20T10:51:50.565Z) to
+   *  epoch ms. Handles the fractional-seconds form the JS/desktop sides emit AND a
+   *  plain seconds form, so ordering-by-time is exact (millisecond precision matters
+   *  when several clips land in the same second). Falls back to now on failure. */
   private static long parseIsoMs(String s) {
     if (s == null || s.isEmpty()) return System.currentTimeMillis();
-    try {
-      // T => space; trim trailing Z so java.text ISO parsing is optional.
-      String t = s.replace('T', ' ');
-      if (t.endsWith("Z")) t = t.substring(0, t.length() - 1);
-      java.text.SimpleDateFormat f = new java.text.SimpleDateFormat(
-          "yyyy-MM-dd HH:mm:ss", java.util.Locale.US);
-      f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
-      return f.parse(t).getTime();
-    } catch (Exception ignored) {
-      return System.currentTimeMillis();
+    String t = s.replace('T', ' ');
+    if (t.endsWith("Z")) t = t.substring(0, t.length() - 1);
+    String[] patterns = {"yyyy-MM-dd HH:mm:ss.SSS", "yyyy-MM-dd HH:mm:ss"};
+    for (String p : patterns) {
+      try {
+        java.text.SimpleDateFormat f = new java.text.SimpleDateFormat(p, java.util.Locale.US);
+        f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        f.setLenient(false);
+        return f.parse(t).getTime();
+      } catch (Exception ignored) {
+        // try next pattern
+      }
     }
+    return System.currentTimeMillis();
   }
 
   // ---- images (dock) --------------------------------------------------------
@@ -727,7 +815,10 @@ public class ClipboardService extends Service {
             if (socket != null) socket.send(msg.toString());
             synchronized (ClipboardService.this) {
               if (thumb != null) thumbs.put(id, thumb);
-              items.add(0, new ClipEntry(id, "image", null, parseIsoMs(now), nd));
+              ClipEntry e = new ClipEntry(id, "image", null, parseIsoMs(now), nd);
+              e.mime = mime == null ? "image/png" : mime;
+              items.add(e);
+              sortItemsLocked();
               trimItemsLocked();
             }
             main.post(() -> { toast("Image sent"); refreshPanelIfOpen(); });
@@ -737,6 +828,100 @@ public class ClipboardService extends Service {
       });
     } catch (Exception e) {
       toast("Image upload failed");
+    }
+  }
+
+  // ---- pin / share (dock row actions) ---------------------------------------
+
+  /** Toggle the pinned flag on a row, broadcast it to other devices, and re-sort so
+   *  pinned items rise to the top. Mirrors the JS `sendPin` payload (the relay just
+   *  flips + re-broadcasts; it doesn't validate). Called from the dock row's pin
+   *  button. */
+  private void togglePin(ClipEntry e) {
+    if (e == null) return;
+    final boolean nowPinned = !e.pinned;
+    e.pinned = nowPinned;
+    synchronized (this) {
+      sortItemsLocked();
+    }
+    try {
+      JSONObject pin = new JSONObject();
+      pin.put("t", "pin");
+      pin.put("itemId", e.id);
+      pin.put("pinned", nowPinned);
+      if (socket != null) socket.send(pin.toString());
+    } catch (Exception ignored) {
+    }
+    refreshPanelIfOpen();
+    toast(nowPinned ? "Pinned" : "Unpinned");
+  }
+
+  /** Share a row through Android's ACTION_SEND sheet. Text rows share directly; image
+   *  rows re-fetch the full ciphertext blob, decrypt, write to a cache file, and
+   *  share its FileProvider content:// URI (the dock only stores a downscaled
+   *  thumbnail, so we have to round-trip to the relay for the full-res bytes). */
+  private void shareEntry(ClipEntry e) {
+    if (e == null) return;
+    if ("text".equals(e.kind) && e.text != null) {
+      try {
+        Intent send = new Intent(Intent.ACTION_SEND);
+        send.setType("text/plain");
+        send.putExtra(Intent.EXTRA_TEXT, e.text);
+        send.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(Intent.createChooser(send, "Share clip").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+      } catch (Exception ignored) {
+        setOsClipboard(e.text);
+        toast("Copied instead");
+      }
+      return;
+    }
+    if ("image".equals(e.kind)) {
+      toast("Preparing image…");
+      new Thread(() -> {
+        File cached = fetchAndCacheFullImage(e.id, e.mime);
+        main.post(() -> {
+          if (cached == null) { toast("Couldn't load image"); return; }
+          try {
+            Uri uri = FileProvider.getUriForFile(this,
+                getPackageName() + ".fileprovider", cached);
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType(e.mime == null ? "image/png" : e.mime);
+            send.putExtra(Intent.EXTRA_STREAM, uri);
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(Intent.createChooser(send, "Share image").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+          } catch (Exception ignored) {
+            toast("Couldn't share image");
+          }
+        });
+      }).start();
+      return;
+    }
+  }
+
+  /** Fetch the full ciphertext blob for an item, decrypt it, write it to the app
+   *  cache dir, and return the File (so {@link #shareEntry} can FileProvider it).
+   *  Returns null on any failure. */
+  private File fetchAndCacheFullImage(String id, String mime) {
+    if (http == null || clipSpace.isEmpty() || httpBase.isEmpty()) return null;
+    String ext = ".png";
+    if (mime != null) {
+      if (mime.contains("jpeg") || mime.contains("jpg")) ext = ".jpg";
+      else if (mime.contains("webp")) ext = ".webp";
+      else if (mime.contains("gif")) ext = ".gif";
+    }
+    String url = httpBase + "/clip/blob/" + clipSpace + "/" + id;
+    try (Response r = http.newCall(new Request.Builder().url(url).build()).execute()) {
+      if (!r.isSuccessful() || r.body() == null) return null;
+      byte[] cipher = r.body().bytes();
+      byte[] raw = decryptBytes(cipher);
+      if (raw == null) return null;
+      File out = new File(getCacheDir(), "share-" + id + ext);
+      try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
+        fos.write(raw);
+      }
+      return out;
+    } catch (Exception ignored) {
+      return null;
     }
   }
 
@@ -1026,6 +1211,14 @@ public class ClipboardService extends Service {
   private EditText dockComposer; // live handle so the mic can append transcripts
   private View dockMic;          // shown only when a Sarvam key is configured
   private String dockFilter = ""; // native search text
+  // Filter chip: "" = all, "text", "image". Mirrors the desktop panel's All / Text /
+  // Images tabs so the floating dock has the same content-type filtering.
+  private String dockFilterKind = "";
+  // Lazy render window: only the first N matching rows are inflated as Views; grows
+  // by RENDER_PAGE as the user scrolls near the bottom so a 300-item history doesn't
+  // inflate hundreds of rows up front. Reset when the filter/search changes.
+  private int renderLimit = RENDER_PAGE;
+  private ScrollView dockScroll;
 
   /** Slide the dock in from the pin's edge. Full-height, translucent-frosted, with
    *  the same features as the app screen: compose (text + image + mic), search,
@@ -1080,6 +1273,7 @@ public class ClipboardService extends Service {
       @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
       @Override public void afterTextChanged(android.text.Editable s) {
         dockFilter = s.toString().trim().toLowerCase(Locale.US);
+        renderLimit = RENDER_PAGE; // new filter → restart from the top
         refreshPanelIfOpen();
       }
     });
@@ -1088,9 +1282,36 @@ public class ClipboardService extends Service {
     searchLp.topMargin = dp(8);
     root.addView(searchField, searchLp);
 
+    // All / Text / Images filter strip — parity with the desktop panel's tabs so
+    // the dock can browse by content type. Each chip resets the render window so
+    // switching filter shows the top of the new set.
+    root.addView(buildFilterStrip());
+
     // Scrollable history.
     ScrollView scroll = new ScrollView(this);
     scroll.setVerticalScrollBarEnabled(false);
+    // Lazy-render: as the user approaches the bottom, grow the render window by
+    // RENDER_PAGE so a 300-item history doesn't inflate hundreds of views up front.
+    scroll.getViewTreeObserver().addOnScrollChangedListener(() -> {
+      if (dockScroll == null || panelList == null) return;
+      View child = dockScroll.getChildAt(0);
+      if (child == null) return;
+      int scrollY = dockScroll.getScrollY();
+      int total = child.getHeight() - dockScroll.getHeight();
+      // Within ~2 screen heights of the end → fetch the next page of rows.
+      if (total - scrollY < dockScroll.getHeight() * 2) {
+        int before = renderLimit;
+        int totalItems;
+        synchronized (this) {
+          totalItems = countShownLocked();
+        }
+        if (renderLimit < totalItems) {
+          renderLimit = Math.min(totalItems, renderLimit + RENDER_PAGE);
+          if (renderLimit != before) refreshPanelIfOpen();
+        }
+      }
+    });
+    dockScroll = scroll;
     LinearLayout list = new LinearLayout(this);
     list.setOrientation(LinearLayout.VERTICAL);
     panelList = list;
@@ -1197,6 +1418,64 @@ public class ClipboardService extends Service {
     return header;
   }
 
+  /** All / Text / Images filter strip — parity with the desktop ClipboardPanel's
+   *  All/Text/Images segmented control. A tap clears the search filter too (so
+   *  picking "Images" doesn't keep filtering for an unrelated search term). */
+  private LinearLayout buildFilterStrip() {
+    LinearLayout strip = new LinearLayout(this);
+    strip.setOrientation(LinearLayout.HORIZONTAL);
+    strip.setGravity(Gravity.CENTER_VERTICAL);
+    LinearLayout.LayoutParams stripLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    stripLp.topMargin = dp(6);
+    strip.setLayoutParams(stripLp);
+    GradientDrawable bg = new GradientDrawable();
+    bg.setColor(0x10FFFFFF);
+    bg.setCornerRadius(dp(10));
+    strip.setBackground(bg);
+    String[] labels = {"All", "Text", "Images"};
+    String[] kinds = {"", "text", "image"};
+    for (int i = 0; i < labels.length; i++) {
+      final String kind = kinds[i];
+      Button chip = new Button(this);
+      chip.setText(labels[i]);
+      chip.setAllCaps(false);
+      chip.setStateListAnimator(null);
+      chip.setPadding(0, dp(4), 0, dp(4));
+      chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+      LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(
+          0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+      if (i > 0) chipLp.leftMargin = dp(2);
+      strip.addView(chip, chipLp);
+      styleFilterChip(chip, kind.equals(dockFilterKind));
+      chip.setOnClickListener((v) -> {
+        dockFilterKind = kind;
+        renderLimit = RENDER_PAGE;
+        for (int j = 0; j < strip.getChildCount(); j++) {
+          View c = strip.getChildAt(j);
+          if (c instanceof Button) {
+            styleFilterChip((Button) c, kinds[j].equals(dockFilterKind));
+          }
+        }
+        refreshPanelIfOpen();
+      });
+    }
+    return strip;
+  }
+
+  private void styleFilterChip(Button b, boolean active) {
+    GradientDrawable bg = new GradientDrawable();
+    bg.setCornerRadius(dp(8));
+    if (active) {
+      bg.setColor(0xFF7C5CFF);
+      b.setTextColor(Color.WHITE);
+    } else {
+      bg.setColor(0x00FFFFFF);
+      b.setTextColor(0xFF94A3B8);
+    }
+    b.setBackground(bg);
+  }
+
   /** Composer row: text field + image button + mic (key-gated) + Add. */
   private LinearLayout buildDockComposer() {
     LinearLayout wrap = new LinearLayout(this);
@@ -1218,6 +1497,37 @@ public class ClipboardService extends Service {
     fieldBg.setCornerRadius(dp(10));
     composer.setBackground(fieldBg);
     composer.setPadding(dp(10), dp(8), dp(10), dp(8));
+    // Keyboard image paste (Gboard rich content): on Android 12+ the IME can hand
+    // image URIs straight to the focused EditText via OnReceiveContentListener.
+    // Without this, pasting an image from the keyboard does nothing in the
+    // floating panel (the desktop panel has the same parity via Composer's
+    // onPaste handler). Wrapped defensively — some OEM builds ship a broken impl.
+    // The contract: return null when we've fully handled the payload (images),
+    // or return the payload to let the EditText do its default text insert.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      try {
+        composer.setOnReceiveContentListener(new String[]{"image/*"},
+            (android.view.View view, android.view.ContentInfo payload) -> {
+              android.content.ClipData clip = payload.getClip();
+              if (clip != null && clip.getItemCount() > 0) {
+                android.content.ClipDescription desc = clip.getDescription();
+                if (desc != null && desc.hasMimeType("image/*")) {
+                  android.content.ClipData.Item it = clip.getItemAt(0);
+                  if (it != null && it.getUri() != null) {
+                    handleUploadImage(it.getUri());
+                    return null; // we consumed it — don't let EditText insert text
+                  }
+                }
+              }
+              return payload;
+            });
+      } catch (NoSuchMethodError ignored) {
+        // Older runtime than the compile-time type — silently skip (the gallery +
+        // clipboard-paste buttons still work).
+      } catch (Throwable ignored) {
+        // Some OEM builds ship a broken impl; the other two upload paths still work.
+      }
+    }
     wrap.addView(composer, new LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
@@ -1229,21 +1539,33 @@ public class ClipboardService extends Service {
     actionsLp.topMargin = dp(6);
     actions.setLayoutParams(actionsLp);
 
-    // Image button: pushes an image the OS clipboard currently holds.
-    Button imgBtn = new Button(this);
-    imgBtn.setText("＋ Image");
-    styleBtn(imgBtn, false);
-    imgBtn.setOnClickListener((v) -> pasteImageFromClipboard());
-    actions.addView(imgBtn, new LinearLayout.LayoutParams(0, dp(34), 1f));
+    // Paste from the OS clipboard (parity with the desktop composer's "Paste Image"
+    // button). Best-effort — toasts guidance if there's no image on the clipboard.
+    Button pasteBtn = new Button(this);
+    pasteBtn.setText("📋 Paste");
+    styleBtn(pasteBtn, false);
+    pasteBtn.setOnClickListener((v) -> pasteImageFromClipboard());
+    actions.addView(pasteBtn, new LinearLayout.LayoutParams(0, dp(34), 1f));
+
+    // Upload button: opens the photo gallery via a transparent proxy Activity
+    // (services can't get an Activity result callback). Picks an image, hands the
+    // content:// URI back here via ACTION_UPLOAD_IMAGE. Full-res image sync.
+    Button uploadBtn = new Button(this);
+    uploadBtn.setText("🖼 Upload");
+    styleBtn(uploadBtn, false);
+    uploadBtn.setOnClickListener((v) -> launchImagePicker());
+    LinearLayout.LayoutParams uploadLp = new LinearLayout.LayoutParams(0, dp(34), 1f);
+    uploadLp.leftMargin = dp(6);
+    actions.addView(uploadBtn, uploadLp);
 
     // Mic button (only when a Sarvam key is set — matches the desktop's gating).
     Button mic = new Button(this);
-    mic.setText("🎤 Speak");
+    mic.setText("🎤");
     styleBtn(mic, false);
     dockMic = mic;
     mic.setVisibility(sarvamKey != null && !sarvamKey.trim().isEmpty() ? View.VISIBLE : View.GONE);
     mic.setOnClickListener((v) -> toggleMic((Button) v));
-    LinearLayout.LayoutParams micLp = new LinearLayout.LayoutParams(0, dp(34), 1f);
+    LinearLayout.LayoutParams micLp = new LinearLayout.LayoutParams(dp(46), dp(34));
     micLp.leftMargin = dp(6);
     actions.addView(mic, micLp);
 
@@ -1256,19 +1578,35 @@ public class ClipboardService extends Service {
       sendTextItem(t);
       synchronized (this) {
         String nd = (deviceId == null ? "" : deviceId) + "-native";
-        items.add(0, new ClipEntry(UUID.randomUUID().toString(), "text", t, System.currentTimeMillis(), nd));
+        ClipEntry e = new ClipEntry(UUID.randomUUID().toString(), "text", t, System.currentTimeMillis(), nd);
+        items.add(e);
+        sortItemsLocked();
         trimItemsLocked();
       }
       composer.setText("");
       refreshPanelIfOpen();
       toast("Sent");
     });
-    LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(72), dp(34));
+    LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(64), dp(34));
     addLp.leftMargin = dp(6);
     actions.addView(addBtn, addLp);
 
     wrap.addView(actions);
     return wrap;
+  }
+
+  /** Launch the system photo picker (or open the gallery as a fallback on older
+   *  devices) via a transparent proxy Activity — services can't receive Activity
+   *  results. {@code ClipboardPickActivity} hands the picked URI back to this
+   *  service as {@link #ACTION_UPLOAD_IMAGE}. */
+  private void launchImagePicker() {
+    try {
+      Intent launch = new Intent(this, ClipboardPickActivity.class);
+      launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+      startActivity(launch);
+    } catch (Exception e) {
+      toast("Couldn't open gallery");
+    }
   }
 
   /** Footer: copy the newest text + open the full app. */
@@ -1325,6 +1663,7 @@ public class ClipboardService extends Service {
     panelStatusText = null;
     dockComposer = null;
     dockMic = null;
+    dockScroll = null;
     final boolean right = pinOnRight;
     final int w = p.getWidth();
     p.animate()
@@ -1354,25 +1693,44 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Populate the list with current items (filtered). Text rows tap-to-copy; image
-   *  rows show a thumbnail and open the app for full-res copy/view. */
+  /** Items that pass BOTH the search text filter and the All/Text/Images kind
+   *  filter, in display order (pinned first, then newest). Caller holds `this`. */
+  private ArrayList<ClipEntry> filteredLocked() {
+    ArrayList<ClipEntry> out = new ArrayList<>();
+    for (ClipEntry e : items) {
+      if (!dockFilterKind.isEmpty() && !dockFilterKind.equals(e.kind)) continue;
+      if (dockFilter.isEmpty()) { out.add(e); continue; }
+      if ("text".equals(e.kind) && e.text != null
+          && e.text.toLowerCase(Locale.US).contains(dockFilter)) {
+        out.add(e);
+      }
+    }
+    return out;
+  }
+
+  /** Total matching rows (used by the lazy-render scroll listener to know when to
+   *  stop growing renderLimit). Caller holds `this`. */
+  private int countShownLocked() {
+    return filteredLocked().size();
+  }
+
+  /** Populate the list with the matching items (search + kind filter), rendering
+   *  only the first {@link #renderLimit} rows so a 300-item history doesn't inflate
+   *  hundreds of views up front — the scroll listener grows renderLimit as the user
+   *  approaches the bottom. Text rows tap-to-copy; image rows show a thumbnail.
+   *  Each row carries a Pin and a Share action (parity with the desktop panel). */
   private void renderList(LinearLayout list) {
     ArrayList<ClipEntry> snapshot;
     synchronized (this) {
-      snapshot = new ArrayList<>(items);
+      snapshot = filteredLocked();
     }
-    ArrayList<ClipEntry> shown = new ArrayList<>();
-    for (ClipEntry e : snapshot) {
-      if (dockFilter.isEmpty()) { shown.add(e); continue; }
-      if ("text".equals(e.kind) && e.text != null && e.text.toLowerCase(Locale.US).contains(dockFilter)) {
-        shown.add(e);
-      }
-    }
-    if (shown.isEmpty()) {
+    if (snapshot.isEmpty()) {
       TextView empty = new TextView(this);
-      empty.setText(snapshot.isEmpty()
-          ? "Nothing here yet\nCopy on your PC and it appears here, or add something above."
-          : "No matches");
+      boolean any;
+      synchronized (this) { any = !items.isEmpty(); }
+      empty.setText(any
+          ? "No matches"
+          : "Nothing here yet\nCopy on your PC and it appears here, or add something above.");
       empty.setTextColor(0xFF94A3B8);
       empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
       empty.setLineSpacing(dp(2), 1f);
@@ -1382,12 +1740,34 @@ public class ClipboardService extends Service {
     }
     long now = System.currentTimeMillis();
     final int collapsedLines = 6;
-    for (ClipEntry e : shown) {
+    final int limit = Math.min(renderLimit, snapshot.size());
+    boolean pinnedHeaderShown = false;
+    boolean dividerShown = false;
+    for (int idx = 0; idx < limit; idx++) {
+      final ClipEntry e = snapshot.get(idx);
+      // Section labels for parity with the desktop panel's "Pinned" header + the
+      // divider between pinned and the rest (items is sorted pinned-first).
+      if (e.pinned && !pinnedHeaderShown) {
+        list.addView(makeSectionLabel("PINNED"));
+        pinnedHeaderShown = true;
+      } else if (!e.pinned && pinnedHeaderShown && !dividerShown) {
+        list.addView(makeSectionDivider());
+        dividerShown = true;
+      }
       LinearLayout row = new LinearLayout(this);
       row.setOrientation(LinearLayout.VERTICAL);
       GradientDrawable rowBg = new GradientDrawable();
-      rowBg.setColor(0x14FFFFFF);
+      rowBg.setColor(e.pendingDelete ? 0x33EF4444 : 0x14FFFFFF);
       rowBg.setCornerRadius(dp(12));
+      if (e.pinned) {
+        // Subtle accent stroke so pinned rows are visibly "kept" (matches the
+        // desktop panel's accent border on pinned items).
+        rowBg.setStroke(dp(1), 0x557C5CFF);
+      }
+      if (e.pendingDelete) {
+        // Red stroke on an armed delete so the two-tap confirm is visible.
+        rowBg.setStroke(dp(1), 0xFFEF4444);
+      }
       row.setBackground(rowBg);
       row.setPadding(dp(11), dp(9), dp(11), dp(9));
       LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
@@ -1404,15 +1784,9 @@ public class ClipboardService extends Service {
         if (bmp != null) iv.setImageBitmap(bmp);
         row.addView(iv, new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-        TextView meta = new TextView(this);
-        meta.setText("Image · " + relativeTime(e.createdAtMs, now) + "  ·  tap to open");
-        meta.setTextColor(0xFF64748B);
-        meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-        LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        metaLp.topMargin = dp(4);
-        row.addView(meta, metaLp);
-        row.setOnClickListener((v) -> { hidePanel(); openApp(); });
+        row.addView(buildMetaActionsRow(e, "Image · " + relativeTime(e.createdAtMs, now)));
+        row.setOnClickListener((v) -> shareEntry(e));
+        row.setOnLongClickListener((v) -> { hidePanel(); openApp(); return true; });
         list.addView(row, rowLp);
         continue;
       }
@@ -1427,15 +1801,9 @@ public class ClipboardService extends Service {
       body.setLineSpacing(dp(1), 1f);
       row.addView(body);
 
-      final TextView meta = new TextView(this);
       final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
-      meta.setText(relativeTime(e.createdAtMs, now) + (longText ? "  ·  hold to expand" : ""));
-      meta.setTextColor(0xFF64748B);
-      meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-      LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
-          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-      metaLp.topMargin = dp(4);
-      row.addView(meta, metaLp);
+      row.addView(buildMetaActionsRow(e,
+          relativeTime(e.createdAtMs, now) + (longText ? "  ·  hold to expand" : "")));
 
       final boolean[] expanded = {false};
       row.setOnClickListener((v) -> {
@@ -1445,12 +1813,154 @@ public class ClipboardService extends Service {
       row.setOnLongClickListener((v) -> {
         expanded[0] = !expanded[0];
         body.setMaxLines(expanded[0] ? Integer.MAX_VALUE : collapsedLines);
-        meta.setText(relativeTime(e.createdAtMs, now)
-            + (expanded[0] ? "  ·  hold to collapse" : (longText ? "  ·  hold to expand" : "")));
+        // Rebuild the meta row so its hint text updates ("hold to collapse" etc.).
+        LinearLayout parent = (LinearLayout) v;
+        if (parent.getChildCount() >= 2 && parent.getChildAt(1) instanceof LinearLayout) {
+          parent.removeViewAt(1);
+          parent.addView(buildMetaActionsRow(e,
+              relativeTime(e.createdAtMs, now)
+                  + (expanded[0] ? "  ·  hold to collapse" : (longText ? "  ·  hold to expand" : ""))),
+              1);
+        }
         return true;
       });
       list.addView(row, rowLp);
     }
+    // Trailing "load more" hint when the window is shorter than the match set.
+    if (limit < snapshot.size()) {
+      TextView more = new TextView(this);
+      more.setText("↓ " + (snapshot.size() - limit) + " more  ·  scroll to load");
+      more.setTextColor(0xFF64748B);
+      more.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+      more.setPadding(dp(8), dp(8), dp(8), dp(8));
+      list.addView(more);
+    }
+  }
+
+  /** The thin meta + actions row under each clip: relative time on the left, a
+   *  pin toggle and a share button on the right (parity with the desktop panel's
+   *  per-row Pin / Share buttons). Returns a horizontal LinearLayout. */
+  private LinearLayout buildMetaActionsRow(final ClipEntry e, String metaText) {
+    LinearLayout row = new LinearLayout(this);
+    row.setOrientation(LinearLayout.HORIZONTAL);
+    row.setGravity(Gravity.CENTER_VERTICAL);
+
+    TextView meta = new TextView(this);
+    meta.setText(metaText);
+    meta.setTextColor(0xFF64748B);
+    meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
+        0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+    metaLp.topMargin = dp(4);
+    row.addView(meta, metaLp);
+
+    Button pin = new Button(this);
+    pin.setText(e.pinned ? "📌" : "📍");
+    pin.setTextColor(e.pinned ? 0xFF7C5CFF : 0xFF94A3B8);
+    pin.setBackgroundColor(Color.TRANSPARENT);
+    pin.setAllCaps(false);
+    pin.setStateListAnimator(null);
+    pin.setPadding(dp(6), dp(2), dp(6), dp(2));
+    pin.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+    pin.setOnClickListener((v) -> togglePin(e));
+    LinearLayout.LayoutParams pinLp = new LinearLayout.LayoutParams(dp(40), dp(28));
+    pinLp.leftMargin = dp(4);
+    row.addView(pin, pinLp);
+
+    Button share = new Button(this);
+    share.setText("↗");
+    share.setTextColor(0xFF94A3B8);
+    share.setBackgroundColor(Color.TRANSPARENT);
+    share.setAllCaps(false);
+    share.setStateListAnimator(null);
+    share.setPadding(dp(6), dp(2), dp(6), dp(2));
+    share.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+    share.setOnClickListener((v) -> shareEntry(e));
+    LinearLayout.LayoutParams shareLp = new LinearLayout.LayoutParams(dp(36), dp(28));
+    shareLp.leftMargin = dp(2);
+    row.addView(share, shareLp);
+
+    Button del = new Button(this);
+    del.setText("✕");
+    del.setTextColor(0xFFF87171);
+    del.setBackgroundColor(Color.TRANSPARENT);
+    del.setAllCaps(false);
+    del.setStateListAnimator(null);
+    del.setPadding(dp(6), dp(2), dp(6), dp(2));
+    del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    del.setOnClickListener((v) -> confirmDelete(e));
+    LinearLayout.LayoutParams delLp = new LinearLayout.LayoutParams(dp(34), dp(28));
+    delLp.leftMargin = dp(2);
+    row.addView(del, delLp);
+    return row;
+  }
+
+  /** Delete an item locally + broadcast the deletion to other devices (parity
+   *  with the desktop panel's per-row delete). Two-tap confirm: the first tap
+   *  marks the row pending (red), the second within 3s removes it. */
+  private void confirmDelete(final ClipEntry e) {
+    if (e == null) return;
+    final boolean[] armed = new boolean[]{e.pendingDelete};
+    if (!armed[0]) {
+      e.pendingDelete = true;
+      toast("Tap ✕ again to delete");
+      refreshPanelIfOpen();
+      main.postDelayed(() -> {
+        if (e.pendingDelete) {
+          e.pendingDelete = false;
+          refreshPanelIfOpen();
+        }
+      }, 3000);
+      return;
+    }
+    deleteEntry(e);
+  }
+
+  /** Remove an item from the local list + send a relay delete notice. */
+  private void deleteEntry(ClipEntry e) {
+    synchronized (this) {
+      for (int i = items.size() - 1; i >= 0; i--) {
+        if (e.id.equals(items.get(i).id)) {
+          ClipEntry gone = items.remove(i);
+          Bitmap b = thumbs.remove(gone.id);
+          if (b != null) b.recycle();
+        }
+      }
+    }
+    try {
+      JSONObject d = new JSONObject();
+      d.put("t", "delete");
+      d.put("itemId", e.id);
+      if (socket != null) socket.send(d.toString());
+    } catch (Exception ignored) {
+    }
+    refreshPanelIfOpen();
+    toast("Deleted");
+  }
+
+  /** Small uppercase section label (e.g. "PINNED") — parity with the desktop
+   *  panel's pinned-section header. */
+  private TextView makeSectionLabel(String text) {
+    TextView label = new TextView(this);
+    label.setText(text);
+    label.setTextColor(0xFF64748B);
+    label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    label.setTypeface(label.getTypeface(), android.graphics.Typeface.BOLD);
+    label.setPadding(dp(4), dp(6), dp(4), dp(2));
+    return label;
+  }
+
+  /** Thin divider between the pinned section and the rest — parity with the
+   *  desktop panel's `h-px bg-white/[0.06]` divider. */
+  private View makeSectionDivider() {
+    View div = new View(this);
+    div.setBackgroundColor(0x14FFFFFF);
+    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
+    lp.topMargin = dp(6);
+    lp.bottomMargin = dp(4);
+    div.setLayoutParams(lp);
+    return div;
   }
 
   private void styleBtn(Button b, boolean primary) {

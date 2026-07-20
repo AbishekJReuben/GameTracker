@@ -214,9 +214,21 @@ export default function ClipboardOverlay() {
           >
             <div
               {...headerDrag}
-              className="flex cursor-grab items-center justify-between gap-2 border-b border-white/[0.06] px-3.5 py-2.5 active:cursor-grabbing"
+              className="flex cursor-grab items-center gap-2 border-b border-white/[0.06] px-3.5 py-2.5 active:cursor-grabbing"
             >
-              <div className="flex min-w-0 items-center gap-2">
+              {/* Close (X) sits in the LEFT corner so it lands on the same spot as
+                  the collapsed bubble — the user's finger is already there from
+                  tapping to open, and the expand morph anchors to top-left. Keep
+                  its pointer-down from initiating a header drag. */}
+              <button
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={collapse}
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-dim hover:bg-white/10 hover:text-ink"
+                title="Collapse"
+              >
+                <X className="h-4 w-4" />
+              </button>
+              <div className="flex min-w-0 flex-1 items-center gap-2">
                 <Clipboard className="h-4 w-4 shrink-0 text-accent-3" />
                 <span className="text-sm font-700 text-ink">Clipboard</span>
                 <span
@@ -234,14 +246,6 @@ export default function ClipboardOverlay() {
                   {status.text}
                 </span>
               </div>
-              <button
-                onPointerDown={(e) => e.stopPropagation()}
-                onClick={collapse}
-                className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-dim hover:bg-white/10 hover:text-ink"
-                title="Collapse"
-              >
-                <X className="h-4 w-4" />
-              </button>
             </div>
             <div className="min-h-0 flex-1 p-2.5">
               <ClipboardPanel compact sttEnabled={sttEnabled} />

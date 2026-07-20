@@ -177,6 +177,19 @@ const save = (path, before, after, msg) => {
     m = m.replace(/([ \t]*<\/application>)/, `${svc}$1`);
   }
 
+  // ClipboardPickActivity — transparent proxy that lets the foreground
+  // ClipboardService pick an image from the gallery (services can't receive an
+  // Activity-result callback). Translucent.NoTitleBar keeps it invisible; it
+  // finishes immediately after handing the URI back to the service.
+  if (!m.includes(".ClipboardPickActivity")) {
+    const act =
+      `        <activity${eol}` +
+      `          android:name=".ClipboardPickActivity"${eol}` +
+      `          android:exported="false"${eol}` +
+      `          android:theme="@android:style/Theme.Translucent.NoTitleBar" />${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${act}$1`);
+  }
+
   // Boot receiver — restart the service after a reboot / app update.
   if (!m.includes(".ClipboardBootReceiver")) {
     const rec =
@@ -617,10 +630,11 @@ const save = (path, before, after, msg) => {
       `}\n` +
       `\n` +
       `# Shared clipboard: ClipboardBridge statics are called from Rust over JNI;\n` +
-      `# the service + boot receiver are referenced only via the manifest.\n` +
+      `# the service + boot receiver + pick-activity are referenced only via the manifest.\n` +
       `-keep class ${pkg}.ClipboardBridge { *; }\n` +
       `-keep class ${pkg}.ClipboardService { *; }\n` +
       `-keep class ${pkg}.ClipboardBootReceiver { *; }\n` +
+      `-keep class ${pkg}.ClipboardPickActivity { *; }\n` +
       `\n` +
       `# Belt-and-braces: never strip @JavascriptInterface methods anywhere.\n` +
       `-keepclassmembers class * {\n` +
@@ -708,7 +722,7 @@ const save = (path, before, after, msg) => {
   if (!pkg) {
     console.warn("[patch-android] no identifier — skipping clipboard components.");
   } else {
-    for (const name of ["ClipboardBridge", "ClipboardService", "ClipboardBootReceiver"]) {
+    for (const name of ["ClipboardBridge", "ClipboardService", "ClipboardBootReceiver", "ClipboardPickActivity"]) {
       const templatePath = join(root, "scripts", "android-templates", `${name}.java`);
       if (!existsSync(templatePath)) {
         console.warn(`[patch-android] ${templatePath} missing — skipping ${name}.`);
