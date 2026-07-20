@@ -1,6 +1,6 @@
 [package]
 name = "gametracker-companion"
-version = "3.9.66"
+version = "3.9.67"
 description = "GameTracker Remote — phone companion"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -27,6 +27,8 @@ ureq = { version = "2", features = ["tls", "gzip"] }
 # Verifies the downloaded APK against the sha256 published in apk-latest.json —
 # the definitive integrity gate (catches every corruption/transcoding mode).
 sha2 = "0.10"
+# Decodes the base64 audio the webview records before POSTing it to Sarvam STT.
+base64 = "0.22"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

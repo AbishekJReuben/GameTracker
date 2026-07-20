@@ -23,7 +23,10 @@ import {
   Trash2,
   Info,
   ExternalLink,
+  Mic,
+  Check,
 } from "lucide-react";
+import { LS_SARVAM_KEY } from "../clipboardCompanion";
 import { checkForUpdateVerbose, openReleasePage, type UpdateCheck } from "../update";
 import { UpdatePanel } from "../UpdatePanel";
 import { deviceName } from "../device";
@@ -47,6 +50,7 @@ export function SettingsScreen({ code, onSaveKey, onDisconnect, onForget }: Sett
     <div className="mx-auto max-w-xl space-y-4 p-4">
       {isTauri() ? <UpdateSection /> : <WebAboutSection />}
       <ConnectionSection code={code} onSaveKey={onSaveKey} onDisconnect={onDisconnect} onForget={onForget} />
+      <VoiceKeySection />
       <div className="pb-2 text-center text-[11px] text-ink-faint">GameTracker Remote · companion</div>
     </div>
   );
@@ -160,6 +164,73 @@ function UpdateSection() {
       {check?.status === "update-available" ? (
         <UpdatePanel info={check.info} current={check.current} />
       ) : null}
+    </section>
+  );
+}
+
+/** Voice-to-text (Sarvam) key for the phone's clipboard mic. Stored locally on the
+ *  device; enables the mic on both the app's Clipboard screen and the floating dock. */
+function VoiceKeySection() {
+  const [key, setKey] = useState(() => localStorage.getItem(LS_SARVAM_KEY) || "");
+  const [saved, setSaved] = useState(false);
+
+  const save = async () => {
+    const trimmed = key.trim();
+    localStorage.setItem(LS_SARVAM_KEY, trimmed);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+    // Push the key to the native background service now (it caches it in prefs for
+    // the floating dock's mic) instead of waiting for the next reconnect.
+    if (isTauri()) {
+      const secret = localStorage.getItem("gt.remote.secret") || "";
+      const deviceId = localStorage.getItem("gt.clip.device") || "";
+      const signalUrl = localStorage.getItem("gt.remote.signal") || "";
+      if (secret) {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          await invoke("clipboard_service_start", {
+            enabled: true,
+            secret,
+            deviceId,
+            signalUrl,
+            sarvamKey: trimmed,
+          });
+        } catch {
+          /* bridge missing / not android */
+        }
+      }
+    }
+  };
+
+  return (
+    <section className="rounded-2xl border border-line bg-bg-900/60 p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <span className="grid h-9 w-9 place-items-center rounded-xl bg-white/[0.05]">
+          <Mic className="h-4 w-4 text-ink-dim" />
+        </span>
+        <div>
+          <div className="font-display text-base font-800">Voice to text</div>
+          <div className="text-[11px] text-ink-faint">Sarvam speech-to-text for the clipboard mic</div>
+        </div>
+      </div>
+      <p className="mb-2 text-[12px] text-ink-faint">
+        Paste your Sarvam API key (sarvam.ai) to enable the mic button on the Clipboard screen and the floating dock.
+      </p>
+      <div className="flex gap-2">
+        <input
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          type="password"
+          placeholder="Sarvam API key"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          className="input flex-1"
+        />
+        <button onClick={save} className="btn btn-primary h-10 gap-1.5 px-4">
+          {saved ? <Check className="h-4 w-4" /> : "Save"}
+        </button>
+      </div>
     </section>
   );
 }

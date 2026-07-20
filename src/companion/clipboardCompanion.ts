@@ -25,6 +25,36 @@ import {
 
 const MAX_ITEMS = 300;
 
+/** LocalStorage key for the user's Sarvam STT key on the phone. Seeded from the PC
+ *  over the trusted channel (see CompanionApp) or entered in companion Settings. */
+export const LS_SARVAM_KEY = "gt.sarvam.key";
+export const LS_SARVAM_LANG = "gt.sarvam.lang";
+
+/** Companion speech-to-text: record → this → Sarvam (native ureq, runtime key).
+ *  Mirrors the desktop mic. Returns "" if no key is set or transcription fails. */
+export async function companionTranscribe(audioB64: string, mime: string): Promise<string> {
+  const apiKey = (localStorage.getItem(LS_SARVAM_KEY) || "").trim();
+  if (!apiKey) throw new Error("Add a Sarvam API key in Settings to use voice-to-text.");
+  const language = (localStorage.getItem(LS_SARVAM_LANG) || "").trim() || undefined;
+  if (isTauri()) {
+    return await invoke<string>("speech_to_text", { audioBase64: audioB64, mime, language, apiKey });
+  }
+  // Web companion (no Tauri): call Sarvam directly. Best-effort; may be CORS-limited.
+  const form = new FormData();
+  form.append("model", "saaras:v3");
+  form.append("mode", "transcribe");
+  if (language) form.append("language_code", language);
+  const bin = b64ToBytes(audioB64);
+  form.append("file", new Blob([bin as BlobPart], { type: mime }), "audio");
+  const r = await fetch("https://api.sarvam.ai/speech-to-text", {
+    method: "POST",
+    headers: { "api-subscription-key": apiKey },
+    body: form,
+  });
+  const j = await r.json().catch(() => ({}));
+  return (j as { transcript?: string }).transcript ?? "";
+}
+
 interface CompanionClipState {
   items: ClipItem[];
   connected: boolean;
@@ -174,7 +204,12 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     sock.onopen = () => {
       backoff = 1000;
       set({ connected: true });
-      sock.send(JSON.stringify({ t: "hello", since: lastRev }));
+      // The phone keeps history only in memory (no local SQLite like the desktop),
+      // so ask for the FULL history (since=0) on connect — otherwise `since=lastRev`
+      // skips everything copied before this session and "old history can't be seen".
+      // The relay streams oldest→newest; we dedupe into a Map and keep the newest
+      // MAX_ITEMS, so memory stays bounded regardless of how much history exists.
+      sock.send(JSON.stringify({ t: "hello", since: 0 }));
       clearInterval(ping);
       ping = setInterval(() => {
         if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ t: "ping" }));
@@ -239,6 +274,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
           secret,
           deviceId,
           signalUrl: wsBase,
+          sarvamKey: (localStorage.getItem(LS_SARVAM_KEY) || "").trim(),
         });
         nativeStartError = "";
       } catch (e) {

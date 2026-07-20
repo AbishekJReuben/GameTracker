@@ -17,10 +17,16 @@ export function Composer({
   onAddText,
   onAddImage,
   sttEnabled,
+  transcribe,
+  placeholder = "Type, paste text or an image…",
 }: {
   onAddText: (text: string) => void;
   onAddImage: (b64: string, mime?: string) => void;
   sttEnabled: boolean;
+  /** Platform-specific speech-to-text. Defaults to the desktop `clip.speechToText`
+   *  (reads the key from settings); the companion injects its own runtime-keyed path. */
+  transcribe?: (audioB64: string, mime: string) => Promise<string>;
+  placeholder?: string;
 }) {
   const [text, setText] = useState("");
   const [recording, setRecording] = useState(false);
@@ -67,7 +73,9 @@ export function Composer({
         try {
           const blob = new Blob(chunks.current, { type: "audio/webm" });
           const b64 = await blobToB64(blob);
-          const out = await clip.speechToText(b64, "audio/webm");
+          const out = transcribe
+            ? await transcribe(b64, "audio/webm")
+            : await clip.speechToText(b64, "audio/webm");
           if (out) setText((t) => (t ? `${t} ${out}` : out));
         } catch {
           /* transcription failed */
@@ -96,7 +104,7 @@ export function Composer({
           }
         }}
         rows={2}
-        placeholder="Type, paste text or an image…"
+        placeholder={placeholder}
         className="max-h-40 min-h-[2.5rem] w-full resize-none bg-transparent px-2 py-1 text-sm text-ink outline-none placeholder:text-ink-faint"
       />
       <div className="flex items-center justify-between gap-2 px-1 pt-1">

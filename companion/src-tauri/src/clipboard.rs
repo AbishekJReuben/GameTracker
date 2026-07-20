@@ -140,6 +140,7 @@ mod imp {
         secret: &str,
         device_id: &str,
         signal_url: &str,
+        sarvam_key: &str,
     ) -> Result<(), String> {
         with_env(|env, context| {
             let class = load_class(env, context, BRIDGE)?;
@@ -149,16 +150,18 @@ mod imp {
                 .new_string(signal_url)
                 .map_err(|e| e.to_string())?
                 .into();
+            let jkey: JObject = env.new_string(sarvam_key).map_err(|e| e.to_string())?.into();
             env.call_static_method(
                 &class,
                 "startService",
-                "(Landroid/content/Context;ZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                "(Landroid/content/Context;ZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
                 &[
                     JValue::Object(context),
                     JValue::Bool(u8::from(enabled)),
                     JValue::Object(&jsecret),
                     JValue::Object(&jdev),
                     JValue::Object(&jurl),
+                    JValue::Object(&jkey),
                 ],
             )
             .map_err(|e| format!("startService: {e}"))?;
@@ -200,18 +203,20 @@ pub async fn clipboard_service_start(
     secret: String,
     device_id: String,
     signal_url: String,
+    sarvam_key: Option<String>,
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
+        let sarvam_key = sarvam_key.unwrap_or_default();
         tauri::async_runtime::spawn_blocking(move || {
-            imp::start_service(enabled, &secret, &device_id, &signal_url)
+            imp::start_service(enabled, &secret, &device_id, &signal_url, &sarvam_key)
         })
         .await
         .map_err(|e| e.to_string())?
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (enabled, secret, device_id, signal_url);
+        let _ = (enabled, secret, device_id, signal_url, sarvam_key);
         Ok(())
     }
 }
@@ -325,4 +330,89 @@ pub async fn clipboard_service_snapshot() -> Result<String, String> {
     }
     #[cfg(not(target_os = "android"))]
     Ok(String::from("{}"))
+}
+
+fn decode_b64(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let raw = s.rsplit(',').next().unwrap_or(s); // tolerate a data: URL prefix
+    base64::engine::general_purpose::STANDARD
+        .decode(raw.trim())
+        .map_err(|e| format!("bad base64 audio: {e}"))
+}
+
+/// Transcribe short (≤30s) audio via Sarvam's speech-to-text REST API. Mirrors the
+/// desktop `speech_to_text` exactly so the phone's mic behaves identically; the key
+/// is supplied by the webview (persisted there, synced from the trusted PC) rather
+/// than baked, since the companion ships no `.env`.
+#[tauri::command]
+pub async fn speech_to_text(
+    audio_base64: String,
+    mime: Option<String>,
+    language: Option<String>,
+    api_key: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let key = api_key.trim();
+        if key.is_empty() {
+            return Err("Sarvam API key not configured".to_string());
+        }
+        let bytes = decode_b64(&audio_base64)?;
+        let mime = mime.unwrap_or_else(|| "audio/webm".into());
+        let boundary = format!("----gtclip{}", uuid_like());
+
+        let mut body: Vec<u8> = Vec::new();
+        let field = |name: &str, value: &str, body: &mut Vec<u8>| {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        };
+        field("model", "saaras:v3", &mut body);
+        field("mode", "transcribe", &mut body);
+        if let Some(lang) = language.as_deref().filter(|s| !s.trim().is_empty()) {
+            field("language_code", lang, &mut body);
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\nContent-Type: {mime}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&bytes);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let resp = ureq::post("https://api.sarvam.ai/speech-to-text")
+            .set("api-subscription-key", key)
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send_bytes(&body)
+            .map_err(|e| format!("Sarvam request failed: {e}"))?;
+        // `into_json` needs ureq's json feature (not enabled here); parse the body
+        // string with serde_json instead.
+        let text = resp.into_string().map_err(|e| e.to_string())?;
+        let json: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        Ok(json
+            .get("transcript")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// A cheap unique-ish token for the multipart boundary (no uuid dep here).
+fn uuid_like() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{n:x}")
 }

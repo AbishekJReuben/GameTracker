@@ -64,6 +64,13 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // that, once the feature is enabled, copies flow in without any extra tap.
     ("clipboard_auto_capture", "true"),
     ("clipboard_stt_enabled", "false"),
+    // Optional user-supplied Sarvam speech-to-text API key. Takes priority over the
+    // key baked from `.env` at compile time, so voice-to-text works on installs that
+    // shipped without a key (and lets the user rotate it without a rebuild). Empty
+    // → fall back to the baked/env key. Shared verbatim to the phone over the trusted
+    // channel so the companion's mic works too. Also the STT language ("" = auto).
+    ("clipboard_sarvam_key", ""),
+    ("clipboard_stt_language", ""),
     // Persisted overlay bubble position ("x,y") and a stable per-install device id
     // (generated on first use). Empty until set.
     ("clipboard_overlay_pos", ""),

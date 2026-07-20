@@ -90,6 +90,9 @@ const save = (path, before, after, msg) => {
     "android.permission.RECEIVE_BOOT_COMPLETED",
     "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
     "android.permission.ACCESS_NETWORK_STATE",
+    // Voice-to-text: the floating dock's mic records a short clip and sends it to
+    // Sarvam STT. Runtime-prompted (dangerous perm); the dock guides the grant.
+    "android.permission.RECORD_AUDIO",
   ]) {
     if (!m.includes(p)) {
       const perm = `    <uses-permission android:name="${p}" />${eol}`;

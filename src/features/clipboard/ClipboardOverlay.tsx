@@ -6,7 +6,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "motion/react";
 import { Clipboard, X } from "lucide-react";
 import { clip } from "@/lib/clip";
-import { clipSync } from "@/lib/clipboardSync";
 import { useClipboard } from "@/store/clipboard";
 import { ClipboardPanel } from "./ClipboardPanel";
 
@@ -101,20 +100,20 @@ export default function ClipboardOverlay() {
     const unItem = listen("clipboard://item", refresh);
     const unChanged = listen("clipboard://changed", refresh);
 
-    // Live sync status pill in the header. Polls the sync engine's diagnostics
-    // (cheap object read) so the user sees Connecting / Synced / relay-error
-    // without opening Settings. 2s cadence — fast enough to feel live, slow
-    // enough not to thrash React on a hidden overlay.
-    const statusTick = () => {
-      const d = clipSync.diagnostics();
+    // Live sync status pill in the header. The real WebSocket runs in the MAIN
+    // window (ClipSyncEngine), which broadcasts its diagnostics over a Tauri event
+    // — reading our own (never-started) clipSync here always said "Off". If no
+    // broadcast has arrived in a while, fall back to "Connecting…".
+    let lastStatusAt = 0;
+    const applyStatus = (d: Record<string, unknown>) => {
+      lastStatusAt = Date.now();
       let text = "Connecting…";
       let color = "var(--accent-3)";
       if (d.started !== "true") {
         text = "Off";
         color = "var(--ink-faint)";
       } else if (d.wsState === "open") {
-        const items = useClipboard.getState().items;
-        const deviceCount = new Set(items.map((i) => i.deviceId)).size;
+        const deviceCount = Number(d.deviceCount ?? 0);
         text = `Synced${deviceCount > 0 ? ` · ${deviceCount} device${deviceCount === 1 ? "" : "s"}` : ""}`;
         color = "#34d399";
       } else if (d.lastError && d.lastError !== "(none)") {
@@ -123,12 +122,21 @@ export default function ClipboardOverlay() {
       }
       setStatus((prev) => (prev.text === text && prev.color === color ? prev : { text, color }));
     };
-    statusTick();
-    const statusTimer = window.setInterval(statusTick, 2000);
+    const unStatus = listen<Record<string, unknown>>("clipboard://sync-status", (e) =>
+      applyStatus(e.payload),
+    );
+    // Watchdog: if the main window's broadcast stops (app closing/reloading),
+    // don't leave a stale "Synced" — degrade to Connecting after 6s of silence.
+    const statusTimer = window.setInterval(() => {
+      if (lastStatusAt && Date.now() - lastStatusAt > 6000) {
+        setStatus({ text: "Connecting…", color: "var(--accent-3)" });
+      }
+    }, 2000);
 
     return () => {
       unItem.then((f) => f());
       unChanged.then((f) => f());
+      unStatus.then((f) => f());
       window.clearInterval(statusTimer);
       if (root && prevRootBg !== "") root.style.background = prevRootBg;
     };
@@ -194,8 +202,15 @@ export default function ClipboardOverlay() {
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.82, transition: { duration: 0.16, ease: "easeIn" } }}
             transition={{ type: "spring", stiffness: 300, damping: 26, opacity: { duration: 0.2 } }}
-            className="glass absolute inset-0 flex flex-col overflow-hidden rounded-[22px] border border-white/12 shadow-float"
-            style={{ backdropFilter: "blur(20px)", transformOrigin: "top left" }}
+            className="absolute inset-0 flex flex-col overflow-hidden rounded-[22px] border border-white/12 shadow-float"
+            style={{
+              // Translucent frosted fill (not see-through): a solid-ish dark base so
+              // text stays readable over any window behind, plus a heavy blur.
+              backgroundColor: "rgba(10,12,20,0.82)",
+              backdropFilter: "blur(24px) saturate(140%)",
+              WebkitBackdropFilter: "blur(24px) saturate(140%)",
+              transformOrigin: "top left",
+            }}
           >
             <div
               {...headerDrag}
@@ -243,13 +258,15 @@ export default function ClipboardOverlay() {
             }}
             exit={{ scale: 0.5, opacity: 0, transition: { duration: 0.14, ease: "easeIn" } }}
             transition={{ type: "spring", stiffness: 380, damping: 22 }}
-            className="glass absolute left-0 top-0 grid h-[68px] w-[68px] cursor-grab place-items-center rounded-full border border-white/15 shadow-float active:cursor-grabbing"
+            className="absolute left-0 top-0 grid h-[68px] w-[68px] cursor-grab place-items-center rounded-full border border-white/15 shadow-float active:cursor-grabbing"
             style={{
               margin: 4,
               transformOrigin: "top left",
-              backdropFilter: "blur(16px)",
+              backgroundColor: "rgba(10,12,20,0.72)",
+              backdropFilter: "blur(16px) saturate(140%)",
+              WebkitBackdropFilter: "blur(16px) saturate(140%)",
               backgroundImage:
-                "radial-gradient(120% 120% at 30% 20%, rgba(255,255,255,0.12), transparent 60%)",
+                "radial-gradient(120% 120% at 30% 20%, rgba(255,255,255,0.14), transparent 60%)",
             }}
             title="Clipboard — tap to open, drag to move"
           >

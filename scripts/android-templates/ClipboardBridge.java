@@ -97,13 +97,15 @@ public class ClipboardBridge {
 
   /** Start/stop the overlay + sync service and remember the choice for boot. */
   public static void startService(
-      Context ctx, boolean enabled, String secret, String deviceId, String signalUrl) {
+      Context ctx, boolean enabled, String secret, String deviceId, String signalUrl,
+      String sarvamKey) {
     SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     p.edit()
         .putBoolean("enabled", enabled)
         .putString("secret", secret)
         .putString("deviceId", deviceId)
         .putString("signalUrl", signalUrl)
+        .putString("sarvamKey", sarvamKey == null ? "" : sarvamKey)
         .apply();
 
     Intent i = new Intent(ctx, ClipboardService.class);

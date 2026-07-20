@@ -42,6 +42,7 @@ pub fn run() {
             clipboard::clipboard_read,
             clipboard::clipboard_write,
             clipboard::clipboard_service_snapshot,
+            clipboard::speech_to_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running GameTracker Remote");

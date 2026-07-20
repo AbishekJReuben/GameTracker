@@ -2770,23 +2770,36 @@ pub fn clipboard_overlay_set_pos(state: State<AppState>, x: f64, y: f64) -> AppR
     )
 }
 
-fn sarvam_key() -> Option<String> {
-    std::env::var("SARVAM_API_KEY")
+/// Resolve the Sarvam key: a user-supplied one in settings wins (so voice-to-text
+/// works on installs that shipped without a baked key, and can be rotated without a
+/// rebuild), falling back to the `.env`/compile-time key.
+fn sarvam_key(state: &State<AppState>) -> Option<String> {
+    settings::get(&state.pool, "clipboard_sarvam_key")
         .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("SARVAM_API_KEY").ok())
         .or_else(|| option_env!("SARVAM_API_KEY").map(str::to_string))
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Transcribe short (≤30s) audio via Sarvam's speech-to-text REST API. The key is
-/// baked from `.env` `SARVAM_API_KEY` at compile time (like RAWG/YouTube).
+/// Transcribe short (≤30s) audio via Sarvam's speech-to-text REST API. The key comes
+/// from settings (`clipboard_sarvam_key`) if set, else the `.env`/baked key.
 #[tauri::command]
 pub async fn speech_to_text(
+    state: State<'_, AppState>,
     audio_base64: String,
     mime: Option<String>,
     language: Option<String>,
 ) -> AppResult<String> {
+    let key = sarvam_key(&state).ok_or_else(|| AppError::msg("Sarvam API key not configured"))?;
+    let language = language.or_else(|| {
+        settings::get(&state.pool, "clipboard_stt_language")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+    });
     run_blocking(move || {
-        let key = sarvam_key().ok_or_else(|| AppError::msg("Sarvam API key not configured"))?;
         let bytes = decode_b64(&audio_base64)?;
         let mime = mime.unwrap_or_else(|| "audio/wav".into());
         let boundary = format!("----gtclip{}", uuid::Uuid::new_v4().simple());

@@ -17,11 +17,13 @@
 /** Backend settings key holding the mode. "true" = remote only. */
 export const REMOTE_ONLY_KEY = "remote_only";
 
-/** Desktop routes that survive remote-only mode. */
-export const REMOTE_ONLY_ROUTES = ["/remote", "/settings"] as const;
+/** Desktop routes that survive remote-only mode. Clipboard is part of the same
+ *  remote/companion stack (shared relay + secret), so it's a first-class feature
+ *  here alongside Remote — not hidden away when the app is set up remote-only. */
+export const REMOTE_ONLY_ROUTES = ["/remote", "/clipboard", "/settings"] as const;
 
 /** Companion tab ids that survive remote-only mode. */
-export const REMOTE_ONLY_TABS = ["control", "settings"] as const;
+export const REMOTE_ONLY_TABS = ["control", "clipboard", "settings"] as const;
 
 /** Read the mode out of a `/api/settings` map (absent/unset → full app). */
 export function readRemoteOnly(settings: Record<string, string> | undefined | null): boolean {

@@ -1,12 +1,17 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ClipboardList, ClipboardPaste, Check, Layers, BatteryCharging, Bell, Power } from "lucide-react";
+import { ClipboardList, ClipboardPaste, Check, Layers, BatteryCharging, Bell, Power, Search, Trash2 } from "lucide-react";
 import { isTauri } from "@/lib/tauri";
+import { cn } from "@/lib/cn";
 import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { EmptyState } from "@/components/ui";
 import { Composer } from "@/features/clipboard/Composer";
 import { ClipboardList as ClipList } from "@/features/clipboard/ClipboardList";
-import { useCompanionClip } from "../clipboardCompanion";
+import { useCompanionClip, companionTranscribe, LS_SARVAM_KEY } from "../clipboardCompanion";
+import type { ClipItem } from "@/lib/clip";
+
+type Filter = "all" | "text" | "image";
+const FILTERS: Filter[] = ["all", "text", "image"];
 
 function PermRow({
   icon,
@@ -45,7 +50,12 @@ export default function ClipboardScreen() {
   const s = useCompanionClip();
   const [perms, setPerms] = useState({ overlay: true, battery: true, notif: true });
   const [captured, setCaptured] = useState(false);
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<Filter>("all");
   const android = isTauri();
+  // Mic is available whenever a Sarvam key is saved on this device (synced from the
+  // PC or entered in Settings). Matches the desktop's key-gated voice-to-text.
+  const sttEnabled = !!(localStorage.getItem(LS_SARVAM_KEY) || "").trim();
 
   const refreshPerms = async () => {
     if (!android) return;
@@ -84,6 +94,7 @@ export default function ClipboardScreen() {
       secret,
       deviceId: s.deviceId,
       signalUrl,
+      sarvamKey: (localStorage.getItem(LS_SARVAM_KEY) || "").trim(),
     }).catch(() => {});
     refreshPerms();
   };
@@ -97,8 +108,14 @@ export default function ClipboardScreen() {
     }
   };
 
-  const pinned = s.items.filter((i) => i.pinned);
-  const rest = s.items.filter((i) => !i.pinned);
+  const q = search.trim().toLowerCase();
+  const match = (i: ClipItem) => {
+    if (filter !== "all" && i.kind !== filter) return false;
+    if (!q) return true;
+    return (i.text ?? "").toLowerCase().includes(q) || (i.deviceName ?? "").toLowerCase().includes(q);
+  };
+  const pinned = s.items.filter((i) => i.pinned && match(i));
+  const rest = s.items.filter((i) => !i.pinned && match(i));
   const needsSetup = android && (!perms.overlay || !perms.battery || !perms.notif);
 
   return (
@@ -145,7 +162,12 @@ export default function ClipboardScreen() {
         </div>
       )}
 
-      <Composer onAddText={s.addText} onAddImage={(b64) => s.addImage(b64)} sttEnabled={false} />
+      <Composer
+        onAddText={s.addText}
+        onAddImage={(b64) => s.addImage(b64)}
+        sttEnabled={sttEnabled}
+        transcribe={companionTranscribe}
+      />
 
       <button
         onClick={captureNow}
@@ -155,12 +177,42 @@ export default function ClipboardScreen() {
         {captured ? "Added" : "Add from clipboard"}
       </button>
 
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-faint" />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search history"
+            className="input w-full py-1.5 pl-8 text-xs"
+          />
+        </div>
+        <div className="flex rounded-lg bg-white/[0.04] p-0.5">
+          {FILTERS.map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={cn(
+                "rounded-md px-2.5 py-1 text-[11px] font-600 capitalize transition-colors",
+                filter === f ? "bg-white/10 text-ink" : "text-ink-dim hover:text-ink-soft",
+              )}
+            >
+              {f === "image" ? "Images" : f}
+            </button>
+          ))}
+        </div>
+      </div>
+
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {s.items.length === 0 ? (
+        {pinned.length === 0 && rest.length === 0 ? (
           <EmptyState
             icon={<ClipboardList className="h-6 w-6" />}
-            title="Nothing here yet"
-            message="Copy on your PC and it appears here, or add something above."
+            title={s.items.length === 0 ? "Nothing here yet" : "No matches"}
+            message={
+              s.items.length === 0
+                ? "Copy on your PC and it appears here, or add something above."
+                : "Try a different search or filter."
+            }
           />
         ) : (
           <ClipList
@@ -176,6 +228,19 @@ export default function ClipboardScreen() {
           />
         )}
       </div>
+
+      {s.items.length > 0 && (
+        <button
+          onClick={() => {
+            if (confirm("Clear this device's clipboard history view? (Other devices keep theirs.)")) {
+              for (const it of [...s.items]) void s.remove(it.id);
+            }
+          }}
+          className="flex items-center justify-center gap-1.5 rounded-xl py-1.5 text-[11px] font-600 text-ink-faint active:scale-[0.99]"
+        >
+          <Trash2 className="h-3.5 w-3.5" /> Clear history
+        </button>
+      )}
     </div>
   );
 }

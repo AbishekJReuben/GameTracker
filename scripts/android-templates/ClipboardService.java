@@ -10,10 +10,14 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
+import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -36,12 +40,14 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -49,8 +55,11 @@ import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
+import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
@@ -81,7 +90,13 @@ public class ClipboardService extends Service {
   public static final String ACTION_STOP = "__PACKAGE__.CLIP_STOP";
   private static final String CHANNEL = "gt_clipboard";
   private static final int NOTIF_ID = 0x6C69; // "li"
-  private static final int MAX_ITEMS = 12; // panel caps at ~8 visible; keep a few spare
+  // Keep a healthy backlog so old history is browsable in the dock (was 12, which
+  // made "old history can't be viewed"). Text rows are cheap; images are kept as
+  // small downscaled thumbnails (see thumbs), so memory stays bounded.
+  private static final int MAX_ITEMS = 100;
+  // Longest edge (px) of a decoded image thumbnail — keeps the dock light even
+  // with many images. Full images are viewed by opening the app.
+  private static final int THUMB_MAX_PX = 240;
 
   /** Process-wide singleton handle so the webview can pull the native service's
    *  state (recent items + connection status) without a round-trip through the
@@ -90,13 +105,15 @@ public class ClipboardService extends Service {
   private static volatile ClipboardService INSTANCE;
 
   private WindowManager wm;
-  private View bubble;
+  private View bubble; // the flat edge pin (mostly off-screen until swiped in)
   private WindowManager.LayoutParams bubbleLp;
   private View panel;
   private LinearLayout panelList; // the row container inside the panel's ScrollView
   private TextView panelStatusText; // status label in floating panel header
   private boolean socketConnected;
   private WindowManager.LayoutParams panelLp;
+  // Which screen edge the pin/dock lives on. The dock slides in from this side.
+  private boolean pinOnRight = true;
   private final Handler main = new Handler(Looper.getMainLooper());
   private OkHttpClient http;
   private WebSocket socket;
@@ -104,8 +121,17 @@ public class ClipboardService extends Service {
   private boolean stopping;
   private String deviceId = "";
   private String socketUrl = "";
+  private String clipSpace = ""; // clipId derived from the secret (for blob URLs)
+  private String httpBase = ""; // https base for /clip/blob fetches
+  private String sarvamKey = ""; // voice-to-text key (from prefs; may be empty)
   private ConnectivityManager cm;
   private ConnectivityManager.NetworkCallback netCallback;
+  // Decoded image thumbnails, keyed by item id. Bounded by MAX_ITEMS eviction.
+  private final HashMap<String, Bitmap> thumbs = new HashMap<>();
+  // Native voice capture (dock mic).
+  private MediaRecorder recorder;
+  private File audioFile;
+  private boolean recording;
   // Cap the reconnect backoff low: the user needs near-real-time sync (a dropped
   // link must recover within ~10s), so we never let the exponential backoff grow
   // past this. The connectivity callback also short-circuits it on network return.
@@ -139,15 +165,17 @@ public class ClipboardService extends Service {
   }
 
   /** Decrypted items, newest first. Synced on `this` (touched from the WS thread
-   *  and read on the UI thread). Text only — image blobs are skipped in the panel
-   *  (open the app to view/copy images). */
+   *  and read on the UI thread). `kind` is "text" or "image"; image rows carry a
+   *  downscaled thumbnail in {@link #thumbs} keyed by id (text is null for them). */
   static final class ClipEntry {
     final String id;
+    final String kind;
     final String text;
     final long createdAtMs;
     final String deviceId;
-    ClipEntry(String id, String text, long createdAtMs, String deviceId) {
+    ClipEntry(String id, String kind, String text, long createdAtMs, String deviceId) {
       this.id = id;
+      this.kind = kind;
       this.text = text;
       this.createdAtMs = createdAtMs;
       this.deviceId = deviceId;
@@ -232,6 +260,21 @@ public class ClipboardService extends Service {
     }
   }
 
+  /** Decrypt raw `iv(12) || ciphertext+tag` bytes (image blobs) with AES-256-GCM.
+   *  Returns null on any failure. Mirrors clipboardCrypto.ts decryptBytes. */
+  private byte[] decryptBytes(byte[] all) {
+    if (cryptoKey == null || all == null || all.length < 13) return null;
+    try {
+      byte[] iv = new byte[12];
+      System.arraycopy(all, 0, iv, 0, 12);
+      Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+      c.init(Cipher.DECRYPT_MODE, cryptoKey, new GCMParameterSpec(128, iv));
+      return c.doFinal(all, 12, all.length - 12);
+    } catch (Exception ignored) {
+      return null;
+    }
+  }
+
   /** Encrypt text → base64(`iv(12) || ciphertext+tag`), mirroring clipboardCrypto.ts.
    *  Returns null on any failure. */
   private String encryptText(String plain) {
@@ -299,6 +342,9 @@ public class ClipboardService extends Service {
     String secret = p.getString("secret", "");
     deviceId = p.getString("deviceId", "");
     String base = p.getString("signalUrl", "");
+    sarvamKey = p.getString("sarvamKey", "");
+    if (sarvamKey == null) sarvamKey = "";
+    main.post(this::refreshComposerIfOpen); // reflect a key change in the mic button
     if (secret == null || secret.isEmpty() || base == null || base.isEmpty()) {
       // Unconfigured (first boot before pairing). Keep the service alive; the
       // webview will call startService again with real prefs and we re-enter here.
@@ -308,7 +354,9 @@ public class ClipboardService extends Service {
     String newUrl;
     try {
       while (base.endsWith("/")) base = base.substring(0, base.length() - 1);
-      newUrl = base + "/clip/ws?clip=" + clipId(secret)
+      clipSpace = clipId(secret);
+      httpBase = base.replaceFirst("^ws", "http");
+      newUrl = base + "/clip/ws?clip=" + clipSpace
           + "&device=" + android.net.Uri.encode(deviceId + "-native");
     } catch (Exception ignored) {
       return;
@@ -382,9 +430,11 @@ public class ClipboardService extends Service {
         reconnectMs = 1000;
         socketConnected = true;
         main.post(ClipboardService.this::refreshStatusIfOpen);
-        long rev = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
-            .getLong("nativeRev", 0);
-        ws.send("{\"t\":\"hello\",\"since\":" + rev + "}");
+        // Request the FULL history (since=0), not just items newer than the last
+        // seen rev — otherwise the dock can't show anything copied before this
+        // launch ("old history can't be viewed"). We dedupe by id and cap at
+        // MAX_ITEMS, so a large history stays memory-bounded.
+        ws.send("{\"t\":\"hello\",\"since\":0}");
       }
 
       @Override public void onMessage(WebSocket ws, String text) {
@@ -441,27 +491,96 @@ public class ClipboardService extends Service {
       // Skip echo of native service's own items.
       String nativeDeviceId = (deviceId == null ? "" : deviceId) + "-native";
       if (nativeDeviceId.equals(v.optString("deviceId"))) return;
-      // Skip images (no preview in the native panel; the app shows them).
+      String id = v.optString("itemId", "");
+      long created = parseIsoMs(v.optString("createdUtc", ""));
+      String dev = v.optString("deviceId", "");
       if ("image".equals(v.optString("kind"))) {
-        main.post(this::showNewItemAttention);
+        // Images now render as thumbnails in the dock. Fetch the ciphertext blob,
+        // decrypt, and decode a downscaled bitmap on the WS thread (already off the
+        // UI thread). Insert a placeholder row immediately so ordering/history is
+        // right even before the bitmap lands.
+        if (v.optBoolean("hasBlob", false)) fetchImageThumb(id, created, dev);
         return;
       }
       String cipher = v.optString("textCipher", "");
       String plain = decryptText(cipher);
       if (plain == null) return;
-      String id = v.optString("itemId", "");
-      long created = parseIsoMs(v.optString("createdUtc", ""));
       synchronized (this) {
         // Dedupe by id (rev-driven re-broadcasts happen).
         for (int i = items.size() - 1; i >= 0; i--) {
           if (id.equals(items.get(i).id)) items.remove(i);
         }
-        items.add(0, new ClipEntry(id, plain, created, v.optString("deviceId", "")));
-        while (items.size() > MAX_ITEMS) items.remove(items.size() - 1);
+        items.add(0, new ClipEntry(id, "text", plain, created, dev));
+        trimItemsLocked();
       }
       main.post(this::showNewItemAttention);
       main.post(this::refreshPanelIfOpen);
     } catch (Exception ignored) {
+    }
+  }
+
+  /** Evict past MAX_ITEMS, dropping any cached thumbnail for removed image rows so
+   *  the bitmap cache can't outgrow the list. Caller holds `this`. */
+  private void trimItemsLocked() {
+    while (items.size() > MAX_ITEMS) {
+      ClipEntry gone = items.remove(items.size() - 1);
+      Bitmap b = thumbs.remove(gone.id);
+      if (b != null) b.recycle();
+    }
+  }
+
+  /** Download → decrypt → downscale one image blob, then insert its row. Runs on the
+   *  OkHttp callback thread (already a background thread). Best-effort. */
+  private void fetchImageThumb(String id, long created, String dev) {
+    if (http == null || clipSpace.isEmpty() || httpBase.isEmpty()) return;
+    // Already have it? Just make sure the row exists.
+    synchronized (this) {
+      if (thumbs.containsKey(id)) return;
+    }
+    String url = httpBase + "/clip/blob/" + clipSpace + "/" + id;
+    try {
+      http.newCall(new Request.Builder().url(url).build()).enqueue(new okhttp3.Callback() {
+        @Override public void onFailure(okhttp3.Call call, java.io.IOException e) { }
+        @Override public void onResponse(okhttp3.Call call, Response resp) {
+          try (Response r = resp) {
+            if (!r.isSuccessful() || r.body() == null) return;
+            byte[] cipher = r.body().bytes();
+            byte[] raw = decryptBytes(cipher);
+            if (raw == null) return;
+            Bitmap bmp = decodeThumb(raw);
+            if (bmp == null) return;
+            synchronized (ClipboardService.this) {
+              for (int i = items.size() - 1; i >= 0; i--) {
+                if (id.equals(items.get(i).id)) items.remove(i);
+              }
+              thumbs.put(id, bmp);
+              items.add(0, new ClipEntry(id, "image", null, created, dev));
+              trimItemsLocked();
+            }
+            main.post(ClipboardService.this::showNewItemAttention);
+            main.post(ClipboardService.this::refreshPanelIfOpen);
+          } catch (Exception ignored) {
+          }
+        }
+      });
+    } catch (Exception ignored) {
+    }
+  }
+
+  /** Decode raw image bytes to a thumbnail no larger than THUMB_MAX_PX per edge. */
+  private static Bitmap decodeThumb(byte[] raw) {
+    try {
+      BitmapFactory.Options bounds = new BitmapFactory.Options();
+      bounds.inJustDecodeBounds = true;
+      BitmapFactory.decodeByteArray(raw, 0, raw.length, bounds);
+      int sample = 1;
+      int longest = Math.max(bounds.outWidth, bounds.outHeight);
+      while (longest / sample > THUMB_MAX_PX) sample *= 2;
+      BitmapFactory.Options opts = new BitmapFactory.Options();
+      opts.inSampleSize = sample;
+      return BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
+    } catch (Exception e) {
+      return null;
     }
   }
 
@@ -508,6 +627,215 @@ public class ClipboardService extends Service {
     } catch (Exception ignored) {
       return System.currentTimeMillis();
     }
+  }
+
+  // ---- images (dock) --------------------------------------------------------
+
+  /** Encrypt raw bytes → `iv(12) || ciphertext+tag`, mirroring clipboardCrypto.ts
+   *  encryptBytes. Returns null on failure. */
+  private byte[] encryptBytes(byte[] raw) {
+    if (cryptoKey == null || raw == null) return null;
+    try {
+      byte[] iv = new byte[12];
+      new SecureRandom().nextBytes(iv);
+      Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+      c.init(Cipher.ENCRYPT_MODE, cryptoKey, new GCMParameterSpec(128, iv));
+      byte[] ct = c.doFinal(raw);
+      byte[] out = new byte[12 + ct.length];
+      System.arraycopy(iv, 0, out, 0, 12);
+      System.arraycopy(ct, 0, out, 12, ct.length);
+      return out;
+    } catch (Exception ignored) {
+      return null;
+    }
+  }
+
+  /** Read an image the OS clipboard currently holds (Android grants clipboard reads
+   *  while an app/overlay of ours is in the foreground) and sync it. Best-effort:
+   *  toasts guidance if the clipboard has no image. */
+  private void pasteImageFromClipboard() {
+    try {
+      ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+      if (cm == null || !cm.hasPrimaryClip()) { toast("Copy an image first, then tap ＋ Image"); return; }
+      ClipData clip = cm.getPrimaryClip();
+      if (clip == null || clip.getItemCount() == 0) { toast("Copy an image first"); return; }
+      android.net.Uri uri = clip.getItemAt(0).getUri();
+      if (uri == null) { toast("No image on the clipboard"); return; }
+      String mime = getContentResolver().getType(uri);
+      if (mime == null || !mime.startsWith("image/")) { toast("Clipboard isn't an image"); return; }
+      final String fmime = mime;
+      byte[] raw = readAll(uri);
+      if (raw == null || raw.length == 0) { toast("Couldn't read the image"); return; }
+      sendImageItem(raw, fmime);
+    } catch (Exception e) {
+      toast("Couldn't paste image");
+    }
+  }
+
+  private byte[] readAll(android.net.Uri uri) {
+    try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+      if (in == null) return null;
+      java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+      byte[] buf = new byte[16384];
+      int n;
+      while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+      return bos.toByteArray();
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  /** Encrypt + upload an image blob, then broadcast an `add` over the WS. Inserts an
+   *  optimistic local thumbnail row so the dock reflects it at once. */
+  private void sendImageItem(byte[] raw, String mime) {
+    if (socket == null || cryptoKey == null || clipSpace.isEmpty() || httpBase.isEmpty()) {
+      toast("Not connected yet"); return;
+    }
+    final byte[] cipher = encryptBytes(raw);
+    if (cipher == null) { toast("Encrypt failed"); return; }
+    final String id = UUID.randomUUID().toString();
+    final String now = isoNow();
+    final String nd = (deviceId == null ? "" : deviceId) + "-native";
+    final Bitmap thumb = decodeThumb(raw);
+    final int size = raw.length;
+    // Upload the blob first (HTTP), then announce it (WS).
+    try {
+      RequestBody body = RequestBody.create(MediaType.parse("application/octet-stream"), cipher);
+      Request put = new Request.Builder()
+          .url(httpBase + "/clip/blob/" + clipSpace + "/" + id)
+          .put(body).build();
+      http.newCall(put).enqueue(new okhttp3.Callback() {
+        @Override public void onFailure(okhttp3.Call call, java.io.IOException e) {
+          main.post(() -> toast("Image upload failed"));
+        }
+        @Override public void onResponse(okhttp3.Call call, Response resp) {
+          try (Response r = resp) {
+            if (!r.isSuccessful()) { main.post(() -> toast("Image upload failed")); return; }
+            JSONObject item = new JSONObject();
+            item.put("itemId", id);
+            item.put("deviceId", nd);
+            item.put("deviceName", android.os.Build.MODEL + " (Overlay)");
+            item.put("kind", "image");
+            item.put("mime", mime);
+            item.put("size", size);
+            item.put("createdUtc", now);
+            item.put("pinned", false);
+            item.put("hasBlob", true);
+            JSONObject msg = new JSONObject();
+            msg.put("t", "add");
+            msg.put("item", item);
+            if (socket != null) socket.send(msg.toString());
+            synchronized (ClipboardService.this) {
+              if (thumb != null) thumbs.put(id, thumb);
+              items.add(0, new ClipEntry(id, "image", null, parseIsoMs(now), nd));
+              trimItemsLocked();
+            }
+            main.post(() -> { toast("Image sent"); refreshPanelIfOpen(); });
+          } catch (Exception ignored) {
+          }
+        }
+      });
+    } catch (Exception e) {
+      toast("Image upload failed");
+    }
+  }
+
+  // ---- voice to text (dock mic) ---------------------------------------------
+
+  /** Toggle native recording. First tap records (MediaRecorder → m4a); second tap
+   *  stops and transcribes via Sarvam, appending the result to the composer. Needs
+   *  RECORD_AUDIO — if not granted, routes the user to the app to grant it. */
+  private void toggleMic(Button micBtn) {
+    if (recording) { stopRecordingAndTranscribe(micBtn); return; }
+    if (sarvamKey == null || sarvamKey.trim().isEmpty()) { toast("Add a Sarvam key in Settings"); return; }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+        && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+      toast("Grant microphone access in the app, then try again");
+      openApp();
+      return;
+    }
+    try {
+      audioFile = new File(getCacheDir(), "gt-clip-voice.m4a");
+      recorder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+          ? new MediaRecorder(this) : new MediaRecorder();
+      recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+      recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+      recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+      recorder.setAudioSamplingRate(16000);
+      recorder.setOutputFile(audioFile.getAbsolutePath());
+      recorder.prepare();
+      recorder.start();
+      recording = true;
+      micBtn.setText("■ Stop");
+      toast("Recording… tap to stop");
+    } catch (Exception e) {
+      recording = false;
+      safeReleaseRecorder();
+      toast("Mic unavailable");
+    }
+  }
+
+  private void stopRecordingAndTranscribe(Button micBtn) {
+    recording = false;
+    micBtn.setText("… transcribing");
+    try {
+      if (recorder != null) { recorder.stop(); }
+    } catch (Exception ignored) {
+    }
+    safeReleaseRecorder();
+    final File f = audioFile;
+    final EditText composer = dockComposer;
+    if (f == null || !f.exists() || http == null) {
+      micBtn.setText("🎤 Speak");
+      return;
+    }
+    new Thread(() -> {
+      String text = transcribeViaSarvam(f);
+      main.post(() -> {
+        if (dockMic instanceof Button) ((Button) dockMic).setText("🎤 Speak");
+        if (text != null && !text.isEmpty() && composer != null) {
+          String cur = composer.getText().toString();
+          composer.setText(cur.isEmpty() ? text : cur + " " + text);
+          composer.setSelection(composer.getText().length());
+        } else if (text == null) {
+          toast("Transcription failed");
+        }
+      });
+    }).start();
+  }
+
+  /** POST the recorded clip to Sarvam STT (multipart), returning the transcript
+   *  (empty string if none, null on error). Mirrors the desktop/companion path. */
+  private String transcribeViaSarvam(File f) {
+    try {
+      byte[] audio = readAll(android.net.Uri.fromFile(f));
+      if (audio == null) return null;
+      MultipartBody.Builder mb = new MultipartBody.Builder().setType(MultipartBody.FORM)
+          .addFormDataPart("model", "saaras:v3")
+          .addFormDataPart("mode", "transcribe")
+          .addFormDataPart("file", "audio.m4a",
+              RequestBody.create(MediaType.parse("audio/mp4"), audio));
+      Request req = new Request.Builder()
+          .url("https://api.sarvam.ai/speech-to-text")
+          .addHeader("api-subscription-key", sarvamKey.trim())
+          .post(mb.build()).build();
+      try (Response r = http.newCall(req).execute()) {
+        if (!r.isSuccessful() || r.body() == null) return null;
+        JSONObject j = new JSONObject(r.body().string());
+        return j.optString("transcript", "");
+      }
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  private void safeReleaseRecorder() {
+    try {
+      if (recorder != null) recorder.release();
+    } catch (Exception ignored) {
+    }
+    recorder = null;
   }
 
   // ---- foreground service / notification ------------------------------------
@@ -562,27 +890,26 @@ public class ClipboardService extends Service {
     return Math.round(v * m.density);
   }
 
-  // ---- bubble ---------------------------------------------------------------
+  // ---- edge pin -------------------------------------------------------------
 
+  /** The pin is a flat, slim tab hugging a screen edge — deliberately unobtrusive
+   *  (a sliver of the app's accent) until you swipe inward from it (or tap it),
+   *  which slides the dock in from that edge. Vertical drags reposition it along
+   *  the edge; a horizontal drag toward the centre opens the dock. */
   private void showBubble() {
     if (bubble != null) return;
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(this)) {
-      return; // no overlay permission — the FGS still runs; bubble appears once granted
+      return; // no overlay permission — the FGS still runs; pin appears once granted
     }
     wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
     if (wm == null) return;
+    // Restore the remembered side + vertical position.
+    android.content.SharedPreferences p =
+        getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE);
+    pinOnRight = p.getBoolean("pinRight", true);
 
-    ImageView view = new ImageView(this);
-    int size = dp(52);
-    int pad = dp(12);
-    view.setPadding(pad, pad, pad, pad);
-    view.setImageResource(getApplicationInfo().icon);
-    GradientDrawable bg = new GradientDrawable();
-    bg.setShape(GradientDrawable.OVAL);
-    bg.setColors(new int[] {Color.parseColor("#7C5CFF"), Color.parseColor("#22D3EE")});
-    bg.setGradientType(GradientDrawable.LINEAR_GRADIENT);
-    view.setBackground(bg);
-    view.setElevation(dp(6));
+    View view = new View(this);
+    styleEdgePin(view);
 
     int type =
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
@@ -590,15 +917,16 @@ public class ClipboardService extends Service {
             : WindowManager.LayoutParams.TYPE_PHONE;
     bubbleLp =
         new WindowManager.LayoutParams(
-            size,
-            size,
+            dp(14), // slim: only a little of it shows
+            dp(72),
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT);
     bubbleLp.gravity = Gravity.TOP | Gravity.START;
-    bubbleLp.x = dp(12);
-    bubbleLp.y = dp(120);
+    DisplayMetrics m = getResources().getDisplayMetrics();
+    bubbleLp.x = pinOnRight ? m.widthPixels - dp(14) : 0;
+    bubbleLp.y = p.getInt("pinY", dp(160));
 
     view.setOnTouchListener(new DragTap());
     try {
@@ -608,16 +936,34 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Drag the bubble + snap to the nearest side; a tap (little movement) opens
-   *  the floating mini-panel instead of launching the app. */
+  /** Flat rounded tab, rounded only on the inner side, low-opacity accent. */
+  private void styleEdgePin(View view) {
+    GradientDrawable bg = new GradientDrawable();
+    bg.setColors(new int[] {0xE07C5CFF, 0xE022D3EE});
+    bg.setOrientation(GradientDrawable.Orientation.TOP_BOTTOM);
+    float r = dp(7);
+    // Round the edge facing the screen centre; keep the outer edge flush/square.
+    bg.setCornerRadii(pinOnRight
+        ? new float[] {r, r, 0, 0, 0, 0, r, r}   // round left side
+        : new float[] {0, 0, r, r, r, r, 0, 0}); // round right side
+    view.setBackground(bg);
+    view.setElevation(dp(4));
+    view.setAlpha(0.9f);
+  }
+
+  /** Drag the pin along the edge (vertical), or swipe inward to open the dock. A
+   *  plain tap also opens it. Crossing to the other half of the screen re-homes the
+   *  pin to that edge. */
   private class DragTap implements View.OnTouchListener {
     private int startX, startY;
     private float touchX, touchY;
     private long downTime;
     private boolean moved;
+    private boolean opened;
 
     @Override
     public boolean onTouch(View v, MotionEvent e) {
+      DisplayMetrics m = getResources().getDisplayMetrics();
       switch (e.getAction()) {
         case MotionEvent.ACTION_DOWN:
           startX = bubbleLp.x;
@@ -626,23 +972,37 @@ public class ClipboardService extends Service {
           touchY = e.getRawY();
           downTime = System.currentTimeMillis();
           moved = false;
+          opened = false;
+          v.animate().alpha(1f).scaleX(1.15f).setDuration(120).start();
           return true;
-        case MotionEvent.ACTION_MOVE:
+        case MotionEvent.ACTION_MOVE: {
           int dx = (int) (e.getRawX() - touchX);
           int dy = (int) (e.getRawY() - touchY);
-          if (Math.abs(dx) > dp(4) || Math.abs(dy) > dp(4)) moved = true;
-          bubbleLp.x = startX + dx;
-          bubbleLp.y = startY + dy;
+          if (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6)) moved = true;
+          // A decisive inward swipe opens the dock (right pin → swipe left, and
+          // vice-versa). Only fire once per gesture.
+          boolean inward = pinOnRight ? dx < -dp(28) : dx > dp(28);
+          if (!opened && inward && Math.abs(dx) > Math.abs(dy)) {
+            opened = true;
+            showPanel();
+            return true;
+          }
+          // Otherwise slide vertically along the edge (x stays pinned to the side).
+          bubbleLp.y = Math.max(0, Math.min(m.heightPixels - dp(72), startY + dy));
           try {
             wm.updateViewLayout(bubble, bubbleLp);
           } catch (Exception ignored) {
           }
           return true;
+        }
         case MotionEvent.ACTION_UP:
+        case MotionEvent.ACTION_CANCEL:
+          v.animate().alpha(0.9f).scaleX(1f).setDuration(160).start();
+          if (opened) return true;
           if (!moved && System.currentTimeMillis() - downTime < 400) {
             showPanel();
           } else {
-            snapToEdge();
+            settlePin();
           }
           return true;
         default:
@@ -651,20 +1011,25 @@ public class ClipboardService extends Service {
     }
   }
 
-  private void snapToEdge() {
-    DisplayMetrics m = getResources().getDisplayMetrics();
-    bubbleLp.x = (bubbleLp.x + bubble.getWidth() / 2 < m.widthPixels / 2)
-        ? dp(12) : m.widthPixels - bubble.getWidth() - dp(12);
+  /** Persist the pin's side + vertical position after a drag. (Side only changes
+   *  via the dock's "flip side" affordance; a vertical drag just saves Y.) */
+  private void settlePin() {
     try {
-      wm.updateViewLayout(bubble, bubbleLp);
+      getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+          .edit().putBoolean("pinRight", pinOnRight).putInt("pinY", bubbleLp.y).apply();
     } catch (Exception ignored) {
     }
   }
 
-  // ---- floating mini-panel --------------------------------------------------
+  // ---- side dock ------------------------------------------------------------
 
-  /** Inflate the floating panel near the bubble. Idempotent — a tap while open
-   *  just dismisses it (toggle behavior). */
+  private EditText dockComposer; // live handle so the mic can append transcripts
+  private View dockMic;          // shown only when a Sarvam key is configured
+  private String dockFilter = ""; // native search text
+
+  /** Slide the dock in from the pin's edge. Full-height, translucent-frosted, with
+   *  the same features as the app screen: compose (text + image + mic), search,
+   *  history (text + image thumbnails), copy-last, open-app. Idempotent (toggles). */
   private void showPanel() {
     if (panel != null) {
       hidePanel();
@@ -677,109 +1042,53 @@ public class ClipboardService extends Service {
     }
 
     DisplayMetrics m = getResources().getDisplayMetrics();
-    int widthPx = Math.min(dp(300), m.widthPixels - dp(24));
-    int heightPx = Math.min(dp(420), m.heightPixels - dp(96));
+    final int widthPx = Math.min(dp(340), m.widthPixels - dp(40));
+    final int heightPx = m.heightPixels;
 
     LinearLayout root = new LinearLayout(this);
     root.setOrientation(LinearLayout.VERTICAL);
     GradientDrawable card = new GradientDrawable();
-    card.setColor(0xF012151F);
-    card.setCornerRadius(dp(18));
-    card.setStroke(dp(1), 0x33FFFFFF);
+    // Translucent frosted fill (not fully transparent) so text stays readable over
+    // whatever app is behind. Rounded only on the inner edge (it hugs a screen side).
+    card.setColor(0xF00B0E17);
+    float r = dp(22);
+    card.setCornerRadii(pinOnRight
+        ? new float[] {r, r, 0, 0, 0, 0, r, r}
+        : new float[] {0, 0, r, r, r, r, 0, 0});
+    card.setStroke(dp(1), 0x24FFFFFF);
     root.setBackground(card);
-    root.setElevation(dp(10));
-    root.setPadding(dp(12), dp(10), dp(12), dp(12));
+    root.setElevation(dp(16));
+    root.setPadding(dp(14), dp(14), dp(14), dp(14));
 
-    // Header.
-    LinearLayout header = new LinearLayout(this);
-    header.setOrientation(LinearLayout.HORIZONTAL);
-    header.setGravity(Gravity.CENTER_VERTICAL);
-    TextView title = new TextView(this);
-    title.setText("Clipboard");
-    title.setTextColor(Color.WHITE);
-    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+    root.addView(buildDockHeader());
+    root.addView(buildDockComposer());
 
-    TextView statusView = new TextView(this);
-    statusView.setText(getSyncStatusText());
-    statusView.setTextColor(getSyncStatusColor());
-    statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-    panelStatusText = statusView;
-
-    LinearLayout titleTextWrap = new LinearLayout(this);
-    titleTextWrap.setOrientation(LinearLayout.VERTICAL);
-    titleTextWrap.addView(title);
-    titleTextWrap.addView(statusView);
-
-    LinearLayout titleWrap = new LinearLayout(this);
-    titleWrap.setOrientation(LinearLayout.HORIZONTAL);
-    titleWrap.setGravity(Gravity.CENTER_VERTICAL);
-    ImageView icon = new ImageView(this);
-    icon.setImageResource(getApplicationInfo().icon);
-    icon.setColorFilter(0xFF22D3EE);
-    LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(18), dp(18));
-    iconLp.rightMargin = dp(6);
-    titleWrap.addView(icon, iconLp);
-    titleWrap.addView(titleTextWrap);
-    header.addView(titleWrap, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-    Button close = new Button(this);
-    close.setText("✕");
-    close.setTextColor(0xFF94A3B8);
-    close.setBackgroundColor(Color.TRANSPARENT);
-    close.setPadding(dp(8), 0, dp(2), 0);
-    close.setOnClickListener((v) -> hidePanel());
-    header.addView(close, new LinearLayout.LayoutParams(dp(40), dp(28)));
-    root.addView(header);
-
-    // Composer: type-to-sync. Lets you push a clip from the bubble without
-    // switching apps — text is encrypted natively and sent over the WS.
-    final EditText composer = new EditText(this);
-    composer.setHint("Type, paste text or an image…");
-    composer.setHintTextColor(0xFF64748B);
-    composer.setTextColor(0xFFE2E8F0);
-    composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-    composer.setMaxLines(3);
-    GradientDrawable fieldBg = new GradientDrawable();
-    fieldBg.setColor(0x14FFFFFF);
-    fieldBg.setCornerRadius(dp(10));
-    composer.setBackground(fieldBg);
-    composer.setPadding(dp(10), dp(7), dp(10), dp(7));
-    LinearLayout.LayoutParams composerLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    composerLp.topMargin = dp(8);
-    root.addView(composer, composerLp);
-
-    // Send button row.
-    LinearLayout sendRow = new LinearLayout(this);
-    sendRow.setOrientation(LinearLayout.HORIZONTAL);
-    sendRow.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-    LinearLayout.LayoutParams sendRowLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    sendRowLp.topMargin = dp(4);
-    final Button sendBtn = new Button(this);
-    sendBtn.setText("Add");
-    styleBtn(sendBtn, true);
-    LinearLayout.LayoutParams sendBtnLp = new LinearLayout.LayoutParams(dp(84), dp(32));
-    sendBtn.setOnClickListener((v) -> {
-      String t = composer.getText().toString().trim();
-      if (t.isEmpty()) return;
-      sendTextItem(t);
-      // Optimistic local insert so the panel reflects it immediately (the
-      // relay broadcasts it back to other devices; our own deviceId filter
-      // prevents the webview from double-adding).
-      synchronized (this) {
-        String nd = (deviceId == null ? "" : deviceId) + "-native";
-        items.add(0, new ClipEntry(UUID.randomUUID().toString(), t, System.currentTimeMillis(), nd));
-        while (items.size() > MAX_ITEMS) items.remove(items.size() - 1);
+    // Search box (parity with the app screen's history filter).
+    final EditText searchField = new EditText(this);
+    searchField.setHint("Search history");
+    searchField.setHintTextColor(0xFF64748B);
+    searchField.setTextColor(0xFFE2E8F0);
+    searchField.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    searchField.setSingleLine(true);
+    GradientDrawable sBg = new GradientDrawable();
+    sBg.setColor(0x14FFFFFF);
+    sBg.setCornerRadius(dp(10));
+    searchField.setBackground(sBg);
+    searchField.setPadding(dp(10), dp(6), dp(10), dp(6));
+    searchField.addTextChangedListener(new android.text.TextWatcher() {
+      @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+      @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+      @Override public void afterTextChanged(android.text.Editable s) {
+        dockFilter = s.toString().trim().toLowerCase(Locale.US);
+        refreshPanelIfOpen();
       }
-      composer.setText("");
-      refreshPanelIfOpen();
-      toast("Sent");
     });
-    sendRow.addView(sendBtn, sendBtnLp);
-    root.addView(sendRow, sendRowLp);
+    LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    searchLp.topMargin = dp(8);
+    root.addView(searchField, searchLp);
 
-    // Scrollable list of recent items.
+    // Scrollable history.
     ScrollView scroll = new ScrollView(this);
     scroll.setVerticalScrollBarEnabled(false);
     LinearLayout list = new LinearLayout(this);
@@ -787,14 +1096,12 @@ public class ClipboardService extends Service {
     panelList = list;
     LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
-    scrollLp.topMargin = dp(6);
+    scrollLp.topMargin = dp(8);
     scroll.addView(list);
     root.addView(scroll, scrollLp);
 
-    // Footer: Copy last + Open app.
-    LinearLayout footer = new LinearLayout(this);
-    footer.setOrientation(LinearLayout.HORIZONTAL);
-    footer.setGravity(Gravity.CENTER_VERTICAL);
+    root.addView(buildDockFooter());
+
     int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
         ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         : WindowManager.LayoutParams.TYPE_PHONE;
@@ -802,52 +1109,15 @@ public class ClipboardService extends Service {
         widthPx,
         heightPx,
         type,
-        // NOT_FOCUSABLE would prevent the EditText from receiving keystrokes, so
-        // we drop it here. WATCH_OUTSIDE_TOUCH still dismisses the panel on tap
-        // outside, and NOT_TOUCH_MODAL lets the rest of the screen work.
+        // Drop NOT_FOCUSABLE so the composer/search EditTexts receive keystrokes;
+        // WATCH_OUTSIDE_TOUCH dismisses on an outside tap.
         WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
             | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
         PixelFormat.TRANSLUCENT);
-    panelLp.gravity = Gravity.TOP | Gravity.START;
-    // Anchor next to the bubble (clamped on-screen).
-    int panelX = bubbleLp.x + dp(52);
-    if (panelX + widthPx > m.widthPixels - dp(8)) panelX = Math.max(dp(8), bubbleLp.x - widthPx - dp(8));
-    int panelY = bubbleLp.y;
-    if (panelY + heightPx > m.heightPixels - dp(8)) panelY = Math.max(dp(8), m.heightPixels - heightPx - dp(8));
-    panelLp.x = panelX;
-    panelLp.y = panelY;
+    panelLp.gravity = Gravity.TOP | (pinOnRight ? Gravity.END : Gravity.START);
+    panelLp.x = 0;
+    panelLp.y = 0;
 
-    Button copyLast = new Button(this);
-    copyLast.setText("Copy last");
-    styleBtn(copyLast, true);
-    copyLast.setOnClickListener((v) -> {
-      String t = newestText();
-      if (t == null) {
-        toast("Nothing to copy yet");
-        return;
-      }
-      setOsClipboard(t);
-      toast("Copied");
-    });
-    footer.addView(copyLast, new LinearLayout.LayoutParams(0, dp(38), 1f));
-
-    Button openApp = new Button(this);
-    openApp.setText("Open app");
-    styleBtn(openApp, false);
-    LinearLayout.LayoutParams openLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
-    openLp.leftMargin = dp(8);
-    openApp.setOnClickListener((v) -> {
-      hidePanel();
-      openApp();
-    });
-    footer.addView(openApp, openLp);
-
-    LinearLayout.LayoutParams footerLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    footerLp.topMargin = dp(8);
-    root.addView(footer, footerLp);
-
-    // Outside-touch handler at the root: ACTION_OUTSIDE / back press dismisses.
     root.setOnTouchListener((v, ev) -> {
       if (ev.getAction() == MotionEvent.ACTION_OUTSIDE) {
         hidePanel();
@@ -859,23 +1129,192 @@ public class ClipboardService extends Service {
     panel = root;
     try {
       wm.addView(root, panelLp);
-      // Grow the panel out of the bubble's corner: pivot toward the bubble side
-      // so it visually unfolds from the pin rather than popping in flat.
-      final boolean panelRightOfBubble = panelX >= bubbleLp.x;
-      root.setPivotX(panelRightOfBubble ? 0f : widthPx);
-      root.setPivotY(dp(24));
-      root.setScaleX(0.82f);
-      root.setScaleY(0.82f);
-      root.setAlpha(0f);
+      // Slide in from the pinned edge.
+      root.setTranslationX(pinOnRight ? widthPx : -widthPx);
+      root.setAlpha(0.4f);
       root.animate()
-          .scaleX(1f).scaleY(1f).alpha(1f)
-          .setDuration(210)
-          .setInterpolator(new android.view.animation.OvershootInterpolator(0.9f))
+          .translationX(0f).alpha(1f)
+          .setDuration(240)
+          .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f))
           .start();
     } catch (Exception ignored) {
       panel = null;
     }
     renderList(list);
+  }
+
+  /** Header: app icon, title, live sync status, flip-side + close controls. */
+  private LinearLayout buildDockHeader() {
+    LinearLayout header = new LinearLayout(this);
+    header.setOrientation(LinearLayout.HORIZONTAL);
+    header.setGravity(Gravity.CENTER_VERTICAL);
+
+    ImageView icon = new ImageView(this);
+    icon.setImageResource(getApplicationInfo().icon);
+    icon.setColorFilter(0xFF22D3EE);
+    LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(20), dp(20));
+    iconLp.rightMargin = dp(8);
+    header.addView(icon, iconLp);
+
+    TextView title = new TextView(this);
+    title.setText("Clipboard");
+    title.setTextColor(Color.WHITE);
+    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+
+    TextView statusView = new TextView(this);
+    statusView.setText(getSyncStatusText());
+    statusView.setTextColor(getSyncStatusColor());
+    statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+    panelStatusText = statusView;
+
+    LinearLayout titleWrap = new LinearLayout(this);
+    titleWrap.setOrientation(LinearLayout.VERTICAL);
+    titleWrap.addView(title);
+    titleWrap.addView(statusView);
+    header.addView(titleWrap, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+    // Flip the dock to the other edge.
+    Button flip = new Button(this);
+    flip.setText(pinOnRight ? "⇤" : "⇥");
+    flip.setTextColor(0xFF94A3B8);
+    flip.setBackgroundColor(Color.TRANSPARENT);
+    flip.setAllCaps(false);
+    flip.setStateListAnimator(null);
+    flip.setPadding(0, 0, 0, 0);
+    flip.setOnClickListener((v) -> flipSide());
+    header.addView(flip, new LinearLayout.LayoutParams(dp(36), dp(30)));
+
+    Button close = new Button(this);
+    close.setText("✕");
+    close.setTextColor(0xFF94A3B8);
+    close.setBackgroundColor(Color.TRANSPARENT);
+    close.setAllCaps(false);
+    close.setStateListAnimator(null);
+    close.setPadding(dp(6), 0, 0, 0);
+    close.setOnClickListener((v) -> hidePanel());
+    header.addView(close, new LinearLayout.LayoutParams(dp(36), dp(30)));
+    return header;
+  }
+
+  /** Composer row: text field + image button + mic (key-gated) + Add. */
+  private LinearLayout buildDockComposer() {
+    LinearLayout wrap = new LinearLayout(this);
+    wrap.setOrientation(LinearLayout.VERTICAL);
+    LinearLayout.LayoutParams wrapLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    wrapLp.topMargin = dp(10);
+    wrap.setLayoutParams(wrapLp);
+
+    final EditText composer = new EditText(this);
+    dockComposer = composer;
+    composer.setHint("Type or dictate…");
+    composer.setHintTextColor(0xFF64748B);
+    composer.setTextColor(0xFFE2E8F0);
+    composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+    composer.setMaxLines(3);
+    GradientDrawable fieldBg = new GradientDrawable();
+    fieldBg.setColor(0x14FFFFFF);
+    fieldBg.setCornerRadius(dp(10));
+    composer.setBackground(fieldBg);
+    composer.setPadding(dp(10), dp(8), dp(10), dp(8));
+    wrap.addView(composer, new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+    LinearLayout actions = new LinearLayout(this);
+    actions.setOrientation(LinearLayout.HORIZONTAL);
+    actions.setGravity(Gravity.CENTER_VERTICAL);
+    LinearLayout.LayoutParams actionsLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    actionsLp.topMargin = dp(6);
+    actions.setLayoutParams(actionsLp);
+
+    // Image button: pushes an image the OS clipboard currently holds.
+    Button imgBtn = new Button(this);
+    imgBtn.setText("＋ Image");
+    styleBtn(imgBtn, false);
+    imgBtn.setOnClickListener((v) -> pasteImageFromClipboard());
+    actions.addView(imgBtn, new LinearLayout.LayoutParams(0, dp(34), 1f));
+
+    // Mic button (only when a Sarvam key is set — matches the desktop's gating).
+    Button mic = new Button(this);
+    mic.setText("🎤 Speak");
+    styleBtn(mic, false);
+    dockMic = mic;
+    mic.setVisibility(sarvamKey != null && !sarvamKey.trim().isEmpty() ? View.VISIBLE : View.GONE);
+    mic.setOnClickListener((v) -> toggleMic((Button) v));
+    LinearLayout.LayoutParams micLp = new LinearLayout.LayoutParams(0, dp(34), 1f);
+    micLp.leftMargin = dp(6);
+    actions.addView(mic, micLp);
+
+    Button addBtn = new Button(this);
+    addBtn.setText("Add");
+    styleBtn(addBtn, true);
+    addBtn.setOnClickListener((v) -> {
+      String t = composer.getText().toString().trim();
+      if (t.isEmpty()) return;
+      sendTextItem(t);
+      synchronized (this) {
+        String nd = (deviceId == null ? "" : deviceId) + "-native";
+        items.add(0, new ClipEntry(UUID.randomUUID().toString(), "text", t, System.currentTimeMillis(), nd));
+        trimItemsLocked();
+      }
+      composer.setText("");
+      refreshPanelIfOpen();
+      toast("Sent");
+    });
+    LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(72), dp(34));
+    addLp.leftMargin = dp(6);
+    actions.addView(addBtn, addLp);
+
+    wrap.addView(actions);
+    return wrap;
+  }
+
+  /** Footer: copy the newest text + open the full app. */
+  private LinearLayout buildDockFooter() {
+    LinearLayout footer = new LinearLayout(this);
+    footer.setOrientation(LinearLayout.HORIZONTAL);
+    footer.setGravity(Gravity.CENTER_VERTICAL);
+    LinearLayout.LayoutParams footerLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    footerLp.topMargin = dp(10);
+    footer.setLayoutParams(footerLp);
+
+    Button copyLast = new Button(this);
+    copyLast.setText("Copy last");
+    styleBtn(copyLast, true);
+    copyLast.setOnClickListener((v) -> {
+      String t = newestText();
+      if (t == null) { toast("Nothing to copy yet"); return; }
+      setOsClipboard(t);
+      toast("Copied");
+    });
+    footer.addView(copyLast, new LinearLayout.LayoutParams(0, dp(38), 1f));
+
+    Button openApp = new Button(this);
+    openApp.setText("Open app");
+    styleBtn(openApp, false);
+    LinearLayout.LayoutParams openLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+    openLp.leftMargin = dp(8);
+    openApp.setOnClickListener((v) -> { hidePanel(); openApp(); });
+    footer.addView(openApp, openLp);
+    return footer;
+  }
+
+  /** Move the dock (and pin) to the opposite edge, remembering the choice. */
+  private void flipSide() {
+    pinOnRight = !pinOnRight;
+    settlePin();
+    if (bubble != null && bubbleLp != null) {
+      DisplayMetrics m = getResources().getDisplayMetrics();
+      styleEdgePin(bubble);
+      bubbleLp.x = pinOnRight ? m.widthPixels - dp(14) : 0;
+      try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
+    }
+    // Re-open on the new side.
+    hidePanel();
+    main.postDelayed(this::showPanel, 180);
   }
 
   private void hidePanel() {
@@ -884,9 +1323,13 @@ public class ClipboardService extends Service {
     panel = null; // clear immediately so a re-tap toggles cleanly
     panelList = null;
     panelStatusText = null;
+    dockComposer = null;
+    dockMic = null;
+    final boolean right = pinOnRight;
+    final int w = p.getWidth();
     p.animate()
-        .scaleX(0.85f).scaleY(0.85f).alpha(0f)
-        .setDuration(140)
+        .translationX(right ? w : -w).alpha(0.3f)
+        .setDuration(160)
         .setInterpolator(new android.view.animation.AccelerateInterpolator())
         .withEndAction(() -> {
           try {
@@ -897,22 +1340,39 @@ public class ClipboardService extends Service {
         .start();
   }
 
-  /** If the panel is open, rebuild its list to reflect new/deleted items. */
+  /** If the panel is open, rebuild its list to reflect new/deleted/filtered items. */
   private void refreshPanelIfOpen() {
     if (panel == null || panelList == null) return;
     panelList.removeAllViews();
     renderList(panelList);
   }
 
-  /** Populate the list with the current items. Each row taps to copy. */
+  /** If the composer is open, reflect a Sarvam-key change (mic visibility). */
+  private void refreshComposerIfOpen() {
+    if (dockMic != null) {
+      dockMic.setVisibility(sarvamKey != null && !sarvamKey.trim().isEmpty() ? View.VISIBLE : View.GONE);
+    }
+  }
+
+  /** Populate the list with current items (filtered). Text rows tap-to-copy; image
+   *  rows show a thumbnail and open the app for full-res copy/view. */
   private void renderList(LinearLayout list) {
     ArrayList<ClipEntry> snapshot;
     synchronized (this) {
       snapshot = new ArrayList<>(items);
     }
-    if (snapshot.isEmpty()) {
+    ArrayList<ClipEntry> shown = new ArrayList<>();
+    for (ClipEntry e : snapshot) {
+      if (dockFilter.isEmpty()) { shown.add(e); continue; }
+      if ("text".equals(e.kind) && e.text != null && e.text.toLowerCase(Locale.US).contains(dockFilter)) {
+        shown.add(e);
+      }
+    }
+    if (shown.isEmpty()) {
       TextView empty = new TextView(this);
-      empty.setText("Nothing here yet\nCopy on your PC and it appears here, or add something above.");
+      empty.setText(snapshot.isEmpty()
+          ? "Nothing here yet\nCopy on your PC and it appears here, or add something above."
+          : "No matches");
       empty.setTextColor(0xFF94A3B8);
       empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
       empty.setLineSpacing(dp(2), 1f);
@@ -922,7 +1382,7 @@ public class ClipboardService extends Service {
     }
     long now = System.currentTimeMillis();
     final int collapsedLines = 6;
-    for (ClipEntry e : snapshot) {
+    for (ClipEntry e : shown) {
       LinearLayout row = new LinearLayout(this);
       row.setOrientation(LinearLayout.VERTICAL);
       GradientDrawable rowBg = new GradientDrawable();
@@ -934,9 +1394,29 @@ public class ClipboardService extends Service {
           LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
       rowLp.bottomMargin = dp(6);
 
-      // The content is the primary element: larger, brighter, up to 6 lines.
-      // The full text is always kept on the view (via a tag) so a long-press can
-      // reveal it in full — nothing is lost to truncation.
+      if ("image".equals(e.kind)) {
+        Bitmap bmp;
+        synchronized (this) { bmp = thumbs.get(e.id); }
+        ImageView iv = new ImageView(this);
+        iv.setAdjustViewBounds(true);
+        iv.setMaxHeight(dp(160));
+        iv.setScaleType(ImageView.ScaleType.FIT_START);
+        if (bmp != null) iv.setImageBitmap(bmp);
+        row.addView(iv, new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        TextView meta = new TextView(this);
+        meta.setText("Image · " + relativeTime(e.createdAtMs, now) + "  ·  tap to open");
+        meta.setTextColor(0xFF64748B);
+        meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        metaLp.topMargin = dp(4);
+        row.addView(meta, metaLp);
+        row.setOnClickListener((v) -> { hidePanel(); openApp(); });
+        list.addView(row, rowLp);
+        continue;
+      }
+
       final TextView body = new TextView(this);
       final String fullText = e.text == null ? "" : e.text;
       body.setText(fullText);
@@ -947,7 +1427,6 @@ public class ClipboardService extends Service {
       body.setLineSpacing(dp(1), 1f);
       row.addView(body);
 
-      // Footer: muted meta + a "long-press to expand" hint (only when clamped).
       final TextView meta = new TextView(this);
       final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
       meta.setText(relativeTime(e.createdAtMs, now) + (longText ? "  ·  hold to expand" : ""));
@@ -963,8 +1442,6 @@ public class ClipboardService extends Service {
         setOsClipboard(fullText);
         toast("Copied");
       });
-      // Long-press toggles full content in place (no truncation), so even long
-      // pastes are fully viewable without opening the app.
       row.setOnLongClickListener((v) -> {
         expanded[0] = !expanded[0];
         body.setMaxLines(expanded[0] ? Integer.MAX_VALUE : collapsedLines);
@@ -1058,9 +1535,12 @@ public class ClipboardService extends Service {
         snap = new ArrayList<>(s.items);
       }
       for (ClipEntry e : snap) {
+        // Only text seeds the webview instantly (images stream from the relay with
+        // their blobs); skip image rows so the webview doesn't show empty entries.
+        if (!"text".equals(e.kind) || e.text == null) continue;
         org.json.JSONObject it = new org.json.JSONObject();
         it.put("id", e.id);
-        it.put("text", e.text == null ? "" : e.text);
+        it.put("text", e.text);
         it.put("createdAtMs", e.createdAtMs);
         arr.put(it);
       }
@@ -1118,6 +1598,13 @@ public class ClipboardService extends Service {
       try { cm.unregisterNetworkCallback(netCallback); } catch (Exception ignored) {}
     }
     netCallback = null;
+    if (recording) { try { if (recorder != null) recorder.stop(); } catch (Exception ignored) {} }
+    recording = false;
+    safeReleaseRecorder();
+    synchronized (this) {
+      for (Bitmap b : thumbs.values()) { if (b != null) b.recycle(); }
+      thumbs.clear();
+    }
     if (socket != null) socket.cancel();
     socket = null;
     if (http != null) http.dispatcher().executorService().shutdown();

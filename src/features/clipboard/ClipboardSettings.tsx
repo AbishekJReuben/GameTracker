@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { ClipboardList, Layers, Zap, Mic, Stethoscope, Check } from "lucide-react";
+import { ClipboardList, Layers, Zap, Mic, Stethoscope, Check, KeyRound } from "lucide-react";
 import { api } from "@/lib/api";
 import { clip } from "@/lib/clip";
 import { clipSync } from "@/lib/clipboardSync";
@@ -67,7 +67,20 @@ export function ClipboardSettings() {
   const auto = settings?.clipboard_auto_capture !== "false";
   const stt = settings?.clipboard_stt_enabled === "true";
 
+  const [keyInput, setKeyInput] = useState("");
+  const [keySaved, setKeySaved] = useState(false);
+  useEffect(() => {
+    setKeyInput(settings?.clipboard_sarvam_key ?? "");
+  }, [settings?.clipboard_sarvam_key]);
+
   const refresh = () => qc.invalidateQueries({ queryKey: ["settings"] });
+
+  const saveKey = async () => {
+    await api.setSetting("clipboard_sarvam_key", keyInput.trim());
+    setKeySaved(true);
+    setTimeout(() => setKeySaved(false), 1500);
+    refresh();
+  };
 
   const setMaster = async (on: boolean) => {
     if (on && !enabled) {
@@ -135,6 +148,35 @@ export function ClipboardSettings() {
           <Row icon={<Mic className="h-4 w-4" />} title="Voice to text" desc="Add a mic button that transcribes speech (Sarvam).">
             <Toggle checked={stt} onChange={setStt} />
           </Row>
+          {stt && (
+            <div className="ml-[3.25rem] mr-2 mb-1 space-y-1.5 rounded-xl border border-white/[0.06] bg-white/[0.02] p-2.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-700 text-ink-soft">
+                <KeyRound className="h-3.5 w-3.5" /> Sarvam API key
+              </div>
+              <p className="text-[11px] text-ink-faint">
+                Paste your key from sarvam.ai. Stored locally; overrides any key baked at build time and works on all your devices' mics.
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="password"
+                  value={keyInput}
+                  onChange={(e) => setKeyInput(e.target.value)}
+                  placeholder="sk_…"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  className="input flex-1 py-1.5 text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={saveKey}
+                  className="btn btn-subtle flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                >
+                  {keySaved ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : "Save"}
+                </button>
+              </div>
+            </div>
+          )}
           <Row
             icon={<Stethoscope className="h-4 w-4" />}
             title="Diagnostics"
