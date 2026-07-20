@@ -26,7 +26,8 @@ public class ClipboardBootReceiver extends BroadcastReceiver {
           true,
           p.getString("secret", ""),
           p.getString("deviceId", ""),
-          p.getString("signalUrl", ""));
+          p.getString("signalUrl", ""),
+          p.getString("sarvamKey", ""));
     }
   }
 }
