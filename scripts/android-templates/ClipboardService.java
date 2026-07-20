@@ -83,6 +83,12 @@ public class ClipboardService extends Service {
   private static final int NOTIF_ID = 0x6C69; // "li"
   private static final int MAX_ITEMS = 12; // panel caps at ~8 visible; keep a few spare
 
+  /** Process-wide singleton handle so the webview can pull the native service's
+   *  state (recent items + connection status) without a round-trip through the
+   *  relay. The service sets this on its first onStartCommand and clears it in
+   *  onDestroy. Accessed via {@link ClipboardBridge#snapshot(Context)}. */
+  private static volatile ClipboardService INSTANCE;
+
   private WindowManager wm;
   private View bubble;
   private WindowManager.LayoutParams bubbleLp;
@@ -107,8 +113,16 @@ public class ClipboardService extends Service {
 
   private String getSyncStatusText() {
     if (cryptoKey == null) return "Set key in app";
-    if (socketConnected) return "Synced";
-    return "Connecting…";
+    if (!socketConnected) return "Connecting.";
+    java.util.HashSet<String> devs = new java.util.HashSet<>();
+    synchronized (this) {
+      for (ClipEntry e : items) {
+        if (e.deviceId != null && !e.deviceId.isEmpty()) devs.add(e.deviceId);
+      }
+    }
+    int count = devs.size();
+    if (count > 0) return "Synced \u00B7 " + count + " device" + (count == 1 ? "" : "s");
+    return "Synced";
   }
 
   private int getSyncStatusColor() {
@@ -131,10 +145,12 @@ public class ClipboardService extends Service {
     final String id;
     final String text;
     final long createdAtMs;
-    ClipEntry(String id, String text, long createdAtMs) {
+    final String deviceId;
+    ClipEntry(String id, String text, long createdAtMs, String deviceId) {
       this.id = id;
       this.text = text;
       this.createdAtMs = createdAtMs;
+      this.deviceId = deviceId;
     }
   }
   private final ArrayList<ClipEntry> items = new ArrayList<>();
@@ -154,6 +170,7 @@ public class ClipboardService extends Service {
       stopSelf();
       return START_NOT_STICKY;
     }
+    INSTANCE = this;
     startForegroundNotif();
     deriveCryptoKey();
     showBubble();
@@ -421,7 +438,7 @@ public class ClipboardService extends Service {
         for (int i = items.size() - 1; i >= 0; i--) {
           if (id.equals(items.get(i).id)) items.remove(i);
         }
-        items.add(0, new ClipEntry(id, plain, created));
+        items.add(0, new ClipEntry(id, plain, created, v.optString("deviceId", "")));
         while (items.size() > MAX_ITEMS) items.remove(items.size() - 1);
       }
       main.post(this::showNewItemAttention);
@@ -733,7 +750,8 @@ public class ClipboardService extends Service {
       // relay broadcasts it back to other devices; our own deviceId filter
       // prevents the webview from double-adding).
       synchronized (this) {
-        items.add(0, new ClipEntry(UUID.randomUUID().toString(), t, System.currentTimeMillis()));
+        String nd = (deviceId == null ? "" : deviceId) + "-native";
+        items.add(0, new ClipEntry(UUID.randomUUID().toString(), t, System.currentTimeMillis(), nd));
         while (items.size() > MAX_ITEMS) items.remove(items.size() - 1);
       }
       composer.setText("");
@@ -997,6 +1015,43 @@ public class ClipboardService extends Service {
     return day / 7 + (day / 7 == 1 ? " week ago" : " weeks ago");
   }
 
+  /** JSON snapshot of the service state for the webview (and diagnostics).
+   *  Shape: { running, connected, hasKey, socketUrl, reconnectMs, items: [{id, text, createdAtMs}] }.
+   *  Lets the webview seed its history instantly on open (no relay round-trip)
+   *  and surface one unified "is sync working" status. Static so it can be
+   *  called from {@link ClipboardBridge#snapshot} even before any instance. */
+  public static String snapshot() {
+    ClipboardService s = INSTANCE;
+    org.json.JSONObject o = new org.json.JSONObject();
+    try {
+      o.put("running", s != null);
+      if (s == null) return o.toString();
+      o.put("connected", s.socketConnected);
+      o.put("hasKey", s.cryptoKey != null);
+      o.put("reconnectMs", s.reconnectMs);
+      // Don't leak the full URL (it carries the clip id hash, which is also the
+      // relay-space key — exposing it would weaken the E2E story). Host only.
+      String url = s.socketUrl == null ? "" : s.socketUrl;
+      int q = url.indexOf('?');
+      o.put("relayHost", q > 0 ? url.substring(0, q) : url);
+      org.json.JSONArray arr = new org.json.JSONArray();
+      ArrayList<ClipEntry> snap;
+      synchronized (s) {
+        snap = new ArrayList<>(s.items);
+      }
+      for (ClipEntry e : snap) {
+        org.json.JSONObject it = new org.json.JSONObject();
+        it.put("id", e.id);
+        it.put("text", e.text == null ? "" : e.text);
+        it.put("createdAtMs", e.createdAtMs);
+        arr.put(it);
+      }
+      o.put("items", arr);
+    } catch (Exception ignored) {
+    }
+    return o.toString();
+  }
+
   private void openApp() {
     Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
     if (open != null) {
@@ -1039,6 +1094,7 @@ public class ClipboardService extends Service {
   public void onDestroy() {
     super.onDestroy();
     stopping = true;
+    INSTANCE = null;
     main.removeCallbacks(reconnect);
     if (cm != null && netCallback != null) {
       try { cm.unregisterNetworkCallback(netCallback); } catch (Exception ignored) {}

@@ -51,6 +51,10 @@ class ClipSyncManager {
   private started = false;
   private lastRev = 0;
   private backoff = 1000;
+  /** Cap the reconnect backoff low: clipboard sync needs near-real-time delivery,
+   *  so a dropped link must recover within seconds. 30s (the old cap) felt broken
+   *  — a transient network blip parked the engine for half a minute. */
+  private static readonly MAX_BACKOFF_MS = 5000;
   private retryTimer?: ReturnType<typeof setTimeout>;
   private pingTimer?: ReturnType<typeof setInterval>;
   private unlisteners: UnlistenFn[] = [];
@@ -62,6 +66,17 @@ class ClipSyncManager {
   private lastError: string | null = null;
   private lastEvent: string | null = null;
   private reconnects = 0;
+  /** Result of the last HTTP probe of the relay's /health endpoint, with the
+   *  HTTP status (or -1 for a network failure). Helps distinguish "server down"
+   *  from "WS upgrade rejected" from "DNS broken". */
+  private lastHealthStatus = -1;
+  private lastHealthAt: number | null = null;
+  private healthTimer?: ReturnType<typeof setInterval>;
+  /** Bound handlers so add/removeEventListener match. */
+  private onlineHandler = () => this.forceReconnect("browser online event");
+  private visibilityHandler = () => {
+    if (document.visibilityState === "visible") this.forceReconnect("tab/window became visible");
+  };
 
   /** Start (idempotent). Reads secret/signal URL from settings; no-op if the
    *  feature is off or no secret is configured yet. */
@@ -102,6 +117,17 @@ class ClipSyncManager {
     this.unlisteners.push(
       await listen<string>("clipboard://delete", (e) => this.sendDelete(e.payload)),
     );
+    // Reconnect immediately when the network comes back or the window becomes
+    // visible — don't wait out the (now short) backoff for events the user can
+    // already see should work. This is the JS twin of the Android service's
+    // ConnectivityManager callback.
+    window.addEventListener("online", this.onlineHandler);
+    document.addEventListener("visibilitychange", this.visibilityHandler);
+    // Probe the relay's /health endpoint every 30s so the diagnostics report
+    // can distinguish "relay unreachable" (HTTP -1) from "up but WS failing"
+    // (HTTP 200 but socket never opens). Cheap HEAD that doubles as a wake-up.
+    this.probeHealth();
+    this.healthTimer = setInterval(() => this.probeHealth(), 30000);
     this.connect();
   }
 
@@ -109,6 +135,10 @@ class ClipSyncManager {
     this.started = false;
     clearTimeout(this.retryTimer);
     clearInterval(this.pingTimer);
+    clearInterval(this.healthTimer);
+    this.healthTimer = undefined;
+    window.removeEventListener("online", this.onlineHandler);
+    document.removeEventListener("visibilitychange", this.visibilityHandler);
     this.unlisteners.forEach((f) => f());
     this.unlisteners = [];
     try {
@@ -117,6 +147,41 @@ class ClipSyncManager {
       /* ignore */
     }
     this.ws = undefined;
+  }
+
+  /** Drop any pending reconnect and try again right now (used by online /
+   *  visibility events and by the user tapping "Retry" in the UI). Resets the
+   *  backoff so a freshly-recovered link doesn't sit idle. */
+  forceReconnect(reason: string): void {
+    if (!this.started) return;
+    this.backoff = 1000;
+    clearTimeout(this.retryTimer);
+    this.lastEvent = `force reconnect (${reason})`;
+    // If a socket is mid-handshake, let it fail through onclose; otherwise
+    // connect immediately.
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      try {
+        this.ws.close();
+      } catch {
+        /* ignore */
+      }
+    } else {
+      this.connect();
+    }
+  }
+
+  /** HEAD/GET the relay's /health endpoint. Stores the result so the diagnostics
+   *  report shows whether the relay is reachable at all (separate from the WS). */
+  private async probeHealth(): Promise<void> {
+    if (!this.httpBase) return;
+    try {
+      const res = await fetch(`${this.httpBase}/health`, { method: "GET", cache: "no-store" });
+      this.lastHealthStatus = res.status;
+      this.lastHealthAt = Date.now();
+    } catch {
+      this.lastHealthStatus = -1;
+      this.lastHealthAt = Date.now();
+    }
   }
 
   /** Restart to pick up a settings change (enable/secret/url). */
@@ -181,7 +246,7 @@ class ClipSyncManager {
     this.reconnects++;
     clearTimeout(this.retryTimer);
     this.retryTimer = setTimeout(() => this.connect(), this.backoff);
-    this.backoff = Math.min(this.backoff * 2, 30000);
+    this.backoff = Math.min(this.backoff * 2, ClipSyncManager.MAX_BACKOFF_MS);
   }
 
   private bumpRev(rev?: number): void {
@@ -352,11 +417,20 @@ class ClipSyncManager {
   /** Snapshot of the sync engine state for the Settings "Copy logs" report. */
   diagnostics(): Record<string, string> {
     const uptimeMs = this.startedAt ? Date.now() - this.startedAt : 0;
+    const healthAge = this.lastHealthAt ? Math.round((Date.now() - this.lastHealthAt) / 1000) : -1;
+    const health =
+      this.lastHealthStatus === -1
+        ? "unreachable (network/DNS failure or server down)"
+        : this.lastHealthStatus === 200
+          ? "ok (200)"
+          : `HTTP ${this.lastHealthStatus}`;
     return {
       started: String(this.started),
       uptimeSec: String(Math.round(uptimeMs / 1000)),
       wsState: this.lastWsState,
       relayUrl: this.wsBase || "(not configured)",
+      relayHealth: health,
+      relayHealthAgeSec: String(healthAge),
       clipId: this.clipId || "(not derived)",
       deviceId: this.deviceId || "(unknown)",
       hasKey: String(!!this.key),

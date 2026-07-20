@@ -59,7 +59,12 @@ if (-not $signing) {
 }
 
 # --- assemble a --config override (only when we actually need one) ---
+$tauriConfPath = Join-Path $root 'src-tauri\tauri.conf.json'
+$tauriConf = Get-Content $tauriConfPath -Raw | ConvertFrom-Json
+
 $override = @{}
+if ($tauriConf.productName) { $override['productName'] = $tauriConf.productName }
+if ($tauriConf.version)     { $override['version']     = $tauriConf.version }
 if ($SkipWebBuild)  { $override['build']  = @{ beforeBuildCommand = '' } }        # dist already built
 if (-not $signing)  { $override['bundle'] = @{ createUpdaterArtifacts = $false } } # no key -> no .sig
 

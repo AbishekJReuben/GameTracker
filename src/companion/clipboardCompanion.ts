@@ -41,6 +41,7 @@ interface CompanionClipState {
   remove: (id: string) => Promise<void>;
   togglePin: (item: ClipItem) => Promise<void>;
   captureClipboard: () => Promise<string>;
+  diagnostics: () => Promise<any>;
 }
 
 let ws: WebSocket | undefined;
@@ -237,11 +238,39 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
 
     init: async () => {
       if (started) return;
+      
+      if (isTauri()) {
+        try {
+          const snapStr = await invoke<string>("clipboard_service_snapshot");
+          if (snapStr && snapStr !== "{}") {
+            const snap = JSON.parse(snapStr);
+            if (snap.items && Array.isArray(snap.items)) {
+              for (const e of snap.items) {
+                if (!items.has(e.id)) {
+                  items.set(e.id, {
+                    id: e.id,
+                    kind: "text",
+                    text: e.text,
+                    imagePath: null,
+                    thumbPath: null,
+                    mime: "text/plain",
+                    size: e.text.length,
+                    createdUtc: new Date(e.createdAtMs).toISOString(),
+                    deviceId: get().deviceId + "-native",
+                    deviceName: "Phone",
+                    source: "android",
+                    pinned: false,
+                  });
+                }
+              }
+              publish();
+            }
+          }
+        } catch {}
+      }
+
       const secret = localStorage.getItem("gt.remote.secret") || "";
       if (!secret) {
-        // No secret yet — the host pushes one after approving this device (see
-        // setSecret). Sit idle until then; the UI shows "set your key" as a hint
-        // that the manual path is still available in More → Remote.
         set({ ready: false });
         return;
       }
@@ -383,6 +412,24 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       } catch {
         return "";
       }
+    },
+
+    diagnostics: async () => {
+      const snapStr = isTauri() ? await invoke<string>("clipboard_service_snapshot").catch(() => "{}") : "{}";
+      return {
+        webview: {
+          started,
+          connected: get().connected,
+          wsState: ws ? ws.readyState : -1,
+          relayUrl: wsBase,
+          clipId,
+          deviceId: get().deviceId,
+          hasKey: !!key,
+          lastRev,
+          backoffMs: backoff,
+        },
+        nativeService: JSON.parse(snapStr)
+      };
     },
   };
 });

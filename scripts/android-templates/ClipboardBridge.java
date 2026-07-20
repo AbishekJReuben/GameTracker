@@ -122,4 +122,8 @@ public class ClipboardBridge {
     } catch (Exception ignored) {
     }
   }
+
+  public static String snapshot(Context ctx) {
+    return ClipboardService.snapshot();
+  }
 }

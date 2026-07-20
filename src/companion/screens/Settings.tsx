@@ -29,6 +29,7 @@ import { UpdatePanel } from "../UpdatePanel";
 import { deviceName } from "../device";
 import { getCompanionRuntime } from "../runtime";
 import { APP_VERSION } from "@/lib/version";
+import { isTauri } from "@/lib/tauri";
 
 interface SettingsProps {
   /** The saved connection code (code 1). */
@@ -42,15 +43,9 @@ interface SettingsProps {
 }
 
 export function SettingsScreen({ code, onSaveKey, onDisconnect, onForget }: SettingsProps) {
-  const isTauri =
-    typeof window !== "undefined" &&
-    Boolean(
-      (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ ||
-        (window as unknown as { __TAURI__?: unknown }).__TAURI__,
-    );
   return (
     <div className="mx-auto max-w-xl space-y-4 p-4">
-      {isTauri ? <UpdateSection /> : <WebAboutSection />}
+      {isTauri() ? <UpdateSection /> : <WebAboutSection />}
       <ConnectionSection code={code} onSaveKey={onSaveKey} onDisconnect={onDisconnect} onForget={onForget} />
       <div className="pb-2 text-center text-[11px] text-ink-faint">GameTracker Remote · companion</div>
     </div>
@@ -224,7 +219,7 @@ function ConnectionSection({ code, onSaveKey, onDisconnect, onForget }: Settings
         </button>
       </div>
 
-      <div className="flex gap-2">
+      <div className="flex gap-2 mb-3">
         <button onClick={onDisconnect} className="btn btn-subtle h-11 flex-1 gap-2">
           <Plug className="h-4 w-4" /> Disconnect
         </button>
@@ -232,6 +227,41 @@ function ConnectionSection({ code, onSaveKey, onDisconnect, onForget }: Settings
           <Trash2 className="h-4 w-4" /> Forget this PC
         </button>
       </div>
+
+      <button
+        onClick={async () => {
+          try {
+            const { useCompanionClip } = await import("../clipboardCompanion");
+            const diag = await useCompanionClip.getState().diagnostics();
+            const text = [
+              "=== GameTracker Companion clipboard diagnostics ===",
+              `Generated: ${new Date().toISOString()}`,
+              "",
+              "--- Webview sync engine ---",
+              ...Object.entries(diag.webview).map(([k, v]) => `${k}: ${v}`),
+              "",
+              "--- Native Android Service ---",
+              ...Object.entries(diag.nativeService).map(([k, v]) => {
+                 if (k === "items") return `${k}: ${Array.isArray(v) ? v.length : 0} items`;
+                 return `${k}: ${v}`;
+              }),
+            ].join("\n");
+            
+            if (isTauri()) {
+              const { invoke } = await import("@tauri-apps/api/core");
+              await invoke("clipboard_write", { text }).catch(() => {});
+            } else {
+              await navigator.clipboard?.writeText(text).catch(() => {});
+            }
+            alert("Diagnostics copied to clipboard.");
+          } catch (e) {
+            alert(`Couldn't copy: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }}
+        className="btn btn-subtle h-11 w-full gap-2 text-ink-dim hover:text-ink"
+      >
+        Copy clipboard diagnostics
+      </button>
     </section>
   );
 }

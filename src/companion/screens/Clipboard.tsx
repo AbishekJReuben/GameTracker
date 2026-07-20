@@ -110,7 +110,7 @@ export default function ClipboardScreen() {
         <div>
           <div className="text-base font-800 text-ink">Clipboard</div>
           <div className="text-[11px] text-ink-dim">
-            {s.ready ? (s.connected ? "Synced" : "Connecting…") : "Set your key in More → Remote to sync"}
+            {s.ready ? (s.connected ? `Synced${new Set(s.items.map(i => i.deviceId)).size > 0 ? ` · ${new Set(s.items.map(i => i.deviceId)).size} device${new Set(s.items.map(i => i.deviceId)).size === 1 ? "" : "s"}` : ""}` : "Connecting…") : "Set your key in More → Remote to sync"}
           </div>
         </div>
       </div>

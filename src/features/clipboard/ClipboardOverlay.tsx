@@ -6,6 +6,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "motion/react";
 import { Clipboard, X } from "lucide-react";
 import { clip } from "@/lib/clip";
+import { clipSync } from "@/lib/clipboardSync";
+import { useClipboard } from "@/store/clipboard";
 import { ClipboardPanel } from "./ClipboardPanel";
 
 const BUBBLE = 76;
@@ -66,6 +68,10 @@ export default function ClipboardOverlay() {
   const [expanded, setExpanded] = useState(false);
   const [sttEnabled, setSttEnabled] = useState(false);
   const [pulse, setPulse] = useState(false);
+  const [status, setStatus] = useState<{ text: string; color: string }>({
+    text: "Connecting…",
+    color: "var(--accent-3)",
+  });
 
   // The overlay window is transparent — clear any global page background.
   // #root carries an opaque #06070d from index.html / index.css, which would
@@ -80,15 +86,50 @@ export default function ClipboardOverlay() {
     invoke<Record<string, string>>("get_settings")
       .then((s) => setSttEnabled(s.clipboard_stt_enabled === "true"))
       .catch(() => {});
+
+    // PULSE on any new item, AND keep the store fresh so the panel shows live
+    // updates the moment it's expanded (the panel itself only mounts expanded,
+    // so without this always-on listener it would miss events while collapsed).
     const triggerPulse = () => {
       setPulse(true);
       setTimeout(() => setPulse(false), 1400);
     };
-    const unItem = listen("clipboard://item", triggerPulse);
-    const unChanged = listen("clipboard://changed", triggerPulse);
+    const refresh = () => {
+      triggerPulse();
+      void useClipboard.getState().refresh();
+    };
+    const unItem = listen("clipboard://item", refresh);
+    const unChanged = listen("clipboard://changed", refresh);
+
+    // Live sync status pill in the header. Polls the sync engine's diagnostics
+    // (cheap object read) so the user sees Connecting / Synced / relay-error
+    // without opening Settings. 2s cadence — fast enough to feel live, slow
+    // enough not to thrash React on a hidden overlay.
+    const statusTick = () => {
+      const d = clipSync.diagnostics();
+      let text = "Connecting…";
+      let color = "var(--accent-3)";
+      if (d.started !== "true") {
+        text = "Off";
+        color = "var(--ink-faint)";
+      } else if (d.wsState === "open") {
+        const items = useClipboard.getState().items;
+        const deviceCount = new Set(items.map((i) => i.deviceId)).size;
+        text = `Synced${deviceCount > 0 ? ` · ${deviceCount} device${deviceCount === 1 ? "" : "s"}` : ""}`;
+        color = "#34d399";
+      } else if (d.lastError && d.lastError !== "(none)") {
+        text = "Reconnecting…";
+        color = "#fbbf24";
+      }
+      setStatus((prev) => (prev.text === text && prev.color === color ? prev : { text, color }));
+    };
+    statusTick();
+    const statusTimer = window.setInterval(statusTick, 2000);
+
     return () => {
       unItem.then((f) => f());
       unChanged.then((f) => f());
+      window.clearInterval(statusTimer);
       if (root && prevRootBg !== "") root.style.background = prevRootBg;
     };
   }, []);
@@ -123,6 +164,10 @@ export default function ClipboardOverlay() {
   }, []);
 
   const expand = useCallback(async () => {
+    // Pull the latest from the DB the instant the panel opens — this is the
+    // fallback for items that arrived while collapsed (the always-on listener
+    // above also refreshes, but this guarantees a fresh view on open).
+    void useClipboard.getState().refresh();
     setExpanded(true);
     await tweenSize(PANEL_W, PANEL_H, 260);
   }, [tweenSize]);
@@ -156,13 +201,28 @@ export default function ClipboardOverlay() {
               {...headerDrag}
               className="flex cursor-grab items-center justify-between gap-2 border-b border-white/[0.06] px-3.5 py-2.5 active:cursor-grabbing"
             >
-              <span className="flex items-center gap-2 text-sm font-700 text-ink">
-                <Clipboard className="h-4 w-4 text-accent-3" /> Clipboard
-              </span>
+              <div className="flex min-w-0 items-center gap-2">
+                <Clipboard className="h-4 w-4 shrink-0 text-accent-3" />
+                <span className="text-sm font-700 text-ink">Clipboard</span>
+                <span
+                  className="flex items-center gap-1 text-[10px] font-600"
+                  style={{ color: status.color }}
+                  title="Live sync status — shows whether this PC is connected to the relay"
+                >
+                  <span
+                    className="inline-block h-1.5 w-1.5 rounded-full"
+                    style={{
+                      background: status.color,
+                      boxShadow: `0 0 6px ${status.color}`,
+                    }}
+                  />
+                  {status.text}
+                </span>
+              </div>
               <button
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={collapse}
-                className="grid h-7 w-7 place-items-center rounded-lg text-ink-dim hover:bg-white/10 hover:text-ink"
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-ink-dim hover:bg-white/10 hover:text-ink"
                 title="Collapse"
               >
                 <X className="h-4 w-4" />

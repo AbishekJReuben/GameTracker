@@ -165,6 +165,31 @@ mod imp {
             Ok(())
         })
     }
+
+    /// Call `ClipboardBridge.snapshot(Context) -> String`.
+    pub fn snapshot() -> Result<String, String> {
+        with_env(|env, context| {
+            let class = load_class(env, context, BRIDGE)?;
+            let obj = env
+                .call_static_method(
+                    &class,
+                    "snapshot",
+                    "(Landroid/content/Context;)Ljava/lang/String;",
+                    &[JValue::Object(context)],
+                )
+                .map_err(|e| format!("snapshot: {e}"))?
+                .l()
+                .map_err(|e| e.to_string())?;
+            if obj.is_null() {
+                return Ok(String::new());
+            }
+            let s: String = env
+                .get_string(&obj.into())
+                .map_err(|e| e.to_string())?
+                .into();
+            Ok(s)
+        })
+    }
 }
 
 // ------------------------------- commands -----------------------------------
@@ -288,4 +313,16 @@ pub async fn clipboard_write(text: String) -> Result<(), String> {
         let _ = text;
         Ok(())
     }
+}
+
+#[tauri::command]
+pub async fn clipboard_service_snapshot() -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        tauri::async_runtime::spawn_blocking(imp::snapshot)
+            .await
+            .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "android"))]
+    Ok(String::from("{}"))
 }
