@@ -32,6 +32,9 @@ interface CompanionClipState {
   deviceId: string;
   init: () => Promise<void>;
   stop: () => void;
+  /** Inject a secret received from the host (post-approval) and (re)connect.
+   *  Idempotent — a no-op if this secret is already active. */
+  setSecret: (secret: string) => Promise<void>;
   addText: (text: string) => Promise<void>;
   addImage: (dataUrl: string) => Promise<void>;
   copy: (id: string) => Promise<void>;
@@ -50,6 +53,12 @@ let backoff = 1000;
 let retry: ReturnType<typeof setTimeout> | undefined;
 let ping: ReturnType<typeof setInterval> | undefined;
 let started = false;
+// The secret the current key was derived from. Lets setSecret no-op when the
+// host re-pushes the same secret on every reconnect.
+let activeSecret = "";
+// Filled in by the store's init() — the live-secret path (host pushed a secret
+// post-approval) calls this to (re)derive the key + relay space and connect.
+let startWithSecret: ((secret: string) => Promise<void>) | null = null;
 
 function sortItems(map: Map<string, ClipItem>): ClipItem[] {
   return [...map.values()]
@@ -195,6 +204,25 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     backoff = Math.min(backoff * 2, 30000);
   };
 
+  // Derive the key + relay space from a secret, remember it, and connect. Shared
+  // by the first-run init() and the live-secret path (host pushed it post-auth).
+  startWithSecret = async (secret: string) => {
+    wsBase = (localStorage.getItem("gt.remote.signal") || DEFAULT_SIGNAL_URL).replace(/\/+$/, "");
+    httpBase = wsBase.replace(/^ws/, "http");
+    key = await deriveKey(secret);
+    clipId = await deriveClipId(secret);
+    activeSecret = secret;
+    lastRev = Number(localStorage.getItem(`gt.clip.rev.${clipId}`) || 0);
+    let deviceId = localStorage.getItem("gt.clip.device") || "";
+    if (!deviceId) {
+      deviceId = `phone-${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem("gt.clip.device", deviceId);
+    }
+    started = true;
+    set({ ready: true, deviceId });
+    connect();
+  };
+
   const addLocal = async (item: ClipItem, cipherPayload: object) => {
     items.set(item.id, item);
     publish();
@@ -211,22 +239,36 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       if (started) return;
       const secret = localStorage.getItem("gt.remote.secret") || "";
       if (!secret) {
+        // No secret yet — the host pushes one after approving this device (see
+        // setSecret). Sit idle until then; the UI shows "set your key" as a hint
+        // that the manual path is still available in More → Remote.
         set({ ready: false });
         return;
       }
-      wsBase = (localStorage.getItem("gt.remote.signal") || DEFAULT_SIGNAL_URL).replace(/\/+$/, "");
-      httpBase = wsBase.replace(/^ws/, "http");
-      key = await deriveKey(secret);
-      clipId = await deriveClipId(secret);
-      lastRev = Number(localStorage.getItem(`gt.clip.rev.${clipId}`) || 0);
-      let deviceId = localStorage.getItem("gt.clip.device") || "";
-      if (!deviceId) {
-        deviceId = `phone-${Math.random().toString(36).slice(2, 10)}`;
-        localStorage.setItem("gt.clip.device", deviceId);
+      await startWithSecret?.(secret);
+    },
+
+    setSecret: async (secret) => {
+      const s = (secret || "").trim();
+      if (!s) return;
+      // Remember it so a re-open of the Clipboard tab (or an app restart before
+      // the host re-approves) can still sync.
+      localStorage.setItem("gt.remote.secret", s);
+      // Already running with THIS secret — nothing to do.
+      if (started && key && activeSecret === s) return;
+      // Tear down any prior session (different/empty secret) then start fresh.
+      if (started) {
+        started = false;
+        clearTimeout(retry);
+        clearInterval(ping);
+        try {
+          ws?.close();
+        } catch {
+          /* ignore */
+        }
+        ws = undefined;
       }
-      started = true;
-      set({ ready: true, deviceId });
-      connect();
+      await startWithSecret?.(s);
     },
 
     stop: () => {

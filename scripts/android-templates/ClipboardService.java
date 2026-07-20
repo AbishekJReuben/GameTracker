@@ -5,6 +5,8 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
@@ -16,14 +18,25 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.IBinder;
 import android.util.DisplayMetrics;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.Toast;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.concurrent.TimeUnit;
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -36,22 +49,33 @@ import org.json.JSONObject;
  *
  * Draws a draggable overlay bubble on top of every app (SYSTEM_ALERT_WINDOW) and
  * runs as a `specialUse` foreground service so it survives indefinitely (the
- * `dataSync` type is capped at 6h/24h). Tapping the bubble foregrounds the app —
- * the only state in which Android 10+ lets us read the clipboard — where the
- * webview's Clipboard screen captures and decrypts history. A native, push-only
- * WebSocket remains connected when the Activity/webview is destroyed, so new
- * remote items still update the notification in real time. `START_STICKY` + the
- * ClipboardBootReceiver bring it back after a kill or reboot.
+ * `dataSync` type is capped at 6h/24h). Tapping the bubble opens a SMALL FLOATING
+ * PANEL over whatever app you're in — recent items, decrypted natively, each tap
+ * copies that item to the system clipboard (no app switch). "Open app" is the
+ * secondary footer action and lands you on the in-app Clipboard screen.
+ *
+ * A native, push-only WebSocket stays connected when the Activity/webview is
+ * destroyed, so new remote items still arrive, decrypt, and surface in the panel
+ * (and in a low-priority notification). `START_STICKY` + the ClipboardBootReceiver
+ * bring the service back after a kill or reboot.
+ *
+ * Crypto mirrors the JS (`clipboardCrypto.ts`) and desktop exactly so any device
+ * can decrypt any other's items: AES-256-GCM with a key derived from the PC's
+ * `remote_secret_code` via HKDF-SHA256 (salt = "gt-clipboard-v1"). Wire format is
+ * `iv(12) || ciphertext+tag(16)`; text payloads are base64-encoded on the wire.
  */
 public class ClipboardService extends Service {
   public static final String ACTION_START = "__PACKAGE__.CLIP_START";
   public static final String ACTION_STOP = "__PACKAGE__.CLIP_STOP";
   private static final String CHANNEL = "gt_clipboard";
   private static final int NOTIF_ID = 0x6C69; // "li"
+  private static final int MAX_ITEMS = 12; // panel caps at ~8 visible; keep a few spare
 
   private WindowManager wm;
   private View bubble;
-  private WindowManager.LayoutParams lp;
+  private WindowManager.LayoutParams bubbleLp;
+  private View panel;
+  private WindowManager.LayoutParams panelLp;
   private final Handler main = new Handler(Looper.getMainLooper());
   private OkHttpClient http;
   private WebSocket socket;
@@ -59,6 +83,24 @@ public class ClipboardService extends Service {
   private boolean stopping;
   private String deviceId = "";
   private String socketUrl = "";
+
+  /** Decrypted items, newest first. Synced on `this` (touched from the WS thread
+   *  and read on the UI thread). Text only — image blobs are skipped in the panel
+   *  (open the app to view/copy images). */
+  static final class ClipEntry {
+    final String id;
+    final String text;
+    final long createdAtMs;
+    ClipEntry(String id, String text, long createdAtMs) {
+      this.id = id;
+      this.text = text;
+      this.createdAtMs = createdAtMs;
+    }
+  }
+  private final ArrayList<ClipEntry> items = new ArrayList<>();
+
+  // Crypto — derived once per service start from the persisted secret.
+  private SecretKey cryptoKey;
 
   @Override
   public IBinder onBind(Intent intent) {
@@ -73,10 +115,65 @@ public class ClipboardService extends Service {
       return START_NOT_STICKY;
     }
     startForegroundNotif();
+    deriveCryptoKey();
     showBubble();
     startSync();
     return START_STICKY;
   }
+
+  /** Derive the AES key from the persisted secret. Mirrors clipboardCrypto.ts
+   *  (HKDF-SHA256, salt = "gt-clipboard-v1", info = empty). Best-effort — if the
+   *  secret is missing/invalid the panel still shows but items stay undecrypted
+   *  (shown as "• Encrypted •" until the secret arrives). */
+  private void deriveCryptoKey() {
+    try {
+      android.content.SharedPreferences p =
+          getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE);
+      String secret = p.getString("secret", "");
+      if (secret == null || secret.isEmpty()) {
+        cryptoKey = null;
+        return;
+      }
+      byte[] ikm = secret.getBytes(StandardCharsets.UTF_8);
+      byte[] salt = "gt-clipboard-v1".getBytes(StandardCharsets.UTF_8);
+      byte[] prk = hmacSha256(salt, ikm);
+      // HKDF-Expand: T(1) = HMAC(prk, info || 0x01) with empty info, L=32 (one block).
+      byte[] info = new byte[0];
+      byte[] input = new byte[info.length + 1];
+      System.arraycopy(info, 0, input, 0, info.length);
+      input[info.length] = 0x01;
+      byte[] okm = hmacSha256(prk, input);
+      cryptoKey = new SecretKeySpec(okm, 0, 32, "AES");
+    } catch (Exception ignored) {
+      cryptoKey = null;
+    }
+  }
+
+  private static byte[] hmacSha256(byte[] key, byte[] msg) throws Exception {
+    javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+    mac.init(new SecretKeySpec(key, "HmacSHA256"));
+    return mac.doFinal(msg);
+  }
+
+  /** Decrypt `iv(12) || ciphertext+tag` with AES-256-GCM. Returns null on any
+   *  failure (the panel row shows a placeholder instead). */
+  private String decryptText(String b64Cipher) {
+    if (cryptoKey == null || b64Cipher == null) return null;
+    try {
+      byte[] all = android.util.Base64.decode(b64Cipher, android.util.Base64.DEFAULT);
+      if (all == null || all.length < 13) return null;
+      byte[] iv = new byte[12];
+      System.arraycopy(all, 0, iv, 0, 12);
+      Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+      c.init(Cipher.DECRYPT_MODE, cryptoKey, new GCMParameterSpec(128, iv));
+      byte[] pt = c.doFinal(all, 12, all.length - 12);
+      return new String(pt, StandardCharsets.UTF_8);
+    } catch (Exception ignored) {
+      return null;
+    }
+  }
+
+  // ---- sync socket ----------------------------------------------------------
 
   /** Keep one idle push socket alive. History/decryption stays lazy in the UI. */
   private void startSync() {
@@ -147,9 +244,41 @@ public class ClipboardService extends Service {
         getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
             .edit().putLong("nativeRev", rev).apply();
       }
-      if (!"item".equals(v.optString("t")) || v.optBoolean("deleted", false)) return;
+      if (!"item".equals(v.optString("t"))) return;
+      if (v.optBoolean("deleted", false)) {
+        String id = v.optString("itemId", "");
+        if (!id.isEmpty()) {
+          synchronized (this) {
+            for (int i = items.size() - 1; i >= 0; i--) {
+              if (id.equals(items.get(i).id)) items.remove(i);
+            }
+          }
+          main.post(this::refreshPanelIfOpen);
+        }
+        return;
+      }
+      // Skip our own items (the webview already added them locally).
       if (deviceId.equals(v.optString("deviceId"))) return;
+      // Skip images (no preview in the native panel; the app shows them).
+      if ("image".equals(v.optString("kind"))) {
+        main.post(this::showNewItemAttention);
+        return;
+      }
+      String cipher = v.optString("textCipher", "");
+      String plain = decryptText(cipher);
+      if (plain == null) return;
+      String id = v.optString("itemId", "");
+      long created = parseIsoMs(v.optString("createdUtc", ""));
+      synchronized (this) {
+        // Dedupe by id (rev-driven re-broadcasts happen).
+        for (int i = items.size() - 1; i >= 0; i--) {
+          if (id.equals(items.get(i).id)) items.remove(i);
+        }
+        items.add(0, new ClipEntry(id, plain, created));
+        while (items.size() > MAX_ITEMS) items.remove(items.size() - 1);
+      }
       main.post(this::showNewItemAttention);
+      main.post(this::refreshPanelIfOpen);
     } catch (Exception ignored) {
     }
   }
@@ -182,6 +311,24 @@ public class ClipboardService extends Service {
     for (int i = 0; i < 8; i++) out.append(String.format(java.util.Locale.US, "%02x", h[i] & 0xff));
     return out.toString();
   }
+
+  /** Parse an RFC3339/ISO-8601 timestamp to epoch ms (best-effort; 0 on failure). */
+  private static long parseIsoMs(String s) {
+    if (s == null || s.isEmpty()) return System.currentTimeMillis();
+    try {
+      // T => space; trim trailing Z so java.text ISO parsing is optional.
+      String t = s.replace('T', ' ');
+      if (t.endsWith("Z")) t = t.substring(0, t.length() - 1);
+      java.text.SimpleDateFormat f = new java.text.SimpleDateFormat(
+          "yyyy-MM-dd HH:mm:ss", java.util.Locale.US);
+      f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+      return f.parse(t).getTime();
+    } catch (Exception ignored) {
+      return System.currentTimeMillis();
+    }
+  }
+
+  // ---- foreground service / notification ------------------------------------
 
   private void startForegroundNotif() {
     createChannel();
@@ -222,7 +369,7 @@ public class ClipboardService extends Service {
             : new Notification.Builder(this);
     return b.setSmallIcon(getApplicationInfo().icon)
         .setContentTitle("Shared clipboard")
-        .setContentText("Tap the bubble to open your clipboard")
+        .setContentText("Tap the bubble to view recent clips")
         .setContentIntent(pi)
         .setOngoing(true)
         .build();
@@ -232,6 +379,8 @@ public class ClipboardService extends Service {
     DisplayMetrics m = getResources().getDisplayMetrics();
     return Math.round(v * m.density);
   }
+
+  // ---- bubble ---------------------------------------------------------------
 
   private void showBubble() {
     if (bubble != null) return;
@@ -257,7 +406,7 @@ public class ClipboardService extends Service {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
             ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             : WindowManager.LayoutParams.TYPE_PHONE;
-    lp =
+    bubbleLp =
         new WindowManager.LayoutParams(
             size,
             size,
@@ -265,19 +414,20 @@ public class ClipboardService extends Service {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT);
-    lp.gravity = Gravity.TOP | Gravity.START;
-    lp.x = dp(12);
-    lp.y = dp(120);
+    bubbleLp.gravity = Gravity.TOP | Gravity.START;
+    bubbleLp.x = dp(12);
+    bubbleLp.y = dp(120);
 
     view.setOnTouchListener(new DragTap());
     try {
-      wm.addView(view, lp);
+      wm.addView(view, bubbleLp);
       bubble = view;
     } catch (Exception ignored) {
     }
   }
 
-  /** Drag to move + snap to the nearest side; a tap (little movement) opens the app. */
+  /** Drag the bubble + snap to the nearest side; a tap (little movement) opens
+   *  the floating mini-panel instead of launching the app. */
   private class DragTap implements View.OnTouchListener {
     private int startX, startY;
     private float touchX, touchY;
@@ -288,8 +438,8 @@ public class ClipboardService extends Service {
     public boolean onTouch(View v, MotionEvent e) {
       switch (e.getAction()) {
         case MotionEvent.ACTION_DOWN:
-          startX = lp.x;
-          startY = lp.y;
+          startX = bubbleLp.x;
+          startY = bubbleLp.y;
           touchX = e.getRawX();
           touchY = e.getRawY();
           downTime = System.currentTimeMillis();
@@ -299,16 +449,16 @@ public class ClipboardService extends Service {
           int dx = (int) (e.getRawX() - touchX);
           int dy = (int) (e.getRawY() - touchY);
           if (Math.abs(dx) > dp(4) || Math.abs(dy) > dp(4)) moved = true;
-          lp.x = startX + dx;
-          lp.y = startY + dy;
+          bubbleLp.x = startX + dx;
+          bubbleLp.y = startY + dy;
           try {
-            wm.updateViewLayout(bubble, lp);
+            wm.updateViewLayout(bubble, bubbleLp);
           } catch (Exception ignored) {
           }
           return true;
         case MotionEvent.ACTION_UP:
           if (!moved && System.currentTimeMillis() - downTime < 400) {
-            openApp();
+            showPanel();
           } else {
             snapToEdge();
           }
@@ -321,11 +471,290 @@ public class ClipboardService extends Service {
 
   private void snapToEdge() {
     DisplayMetrics m = getResources().getDisplayMetrics();
-    lp.x = (lp.x + bubble.getWidth() / 2 < m.widthPixels / 2) ? dp(12) : m.widthPixels - bubble.getWidth() - dp(12);
+    bubbleLp.x = (bubbleLp.x + bubble.getWidth() / 2 < m.widthPixels / 2)
+        ? dp(12) : m.widthPixels - bubble.getWidth() - dp(12);
     try {
-      wm.updateViewLayout(bubble, lp);
+      wm.updateViewLayout(bubble, bubbleLp);
     } catch (Exception ignored) {
     }
+  }
+
+  // ---- floating mini-panel --------------------------------------------------
+
+  /** Inflate the floating panel near the bubble. Idempotent — a tap while open
+   *  just dismisses it (toggle behavior). */
+  private void showPanel() {
+    if (panel != null) {
+      hidePanel();
+      return;
+    }
+    if (wm == null) wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+    if (wm == null) return;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(this)) {
+      return;
+    }
+
+    DisplayMetrics m = getResources().getDisplayMetrics();
+    int widthPx = Math.min(dp(300), m.widthPixels - dp(24));
+    int heightPx = Math.min(dp(420), m.heightPixels - dp(96));
+
+    LinearLayout root = new LinearLayout(this);
+    root.setOrientation(LinearLayout.VERTICAL);
+    GradientDrawable card = new GradientDrawable();
+    card.setColor(0xF012151F);
+    card.setCornerRadius(dp(18));
+    card.setStroke(dp(1), 0x33FFFFFF);
+    root.setBackground(card);
+    root.setElevation(dp(10));
+    root.setPadding(dp(12), dp(10), dp(12), dp(12));
+
+    // Header.
+    LinearLayout header = new LinearLayout(this);
+    header.setOrientation(LinearLayout.HORIZONTAL);
+    header.setGravity(Gravity.CENTER_VERTICAL);
+    TextView title = new TextView(this);
+    title.setText("Clipboard");
+    title.setTextColor(Color.WHITE);
+    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+    LinearLayout titleWrap = new LinearLayout(this);
+    titleWrap.setOrientation(LinearLayout.HORIZONTAL);
+    titleWrap.setGravity(Gravity.CENTER_VERTICAL);
+    ImageView icon = new ImageView(this);
+    icon.setImageResource(getApplicationInfo().icon);
+    icon.setColorFilter(0xFF22D3EE);
+    LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(18), dp(18));
+    iconLp.rightMargin = dp(6);
+    titleWrap.addView(icon, iconLp);
+    titleWrap.addView(title);
+    header.addView(titleWrap, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+    Button close = new Button(this);
+    close.setText("✕");
+    close.setTextColor(0xFF94A3B8);
+    close.setBackgroundColor(Color.TRANSPARENT);
+    close.setPadding(dp(8), 0, dp(2), 0);
+    close.setOnClickListener((v) -> hidePanel());
+    header.addView(close, new LinearLayout.LayoutParams(dp(40), dp(28)));
+    root.addView(header);
+
+    // Scrollable list of recent items.
+    ScrollView scroll = new ScrollView(this);
+    scroll.setVerticalScrollBarEnabled(false);
+    LinearLayout list = new LinearLayout(this);
+    list.setOrientation(LinearLayout.VERTICAL);
+    LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
+    scrollLp.topMargin = dp(6);
+    scroll.addView(list);
+    root.addView(scroll, scrollLp);
+
+    // Footer: Copy last + Open app.
+    LinearLayout footer = new LinearLayout(this);
+    footer.setOrientation(LinearLayout.HORIZONTAL);
+    footer.setGravity(Gravity.CENTER_VERTICAL);
+    int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+        ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        : WindowManager.LayoutParams.TYPE_PHONE;
+    panelLp = new WindowManager.LayoutParams(
+        widthPx,
+        heightPx,
+        type,
+        // Watch outside touches so tapping anywhere off the panel dismisses it.
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+        PixelFormat.TRANSLUCENT);
+    panelLp.gravity = Gravity.TOP | Gravity.START;
+    // Anchor next to the bubble (clamped on-screen).
+    int panelX = bubbleLp.x + dp(52);
+    if (panelX + widthPx > m.widthPixels - dp(8)) panelX = Math.max(dp(8), bubbleLp.x - widthPx - dp(8));
+    int panelY = bubbleLp.y;
+    if (panelY + heightPx > m.heightPixels - dp(8)) panelY = Math.max(dp(8), m.heightPixels - heightPx - dp(8));
+    panelLp.x = panelX;
+    panelLp.y = panelY;
+
+    Button copyLast = new Button(this);
+    copyLast.setText("Copy last");
+    styleBtn(copyLast, true);
+    copyLast.setOnClickListener((v) -> {
+      String t = newestText();
+      if (t == null) {
+        toast("Nothing to copy yet");
+        return;
+      }
+      setOsClipboard(t);
+      toast("Copied");
+    });
+    footer.addView(copyLast, new LinearLayout.LayoutParams(0, dp(38), 1f));
+
+    Button openApp = new Button(this);
+    openApp.setText("Open app");
+    styleBtn(openApp, false);
+    LinearLayout.LayoutParams openLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+    openLp.leftMargin = dp(8);
+    openApp.setOnClickListener((v) -> {
+      hidePanel();
+      openApp();
+    });
+    footer.addView(openApp, openLp);
+
+    LinearLayout.LayoutParams footerLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    footerLp.topMargin = dp(8);
+    root.addView(footer, footerLp);
+
+    // Outside-touch handler at the root: ACTION_OUTSIDE / back press dismisses.
+    root.setOnTouchListener((v, ev) -> {
+      if (ev.getAction() == MotionEvent.ACTION_OUTSIDE) {
+        hidePanel();
+        return true;
+      }
+      return false;
+    });
+
+    panel = root;
+    try {
+      wm.addView(root, panelLp);
+    } catch (Exception ignored) {
+      panel = null;
+    }
+    renderList(list);
+  }
+
+  private void hidePanel() {
+    if (panel == null || wm == null) return;
+    try {
+      wm.removeView(panel);
+    } catch (Exception ignored) {
+    }
+    panel = null;
+  }
+
+  /** If the panel is open, rebuild its list to reflect new/deleted items. */
+  private void refreshPanelIfOpen() {
+    if (panel == null) return;
+    ScrollView scroll = (ScrollView) ((LinearLayout) panel).getChildAt(1);
+    if (scroll == null || scroll.getChildCount() == 0) return;
+    LinearLayout list = (LinearLayout) scroll.getChildAt(0);
+    list.removeAllViews();
+    renderList(list);
+  }
+
+  /** Populate the list with the current items. Each row taps to copy. */
+  private void renderList(LinearLayout list) {
+    ArrayList<ClipEntry> snapshot;
+    synchronized (this) {
+      snapshot = new ArrayList<>(items);
+    }
+    if (snapshot.isEmpty()) {
+      TextView empty = new TextView(this);
+      empty.setText("Nothing here yet.\nCopy something on your PC and it appears here.");
+      empty.setTextColor(0xFF94A3B8);
+      empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+      empty.setLineSpacing(dp(2), 1f);
+      empty.setPadding(dp(8), dp(16), dp(8), dp(16));
+      list.addView(empty);
+      return;
+    }
+    long now = System.currentTimeMillis();
+    for (ClipEntry e : snapshot) {
+      LinearLayout row = new LinearLayout(this);
+      row.setOrientation(LinearLayout.VERTICAL);
+      GradientDrawable rowBg = new GradientDrawable();
+      rowBg.setColor(0x14FFFFFF);
+      rowBg.setCornerRadius(dp(12));
+      row.setBackground(rowBg);
+      row.setPadding(dp(10), dp(8), dp(10), dp(8));
+      LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+      rowLp.bottomMargin = dp(6);
+
+      TextView body = new TextView(this);
+      body.setText(truncate(e.text, 140));
+      body.setTextColor(0xFFE2E8F0);
+      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+      body.setMaxLines(2);
+      body.setEllipsize(android.text.TextUtils.TruncateAt.END);
+      row.addView(body);
+
+      TextView meta = new TextView(this);
+      meta.setText(relativeTime(e.createdAtMs, now));
+      meta.setTextColor(0xFF64748B);
+      meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+      LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+      metaLp.topMargin = dp(3);
+      row.addView(meta, metaLp);
+
+      row.setOnClickListener((v) -> {
+        setOsClipboard(e.text);
+        toast("Copied");
+      });
+      list.addView(row, rowLp);
+    }
+  }
+
+  private void styleBtn(Button b, boolean primary) {
+    GradientDrawable bg = new GradientDrawable();
+    bg.setCornerRadius(dp(10));
+    if (primary) {
+      bg.setColor(0xFF7C5CFF);
+      b.setTextColor(Color.WHITE);
+    } else {
+      bg.setColor(0x1FFFFFFF);
+      b.setTextColor(0xFFE2E8F0);
+    }
+    b.setBackground(bg);
+    b.setPadding(0, 0, 0, 0);
+    b.setAllCaps(false);
+    b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+    b.setStateListAnimator(null);
+  }
+
+  private String newestText() {
+    synchronized (this) {
+      for (ClipEntry e : items) {
+        if (e.text != null && !e.text.isEmpty()) return e.text;
+      }
+    }
+    return null;
+  }
+
+  private void setOsClipboard(String text) {
+    try {
+      ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+      if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("GameTracker", text));
+    } catch (Exception ignored) {
+    }
+  }
+
+  private void toast(String msg) {
+    try {
+      Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+    } catch (Exception ignored) {
+    }
+  }
+
+  private static String truncate(String s, int max) {
+    if (s == null) return "";
+    String one = s.replaceAll("\\s+", " ").trim();
+    if (one.length() <= max) return one;
+    return one.substring(0, max) + "…";
+  }
+
+  private static String relativeTime(long then, long now) {
+    long sec = Math.max(0, (now - then) / 1000);
+    if (sec < 45) return "just now";
+    if (sec < 90) return "a minute ago";
+    long min = sec / 60;
+    if (min < 45) return min + " minutes ago";
+    if (min < 90) return "an hour ago";
+    long hr = min / 60;
+    if (hr < 24) return hr + " hours ago";
+    long day = hr / 24;
+    if (day == 1) return "yesterday";
+    if (day < 7) return day + " days ago";
+    return day / 7 + (day / 7 == 1 ? " week ago" : " weeks ago");
   }
 
   private void openApp() {
@@ -349,6 +778,13 @@ public class ClipboardService extends Service {
     socket = null;
     if (http != null) http.dispatcher().executorService().shutdown();
     http = null;
+    if (panel != null && wm != null) {
+      try {
+        wm.removeView(panel);
+      } catch (Exception ignored) {
+      }
+      panel = null;
+    }
     if (bubble != null && wm != null) {
       try {
         wm.removeView(bubble);

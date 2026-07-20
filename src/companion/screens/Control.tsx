@@ -201,6 +201,8 @@ type NetStats = {
 // ---------- tuning constants ----------
 const TAP_MS = 260; // max press time still counted as a tap
 const TAP_SLOP = 12; // max finger travel (px) still counted as a tap
+const TWO_FINGER_TAP_MS = 400; // two-finger taps are inherently slower (fingers land apart in time)
+const TWO_FINGER_TAP_SLOP = 18; // and jitter more — give a little more slack than single-finger
 const LONGPRESS_MS = 550; // stationary hold before left-button-down
 const SCROLL_STEP = 20; // finger px per wheel notch
 const MIN_ZOOM = 0.25; // 25% — match toolbar / pin scale floor
@@ -2147,6 +2149,13 @@ export function ControlScreen({
   const scrollAcc = useRef({ x: 0, y: 0 });
   const downT = useRef(0);
   const maxMove = useRef(0);
+  // Two-finger taps need their OWN timing/movement window: `downT`/`maxMove` are
+  // set at the FIRST pointer-down and never updated when finger two lands, so a
+  // slow two-finger tap (fingers rarely land within 50ms of each other) failed the
+  // single-finger TAP_MS test. These track the moment finger two landed and how
+  // much the two-finger centroid moved since then — independent of finger one.
+  const twoDownT = useRef(0);
+  const twoMaxMove = useRef(0);
   const downCount = useRef(0);
   const touchPressed = useRef(false);
   const longTimer = useRef<number | null>(null);
@@ -2287,6 +2296,11 @@ export function ControlScreen({
       const [a, b] = [...pts.current.values()];
       prevMid.current = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
       twoStart.current = { dist: Math.hypot(a.x - b.x, a.y - b.y), midX: prevMid.current.x, midY: prevMid.current.y, zoom: zoomRef.current };
+      // Start the two-finger tap clock from THIS moment (finger two's landing),
+      // not from finger one's earlier pointer-down. Resets on every second-finger
+      // landing so a re-tap after a pinch gets a fresh window.
+      twoDownT.current = now;
+      twoMaxMove.current = 0;
     }
   };
 
@@ -2317,6 +2331,10 @@ export function ControlScreen({
         const dm = Math.hypot(midX - twoStart.current.midX, midY - twoStart.current.midY);
         if (dd > 14 && dd >= dm) twoMode.current = "pinch";
         else if (dm > 14) twoMode.current = "scroll";
+        // Accumulate centroid travel for the two-finger tap test (below). Only
+        // matters while mode is still undecided — once it becomes pinch/scroll,
+        // it's not a tap regardless of how little it moved.
+        if (dm > twoMaxMove.current) twoMaxMove.current = dm;
       }
       if (twoMode.current === "pinch") {
         const r = rect();
@@ -2386,6 +2404,12 @@ export function ControlScreen({
     if (pts.current.size === 0) {
       const g = gesture.current;
       const wasTap = maxMove.current < TAP_SLOP && now - downT.current < TAP_MS;
+      // Two-finger tap test: independent window measured from when finger TWO
+      // landed (not finger one), with more slack for timing + jitter. The old
+      // test used the single-finger `wasTap`, which a slow two-finger tap (fingers
+      // landing ~150ms apart) routinely failed on TAP_MS alone.
+      const twoWasTap =
+        twoMaxMove.current < TWO_FINGER_TAP_SLOP && now - twoDownT.current < TWO_FINGER_TAP_MS;
       const primaryClick =
         e.button === 0 &&
         g !== "two" &&
@@ -2394,11 +2418,11 @@ export function ControlScreen({
       if (mode === "touch") {
         if (touchPressed.current) send({ type: "up", button: "left" });
         else if (wasTap && downCount.current === 1) send({ type: "click", button: "left" });
-        if (downCount.current === 2 && wasTap && twoMode.current === "undecided") sendRightClick();
+        if (downCount.current === 2 && twoWasTap && twoMode.current === "undecided") sendRightClick();
       } else if (g === "dragging") {
         send({ type: "up", button: "left" });
       } else if (g === "two") {
-        if (twoMode.current === "undecided" && wasTap && downCount.current === 2) sendRightClick();
+        if (twoMode.current === "undecided" && twoWasTap && downCount.current === 2) sendRightClick();
       } else if (g === "cursor" && wasTap && downCount.current === 1) {
         send({ type: "click", button: "left" });
       }

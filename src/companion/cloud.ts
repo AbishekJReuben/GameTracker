@@ -1184,6 +1184,10 @@ export class CloudConn {
           deviceId: a?.deviceId ?? "",
           name: a?.name ?? "Phone",
           secret: a?.secret || undefined,
+          // Ask the host to include the shared-clipboard secret on its auth-ok.
+          // Lets the companion derive its clip key without the user typing the
+          // permanent key by hand. The host only honors this AFTER approving us.
+          wantSecret: true,
         }),
       );
       this.authSentCount++;
@@ -2653,6 +2657,15 @@ export class CloudConn {
           void this.maybeStartWc();
           // Same for DIRECT audio — closes the lag behind near-instant video.
           void this.maybeStartAudioDirect();
+          // Shared-clipboard secret: the host attaches it to auth-ok ONLY when we
+          // asked (wantSecret) and only after it approved us. Forward as an event
+          // so the companion's clip store can derive its key and start syncing
+          // without the user typing the permanent key by hand. Older hosts won't
+          // include it — the manual-entry path still works as a fallback.
+          const secret = (msg as { secret?: string }).secret;
+          if (typeof secret === "string" && secret) {
+            this.emitEvent({ event: "secret", secret });
+          }
         } else if (state === "pending") {
           this.authState = "pending";
           this.authStallSince = 0;

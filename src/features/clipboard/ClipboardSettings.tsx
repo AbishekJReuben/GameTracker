@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { ClipboardList, Layers, Zap, Mic } from "lucide-react";
 import { api } from "@/lib/api";
@@ -92,7 +93,15 @@ export function ClipboardSettings() {
         </>
       )}
 
-      {intro && <ClipboardIntro onClose={() => setIntro(false)} onEnabled={refresh} />}
+      {/* Portal to document.body: this section lives inside a transformed, clipped
+          Settings <Panel>, where a position:fixed modal would be trapped and its
+          bottom buttons cut off. Escaping the panel makes the overlay cover the
+          viewport as intended (same pattern as Modal/Captures). */}
+      {intro &&
+        createPortal(
+          <ClipboardIntro onClose={() => setIntro(false)} onEnabled={refresh} />,
+          typeof document !== "undefined" ? document.body : (undefined as never),
+        )}
     </div>
   );
 }

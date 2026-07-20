@@ -89,6 +89,14 @@ interface HostOptions {
    * capture path (multi-monitor pop-out tabs). Primary hosts leave this unset.
    */
   fixedMonitor?: number;
+  /**
+   * The PC's `remote_secret_code`. Sent to an AUTHORIZED guest that asked for it
+   * (their auth message carried `wantSecret:true`) so the companion's shared
+   * clipboard can derive its encryption key without the user typing the permanent
+   * key by hand. Only ever attached to the auth-ok event — never broadcast, never
+   * sent to an unauthorized peer. Aux (pop-out) hosts leave this unset.
+   */
+  clipboardSecret?: string;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -1513,6 +1521,9 @@ export function startHost(opts: HostOptions): () => void {
     // Access gate: the screen/audio capture and input injection stay off until the
     // guest is authorized (trusted device, correct secret, or user approval).
     let authorized = false;
+    // Latest auth message from this peer asked for the clipboard secret. Reset per
+    // session and re-read on every auth message (the guest resends auth periodically).
+    let lastAuthWantedSecret = false;
     // True while an auth decision is in flight (checkAuth call or approval prompt).
     // Guests RE-SEND their auth every few seconds until answered (the first ask can
     // be lost around channel-open) — this guard keeps a retry from stacking a
@@ -1607,7 +1618,18 @@ export function startHost(opts: HostOptions): () => void {
       } catch {
         /* ignore */
       }
-      if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "ok" }));
+      if (dataCh?.readyState === "open") {
+        // Attach the shared-clipboard secret ONLY when (a) this host has one
+        // configured and (b) the guest explicitly asked for it on its auth
+        // message. Never broadcast — it rides the auth-ok the guest already
+        // trusts, and only after the user approved this device. Aux pop-out
+        // hosts have no secret and skip this entirely.
+        const authOk: Record<string, unknown> = { event: "auth", state: "ok" };
+        if (opts.clipboardSecret && lastAuthWantedSecret) {
+          authOk.secret = opts.clipboardSecret;
+        }
+        dataCh.send(JSON.stringify(authOk));
+      }
     };
 
     // Pre-gather a small candidate pool so a reconnect/ICE-restart has paths ready
@@ -2417,8 +2439,15 @@ export function startHost(opts: HostOptions): () => void {
         // already-authorized session re-acks "ok" instead of staying silent (a lost
         // "ok" used to wedge the phone in "authorizing" until an app restart).
         if (msg && msg.type === "auth") {
+          // The guest may ask the host to include the shared-clipboard secret on
+          // the auth-ok event (so the companion's clipboard can derive its key
+          // without the user typing the permanent key). Captured here and read by
+          // the authorize() callback above — the secret only ships post-approval.
+          lastAuthWantedSecret = msg.wantSecret === true;
           if (authorized) {
-            if (dataCh?.readyState === "open") dataCh.send(JSON.stringify({ event: "auth", state: "ok" }));
+            const ack: Record<string, unknown> = { event: "auth", state: "ok" };
+            if (opts.clipboardSecret && lastAuthWantedSecret) ack.secret = opts.clipboardSecret;
+            if (dataCh?.readyState === "open") dataCh.send(JSON.stringify(ack));
             return;
           }
           if (authBusy) {

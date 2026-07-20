@@ -39,6 +39,7 @@ import { ControlScreen } from "./screens/Control";
 import { SystemScreen } from "./screens/System";
 import { SettingsScreen } from "./screens/Settings";
 import ClipboardScreen from "./screens/Clipboard";
+import { useCompanionClip } from "./clipboardCompanion";
 import { GameDetailScreen } from "./screens/GameDetail";
 import { useOpenGame, closeGame } from "./ui";
 import { ScreenErrorBoundary } from "./ErrorBoundary";
@@ -120,6 +121,16 @@ export function CompanionApp() {
       autoConnRef.current = null;
       setConn(null);
       setPhase("pairing");
+    });
+    // Shared clipboard: the host attaches the PC's remote_secret_code to auth-ok
+    // (only after it approved us). Forward it to the clip store so it can derive
+    // its key and start syncing without the user typing the permanent key. The
+    // host only sends this when the user has already trusted this device.
+    c.onEvent((e) => {
+      if (e.event === "secret" && typeof e.secret === "string" && e.secret) {
+        localStorage.setItem(LS_SECRET, e.secret);
+        void useCompanionClip.getState().setSecret(e.secret);
+      }
     });
     setCloudMode(c);
     setConn(c);

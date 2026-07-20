@@ -17,13 +17,17 @@ export function RemoteHostManager() {
   const setCloudClients = useRemoteHost((s) => s.setCloudClients);
   const setHostStats = useRemoteHost((s) => s.setHostStats);
   const setPendingApproval = useRemoteHost((s) => s.setPendingApproval);
-  const cfg = useRef({ on: false, url: "", code: "" });
+  // Track every value that affects the host: enabling/disabling cloud, the room
+  // code, OR a rotated permanent key all require a host restart to take effect.
+  // The secret is forwarded to authorized companions so their shared clipboard
+  // can derive its encryption key without the user typing the permanent key.
+  const cfg = useRef({ on: false, url: "", code: "", secret: "" });
   const stopRef = useRef<null | (() => void)>(null);
 
   useEffect(() => {
     let alive = true;
 
-    const restart = (on: boolean, url: string, code: string) => {
+    const restart = (on: boolean, url: string, code: string, secret: string) => {
       stopRef.current?.();
       stopRef.current = null;
       setCloudClients(0);
@@ -32,6 +36,7 @@ export function RemoteHostManager() {
         stopRef.current = startHost({
           signalUrl: url,
           code,
+          clipboardSecret: secret || undefined,
           onClients: (n) => alive && setCloudClients(n),
           onStats: (s) => alive && setHostStats(s),
           // An untrusted device raises the app-wide approval prompt; the modal
@@ -48,10 +53,11 @@ export function RemoteHostManager() {
         const on = !!s.cloudEnabled;
         const url = s.signalUrl ?? "";
         const code = s.code ?? "";
+        const secret = s.secretCode ?? "";
         const c = cfg.current;
-        if (on !== c.on || url !== c.url || code !== c.code) {
-          cfg.current = { on, url, code };
-          restart(on, url, code);
+        if (on !== c.on || url !== c.url || code !== c.code || secret !== c.secret) {
+          cfg.current = { on, url, code, secret };
+          restart(on, url, code, secret);
         }
       } catch {
         /* transient poll error */

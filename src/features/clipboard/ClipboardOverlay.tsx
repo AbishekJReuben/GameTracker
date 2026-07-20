@@ -68,9 +68,15 @@ export default function ClipboardOverlay() {
   const [pulse, setPulse] = useState(false);
 
   // The overlay window is transparent — clear any global page background.
+  // #root carries an opaque #06070d from index.html / index.css, which would
+  // paint a solid dark square behind the transparent bubble. Restore on unmount
+  // (though this route is dedicated to the overlay, so it never unmounts in practice).
   useEffect(() => {
     document.documentElement.style.background = "transparent";
     document.body.style.background = "transparent";
+    const root = document.getElementById("root");
+    const prevRootBg = root?.style.background ?? "";
+    if (root) root.style.background = "transparent";
     invoke<Record<string, string>>("get_settings")
       .then((s) => setSttEnabled(s.clipboard_stt_enabled === "true"))
       .catch(() => {});
@@ -80,6 +86,7 @@ export default function ClipboardOverlay() {
     });
     return () => {
       un.then((f) => f());
+      if (root && prevRootBg !== "") root.style.background = prevRootBg;
     };
   }, []);
 
