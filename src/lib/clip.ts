@@ -26,6 +26,9 @@ export interface ClipItem {
   pinned: boolean;
   /** Folder/list label for the notes view ("" = unfiled). */
   folder?: string;
+  /** Every UTC timestamp this exact content was copied/added (dedup history).
+   *  Shown on the app screens; usually a single entry. */
+  copies?: string[];
   deleted?: boolean;
   synced?: boolean;
 }
@@ -43,6 +46,7 @@ export interface ClipAddInput {
   deviceName?: string | null;
   pinned?: boolean;
   folder?: string;
+  copies?: string[];
 }
 
 /** True on the desktop app (where the Rust clipboard commands exist). */
@@ -70,6 +74,21 @@ export const clip = {
   setFolder: (id: string, folder: string, propagate = true) =>
     invoke<void>("clipboard_set_folder", { id, folder, propagate }),
   folders: () => invoke<string[]>("clipboard_folders"),
+  /** Create an empty folder that syncs to every device. */
+  createFolder: (name: string) => invoke<void>("clipboard_create_folder", { name }),
+  /** Delete a folder everywhere (its notes move to unfiled). */
+  deleteFolder: (name: string) => invoke<void>("clipboard_delete_folder", { name }),
+  /** Apply a remote folder entity (kind='folder' notice) locally. */
+  applyFolder: (args: {
+    id: string;
+    name: string;
+    createdUtc?: string;
+    deviceId?: string;
+    deviceName?: string | null;
+    deleted?: boolean;
+  }) => invoke<void>("clipboard_apply_folder", args),
+  /** One-time retroactive dedup; returns tombstoned loser ids to propagate. */
+  dedupe: () => invoke<string[]>("clipboard_dedupe"),
   copy: (id: string) => invoke<void>("clipboard_copy", { id }),
   imageB64: (id: string) => invoke<string | null>("clipboard_image_b64", { id }),
   clearAll: () => invoke<void>("clipboard_clear_all"),

@@ -32,6 +32,13 @@ pub struct ClipItem {
     /// Folder/list label for the notes view ("" = unfiled).
     #[serde(default)]
     pub folder: String,
+    /// Stable fingerprint of the content (text/image bytes) for dedup. Not shown.
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// Every UTC timestamp this exact content was copied/added (dedup history).
+    /// The app screens show all of these; a single-entry list is the normal case.
+    #[serde(default)]
+    pub copies: Vec<String>,
     #[serde(default)]
     pub deleted: bool,
     #[serde(default)]
@@ -59,7 +66,33 @@ pub struct ClipInput {
     #[serde(default)]
     pub folder: String,
     #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub copies: Vec<String>,
+    #[serde(default)]
     pub synced: bool,
+}
+
+/// Stable content fingerprint (hex), namespaced by kind so a text item and an
+/// image that hash-collide never dedupe each other. Callers pass the raw content
+/// bytes (text bytes / image file bytes).
+pub fn content_hash(kind: &str, bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut h);
+    bytes.hash(&mut h);
+    format!("{}:{:016x}", kind, h.finish())
+}
+
+/// Parse the stored `copies` JSON array; a NULL/blank/garbage column → empty vec.
+fn parse_copies(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Serialize a copies list to the JSON stored in the column.
+fn copies_json(copies: &[String]) -> String {
+    serde_json::to_string(copies).unwrap_or_else(|_| "[]".into())
 }
 
 fn from_row(r: &Row) -> rusqlite::Result<ClipItem> {
@@ -77,32 +110,49 @@ fn from_row(r: &Row) -> rusqlite::Result<ClipItem> {
         source: r.get("source")?,
         pinned: r.get::<_, i64>("pinned")? != 0,
         folder: r.get::<_, Option<String>>("folder")?.unwrap_or_default(),
+        content_hash: r.get::<_, Option<String>>("content_hash")?,
+        copies: parse_copies(r.get::<_, Option<String>>("copies")?),
         deleted: r.get::<_, i64>("deleted")? != 0,
         synced: r.get::<_, i64>("synced")? != 0,
     })
 }
 
 const COLS: &str = "id, kind, text, image_path, thumb_path, mime, size, created_utc, \
-                    device_id, device_name, source, pinned, folder, deleted, synced";
+                    device_id, device_name, source, pinned, folder, content_hash, copies, \
+                    deleted, synced";
+
+/// Item lists never surface folder entities (kind='folder' rows are the synced
+/// empty-folder registry, not notes).
+const NOT_FOLDER: &str = "kind != 'folder'";
 
 /// Insert (or replace, idempotent by id) an item. Used for both local captures
 /// and applied remote items — `id` is the dedupe key so a re-delivered remote
 /// item can't duplicate.
 pub fn upsert(pool: &DbPool, i: &ClipInput) -> AppResult<()> {
     let conn = pool.get()?;
-    // NOTE: created_utc is NOT updated on conflict — an edit (re-delivery with the
-    // same id) keeps the item's original position in time. `deleted` resets to 0 so
-    // a re-add revives a tombstone (matches the relay's behavior).
+    // A single-entry copies list is the default when a caller doesn't track one
+    // (e.g. an applied remote item that predates the feature) — seed it with the
+    // item's created_utc so the app screens always have at least one date.
+    let copies = if i.copies.is_empty() {
+        vec![i.created_utc.clone()]
+    } else {
+        i.copies.clone()
+    };
+    // created_utc + copies ARE updated on conflict now: an edit or a dedup re-add
+    // carries a fresh timestamp and must jump the item to the top on every device.
+    // `deleted` resets to 0 so a re-add revives a tombstone (matches the relay).
     conn.execute(
         "INSERT INTO clipboard_items
             (id, kind, text, image_path, thumb_path, mime, size, created_utc,
-             device_id, device_name, source, pinned, folder, deleted, synced)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?14,0,?13)
+             device_id, device_name, source, pinned, folder, content_hash, copies,
+             deleted, synced)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?14,?15,?16,0,?13)
          ON CONFLICT(id) DO UPDATE SET
             text=excluded.text, image_path=excluded.image_path,
             thumb_path=excluded.thumb_path, mime=excluded.mime, size=excluded.size,
-            pinned=excluded.pinned, folder=excluded.folder, deleted=0,
-            synced=excluded.synced",
+            pinned=excluded.pinned, folder=excluded.folder,
+            content_hash=excluded.content_hash, copies=excluded.copies,
+            created_utc=excluded.created_utc, deleted=0, synced=excluded.synced",
         rusqlite::params![
             i.id,
             i.kind,
@@ -118,19 +168,69 @@ pub fn upsert(pool: &DbPool, i: &ClipInput) -> AppResult<()> {
             i.pinned as i64,
             i.synced as i64,
             i.folder,
+            i.content_hash,
+            copies_json(&copies),
         ],
     )?;
     Ok(())
 }
 
-/// Edit a text item in place (notes). Marks it unsynced so the JS sync engine
-/// re-uploads it (same id → the relay upserts + rebroadcasts to other devices).
-pub fn update_text(pool: &DbPool, id: &str, text: &str) -> AppResult<bool> {
+/// Find a live (non-deleted) note whose content matches `hash`, newest first.
+/// Used to dedupe a re-copy of identical content into the existing item instead
+/// of a new row. Folder entities are excluded.
+pub fn find_by_hash(pool: &DbPool, hash: &str) -> AppResult<Option<ClipItem>> {
     let conn = pool.get()?;
+    let item = conn
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM clipboard_items
+                 WHERE deleted = 0 AND content_hash = ?1 AND {NOT_FOLDER}
+                 ORDER BY created_utc DESC LIMIT 1"
+            ),
+            [hash],
+            from_row,
+        )
+        .ok();
+    Ok(item)
+}
+
+/// Bump an existing item to the top (new created_utc) and append `stamp` to its
+/// copy history, marking it unsynced so the sync engine re-uploads it. Returns
+/// the refreshed row for the caller to emit.
+pub fn bump_to_top(pool: &DbPool, id: &str, stamp: &str) -> AppResult<Option<ClipItem>> {
+    let Some(mut item) = get(pool, id)? else {
+        return Ok(None);
+    };
+    item.copies.push(stamp.to_string());
+    // Keep the history bounded + chronological; dedupe exact-equal stamps.
+    item.copies.sort();
+    item.copies.dedup();
+    if item.copies.len() > 200 {
+        let start = item.copies.len() - 200;
+        item.copies.drain(0..start);
+    }
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE clipboard_items
+         SET created_utc = ?2, copies = ?3, synced = 0
+         WHERE id = ?1",
+        rusqlite::params![id, stamp, copies_json(&item.copies)],
+    )?;
+    get(pool, id)
+}
+
+/// Edit a text item in place (notes). Bumps it to the top (fresh `now`) and
+/// refreshes its content hash so future dedup matches the new text. Marks it
+/// unsynced so the JS sync engine re-uploads it (same id → the relay upserts +
+/// rebroadcasts to other devices, jumping it to the top there too).
+pub fn update_text(pool: &DbPool, id: &str, text: &str, now: &str) -> AppResult<bool> {
+    let conn = pool.get()?;
+    let hash = content_hash("text", text.as_bytes());
     let changed = conn.execute(
-        "UPDATE clipboard_items SET text = ?2, size = ?3, synced = 0
+        "UPDATE clipboard_items
+         SET text = ?2, size = ?3, created_utc = ?4, content_hash = ?5, synced = 0
          WHERE id = ?1 AND deleted = 0 AND kind = 'text'",
-        rusqlite::params![id, text, text.len() as i64],
+        rusqlite::params![id, text, text.len() as i64, now, hash],
     )?;
     Ok(changed > 0)
 }
@@ -145,8 +245,10 @@ pub fn set_folder(pool: &DbPool, id: &str, folder: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Distinct non-empty folder names across live items (for the filter chips),
-/// alphabetical.
+/// Every folder name to show as a chip: the union of (a) folders that live items
+/// are filed under and (b) folder entities (empty folders created + synced as
+/// kind='folder' rows). Both carry the name in the `folder` column, so this is a
+/// single DISTINCT. Alphabetical.
 pub fn list_folders(pool: &DbPool) -> AppResult<Vec<String>> {
     let conn = pool.get()?;
     let mut stmt = conn.prepare(
@@ -155,6 +257,137 @@ pub fn list_folders(pool: &DbPool) -> AppResult<Vec<String>> {
          ORDER BY folder COLLATE NOCASE ASC",
     )?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Create (or revive) a folder entity by name — a `kind='folder'` row carrying the
+/// name in its `folder` column (the same plaintext carrier the wire uses).
+/// Idempotent by name (case-insensitive) so two devices converge. The row is
+/// unsynced so the sync engine uploads it as a `kind='folder'` item.
+pub fn create_folder(
+    pool: &DbPool,
+    name: &str,
+    device_id: &str,
+    device_name: Option<&str>,
+    now: &str,
+) -> AppResult<ClipItem> {
+    let name = name.trim();
+    let existing: Option<String> = {
+        let conn = pool.get()?;
+        conn.query_row(
+            "SELECT id FROM clipboard_items
+             WHERE deleted = 0 AND kind = 'folder' AND folder = ?1 COLLATE NOCASE
+             LIMIT 1",
+            [name],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    let id = existing.unwrap_or_else(|| format!("folder-{}", uuid::Uuid::new_v4()));
+    let item = ClipInput {
+        id: id.clone(),
+        kind: "folder".into(),
+        text: None,
+        image_path: None,
+        thumb_path: None,
+        mime: None,
+        size: 0,
+        created_utc: now.to_string(),
+        device_id: device_id.to_string(),
+        device_name: device_name.map(|s| s.to_string()),
+        source: "folder".into(),
+        pinned: false,
+        folder: name.to_string(),
+        content_hash: None,
+        copies: Vec::new(),
+        synced: false,
+    };
+    upsert(pool, &item)?;
+    get(pool, &id)?.ok_or_else(|| crate::error::AppError::msg("folder vanished after insert"))
+}
+
+/// Apply a remote folder entity (kind='folder' notice) into the local store,
+/// keeping its id/timestamp so it converges. `deleted` tombstones it.
+pub fn apply_folder_entity(
+    pool: &DbPool,
+    id: &str,
+    name: &str,
+    created_utc: &str,
+    device_id: Option<&str>,
+    device_name: Option<&str>,
+    deleted: bool,
+) -> AppResult<()> {
+    if deleted {
+        let conn = pool.get()?;
+        conn.execute(
+            "UPDATE clipboard_items SET deleted = 1 WHERE id = ?1",
+            [id],
+        )?;
+        return Ok(());
+    }
+    let item = ClipInput {
+        id: id.to_string(),
+        kind: "folder".into(),
+        text: None,
+        image_path: None,
+        thumb_path: None,
+        mime: None,
+        size: 0,
+        created_utc: created_utc.to_string(),
+        device_id: device_id.unwrap_or("").to_string(),
+        device_name: device_name.map(|s| s.to_string()),
+        source: "folder".into(),
+        pinned: false,
+        folder: name.to_string(),
+        content_hash: None,
+        copies: Vec::new(),
+        synced: true, // already on the relay
+    };
+    upsert(pool, &item)
+}
+
+/// Live folder entities (for the sync engine's initial upload backlog).
+pub fn list_folder_entities(pool: &DbPool) -> AppResult<Vec<ClipItem>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM clipboard_items
+         WHERE deleted = 0 AND kind = 'folder'
+         ORDER BY created_utc ASC"
+    ))?;
+    let rows = stmt.query_map([], from_row)?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Tombstone the folder entity for `name` (case-insensitive). Returns the entity
+/// ids that were tombstoned so the caller can propagate the deletes. Member items
+/// are NOT deleted here — the caller unfiles them separately.
+pub fn tombstone_folder(pool: &DbPool, name: &str) -> AppResult<Vec<String>> {
+    let conn = pool.get()?;
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM clipboard_items
+             WHERE deleted = 0 AND kind = 'folder' AND folder = ?1 COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([name], |r| r.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).collect()
+    };
+    conn.execute(
+        "UPDATE clipboard_items SET deleted = 1
+         WHERE kind = 'folder' AND folder = ?1 COLLATE NOCASE",
+        [name],
+    )?;
+    Ok(ids)
+}
+
+/// Ids of live items filed under `folder` (case-insensitive) — so a folder delete
+/// can unfile (and propagate) each member.
+pub fn ids_in_folder(pool: &DbPool, folder: &str) -> AppResult<Vec<String>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM clipboard_items
+         WHERE deleted = 0 AND kind != 'folder' AND folder = ?1 COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([folder], |r| r.get::<_, String>(0))?;
     Ok(rows.filter_map(Result::ok).collect())
 }
 
@@ -181,7 +414,7 @@ pub fn list(pool: &DbPool, before_utc: Option<&str>, limit: i64) -> AppResult<Ve
         Some(before) => {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {COLS} FROM clipboard_items
-                 WHERE deleted = 0 AND created_utc < ?1
+                 WHERE deleted = 0 AND {NOT_FOLDER} AND created_utc < ?1
                  ORDER BY created_utc DESC LIMIT ?2"
             ))?;
             let rows = stmt.query_map(rusqlite::params![before, limit], from_row)?;
@@ -192,7 +425,7 @@ pub fn list(pool: &DbPool, before_utc: Option<&str>, limit: i64) -> AppResult<Ve
         None => {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {COLS} FROM clipboard_items
-                 WHERE deleted = 0
+                 WHERE deleted = 0 AND {NOT_FOLDER}
                  ORDER BY created_utc DESC LIMIT ?1"
             ))?;
             let rows = stmt.query_map([limit], from_row)?;
@@ -210,7 +443,7 @@ pub fn list_pinned(pool: &DbPool) -> AppResult<Vec<ClipItem>> {
     let conn = pool.get()?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM clipboard_items
-         WHERE deleted = 0 AND pinned = 1
+         WHERE deleted = 0 AND pinned = 1 AND {NOT_FOLDER}
          ORDER BY created_utc DESC"
     ))?;
     let rows = stmt.query_map([], from_row)?;
@@ -236,6 +469,104 @@ pub fn list_unsynced(pool: &DbPool, limit: i64) -> AppResult<Vec<ClipItem>> {
         out.push(row?);
     }
     Ok(out)
+}
+
+/// One-time retroactive dedup: backfill `content_hash` for every live note and
+/// merge pre-existing duplicates (same content) into a single item, unioning all
+/// their copy timestamps and tombstoning the extras. Returns
+/// `(survivors, loser_ids)` — survivors to re-emit so their merged history syncs,
+/// loser ids to propagate as deletes. Idempotent: a second run finds nothing to
+/// merge (hashes are already set and duplicates already collapsed).
+pub fn dedupe_existing(pool: &DbPool) -> AppResult<(Vec<ClipItem>, Vec<String>)> {
+    use std::collections::HashMap;
+    // Snapshot every live note (folder entities excluded).
+    let items: Vec<ClipItem> = {
+        let conn = pool.get()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLS} FROM clipboard_items
+             WHERE deleted = 0 AND {NOT_FOLDER}
+             ORDER BY created_utc ASC"
+        ))?;
+        let rows = stmt.query_map([], from_row)?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    // Compute/backfill each item's content hash. Images that have lost their file
+    // are left without a hash (never merged blindly).
+    let mut hash_of: HashMap<String, String> = HashMap::new();
+    for it in &items {
+        let hash = match it.kind.as_str() {
+            "text" => Some(content_hash("text", it.text.clone().unwrap_or_default().as_bytes())),
+            "image" => it
+                .image_path
+                .as_ref()
+                .and_then(|p| std::fs::read(p).ok())
+                .map(|bytes| content_hash("image", &bytes)),
+            _ => None,
+        };
+        if let Some(h) = hash {
+            // Persist the backfilled hash so future captures dedup against it.
+            if it.content_hash.as_deref() != Some(h.as_str()) {
+                let conn = pool.get()?;
+                let _ = conn.execute(
+                    "UPDATE clipboard_items SET content_hash = ?2 WHERE id = ?1",
+                    rusqlite::params![it.id, h],
+                );
+            }
+            hash_of.insert(it.id.clone(), h);
+        }
+    }
+
+    // Group by hash; a group of >1 is a set of duplicates to collapse.
+    let mut groups: HashMap<String, Vec<&ClipItem>> = HashMap::new();
+    for it in &items {
+        if let Some(h) = hash_of.get(&it.id) {
+            groups.entry(h.clone()).or_default().push(it);
+        }
+    }
+
+    let mut survivors = Vec::new();
+    let mut losers = Vec::new();
+    for (_h, group) in groups {
+        if group.len() < 2 {
+            continue;
+        }
+        // Survivor = newest (last, since we ordered ASC). Union every member's
+        // copy history + its own created_utc into the survivor's copies.
+        let survivor = *group.last().unwrap();
+        let mut copies: Vec<String> = Vec::new();
+        for m in &group {
+            copies.extend(m.copies.iter().cloned());
+            copies.push(m.created_utc.clone());
+        }
+        copies.sort();
+        copies.dedup();
+        if copies.len() > 200 {
+            let start = copies.len() - 200;
+            copies.drain(0..start);
+        }
+        // Preserve a pin if any member was pinned.
+        let pinned = group.iter().any(|m| m.pinned);
+        {
+            let conn = pool.get()?;
+            conn.execute(
+                "UPDATE clipboard_items SET copies = ?2, pinned = ?3, synced = 0 WHERE id = ?1",
+                rusqlite::params![survivor.id, copies_json(&copies), pinned as i64],
+            )?;
+        }
+        for m in &group {
+            if m.id == survivor.id {
+                continue;
+            }
+            let (img, thumb) = tombstone(pool, &m.id)?;
+            crate::clipboard::remove_files([img, thumb]);
+            losers.push(m.id.clone());
+        }
+        if let Some(row) = get(pool, &survivor.id)? {
+            survivors.push(row);
+        }
+    }
+    Ok((survivors, losers))
 }
 
 pub fn mark_synced(pool: &DbPool, id: &str) -> AppResult<()> {

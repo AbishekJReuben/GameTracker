@@ -467,6 +467,27 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 24;
     }
 
+    if version < 25 {
+        // Dedup-to-top + copy history:
+        //  - `content_hash` is a stable fingerprint of the item's content (text
+        //    bytes / image bytes), so a re-copy of the SAME content finds the
+        //    existing row instead of inserting a duplicate.
+        //  - `copies` is a JSON array of every UTC timestamp this content was
+        //    copied/added, so the app screens can show all the dates.
+        // Empty folders also sync now, stored as kind='folder' rows (text = the
+        // folder name) that ride the same relay pipeline as clips but never show
+        // in the item lists.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE clipboard_items ADD COLUMN content_hash TEXT;
+            ALTER TABLE clipboard_items ADD COLUMN copies TEXT;
+            CREATE INDEX IF NOT EXISTS idx_clip_hash ON clipboard_items(content_hash);
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 25;")?;
+        version = 25;
+    }
+
     let _ = version;
     Ok(())
 }

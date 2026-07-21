@@ -31,7 +31,7 @@ type Notice = {
   itemId?: string;
   deviceId?: string;
   deviceName?: string | null;
-  kind?: "text" | "image";
+  kind?: "text" | "image" | "folder";
   mime?: string | null;
   size?: number;
   createdUtc?: string;
@@ -40,6 +40,7 @@ type Notice = {
   deleted?: boolean;
   pinned?: boolean;
   folder?: string | null;
+  copies?: string[] | null;
 };
 
 class ClipSyncManager {
@@ -266,10 +267,28 @@ class ClipSyncManager {
     if (v.t === "synced") {
       this.bumpRev(v.rev);
       await this.flushBacklog();
+      await this.dedupeOnce();
       return;
     }
     if (v.t !== "item" || !v.itemId) return;
     this.bumpRev(v.rev);
+
+    // Folder entity (empty-folder registry). Apply regardless of origin — a bare
+    // registry row has no content to duplicate.
+    if (v.kind === "folder") {
+      await clip
+        .applyFolder({
+          id: v.itemId,
+          name: v.folder ?? "",
+          createdUtc: v.createdUtc,
+          deviceId: v.deviceId ?? undefined,
+          deviceName: v.deviceName ?? null,
+          deleted: v.deleted ?? false,
+        })
+        .catch(() => {});
+      this.onChange?.();
+      return;
+    }
 
     // Our own items echoed back on a catch-up — already local, skip the work.
     if (v.deviceId && v.deviceId === this.deviceId && !v.deleted) return;
@@ -308,6 +327,7 @@ class ClipSyncManager {
             source: v.deviceName ? "android" : "remote",
             pinned: v.pinned ?? false,
             folder: v.folder ?? "",
+            copies: v.copies ?? undefined,
           },
           true,
         );
@@ -324,6 +344,7 @@ class ClipSyncManager {
             source: v.deviceName ? "android" : "remote",
             pinned: v.pinned ?? false,
             folder: v.folder ?? "",
+            copies: v.copies ?? undefined,
           },
           true,
         );
@@ -334,12 +355,52 @@ class ClipSyncManager {
     }
   }
 
+  /** Run the one-time retroactive dedup (merge pre-existing duplicate notes) once
+   *  the link is up, then propagate the tombstoned losers over the relay. Guarded
+   *  by a localStorage flag so it runs a single time per device. */
+  private async dedupeOnce(): Promise<void> {
+    const flag = `gt.clip.deduped.v1.${this.clipId}`;
+    if (localStorage.getItem(flag)) return;
+    try {
+      const losers = await clip.dedupe();
+      for (const id of losers) this.sendDelete(id);
+      // Survivors were marked unsynced by the merge — re-upload their merged
+      // copy history now.
+      await this.flushBacklog();
+      localStorage.setItem(flag, String(Date.now()));
+      this.onChange?.();
+    } catch {
+      /* try again on the next reconnect */
+    }
+  }
+
   private ready(): boolean {
     return !!this.ws && this.ws.readyState === WebSocket.OPEN && !!this.key;
   }
 
   private async uploadItem(item: ClipItem): Promise<void> {
     if (!this.ready() || !this.key) return;
+    // Folder entity (empty-folder registry) — a plaintext, content-less row that
+    // rides the same relay pipeline as clips (kind='folder', name in `folder`).
+    if ((item.kind as string) === "folder") {
+      this.ws!.send(
+        JSON.stringify({
+          t: "add",
+          item: {
+            itemId: item.id,
+            deviceId: item.deviceId,
+            deviceName: item.deviceName,
+            kind: "folder",
+            size: 0,
+            createdUtc: item.createdUtc,
+            folder: item.folder ?? "",
+            hasBlob: false,
+          },
+        }),
+      );
+      await clip.markSynced(item.id).catch(() => {});
+      return;
+    }
     try {
       if (item.kind === "image") {
         const b64 = await clip.imageB64(item.id);
@@ -360,6 +421,7 @@ class ClipSyncManager {
               createdUtc: item.createdUtc,
               pinned: item.pinned,
               folder: item.folder ?? "",
+              copies: item.copies ?? [],
               hasBlob: true,
             },
           }),
@@ -379,6 +441,7 @@ class ClipSyncManager {
               createdUtc: item.createdUtc,
               pinned: item.pinned,
               folder: item.folder ?? "",
+              copies: item.copies ?? [],
               textCipher: cipher,
               hasBlob: false,
             },

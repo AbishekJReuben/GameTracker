@@ -62,6 +62,10 @@ impl ClipState {
         // Additive migration: folder/list label for the notes rebrand. Ignore the
         // "duplicate column" error on an already-migrated store.
         let _ = conn.execute("ALTER TABLE items ADD COLUMN folder TEXT", []);
+        // Additive migration: `copies` is a JSON array of the UTC timestamps this
+        // exact content was copied/added (the dedup-to-top history). Client owns
+        // the merge; the relay just stores + echoes the array verbatim.
+        let _ = conn.execute("ALTER TABLE items ADD COLUMN copies TEXT", []);
         Arc::new(Self {
             db: Mutex::new(conn),
             blob_dir: data_dir.join("clip-blobs"),
@@ -99,17 +103,22 @@ impl ClipState {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let folder = item.get("folder").and_then(|v| v.as_str());
-        // NOTE: created_utc is NOT updated on conflict — an edit (re-add with the
-        // same itemId) keeps the item's original position in time.
+        // `copies` rides as a JSON array (of copy timestamps). Store its text
+        // verbatim; the client is the source of truth for the merged history.
+        let copies = item.get("copies").filter(|v| v.is_array()).map(|v| v.to_string());
+        // NOTE: created_utc IS updated on conflict now — both an edit and a
+        // duplicate-dedup re-add carry a fresh createdUtc and must jump the item
+        // to the top on every device (the notes now sort newest-touched first).
         conn.execute(
             "INSERT INTO items
                 (clip_id, item_id, rev, device_id, device_name, kind, mime, size,
-                 created_utc, text_cipher, has_blob, deleted, pinned, folder)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13)
+                 created_utc, text_cipher, has_blob, deleted, pinned, folder, copies)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13,?14)
              ON CONFLICT(clip_id, item_id) DO UPDATE SET
                 rev=excluded.rev, text_cipher=excluded.text_cipher,
                 has_blob=excluded.has_blob, pinned=excluded.pinned, size=excluded.size,
-                mime=excluded.mime, folder=excluded.folder, deleted=0",
+                mime=excluded.mime, folder=excluded.folder, deleted=0,
+                created_utc=excluded.created_utc, copies=excluded.copies",
             rusqlite::params![
                 clip_id,
                 item_id,
@@ -123,20 +132,11 @@ impl ClipState {
                 text_cipher,
                 has_blob as i64,
                 pinned as i64,
-                folder
+                folder,
+                copies,
             ],
         )
         .ok()?;
-        // Preserve the ORIGINAL created_utc in the broadcast (an edit's payload may
-        // carry a slightly different one; the row is authoritative).
-        let created_row: Option<String> = conn
-            .query_row(
-                "SELECT created_utc FROM items WHERE clip_id=?1 AND item_id=?2",
-                rusqlite::params![clip_id, item_id],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten();
         Some(row_notice(
             rev,
             &item_id,
@@ -145,12 +145,13 @@ impl ClipState {
             kind,
             mime,
             size,
-            created_row.as_deref().or(created),
+            created,
             text_cipher,
             has_blob,
             false,
             pinned,
             folder,
+            copies.as_deref(),
         ))
     }
 
@@ -211,7 +212,7 @@ impl ClipState {
         };
         let Ok(mut stmt) = conn.prepare(
             "SELECT rev, item_id, device_id, device_name, kind, mime, size, created_utc,
-                    text_cipher, has_blob, deleted, pinned, folder
+                    text_cipher, has_blob, deleted, pinned, folder, copies
              FROM items WHERE clip_id=?1 AND rev>?2 ORDER BY rev ASC",
         ) else {
             return Vec::new();
@@ -231,6 +232,7 @@ impl ClipState {
                 r.get::<_, i64>(10)? != 0,
                 r.get::<_, i64>(11)? != 0,
                 r.get::<_, Option<String>>(12)?.as_deref(),
+                r.get::<_, Option<String>>(13)?.as_deref(),
             ))
         });
         match rows {
@@ -319,7 +321,13 @@ fn row_notice(
     deleted: bool,
     pinned: bool,
     folder: Option<&str>,
+    copies: Option<&str>,
 ) -> serde_json::Value {
+    // `copies` is stored as a JSON-array string; emit it back as real JSON so the
+    // client gets an array (not a string). Anything unparseable → null.
+    let copies_json = copies
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .filter(|v| v.is_array());
     json!({
         "t": "item",
         "rev": rev,
@@ -335,6 +343,7 @@ fn row_notice(
         "deleted": deleted,
         "pinned": pinned,
         "folder": folder,
+        "copies": copies_json,
     })
 }
 
@@ -506,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_roundtrip_and_edit_keeps_created() {
+    fn folder_roundtrip_and_edit_bumps_to_top() {
         let s = temp_state("folder");
         s.upsert("c", &text_item("a", "d")).unwrap();
         // Bare folder move.
@@ -514,8 +523,8 @@ mod tests {
         assert_eq!(n.get("folder").unwrap().as_str().unwrap(), "work");
         let replay = s.items_since("c", 0);
         assert_eq!(replay[0].get("folder").unwrap().as_str().unwrap(), "work");
-        // An edit (re-add, same id, different createdUtc + folder in payload)
-        // keeps the ORIGINAL created_utc but applies the new folder.
+        // An edit (re-add, same id, fresh createdUtc + folder in payload) now BUMPS
+        // the item to the top: created_utc becomes the incoming value.
         let mut edited = text_item("a", "d");
         edited["textCipher"] = json!("BBBB");
         edited["createdUtc"] = json!("2030-01-01T00:00:00.000Z");
@@ -523,11 +532,50 @@ mod tests {
         let n2 = s.upsert("c", &edited).unwrap();
         assert_eq!(
             n2.get("createdUtc").unwrap().as_str().unwrap(),
-            "2026-07-20T00:00:00.000Z"
+            "2030-01-01T00:00:00.000Z"
         );
         assert_eq!(n2.get("folder").unwrap().as_str().unwrap(), "notes");
         assert_eq!(n2.get("textCipher").unwrap().as_str().unwrap(), "BBBB");
         assert!(s.set_folder("c", "nope", "x").is_none());
+    }
+
+    #[test]
+    fn copies_history_roundtrips() {
+        let s = temp_state("copies");
+        let mut it = text_item("a", "d");
+        it["copies"] = json!(["2026-07-20T00:00:00.000Z"]);
+        s.upsert("c", &it).unwrap();
+        // Re-add with a grown copies history + newer createdUtc (a dedup bump).
+        it["copies"] = json!(["2026-07-20T00:00:00.000Z", "2026-07-21T00:00:00.000Z"]);
+        it["createdUtc"] = json!("2026-07-21T00:00:00.000Z");
+        let n = s.upsert("c", &it).unwrap();
+        let copies = n.get("copies").unwrap().as_array().unwrap();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(n.get("createdUtc").unwrap().as_str().unwrap(), "2026-07-21T00:00:00.000Z");
+        // Replay carries the array back as real JSON.
+        let replay = s.items_since("c", 0);
+        assert_eq!(replay[0].get("copies").unwrap().as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn folder_entity_syncs_like_an_item() {
+        // A folder is just an item with kind="folder"; it rides the same pipeline
+        // so empty folders replay to every device.
+        let s = temp_state("folderentity");
+        let folder = json!({
+            "itemId": "folder:x",
+            "deviceId": "d",
+            "deviceName": "Test",
+            "kind": "folder",
+            "size": 0,
+            "createdUtc": "2026-07-21T00:00:00.000Z",
+            "folder": "Work",
+        });
+        let n = s.upsert("c", &folder).unwrap();
+        assert_eq!(n.get("kind").unwrap().as_str().unwrap(), "folder");
+        assert_eq!(n.get("folder").unwrap().as_str().unwrap(), "Work");
+        let replay = s.items_since("c", 0);
+        assert_eq!(replay[0].get("kind").unwrap().as_str().unwrap(), "folder");
     }
 
     #[test]

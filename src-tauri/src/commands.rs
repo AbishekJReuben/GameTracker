@@ -2508,6 +2508,9 @@ pub struct ClipAddInput {
     pub pinned: Option<bool>,
     /// Folder/list label for the notes view ("" = unfiled).
     pub folder: Option<String>,
+    /// Copy-history timestamps (present when applying a remote item that carries
+    /// a merged dedup history).
+    pub copies: Option<Vec<String>>,
 }
 
 fn decode_b64(s: &str) -> AppResult<Vec<u8>> {
@@ -2598,18 +2601,27 @@ pub fn clipboard_add(
         }
     });
 
-    let (image_path, thumb_path, mime, size) = if input.kind == "image" {
+    let (image_path, thumb_path, mime, size, content_hash) = if input.kind == "image" {
         let raw = decode_b64(input.image_base64.as_deref().unwrap_or_default())?;
         let png = to_png(&raw);
+        let hash = clip_store::content_hash("image", &png);
         let (ip, tp, sz) = crate::clipboard::save_image(&state.media_dir, &id, &png)?;
-        (Some(ip), Some(tp), Some("image/png".to_string()), sz)
+        (
+            Some(ip),
+            Some(tp),
+            Some("image/png".to_string()),
+            sz,
+            Some(hash),
+        )
     } else {
         let size = input.text.as_ref().map(|t| t.len() as i64).unwrap_or(0);
+        let hash = clip_store::content_hash("text", input.text.as_deref().unwrap_or_default().as_bytes());
         (
             None,
             None,
             input.mime.clone().or(Some("text/plain".into())),
             size,
+            Some(hash),
         )
     };
 
@@ -2627,6 +2639,8 @@ pub fn clipboard_add(
         source,
         pinned: input.pinned.unwrap_or(false),
         folder: input.folder.unwrap_or_default(),
+        content_hash,
+        copies: input.copies.unwrap_or_default(),
         synced: remote, // remote items are already on the relay
     };
 
@@ -2682,7 +2696,12 @@ pub fn clipboard_update_text(
     id: String,
     text: String,
 ) -> AppResult<ClipItem> {
-    if !clip_store::update_text(&state.pool, &id, &text)? {
+    // Bump the edited note to the top (fresh timestamp), the same wire shape every
+    // client emits/parses (millis + literal Z).
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    if !clip_store::update_text(&state.pool, &id, &text, &now)? {
         return Err(AppError::msg("item not found or not editable"));
     }
     let saved = clip_store::get(&state.pool, &id)?
@@ -2717,6 +2736,99 @@ pub fn clipboard_set_folder(
 #[tauri::command]
 pub fn clipboard_folders(state: State<AppState>) -> AppResult<Vec<String>> {
     clip_store::list_folders(&state.pool)
+}
+
+/// Create an (empty) folder that syncs to every device. Stored as a kind='folder'
+/// entity; emits `clipboard://item` so the sync engine uploads it to the relay.
+#[tauri::command]
+pub fn clipboard_create_folder(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    name: String,
+) -> AppResult<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let device_id = crate::clipboard::device_id(&state.pool);
+    let device_name = crate::clipboard::device_name();
+    let folder = clip_store::create_folder(&state.pool, name, &device_id, Some(&device_name), &now)?;
+    let _ = app.emit("clipboard://item", &folder);
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(())
+}
+
+/// Delete a folder everywhere: tombstone the folder entity AND unfile its notes
+/// (they move to "unfiled", not deleted). Both the entity deletes and the folder
+/// moves propagate over the relay.
+#[tauri::command]
+pub fn clipboard_delete_folder(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    name: String,
+) -> AppResult<()> {
+    // Unfile members first (propagate each move).
+    for id in clip_store::ids_in_folder(&state.pool, &name)? {
+        clip_store::set_folder(&state.pool, &id, "")?;
+        let _ = app.emit("clipboard://folder", &(id, String::new()));
+    }
+    // Tombstone the entity rows + propagate their deletes.
+    for id in clip_store::tombstone_folder(&state.pool, &name)? {
+        let _ = app.emit("clipboard://delete", &id);
+    }
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(())
+}
+
+/// One-time retroactive dedup: merge pre-existing duplicate notes (same content)
+/// into one, unioning their copy timestamps + tombstoning the extras. Survivors
+/// are left unsynced so the JS backlog flush re-uploads their merged history;
+/// returns the tombstoned loser ids so the caller can propagate the deletes.
+#[tauri::command]
+pub fn clipboard_dedupe(state: State<AppState>, app: tauri::AppHandle) -> AppResult<Vec<String>> {
+    let (survivors, losers) = clip_store::dedupe_existing(&state.pool)?;
+    if !survivors.is_empty() || !losers.is_empty() {
+        let _ = app.emit("clipboard://changed", ());
+        let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    }
+    Ok(losers)
+}
+
+/// Apply a remote folder entity (kind='folder' notice) into the local store.
+/// Called by the JS sync engine; never re-emits a sync signal.
+#[tauri::command]
+pub fn clipboard_apply_folder(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+    name: String,
+    created_utc: Option<String>,
+    device_id: Option<String>,
+    device_name: Option<String>,
+    deleted: Option<bool>,
+) -> AppResult<()> {
+    let created = created_utc.unwrap_or_else(|| {
+        chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    });
+    clip_store::apply_folder_entity(
+        &state.pool,
+        &id,
+        &name,
+        &created,
+        device_id.as_deref(),
+        device_name.as_deref(),
+        deleted.unwrap_or(false),
+    )?;
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(())
 }
 
 #[tauri::command]

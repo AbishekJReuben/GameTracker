@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   NotebookPen,
@@ -140,14 +140,7 @@ export default function ClipboardScreen() {
     flashPasted("image");
   };
 
-  const folders = useMemo(() => {
-    const set = new Set<string>();
-    for (const i of s.items) {
-      const f = (i.folder ?? "").trim();
-      if (f) set.add(f);
-    }
-    return [...set].sort((a, b) => a.localeCompare(b));
-  }, [s.items]);
+  const folders = s.folders;
 
   const q = search.trim().toLowerCase();
   const match = (i: ClipItem) => {
@@ -262,7 +255,13 @@ export default function ClipboardScreen() {
         </div>
       </div>
 
-      <FolderChips folders={folders} active={folderFilter} onPick={setFolderFilter} />
+      <FolderChips
+        folders={folders}
+        active={folderFilter}
+        onPick={setFolderFilter}
+        onCreate={(name) => void s.createFolder(name)}
+        onDelete={(name) => void s.deleteFolder(name)}
+      />
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {pinned.length === 0 && rest.length === 0 ? (
@@ -289,6 +288,7 @@ export default function ClipboardScreen() {
             folders={folders}
             onLoadMore={() => {}}
             compact
+            showHistory
           />
         )}
       </div>

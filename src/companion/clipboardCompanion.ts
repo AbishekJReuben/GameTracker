@@ -57,6 +57,8 @@ export async function companionTranscribe(audioB64: string, mime: string): Promi
 
 interface CompanionClipState {
   items: ClipItem[];
+  /** Folder names to show as chips: item memberships ∪ empty-folder entities. */
+  folders: string[];
   connected: boolean;
   ready: boolean; // has a secret key configured
   deviceId: string;
@@ -67,9 +69,11 @@ interface CompanionClipState {
   setSecret: (secret: string) => Promise<void>;
   addText: (text: string, folder?: string) => Promise<void>;
   addImage: (dataUrl: string, folder?: string) => Promise<void>;
-  /** Edit a text note in place — same id, original timestamp, synced to all devices. */
+  /** Edit a text note in place — bumps it to the top, synced to all devices. */
   editText: (id: string, text: string) => Promise<void>;
   moveToFolder: (id: string, folder: string) => Promise<void>;
+  createFolder: (name: string) => Promise<void>;
+  deleteFolder: (name: string) => Promise<void>;
   copy: (id: string) => Promise<void>;
   remove: (id: string) => Promise<void>;
   togglePin: (item: ClipItem) => Promise<void>;
@@ -101,7 +105,7 @@ let nativeStartError = "";
 
 function sortItems(map: Map<string, ClipItem>): ClipItem[] {
   return [...map.values()]
-    .filter((i) => !i.deleted)
+    .filter((i) => !i.deleted && (i.kind as string) !== "folder")
     .sort((a, b) => {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       return b.createdUtc.localeCompare(a.createdUtc);
@@ -109,10 +113,35 @@ function sortItems(map: Map<string, ClipItem>): ClipItem[] {
     .slice(0, MAX_ITEMS);
 }
 
+/** Folder names: union of (a) folders live notes are filed under and (b) empty
+ *  folder entities (`folderEntities`). Alphabetical. */
+function folderNames(map: Map<string, ClipItem>, entities: Map<string, string>): string[] {
+  const set = new Set<string>();
+  for (const i of map.values()) {
+    if (i.deleted || (i.kind as string) === "folder") continue;
+    const f = (i.folder ?? "").trim();
+    if (f) set.add(f);
+  }
+  for (const name of entities.values()) {
+    const n = name.trim();
+    if (n) set.add(n);
+  }
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+
+/** Content key for in-memory dedup: identical text / identical image data URL
+ *  maps to the same existing note (bumped to the top instead of duplicated). */
+function contentKey(kind: string, text?: string | null, image?: string | null): string {
+  return kind === "image" ? `image:${image ?? ""}` : `text:${text ?? ""}`;
+}
+
 const items = new Map<string, ClipItem>();
+/** Empty-folder registry: entity id → folder name. */
+const folderEntities = new Map<string, string>();
 
 export const useCompanionClip = create<CompanionClipState>((set, get) => {
-  const publish = () => set({ items: sortItems(items) });
+  const publish = () =>
+    set({ items: sortItems(items), folders: folderNames(items, folderEntities) });
 
   const ready = () => !!ws && ws.readyState === WebSocket.OPEN && !!key;
 
@@ -147,8 +176,17 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     if (v.rev > lastRev) lastRev = v.rev;
     localStorage.setItem(`gt.clip.rev.${clipId}`, String(lastRev));
 
+    // Folder entity (empty-folder registry): a content-less kind='folder' row.
+    if (v.kind === "folder") {
+      if (v.deleted) folderEntities.delete(v.itemId);
+      else folderEntities.set(v.itemId, v.folder ?? "");
+      publish();
+      return;
+    }
+
     if (v.deleted) {
       items.delete(v.itemId);
+      folderEntities.delete(v.itemId); // a deleted folder entity has no kind field
       publish();
       return;
     }
@@ -182,6 +220,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         source: v.deviceName ? "desktop" : "remote",
         pinned: v.pinned ?? false,
         folder: v.folder ?? "",
+        copies: v.copies ?? undefined,
       };
       if (v.kind === "image" && v.hasBlob) {
         const bytes = await fetchBlob(v.itemId);
@@ -302,8 +341,60 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     if (ready()) ws!.send(JSON.stringify({ t: "add", item: cipherPayload }));
   };
 
+  // Bump an existing in-memory note to the top (fresh timestamp), appending the
+  // copy to its history, and re-upload it so every device jumps it to the top.
+  const bumpToTop = async (item: ClipItem, now: string, appendCopy = true) => {
+    const copies = appendCopy
+      ? [...new Set([...(item.copies ?? []), now])].sort()
+      : (item.copies ?? []);
+    items.set(item.id, { ...item, createdUtc: now, copies });
+    publish();
+    if (!ready() || !key) return;
+    if (item.kind === "image") {
+      ws!.send(
+        JSON.stringify({
+          t: "add",
+          item: {
+            itemId: item.id,
+            deviceId: item.deviceId,
+            deviceName: item.deviceName ?? "Phone",
+            kind: "image",
+            mime: item.mime ?? "image/png",
+            size: item.size,
+            createdUtc: now,
+            pinned: item.pinned,
+            folder: item.folder ?? "",
+            copies,
+            hasBlob: true,
+          },
+        }),
+      );
+    } else {
+      ws!.send(
+        JSON.stringify({
+          t: "add",
+          item: {
+            itemId: item.id,
+            deviceId: item.deviceId,
+            deviceName: item.deviceName ?? "Phone",
+            kind: "text",
+            mime: "text/plain",
+            size: (item.text ?? "").length,
+            createdUtc: now,
+            pinned: item.pinned,
+            folder: item.folder ?? "",
+            copies,
+            textCipher: await encryptText(key, item.text ?? ""),
+            hasBlob: false,
+          },
+        }),
+      );
+    }
+  };
+
   return {
     items: [],
+    folders: [],
     connected: false,
     ready: false,
     deviceId: "",
@@ -389,8 +480,16 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     addText: async (text, folder) => {
       const t = text.trim();
       if (!t || !key) return;
-      const id = crypto.randomUUID();
       const now = new Date().toISOString();
+      // Dedup: a re-copy of identical text bumps the existing note to the top.
+      const dup = [...items.values()].find(
+        (i) => !i.deleted && i.kind === "text" && (i.text ?? "") === t,
+      );
+      if (dup) {
+        await bumpToTop(dup, now);
+        return;
+      }
+      const id = crypto.randomUUID();
       const item: ClipItem = {
         id,
         kind: "text",
@@ -405,6 +504,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         source: "android",
         pinned: false,
         folder: folder ?? "",
+        copies: [now],
       };
       await addLocal(item, {
         itemId: id,
@@ -416,6 +516,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         createdUtc: now,
         pinned: false,
         folder: folder ?? "",
+        copies: [now],
         textCipher: await encryptText(key, t),
         hasBlob: false,
       });
@@ -423,8 +524,16 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
 
     addImage: async (dataUrl, folder) => {
       if (!key) return;
-      const id = crypto.randomUUID();
       const now = new Date().toISOString();
+      // Dedup: an identical image bumps the existing note to the top.
+      const dup = [...items.values()].find(
+        (i) => !i.deleted && i.kind === "image" && (i.imagePath ?? "") === dataUrl,
+      );
+      if (dup) {
+        await bumpToTop(dup, now);
+        return;
+      }
+      const id = crypto.randomUUID();
       const raw = b64ToBytes(dataUrl);
       const cipher = await encryptBytes(key, raw);
       const ok = await putBlob(id, cipher);
@@ -443,6 +552,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         source: "android",
         pinned: false,
         folder: folder ?? "",
+        copies: [now],
       };
       await addLocal(item, {
         itemId: id,
@@ -454,40 +564,19 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         createdUtc: now,
         pinned: false,
         folder: folder ?? "",
+        copies: [now],
         hasBlob: true,
       });
     },
 
-    // Edit = re-add under the SAME id with the ORIGINAL timestamp. The relay
-    // upserts (rev bumps, created_utc is preserved server-side) and every other
-    // device replaces its copy in place.
+    // Edit bumps the note to the top (fresh timestamp) and re-uploads it, so every
+    // device jumps it to the top too.
     editText: async (id, text) => {
       const t = text.trim();
       const cur = items.get(id);
       if (!t || !key || !cur || cur.kind !== "text") return;
-      const updated: ClipItem = { ...cur, text: t, size: t.length };
-      items.set(id, updated);
-      publish();
-      if (ready()) {
-        ws!.send(
-          JSON.stringify({
-            t: "add",
-            item: {
-              itemId: id,
-              deviceId: cur.deviceId || get().deviceId,
-              deviceName: cur.deviceName ?? "Phone",
-              kind: "text",
-              mime: "text/plain",
-              size: t.length,
-              createdUtc: cur.createdUtc,
-              pinned: cur.pinned,
-              folder: cur.folder ?? "",
-              textCipher: await encryptText(key, t),
-              hasBlob: false,
-            },
-          }),
-        );
-      }
+      // An edit bumps to the top but isn't a new "copy" — don't add a copy stamp.
+      await bumpToTop({ ...cur, text: t, size: t.length }, new Date().toISOString(), false);
     },
 
     moveToFolder: async (id, folder) => {
@@ -496,6 +585,55 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       items.set(id, { ...cur, folder });
       publish();
       if (ready()) ws!.send(JSON.stringify({ t: "folder", itemId: id, folder }));
+    },
+
+    createFolder: async (name) => {
+      const n = name.trim();
+      if (!n) return;
+      // Converge on an existing entity for this name, else mint a new id.
+      let id = [...folderEntities.entries()].find(
+        ([, v]) => v.toLowerCase() === n.toLowerCase(),
+      )?.[0];
+      if (!id) id = `folder-${crypto.randomUUID()}`;
+      folderEntities.set(id, n);
+      publish();
+      const now = new Date().toISOString();
+      if (ready()) {
+        ws!.send(
+          JSON.stringify({
+            t: "add",
+            item: {
+              itemId: id,
+              deviceId: get().deviceId,
+              deviceName: "Phone",
+              kind: "folder",
+              size: 0,
+              createdUtc: now,
+              folder: n,
+              hasBlob: false,
+            },
+          }),
+        );
+      }
+    },
+
+    deleteFolder: async (name) => {
+      const n = name.trim().toLowerCase();
+      // Unfile members (propagate each move).
+      for (const it of [...items.values()]) {
+        if ((it.folder ?? "").toLowerCase() === n && (it.kind as string) !== "folder") {
+          items.set(it.id, { ...it, folder: "" });
+          if (ready()) ws!.send(JSON.stringify({ t: "folder", itemId: it.id, folder: "" }));
+        }
+      }
+      // Tombstone matching folder entities.
+      for (const [id, v] of [...folderEntities.entries()]) {
+        if (v.toLowerCase() === n) {
+          folderEntities.delete(id);
+          if (ready()) ws!.send(JSON.stringify({ t: "delete", itemId: id }));
+        }
+      }
+      publish();
     },
 
     copy: async (id) => {

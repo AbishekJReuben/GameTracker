@@ -32,6 +32,8 @@ interface ClipStore {
   addImage: (imageBase64: string, mime?: string) => Promise<void>;
   editText: (id: string, text: string) => Promise<void>;
   moveToFolder: (id: string, folder: string) => Promise<void>;
+  createFolder: (name: string) => Promise<void>;
+  deleteFolder: (name: string) => Promise<void>;
   copy: (id: string) => Promise<void>;
   remove: (id: string) => Promise<void>;
   togglePin: (item: ClipItem) => Promise<void>;
@@ -128,6 +130,21 @@ export const useClipboard = create<ClipStore>((set, get) => ({
 
   moveToFolder: async (id, folder) => {
     await clip.setFolder(id, folder);
+    await get().refresh();
+  },
+
+  createFolder: async (name) => {
+    const n = name.trim();
+    if (!n) return;
+    await clip.createFolder(n);
+    // Open the new folder so the next note lands in it.
+    set({ folderFilter: n });
+    await get().refresh();
+  },
+
+  deleteFolder: async (name) => {
+    await clip.deleteFolder(name);
+    set((s) => ({ folderFilter: s.folderFilter === name ? null : s.folderFilter }));
     await get().refresh();
   },
 

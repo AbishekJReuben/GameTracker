@@ -338,11 +338,41 @@ fn overlay_pos(app: &AppHandle) -> (Option<f64>, Option<f64>) {
 
 /// Insert a locally-captured item and notify the webview to sync + display it.
 /// Called by the native watcher and the manual-add command.
+///
+/// Dedup-to-top: if a live note with the SAME content already exists, this bumps
+/// that existing item to the top (appending this capture's timestamp to its copy
+/// history) instead of inserting a duplicate — and drops the just-saved image
+/// file, if any. `item.content_hash` must be set by the caller (text or image);
+/// for text we compute it here as a fallback.
 pub fn add_local(
     app: &AppHandle,
     pool: &crate::db::DbPool,
-    item: ClipInput,
+    mut item: ClipInput,
 ) -> AppResult<ClipItem> {
+    if item.content_hash.is_none() && item.kind == "text" {
+        item.content_hash = Some(store::content_hash(
+            "text",
+            item.text.clone().unwrap_or_default().as_bytes(),
+        ));
+    }
+
+    // Dedup against an existing live note with identical content.
+    if let Some(hash) = item.content_hash.clone() {
+        if let Some(existing) = store::find_by_hash(pool, &hash)? {
+            if existing.id != item.id {
+                // This capture's blob is redundant — remove it from disk.
+                remove_files([item.image_path.clone(), item.thumb_path.clone()]);
+                if let Some(saved) = store::bump_to_top(pool, &existing.id, &item.created_utc)? {
+                    let _ = app.emit("clipboard://item", &saved);
+                    let _ = app.emit_to(OVERLAY_LABEL, "clipboard://item", &saved);
+                    let _ = app.emit("clipboard://changed", ());
+                    let _ = app.emit_to(OVERLAY_LABEL, "clipboard://changed", ());
+                    return Ok(saved);
+                }
+            }
+        }
+    }
+
     store::upsert(pool, &item)?;
     let saved = store::get(pool, &item.id)?
         .ok_or_else(|| crate::error::AppError::msg("clip item vanished after insert"))?;

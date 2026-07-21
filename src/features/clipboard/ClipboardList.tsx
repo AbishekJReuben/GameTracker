@@ -14,6 +14,7 @@ import {
   Pencil,
   Folder,
   FolderPlus,
+  History,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { relativeTime } from "@/lib/format";
@@ -140,6 +141,7 @@ export function ClipRow({
   onMoveToFolder,
   folders,
   compact,
+  showHistory,
 }: {
   item: ClipItem;
   onCopy: (id: string) => void;
@@ -149,13 +151,24 @@ export function ClipRow({
   onMoveToFolder?: (id: string, folder: string) => void;
   folders?: string[];
   compact?: boolean;
+  /** App screens (not the floating panels) show every date this exact item was
+   *  copied. Off in the overlay/dock. */
+  showHistory?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
+  const [datesOpen, setDatesOpen] = useState(false);
   const textRef = useRef<HTMLParagraphElement>(null);
+  // Distinct copy timestamps, newest first; only meaningful when the same content
+  // was copied more than once.
+  const copyDates = Array.from(new Set(item.copies ?? []))
+    .filter(Boolean)
+    .sort()
+    .reverse();
+  const hasHistory = !!showHistory && copyDates.length > 1;
 
   const doCopy = () => {
     haptic();
@@ -255,6 +268,16 @@ export function ClipRow({
           {item.deviceName && <span className="truncate">{item.deviceName}</span>}
           <span className="text-white/15">·</span>
           <span className="shrink-0">{relativeTime(item.createdUtc)}</span>
+          {hasHistory && (
+            <button
+              onClick={() => setDatesOpen((v) => !v)}
+              className="flex shrink-0 items-center gap-0.5 rounded px-1 py-px text-accent-3 hover:bg-white/[0.06]"
+              title="Show every time this was copied"
+            >
+              <History className="h-2.5 w-2.5" />
+              {copyDates.length}×
+            </button>
+          )}
           {isImage && item.size > 0 && (
             <>
               <span className="text-white/15">·</span>
@@ -338,6 +361,33 @@ export function ClipRow({
           />
         )}
       </AnimatePresence>
+
+      <AnimatePresence initial={false}>
+        {hasHistory && datesOpen && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            className="overflow-hidden"
+          >
+            <div className="mt-1 rounded-xl bg-white/[0.04] p-2">
+              <div className="mb-1 px-0.5 text-[9px] font-700 uppercase tracking-wide text-ink-faint">
+                Copied {copyDates.length} times
+              </div>
+              <ul className="flex flex-col gap-0.5">
+                {copyDates.map((d, i) => (
+                  <li key={d + i} className="flex items-center gap-1.5 text-[10px] text-ink-dim">
+                    <span className="h-1 w-1 shrink-0 rounded-full bg-accent-3/60" />
+                    <span className="shrink-0 tabular-nums">{new Date(d).toLocaleString()}</span>
+                    <span className="text-white/15">·</span>
+                    <span className="text-ink-faint">{relativeTime(d)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }
@@ -378,6 +428,7 @@ export function ClipboardList({
   folders,
   onLoadMore,
   compact,
+  showHistory,
 }: {
   pinned: ClipItem[];
   rest: ClipItem[];
@@ -391,6 +442,7 @@ export function ClipboardList({
   folders?: string[];
   onLoadMore: () => void;
   compact?: boolean;
+  showHistory?: boolean;
 }) {
   const sentinel = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -423,6 +475,7 @@ export function ClipboardList({
                 onMoveToFolder={onMoveToFolder}
                 folders={folders}
                 compact={compact}
+                showHistory={showHistory}
               />
             ))}
           </AnimatePresence>
@@ -441,6 +494,7 @@ export function ClipboardList({
             onMoveToFolder={onMoveToFolder}
             folders={folders}
             compact={compact}
+            showHistory={showHistory}
           />
         ))}
       </AnimatePresence>

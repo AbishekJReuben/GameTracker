@@ -233,8 +233,11 @@ unsafe fn handle_update(hwnd: HWND) {
                 source: "desktop".into(),
                 pinned: false,
                 folder: String::new(),
+                content_hash: Some(store::content_hash("image", &png)),
+                copies: Vec::new(),
                 synced: false,
             };
+            // add_local dedups: a re-copy of the same image bumps the existing note.
             let _ = crate::clipboard::add_local(&ctx.app, &ctx.pool, input);
             LAST_HASH.store(hash, Ordering::SeqCst);
         }
@@ -246,20 +249,17 @@ unsafe fn handle_update(hwnd: HWND) {
         if text.is_empty() {
             return;
         }
-        // De-dupe consecutive identical copies (in-memory guard for rapid
-        // re-fires, plus the DB check so it also holds across a restart).
+        // In-memory guard against Windows' rapid duplicate WM_CLIPBOARDUPDATE
+        // re-fires for a SINGLE copy. A deliberate re-copy of the same text later
+        // (after copying something else) flows through — add_local dedups it into
+        // the existing note and bumps that note to the top.
         let hash = content_hash("text", text.as_bytes());
         if LAST_HASH.load(Ordering::SeqCst) == hash {
             return;
         }
-        if let Ok(Some(last)) = store::latest_text(&ctx.pool) {
-            if last == text {
-                LAST_HASH.store(hash, Ordering::SeqCst);
-                return;
-            }
-        }
         let id = uuid::Uuid::new_v4().to_string();
         let size = text.len() as i64;
+        let store_hash = store::content_hash("text", text.as_bytes());
         let input = ClipInput {
             id,
             kind: "text".into(),
@@ -274,6 +274,8 @@ unsafe fn handle_update(hwnd: HWND) {
             source: "desktop".into(),
             pinned: false,
             folder: String::new(),
+            content_hash: Some(store_hash),
+            copies: Vec::new(),
             synced: false,
         };
         let _ = crate::clipboard::add_local(&ctx.app, &ctx.pool, input);

@@ -140,3 +140,4 @@ src-tauri/target/release/deps/gametracker_lib.lib
 
 # Platform pre-commit entry (Unix copy of pre-commit.sh). Windows uses .cmd.
 .githooks/pre-commit
+/signaling/target-hot/release
