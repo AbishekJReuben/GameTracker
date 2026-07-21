@@ -1234,3 +1234,27 @@ per-row copy/edit/folder/pin/share/delete.
   gesture-armed `resumeAudioCtx()` — `AudioContext.resume()` silently failing
   before the first tap was the "no sound until I toggle audio" bug.
 
+### Notes follow-up pass (v3.9.x, later July 2026 — do not regress)
+
+- **Two-finger right-click fires only on a SHORT, stationary tap** (`Control.tsx`).
+  `TWO_FINGER_TAP_MS` 450→260, `TWO_FINGER_TAP_SLOP` 24→20, and the second-finger
+  landing now RE-BASELINES both fingers' travel origins + zeroes `maxMove`; the tap
+  test requires `twoMaxMove < slop && maxMove < slop && dt < TAP_MS`. A slow
+  two-finger scroll (longer, fingers travel) can no longer register as a
+  right-click. Don't loosen these back — that reintroduces the scroll-fires-
+  right-click bug.
+- **Notes quick-jump in the remote screen** — the top-left "Go to…" menu
+  (`onNavigate`) has a pinned, accented **Notes** entry (`clipboard` tab);
+  `NavTab` includes `clipboard` and `tabAllowed` already permits it in remote-only
+  mode.
+- **Android dock open/close flicker fix** (`ClipboardService.showPanel`):
+  `renderList` + `setTranslationX`/`setAlpha(0)` run BEFORE `wm.addView` (View
+  transform props persist while detached), so the first composited frame is
+  already off-screen. The old order drew one frame at the final position then
+  jumped to the offset — that was the flicker. `hidePanel` cancels the in-flight
+  enter animation and falls back to `panelLp.width` when `getWidth()==0`.
+- **Edge-pin touch area:** the pin View is `PIN_TOUCH_W`(32dp)×`PIN_HEIGHT`(112dp)
+  but paints only a `PIN_VISIBLE_W`(13dp) outer sliver via an `InsetDrawable`
+  (pad on the inner side) — a big, easy hit/swipe target that still looks slim.
+  All pin geometry now goes through those constants (drag clamp, flip, position).
+

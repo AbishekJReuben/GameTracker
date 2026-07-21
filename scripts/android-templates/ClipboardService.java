@@ -1271,6 +1271,13 @@ public class ClipboardService extends Service {
 
   // ---- edge pin -------------------------------------------------------------
 
+  // The pin's touchable View is wide (PIN_TOUCH_W) but only paints a slim outer
+  // sliver (PIN_VISIBLE_W) — bigger hit area, same unobtrusive look. Taller than
+  // before too, so it's easier to grab.
+  private static final int PIN_TOUCH_W = 32;
+  private static final int PIN_VISIBLE_W = 13;
+  private static final int PIN_HEIGHT = 112;
+
   /** The pin is a flat, slim tab hugging a screen edge — deliberately unobtrusive
    *  (a sliver of the app's accent) until you swipe inward from it (or tap it),
    *  which slides the dock in from that edge. Vertical drags reposition it along
@@ -1296,15 +1303,15 @@ public class ClipboardService extends Service {
             : WindowManager.LayoutParams.TYPE_PHONE;
     bubbleLp =
         new WindowManager.LayoutParams(
-            dp(14), // slim: only a little of it shows
-            dp(72),
+            dp(PIN_TOUCH_W), // wide touch target; only a slim sliver is painted
+            dp(PIN_HEIGHT),
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT);
     bubbleLp.gravity = Gravity.TOP | Gravity.START;
     DisplayMetrics m = getResources().getDisplayMetrics();
-    bubbleLp.x = pinOnRight ? m.widthPixels - dp(14) : 0;
+    bubbleLp.x = pinOnRight ? m.widthPixels - dp(PIN_TOUCH_W) : 0;
     bubbleLp.y = p.getInt("pinY", dp(160));
 
     view.setOnTouchListener(new DragTap());
@@ -1374,7 +1381,11 @@ public class ClipboardService extends Service {
     });
   }
 
-  /** Flat rounded tab, rounded only on the inner side, low-opacity accent. */
+  /** Flat rounded tab, rounded only on the inner side, low-opacity accent. The
+   *  VIEW is {@link #PIN_TOUCH_W}dp wide for an easy hit target, but only the
+   *  outer {@link #PIN_VISIBLE_W}dp sliver is painted — the rest is transparent,
+   *  touchable space toward the screen centre, so the pin is easy to grab/swipe
+   *  without looking bulky. */
   private void styleEdgePin(View view) {
     GradientDrawable bg = new GradientDrawable();
     bg.setColors(new int[] {0xE07C5CFF, 0xE022D3EE});
@@ -1384,7 +1395,11 @@ public class ClipboardService extends Service {
     bg.setCornerRadii(pinOnRight
         ? new float[] {r, r, 0, 0, 0, 0, r, r}   // round left side
         : new float[] {0, 0, r, r, r, r, 0, 0}); // round right side
-    view.setBackground(bg);
+    int pad = dp(PIN_TOUCH_W - PIN_VISIBLE_W);
+    android.graphics.drawable.InsetDrawable inset = pinOnRight
+        ? new android.graphics.drawable.InsetDrawable(bg, pad, 0, 0, 0)  // gradient hugs the RIGHT edge
+        : new android.graphics.drawable.InsetDrawable(bg, 0, 0, pad, 0); // gradient hugs the LEFT edge
+    view.setBackground(inset);
     view.setElevation(dp(4));
     view.setAlpha(0.9f);
   }
@@ -1426,7 +1441,7 @@ public class ClipboardService extends Service {
             return true;
           }
           // Otherwise slide vertically along the edge (x stays pinned to the side).
-          bubbleLp.y = Math.max(0, Math.min(m.heightPixels - dp(72), startY + dy));
+          bubbleLp.y = Math.max(0, Math.min(m.heightPixels - dp(PIN_HEIGHT), startY + dy));
           try {
             wm.updateViewLayout(bubble, bubbleLp);
           } catch (Exception ignored) {
@@ -1615,20 +1630,26 @@ public class ClipboardService extends Service {
     });
 
     panel = root;
+    // Populate the history BEFORE the window is shown so there's no empty→filled
+    // pop-in during the slide.
+    renderList(list);
+    // Set the slide-in offset + transparent state BEFORE attaching: View transform
+    // properties persist while detached, so the very first frame the compositor
+    // draws is already off-screen and faded. Setting them AFTER addView (the old
+    // order) drew one frame at the final position, then jumped to the offset to
+    // animate — that one-frame jump was the open flicker.
+    root.setTranslationX(pinOnRight ? widthPx : -widthPx);
+    root.setAlpha(0f);
     try {
       wm.addView(root, panelLp);
-      // Slide in from the pinned edge.
-      root.setTranslationX(pinOnRight ? widthPx : -widthPx);
-      root.setAlpha(0.4f);
       root.animate()
           .translationX(0f).alpha(1f)
-          .setDuration(240)
+          .setDuration(220)
           .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f))
           .start();
     } catch (Exception ignored) {
       panel = null;
     }
-    renderList(list);
   }
 
   /** Header: app icon, title, live sync status, flip-side + close controls. */
@@ -2114,7 +2135,7 @@ public class ClipboardService extends Service {
     if (bubble != null && bubbleLp != null) {
       DisplayMetrics m = getResources().getDisplayMetrics();
       styleEdgePin(bubble);
-      bubbleLp.x = pinOnRight ? m.widthPixels - dp(14) : 0;
+      bubbleLp.x = pinOnRight ? m.widthPixels - dp(PIN_TOUCH_W) : 0;
       try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
     }
     // Re-open on the new side.
@@ -2136,9 +2157,16 @@ public class ClipboardService extends Service {
     dockEditingId = null;
     folderPickForId = null;
     final boolean right = pinOnRight;
-    final int w = p.getWidth();
+    // Fall back to the laid-out width if getWidth() is 0 (rapid open→close before
+    // a layout pass) — a 0 slide would just alpha-blink instead of sliding out.
+    int width = p.getWidth();
+    if (width <= 0 && panelLp != null) width = panelLp.width;
+    final int w = width;
+    // Cancel any in-flight enter animation so the exit starts from the current
+    // position instead of fighting it (a visible stutter when you close mid-open).
+    p.animate().cancel();
     p.animate()
-        .translationX(right ? w : -w).alpha(0.3f)
+        .translationX(right ? w : -w).alpha(0f)
         .setDuration(160)
         .setInterpolator(new android.view.animation.AccelerateInterpolator())
         .withEndAction(() -> {

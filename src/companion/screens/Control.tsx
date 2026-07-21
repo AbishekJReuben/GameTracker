@@ -48,6 +48,7 @@ import {
   Headphones,
   Cpu as CpuIcon,
   Settings as SettingsIcon,
+  NotebookPen,
   Send,
   Type as TypeIcon,
   Film,
@@ -201,8 +202,8 @@ type NetStats = {
 // ---------- tuning constants ----------
 const TAP_MS = 260; // max press time still counted as a tap
 const TAP_SLOP = 12; // max finger travel (px) still counted as a tap
-const TWO_FINGER_TAP_MS = 450; // two-finger taps are inherently slower (fingers land apart in time)
-const TWO_FINGER_TAP_SLOP = 24; // and jitter more — give a little more slack than single-finger
+const TWO_FINGER_TAP_MS = 260; // a right-click tap must be SHORT — a longer two-finger press is a scroll/pinch, not a tap
+const TWO_FINGER_TAP_SLOP = 20; // and either finger drifting past this is a scroll, not a tap
 const LONGPRESS_MS = 550; // stationary hold before left-button-down
 const SCROLL_STEP = 20; // finger px per wheel notch
 const MIN_ZOOM = 0.25; // 25% — match toolbar / pin scale floor
@@ -214,7 +215,7 @@ const EDGE_SPEED = 0.016; // max cursor movement (fraction of the screen) per fr
 type Mode = "trackpad" | "touch";
 type Mod = "ctrl" | "alt" | "shift" | "win";
 type KbMode = "direct" | "buffered";
-type NavTab = "stats" | "library" | "timeline" | "collection" | "music" | "control" | "system" | "settings";
+type NavTab = "stats" | "library" | "timeline" | "collection" | "music" | "clipboard" | "control" | "system" | "settings";
 /** Which bottom control panel is expanded (null = collapsed to just the tab strip).
  * Keyboard uses a ghost input (Surface Keyboard / IME); phone gets a flex compose row. */
 type Panel = "mouse" | "keys" | "shortcuts" | "game" | "quality" | "gamepad";
@@ -2333,6 +2334,17 @@ export function ControlScreen({
       // landing so a re-tap after a pinch gets a fresh window.
       twoDownT.current = now;
       twoMaxMove.current = 0;
+      // Re-baseline BOTH fingers' travel origins to where they are now and clear
+      // maxMove, so the per-finger travel guard for the two-finger tap measures
+      // movement only from the moment both fingers are down. Without this, finger
+      // one's earlier cursor travel (or a slow scroll) is already banked in
+      // maxMove and would either wrongly veto a genuine tap or, worse, a small
+      // scroll segment under the centroid threshold could still read as a tap.
+      for (const pt of pts.current.values()) {
+        pt.sx = pt.x;
+        pt.sy = pt.y;
+      }
+      maxMove.current = 0;
     }
   };
 
@@ -2440,8 +2452,15 @@ export function ControlScreen({
       // landed (not finger one), with more slack for timing + jitter. The old
       // test used the single-finger `wasTap`, which a slow two-finger tap (fingers
       // landing ~150ms apart) routinely failed on TAP_MS alone.
+      // A two-finger tap must be SHORT and near-stationary: the centroid barely
+      // moved (twoMaxMove), NEITHER finger drifted (maxMove — re-baselined when
+      // finger two landed), and both fingers lifted within the short window. A
+      // scroll fails all three — it takes longer and the fingers travel — so a
+      // slow two-finger scroll can no longer masquerade as a right-click.
       const twoWasTap =
-        twoMaxMove.current < TWO_FINGER_TAP_SLOP && now - twoDownT.current < TWO_FINGER_TAP_MS;
+        twoMaxMove.current < TWO_FINGER_TAP_SLOP &&
+        maxMove.current < TWO_FINGER_TAP_SLOP &&
+        now - twoDownT.current < TWO_FINGER_TAP_MS;
       // Two-finger right-click fires when BOTH fingers are lifted (downCount === 2),
       // the gesture never became pinch/scroll, and the centroid didn't wander.
       // This MUST NOT depend on `gesture.current === "two"`: the first finger to
@@ -2968,7 +2987,18 @@ export function ControlScreen({
                 <div className="absolute left-0 top-[calc(100%+6px)] z-50 flex flex-col gap-0.5 rounded-2xl glass border border-white/[0.08] p-1.5 shadow-float">
                   {/* The bottom tab strip is hidden on this screen, so this menu is
                       the only way off it — it has to keep listing every tab the
-                      current setup mode still allows. */}
+                      current setup mode still allows. Notes is pinned to the top +
+                      accented as the fast jump-to for the synced-notes/clipboard. */}
+                  <button
+                    onClick={() => {
+                      setNavOpen(false);
+                      onNavigate("clipboard");
+                    }}
+                    className="flex items-center gap-2 rounded-xl bg-accent-3/15 px-3 py-2 text-left text-sm font-700 text-accent-3 active:bg-accent-3/25"
+                  >
+                    <NotebookPen className="h-4 w-4" /> Notes
+                  </button>
+                  <div className="my-0.5 h-px bg-white/[0.06]" />
                   {([
                     { id: "stats", label: "Home", icon: BarChart3 },
                     { id: "library", label: "Library", icon: LibraryIcon },
