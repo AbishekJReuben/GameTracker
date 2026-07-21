@@ -87,6 +87,33 @@ public class ClipboardBridge {
     }
   }
 
+  /** Read an IMAGE from the OS clipboard as a data URL ("data:<mime>;base64,…"),
+   *  or "" when the clipboard holds no image. Foreground-only, like readClipboard. */
+  public static String readClipboardImage(Context ctx) {
+    try {
+      ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+      if (cm == null || !cm.hasPrimaryClip()) return "";
+      ClipData clip = cm.getPrimaryClip();
+      if (clip == null || clip.getItemCount() == 0) return "";
+      Uri uri = clip.getItemAt(0).getUri();
+      if (uri == null) return "";
+      String mime = ctx.getContentResolver().getType(uri);
+      if (mime == null || !mime.startsWith("image/")) return "";
+      try (java.io.InputStream in = ctx.getContentResolver().openInputStream(uri)) {
+        if (in == null) return "";
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[16384];
+        int n;
+        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+        if (bos.size() == 0) return "";
+        return "data:" + mime + ";base64,"
+            + android.util.Base64.encodeToString(bos.toByteArray(), android.util.Base64.NO_WRAP);
+      }
+    } catch (Exception e) {
+      return "";
+    }
+  }
+
   public static void writeClipboard(Context ctx, String text) {
     try {
       ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);

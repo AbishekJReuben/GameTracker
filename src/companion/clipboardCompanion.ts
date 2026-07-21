@@ -65,12 +65,17 @@ interface CompanionClipState {
   /** Inject a secret received from the host (post-approval) and (re)connect.
    *  Idempotent — a no-op if this secret is already active. */
   setSecret: (secret: string) => Promise<void>;
-  addText: (text: string) => Promise<void>;
-  addImage: (dataUrl: string) => Promise<void>;
+  addText: (text: string, folder?: string) => Promise<void>;
+  addImage: (dataUrl: string, folder?: string) => Promise<void>;
+  /** Edit a text note in place — same id, original timestamp, synced to all devices. */
+  editText: (id: string, text: string) => Promise<void>;
+  moveToFolder: (id: string, folder: string) => Promise<void>;
   copy: (id: string) => Promise<void>;
   remove: (id: string) => Promise<void>;
   togglePin: (item: ClipItem) => Promise<void>;
   captureClipboard: () => Promise<string>;
+  /** Read an image from the OS clipboard (Android native). Returns a data URL or "". */
+  captureClipboardImage: () => Promise<string>;
   diagnostics: () => Promise<any>;
 }
 
@@ -153,7 +158,13 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       publish();
       return;
     }
-    // Our own items already local — just keep pin state fresh.
+    // A bare folder move (no content fields).
+    if (v.kind === undefined && v.folder !== undefined && existing) {
+      items.set(v.itemId, { ...existing, folder: v.folder ?? "" });
+      publish();
+      return;
+    }
+    // Our own items already local — keep them (an echo can't improve on them).
     if (v.deviceId === get().deviceId && existing) return;
 
     try {
@@ -170,6 +181,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         deviceName: v.deviceName ?? null,
         source: v.deviceName ? "desktop" : "remote",
         pinned: v.pinned ?? false,
+        folder: v.folder ?? "",
       };
       if (v.kind === "image" && v.hasBlob) {
         const bytes = await fetchBlob(v.itemId);
@@ -319,7 +331,8 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
                     deviceId: get().deviceId + "-native",
                     deviceName: "Phone",
                     source: "android",
-                    pinned: false,
+                    pinned: !!e.pinned,
+                    folder: e.folder || "",
                   });
                 }
               }
@@ -373,7 +386,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       set({ connected: false });
     },
 
-    addText: async (text) => {
+    addText: async (text, folder) => {
       const t = text.trim();
       if (!t || !key) return;
       const id = crypto.randomUUID();
@@ -391,6 +404,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         deviceName: "Phone",
         source: "android",
         pinned: false,
+        folder: folder ?? "",
       };
       await addLocal(item, {
         itemId: id,
@@ -401,12 +415,13 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         size: t.length,
         createdUtc: now,
         pinned: false,
+        folder: folder ?? "",
         textCipher: await encryptText(key, t),
         hasBlob: false,
       });
     },
 
-    addImage: async (dataUrl) => {
+    addImage: async (dataUrl, folder) => {
       if (!key) return;
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
@@ -427,6 +442,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         deviceName: "Phone",
         source: "android",
         pinned: false,
+        folder: folder ?? "",
       };
       await addLocal(item, {
         itemId: id,
@@ -437,8 +453,49 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         size: raw.length,
         createdUtc: now,
         pinned: false,
+        folder: folder ?? "",
         hasBlob: true,
       });
+    },
+
+    // Edit = re-add under the SAME id with the ORIGINAL timestamp. The relay
+    // upserts (rev bumps, created_utc is preserved server-side) and every other
+    // device replaces its copy in place.
+    editText: async (id, text) => {
+      const t = text.trim();
+      const cur = items.get(id);
+      if (!t || !key || !cur || cur.kind !== "text") return;
+      const updated: ClipItem = { ...cur, text: t, size: t.length };
+      items.set(id, updated);
+      publish();
+      if (ready()) {
+        ws!.send(
+          JSON.stringify({
+            t: "add",
+            item: {
+              itemId: id,
+              deviceId: cur.deviceId || get().deviceId,
+              deviceName: cur.deviceName ?? "Phone",
+              kind: "text",
+              mime: "text/plain",
+              size: t.length,
+              createdUtc: cur.createdUtc,
+              pinned: cur.pinned,
+              folder: cur.folder ?? "",
+              textCipher: await encryptText(key, t),
+              hasBlob: false,
+            },
+          }),
+        );
+      }
+    },
+
+    moveToFolder: async (id, folder) => {
+      const cur = items.get(id);
+      if (!cur) return;
+      items.set(id, { ...cur, folder });
+      publish();
+      if (ready()) ws!.send(JSON.stringify({ t: "folder", itemId: id, folder }));
     },
 
     copy: async (id) => {
@@ -469,6 +526,32 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       try {
         if (isTauri()) return await invoke<string>("clipboard_read");
         return (await navigator.clipboard?.readText()) || "";
+      } catch {
+        return "";
+      }
+    },
+
+    // Read an image from the OS clipboard. Android: JNI (content URI → bytes);
+    // web: async Clipboard API where the browser allows it. Data URL or "".
+    captureClipboardImage: async () => {
+      try {
+        if (isTauri()) return (await invoke<string>("clipboard_read_image")) || "";
+        const nav = navigator as Navigator & {
+          clipboard?: Clipboard & { read?: () => Promise<ClipboardItem[]> };
+        };
+        if (!nav.clipboard?.read) return "";
+        for (const entry of await nav.clipboard.read()) {
+          const mime = entry.types.find((t) => t.startsWith("image/"));
+          if (!mime) continue;
+          const blob = await entry.getType(mime);
+          return await new Promise<string>((resolve, reject) => {
+            const r = new FileReader();
+            r.onloadend = () => resolve(String(r.result));
+            r.onerror = reject;
+            r.readAsDataURL(blob);
+          });
+        }
+        return "";
       } catch {
         return "";
       }

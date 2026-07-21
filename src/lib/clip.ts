@@ -24,6 +24,8 @@ export interface ClipItem {
   deviceName?: string | null;
   source: string;
   pinned: boolean;
+  /** Folder/list label for the notes view ("" = unfiled). */
+  folder?: string;
   deleted?: boolean;
   synced?: boolean;
 }
@@ -40,6 +42,7 @@ export interface ClipAddInput {
   deviceId?: string;
   deviceName?: string | null;
   pinned?: boolean;
+  folder?: string;
 }
 
 /** True on the desktop app (where the Rust clipboard commands exist). */
@@ -61,6 +64,12 @@ export const clip = {
     invoke<void>("clipboard_delete", { id, propagate }),
   setPinned: (id: string, pinned: boolean) =>
     invoke<void>("clipboard_set_pinned", { id, pinned }),
+  /** Edit a text note in place; the sync engine re-uploads it under the same id. */
+  updateText: (id: string, text: string) =>
+    invoke<ClipItem>("clipboard_update_text", { id, text }),
+  setFolder: (id: string, folder: string, propagate = true) =>
+    invoke<void>("clipboard_set_folder", { id, folder, propagate }),
+  folders: () => invoke<string[]>("clipboard_folders"),
   copy: (id: string) => invoke<void>("clipboard_copy", { id }),
   imageB64: (id: string) => invoke<string | null>("clipboard_image_b64", { id }),
   clearAll: () => invoke<void>("clipboard_clear_all"),

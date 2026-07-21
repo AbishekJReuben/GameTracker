@@ -2021,6 +2021,27 @@ export function ControlScreen({
     });
   };
 
+  // PiP: the floating mini window must show the WHOLE screen — a zoomed/panned
+  // crop makes it useless. Entering PiP stashes the current view and resets to
+  // fit; leaving restores exactly what the user had. Runs here (after commitView
+  // exists) rather than next to the pipView state.
+  const pipSavedView = useRef<{ zoom: number; pan: { x: number; y: number } } | null>(null);
+  useEffect(() => {
+    if (pipView) {
+      pipSavedView.current = { zoom: zoomRef.current, pan: { ...panRef.current } };
+      zoomRef.current = 1;
+      panRef.current = { x: 0, y: 0 };
+    } else if (pipSavedView.current) {
+      zoomRef.current = pipSavedView.current.zoom;
+      panRef.current = { ...pipSavedView.current.pan };
+      pipSavedView.current = null;
+    } else {
+      return;
+    }
+    commitView();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pipView]);
+
   /** Keep the MediaCodec SurfaceView aligned with the letterboxed video box. */
   const syncNativeSurface = () => {
     if (!wcNativeRef.current) {
@@ -3119,7 +3140,7 @@ export function ControlScreen({
 
       {/* ==== viewport — video only; chrome above/below shrinks this, never overlays it ==== */}
       <div className="relative min-h-0 flex-1">
-      {decoderMsg && (
+      {decoderMsg && !pipView && (
         <div
           className={`absolute left-2 right-2 top-2 z-[45] rounded-lg border border-amber/40 px-3 py-2 text-[11px] text-amber shadow-float ${
             // Solid over the hole punch — semi-opaque surfaces over the
@@ -3261,7 +3282,7 @@ export function ControlScreen({
               : { opacity: 1 }),
           }}
         />
-        {showRemoteCursor && connected && cursorScreen && (
+        {showRemoteCursor && connected && cursorScreen && !pipView && (
           <RemoteCursor x={cursorScreen.x} y={cursorScreen.y} kind={cursorKind} dragging={dragging} fx={cursorFx} />
         )}
         {/* App-icon placeholder for the ~1s gap before the first frame arrives. */}
@@ -3285,7 +3306,7 @@ export function ControlScreen({
             </motion.div>
           )}
         </AnimatePresence>
-        {showReconnect && (
+        {showReconnect && !pipView && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
             <div className="pointer-events-auto">
               {progress ? (

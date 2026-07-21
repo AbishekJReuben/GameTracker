@@ -1,6 +1,20 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Copy, Share2, Trash2, Pin, PinOff, Check, Type, Image as ImageIcon, X, ChevronDown } from "lucide-react";
+import {
+  Copy,
+  Share2,
+  Trash2,
+  Pin,
+  PinOff,
+  Check,
+  Type,
+  Image as ImageIcon,
+  X,
+  ChevronDown,
+  Pencil,
+  Folder,
+  FolderPlus,
+} from "lucide-react";
 import { cn } from "@/lib/cn";
 import { relativeTime } from "@/lib/format";
 import { clipAssetUrl, type ClipItem } from "@/lib/clip";
@@ -38,23 +52,109 @@ async function shareClip(item: ClipItem, fallbackCopy: () => void) {
   fallbackCopy();
 }
 
+/** Inline folder picker shown when the row's Folder action is tapped. */
+function FolderPicker({
+  current,
+  folders,
+  onPick,
+  onClose,
+}: {
+  current: string;
+  folders: string[];
+  onPick: (folder: string) => void;
+  onClose: () => void;
+}) {
+  const [newName, setNewName] = useState("");
+  const all = folders.filter((f) => f.trim().length > 0);
+  return (
+    <motion.div
+      initial={{ opacity: 0, height: 0 }}
+      animate={{ opacity: 1, height: "auto" }}
+      exit={{ opacity: 0, height: 0 }}
+      className="overflow-hidden"
+    >
+      <div className="mt-1 flex flex-wrap items-center gap-1 rounded-xl bg-white/[0.04] p-1.5">
+        <button
+          onClick={() => {
+            onPick("");
+            onClose();
+          }}
+          className={cn(
+            "rounded-md px-2 py-0.5 text-[10px] font-600",
+            current === "" ? "bg-white/15 text-ink" : "text-ink-dim hover:bg-white/10 hover:text-ink",
+          )}
+        >
+          No folder
+        </button>
+        {all.map((f) => (
+          <button
+            key={f}
+            onClick={() => {
+              onPick(f);
+              onClose();
+            }}
+            className={cn(
+              "flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-600",
+              current === f ? "bg-accent-2/25 text-ink" : "text-ink-dim hover:bg-white/10 hover:text-ink",
+            )}
+          >
+            <Folder className="h-2.5 w-2.5" /> {f}
+          </button>
+        ))}
+        <form
+          className="flex items-center gap-1"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const n = newName.trim();
+            if (!n) return;
+            onPick(n);
+            onClose();
+          }}
+        >
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="New folder…"
+            className="w-24 rounded-md bg-white/[0.06] px-2 py-0.5 text-[10px] text-ink outline-none placeholder:text-ink-faint"
+          />
+          <button
+            type="submit"
+            disabled={!newName.trim()}
+            className="grid h-5 w-5 place-items-center rounded-md text-accent-3 hover:bg-white/10 disabled:opacity-40"
+            title="Create folder and move"
+          >
+            <FolderPlus className="h-3 w-3" />
+          </button>
+        </form>
+      </div>
+    </motion.div>
+  );
+}
+
 export function ClipRow({
   item,
   onCopy,
   onDelete,
   onTogglePin,
+  onEdit,
+  onMoveToFolder,
+  folders,
   compact,
 }: {
   item: ClipItem;
   onCopy: (id: string) => void;
   onDelete: (id: string) => void;
   onTogglePin: (item: ClipItem) => void;
+  onEdit?: (item: ClipItem) => void;
+  onMoveToFolder?: (id: string, folder: string) => void;
+  folders?: string[];
   compact?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
+  const [folderOpen, setFolderOpen] = useState(false);
   const textRef = useRef<HTMLParagraphElement>(null);
 
   const doCopy = () => {
@@ -146,6 +246,12 @@ export function ClipRow({
           </span>
         )}
         <span className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden text-[10px] text-ink-faint">
+          {(item.folder ?? "") !== "" && (
+            <span className="flex shrink-0 items-center gap-0.5 rounded bg-accent-2/15 px-1 py-px text-accent-2">
+              <Folder className="h-2.5 w-2.5" />
+              <span className="max-w-[7rem] truncate">{item.folder}</span>
+            </span>
+          )}
           {item.deviceName && <span className="truncate">{item.deviceName}</span>}
           <span className="text-white/15">·</span>
           <span className="shrink-0">{relativeTime(item.createdUtc)}</span>
@@ -197,6 +303,16 @@ export function ClipRow({
               <IconBtn label={copied ? "Copied" : "Copy"} onClick={doCopy}>
                 {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
               </IconBtn>
+              {!isImage && onEdit && (
+                <IconBtn label="Edit" onClick={() => onEdit(item)}>
+                  <Pencil className="h-4 w-4" />
+                </IconBtn>
+              )}
+              {onMoveToFolder && (
+                <IconBtn label="Move to folder" onClick={() => setFolderOpen((v) => !v)}>
+                  <Folder className={cn("h-4 w-4", folderOpen && "text-accent-2")} />
+                </IconBtn>
+              )}
               <IconBtn label="Share" onClick={() => shareClip(item, doCopy)}>
                 <Share2 className="h-4 w-4" />
               </IconBtn>
@@ -211,6 +327,17 @@ export function ClipRow({
         </AnimatePresence>
         </div>
       </div>
+
+      <AnimatePresence initial={false}>
+        {folderOpen && onMoveToFolder && (
+          <FolderPicker
+            current={item.folder ?? ""}
+            folders={folders ?? []}
+            onPick={(f) => onMoveToFolder(item.id, f)}
+            onClose={() => setFolderOpen(false)}
+          />
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }
@@ -246,6 +373,9 @@ export function ClipboardList({
   onCopy,
   onDelete,
   onTogglePin,
+  onEdit,
+  onMoveToFolder,
+  folders,
   onLoadMore,
   compact,
 }: {
@@ -256,6 +386,9 @@ export function ClipboardList({
   onCopy: (id: string) => void;
   onDelete: (id: string) => void;
   onTogglePin: (item: ClipItem) => void;
+  onEdit?: (item: ClipItem) => void;
+  onMoveToFolder?: (id: string, folder: string) => void;
+  folders?: string[];
   onLoadMore: () => void;
   compact?: boolean;
 }) {
@@ -280,7 +413,17 @@ export function ClipboardList({
           <div className="px-1 text-[10px] font-700 uppercase tracking-[0.18em] text-ink-faint">Pinned</div>
           <AnimatePresence initial={false}>
             {pinned.map((it) => (
-              <ClipRow key={it.id} item={it} onCopy={onCopy} onDelete={onDelete} onTogglePin={onTogglePin} compact={compact} />
+              <ClipRow
+                key={it.id}
+                item={it}
+                onCopy={onCopy}
+                onDelete={onDelete}
+                onTogglePin={onTogglePin}
+                onEdit={onEdit}
+                onMoveToFolder={onMoveToFolder}
+                folders={folders}
+                compact={compact}
+              />
             ))}
           </AnimatePresence>
           {rest.length > 0 && <div className="my-1 h-px bg-white/[0.06]" />}
@@ -288,7 +431,17 @@ export function ClipboardList({
       )}
       <AnimatePresence initial={false}>
         {rest.map((it) => (
-          <ClipRow key={it.id} item={it} onCopy={onCopy} onDelete={onDelete} onTogglePin={onTogglePin} compact={compact} />
+          <ClipRow
+            key={it.id}
+            item={it}
+            onCopy={onCopy}
+            onDelete={onDelete}
+            onTogglePin={onTogglePin}
+            onEdit={onEdit}
+            onMoveToFolder={onMoveToFolder}
+            folders={folders}
+            compact={compact}
+          />
         ))}
       </AnimatePresence>
       {loading && (

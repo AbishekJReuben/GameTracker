@@ -131,8 +131,8 @@ export function ClipboardSettings() {
     <div className="space-y-1">
       <Row
         icon={<ClipboardList className="h-4 w-4" />}
-        title="Shared clipboard"
-        desc="A floating widget + a permanent, end-to-end-encrypted history that syncs across your PC and phone."
+        title="Synced notes & clipboard"
+        desc="Editable notes, folders, and a floating widget — a permanent, end-to-end-encrypted history that syncs across your PC and phone."
       >
         <Toggle checked={enabled} onChange={setMaster} />
       </Row>

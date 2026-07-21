@@ -1,5 +1,5 @@
 import { useNavigate } from "react-router-dom";
-import { Trash2, Settings2, ClipboardList } from "lucide-react";
+import { Trash2, Settings2, NotebookPen } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
 import { EmptyState } from "@/components/ui";
@@ -16,14 +16,14 @@ export default function ClipboardPage() {
 
   return (
     <Page
-      title="Clipboard"
-      subtitle="Your synced, end-to-end-encrypted clipboard history"
+      title="Notes"
+      subtitle="Your synced, end-to-end-encrypted notes & clipboard history"
       width="max-w-3xl"
       actions={
         enabled ? (
           <button
             onClick={() => {
-              if (confirm("Delete the entire clipboard history? This can't be undone.")) clearAll();
+              if (confirm("Delete every note on every device? This can't be undone.")) clearAll();
             }}
             className="btn-ghost flex items-center gap-1.5 px-3 py-1.5 text-xs"
           >
@@ -39,13 +39,13 @@ export default function ClipboardPage() {
           className="flex min-h-[60vh] flex-col p-3"
           bodyClassName="flex min-h-0 flex-1 flex-col"
         >
-          <ClipboardPanel sttEnabled={stt} />
+          <ClipboardPanel sttEnabled={stt} draftKey="gt.clip.draft.app" />
         </Panel>
       ) : (
         <EmptyState
-          icon={<ClipboardList className="h-6 w-6" />}
-          title="Shared clipboard is off"
-          message="Turn it on to capture text & images and sync them across your PC and phone."
+          icon={<NotebookPen className="h-6 w-6" />}
+          title="Notes sync is off"
+          message="Turn it on to capture text & images, keep editable notes, and sync them across your PC and phone."
           action={
             <button onClick={() => navigate("/settings")} className="btn-primary flex items-center gap-2 px-4 py-2 text-sm">
               <Settings2 className="h-4 w-4" /> Open settings

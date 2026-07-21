@@ -202,7 +202,10 @@ unsafe fn handle_update(hwnd: HWND) {
         return;
     };
     let (text, png) = read_clipboard(hwnd);
-    let now = chrono::Utc::now().to_rfc3339();
+    // Millisecond UTC + literal Z — the shared wire shape (see clipboard_add).
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
 
     // An image copy wins over its text alternative (many apps offer both).
     if let Some(png) = png {
@@ -229,6 +232,7 @@ unsafe fn handle_update(hwnd: HWND) {
                 device_name: Some(ctx.device_name.clone()),
                 source: "desktop".into(),
                 pinned: false,
+                folder: String::new(),
                 synced: false,
             };
             let _ = crate::clipboard::add_local(&ctx.app, &ctx.pool, input);
@@ -269,6 +273,7 @@ unsafe fn handle_update(hwnd: HWND) {
             device_name: Some(ctx.device_name.clone()),
             source: "desktop".into(),
             pinned: false,
+            folder: String::new(),
             synced: false,
         };
         let _ = crate::clipboard::add_local(&ctx.app, &ctx.pool, input);

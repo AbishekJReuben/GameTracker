@@ -456,6 +456,17 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 23;
     }
 
+    if version < 24 {
+        // Notes rebrand: items can live in a named folder/list ('' = unfiled).
+        conn.execute_batch(
+            r#"
+            ALTER TABLE clipboard_items ADD COLUMN folder TEXT NOT NULL DEFAULT '';
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 24;")?;
+        version = 24;
+    }
+
     let _ = version;
     Ok(())
 }

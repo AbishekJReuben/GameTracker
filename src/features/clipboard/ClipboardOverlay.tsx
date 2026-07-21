@@ -4,7 +4,7 @@ import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "motion/react";
-import { Clipboard, X } from "lucide-react";
+import { NotebookPen, X } from "lucide-react";
 import { clip } from "@/lib/clip";
 import { useClipboard } from "@/store/clipboard";
 import { ClipboardPanel } from "./ClipboardPanel";
@@ -12,6 +12,23 @@ import { ClipboardPanel } from "./ClipboardPanel";
 const BUBBLE = 76;
 const PANEL_W = 380;
 const PANEL_H = 560;
+const SIZE_KEY = "gt.clip.overlaySize";
+
+/** Last user-chosen expanded size (logical px), clamped to something sane. */
+function savedPanelSize(): { w: number; h: number } {
+  try {
+    const raw = localStorage.getItem(SIZE_KEY);
+    if (raw) {
+      const [w, h] = raw.split(",").map((n) => Math.round(Number(n)));
+      if (Number.isFinite(w) && Number.isFinite(h)) {
+        return { w: Math.max(300, Math.min(w, 900)), h: Math.max(360, Math.min(h, 1200)) };
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return { w: PANEL_W, h: PANEL_H };
+}
 
 /** Pointer-driven window drag that also reports a tap (no movement). Distinguishes
  *  a click-to-open from a drag-to-move, and persists the final position. */
@@ -144,15 +161,18 @@ export default function ClipboardOverlay() {
 
   // Smoothly tween the OS window size instead of snapping. A snap makes the
   // panel appear before the window has room (or leaves a big empty window as it
-  // collapses); easing the actual window bounds is what sells the morph.
+  // collapses); easing the actual window bounds is what sells the morph. Reads
+  // the REAL current size first — the expanded panel is user-resizable now, so
+  // the starting size can't be assumed.
   const animRef = useRef<number | null>(null);
-  const tweenSize = useCallback((toW: number, toH: number, ms: number) => {
+  const tweenSize = useCallback(async (toW: number, toH: number, ms: number) => {
+    if (animRef.current != null) cancelAnimationFrame(animRef.current);
+    const win = getCurrentWindow();
+    const [cur, sf] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+    const fromW = cur.width / sf;
+    const fromH = cur.height / sf;
     return new Promise<void>((resolve) => {
-      if (animRef.current != null) cancelAnimationFrame(animRef.current);
-      const win = getCurrentWindow();
       const start = performance.now();
-      const fromW = BUBBLE + (PANEL_W - BUBBLE) * (toW === BUBBLE ? 1 : 0);
-      const fromH = BUBBLE + (PANEL_H - BUBBLE) * (toH === BUBBLE ? 1 : 0);
       const ease = (t: number) => 1 - Math.pow(1 - t, 3); // easeOutCubic
       const step = (now: number) => {
         const t = Math.min(1, (now - start) / ms);
@@ -171,16 +191,35 @@ export default function ClipboardOverlay() {
     });
   }, []);
 
+  // The bubble must never grow OS resize grips; only the expanded panel is
+  // user-resizable (the window is created resizable — turn it off at mount).
+  useEffect(() => {
+    void getCurrentWindow().setResizable(false);
+  }, []);
+
   const expand = useCallback(async () => {
     // Pull the latest from the DB the instant the panel opens — this is the
     // fallback for items that arrived while collapsed (the always-on listener
     // above also refreshes, but this guarantees a fresh view on open).
     void useClipboard.getState().refresh();
     setExpanded(true);
-    await tweenSize(PANEL_W, PANEL_H, 260);
+    const { w, h } = savedPanelSize();
+    await tweenSize(w, h, 260);
+    await getCurrentWindow().setResizable(true).catch(() => {});
   }, [tweenSize]);
 
   const collapse = useCallback(async () => {
+    // Remember the size the user left the panel at (they can drag OS edges).
+    try {
+      const win = getCurrentWindow();
+      const [cur, sf] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+      const w = Math.round(cur.width / sf);
+      const h = Math.round(cur.height / sf);
+      if (w > BUBBLE + 20 && h > BUBBLE + 20) localStorage.setItem(SIZE_KEY, `${w},${h}`);
+      await win.setResizable(false).catch(() => {});
+    } catch {
+      /* ignore */
+    }
     setExpanded(false);
     await tweenSize(BUBBLE, BUBBLE, 220);
   }, [tweenSize]);
@@ -229,8 +268,8 @@ export default function ClipboardOverlay() {
                 <X className="h-4 w-4" />
               </button>
               <div className="flex min-w-0 flex-1 items-center gap-2">
-                <Clipboard className="h-4 w-4 shrink-0 text-accent-3" />
-                <span className="text-sm font-700 text-ink">Clipboard</span>
+                <NotebookPen className="h-4 w-4 shrink-0 text-accent-3" />
+                <span className="text-sm font-700 text-ink">Notes</span>
                 <span
                   className="flex items-center gap-1 text-[10px] font-600"
                   style={{ color: status.color }}
@@ -248,7 +287,7 @@ export default function ClipboardOverlay() {
               </div>
             </div>
             <div className="min-h-0 flex-1 p-2.5">
-              <ClipboardPanel compact sttEnabled={sttEnabled} />
+              <ClipboardPanel compact sttEnabled={sttEnabled} draftKey="gt.clip.draft.overlay" />
             </div>
           </motion.div>
         ) : (
@@ -272,13 +311,13 @@ export default function ClipboardOverlay() {
               backgroundImage:
                 "radial-gradient(120% 120% at 30% 20%, rgba(255,255,255,0.14), transparent 60%)",
             }}
-            title="Clipboard — tap to open, drag to move"
+            title="Notes — tap to open, drag to move"
           >
             <span
               className="grid h-10 w-10 place-items-center rounded-full text-white"
               style={{ backgroundImage: "linear-gradient(135deg,var(--accent-1),var(--accent-3))" }}
             >
-              <Clipboard className="h-5 w-5" />
+              <NotebookPen className="h-5 w-5" />
             </span>
             <AnimatePresence>
               {pulse && (

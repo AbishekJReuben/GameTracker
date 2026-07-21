@@ -168,11 +168,98 @@ pub fn apply_settings(app: &AppHandle) -> AppResult<()> {
                 return Err(e);
             }
         }
+        #[cfg(windows)]
+        spawn_fullscreen_guard(app.clone());
     } else {
         close_overlay(app);
         log("close_overlay");
     }
     Ok(())
+}
+
+/// While the overlay is on, hide it whenever the foreground app is fullscreen
+/// (games, video players) so the bubble never floats over a movie or a match —
+/// and bring it back the moment the fullscreen app goes away. Cheap 2s poll on a
+/// dedicated thread; only ever toggles visibility on a state CHANGE.
+#[cfg(windows)]
+fn spawn_fullscreen_guard(app: AppHandle) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return; // one guard for the process lifetime
+    }
+    std::thread::spawn(move || {
+        let mut hidden_for_fs = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let Some(win) = app.get_webview_window(OVERLAY_LABEL) else {
+                // Overlay closed (feature toggled off) — idle cheaply until it's back.
+                hidden_for_fs = false;
+                continue;
+            };
+            let fs = foreground_is_fullscreen();
+            if fs && !hidden_for_fs {
+                if win.hide().is_ok() {
+                    hidden_for_fs = true;
+                    log("overlay hidden (fullscreen app in front)");
+                }
+            } else if !fs && hidden_for_fs {
+                if win.show().is_ok() {
+                    hidden_for_fs = false;
+                    log("overlay restored (fullscreen app gone)");
+                }
+            }
+        }
+    });
+}
+
+/// True when the current foreground window covers its whole monitor (borderless/
+/// exclusive fullscreen). The desktop shell (Progman/WorkerW) and our own windows
+/// never count.
+#[cfg(windows)]
+fn foreground_is_fullscreen() -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        // Never react to our own process (the overlay itself, the main window).
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+        if pid == std::process::id() {
+            return false;
+        }
+        // The desktop shell reports monitor-sized rects; skip it.
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(hwnd, &mut class);
+        if n > 0 {
+            let name = String::from_utf16_lossy(&class[..n as usize]);
+            if name == "Progman" || name == "WorkerW" {
+                return false;
+            }
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return false;
+        }
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(mon, &mut info).as_bool() {
+            return false;
+        }
+        let m = info.rcMonitor;
+        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+    }
 }
 
 /// Create the always-on-top floating overlay window (idempotent). MUST run on the

@@ -158,8 +158,21 @@ const save = (path, before, after, msg) => {
       `            <action android:name="android.intent.action.VIEW" />${eol}` +
       `            <data android:mimeType="application/vnd.android.package-archive" />${eol}` +
       `        </intent>${eol}` +
+      `        <intent>${eol}` +
+      `            <action android:name="android.speech.RecognitionService" />${eol}` +
+      `        </intent>${eol}` +
       `    </queries>${eol}`;
     m = m.replace(/([ \t]*<application\b)/, `${queries}$1`);
+  }
+  // Package-visibility for the built-in speech recognizer (Android 11+): without
+  // this <queries> entry, SpeechRecognizer.isRecognitionAvailable() is false and
+  // the dock's keyless voice input can never bind to Google's service. Additive
+  // for manifests generated before this block existed.
+  if (!m.includes("android.speech.RecognitionService")) {
+    m = m.replace(
+      /(<queries>)/,
+      `$1${eol}        <intent>${eol}            <action android:name="android.speech.RecognitionService" />${eol}        </intent>`,
+    );
   }
 
   // Shared-clipboard overlay + sync foreground service. `specialUse` avoids the

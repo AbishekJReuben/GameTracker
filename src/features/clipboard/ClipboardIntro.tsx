@@ -102,7 +102,7 @@ export function ClipboardIntro({ onClose, onEnabled }: { onClose: () => void; on
             >
               <Sparkles className="h-4 w-4" />
             </span>
-            Shared clipboard
+            Synced notes
           </span>
           <button onClick={onClose} className="grid h-8 w-8 place-items-center rounded-lg text-ink-dim hover:bg-white/10 hover:text-ink">
             <X className="h-4 w-4" />
@@ -110,7 +110,8 @@ export function ClipboardIntro({ onClose, onEnabled }: { onClose: () => void; on
         </div>
 
         <p className="px-5 pt-2 text-sm text-ink-dim">
-          A floating widget and a permanent history that follow you across your PC and phone.
+          A notes + clipboard hub with a floating widget: editable notes, folders, and a permanent
+          history that follow you across your PC and phone.
         </p>
 
         <div className="mt-4 grid grid-cols-3 gap-2 px-5">
@@ -155,7 +156,7 @@ export function ClipboardIntro({ onClose, onEnabled }: { onClose: () => void; on
 
         {error && (
           <div className="mx-5 mt-3 rounded-xl border border-rose-500/30 bg-rose-500/[0.08] px-3 py-2.5 text-[12px] leading-relaxed text-rose-200">
-            <div className="mb-1 font-700">Couldn't turn on the shared clipboard</div>
+            <div className="mb-1 font-700">Couldn't turn on synced notes</div>
             <div className="break-words text-rose-300/90">{error}</div>
             <div className="mt-1 text-rose-300/70">
               Tap "Copy logs" and share the report — it captures the watcher, the overlay window, and the sync engine.

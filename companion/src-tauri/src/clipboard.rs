@@ -117,6 +117,31 @@ mod imp {
         })
     }
 
+    /// Call `ClipboardBridge.readClipboardImage(Context) -> String` (data URL or "").
+    pub fn read_clipboard_image() -> Result<String, String> {
+        with_env(|env, context| {
+            let class = load_class(env, context, BRIDGE)?;
+            let obj = env
+                .call_static_method(
+                    &class,
+                    "readClipboardImage",
+                    "(Landroid/content/Context;)Ljava/lang/String;",
+                    &[JValue::Object(context)],
+                )
+                .map_err(|e| format!("readClipboardImage: {e}"))?
+                .l()
+                .map_err(|e| e.to_string())?;
+            if obj.is_null() {
+                return Ok(String::new());
+            }
+            let s: String = env
+                .get_string(&obj.into())
+                .map_err(|e| e.to_string())?
+                .into();
+            Ok(s)
+        })
+    }
+
     /// Call `ClipboardBridge.writeClipboard(Context, String)`.
     pub fn write_clipboard(text: &str) -> Result<(), String> {
         with_env(|env, context| {
@@ -305,6 +330,19 @@ pub async fn clipboard_read() -> Result<String, String> {
     Ok(String::new())
 }
 
+/// Read an image from the OS clipboard as a data URL ("" when none). Android only.
+#[tauri::command]
+pub async fn clipboard_read_image() -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        tauri::async_runtime::spawn_blocking(imp::read_clipboard_image)
+            .await
+            .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "android"))]
+    Ok(String::new())
+}
+
 #[tauri::command]
 pub async fn clipboard_write(text: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
@@ -384,14 +422,32 @@ pub async fn speech_to_text(
         body.extend_from_slice(b"\r\n");
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
-        let resp = ureq::post("https://api.sarvam.ai/speech-to-text")
-            .set("api-subscription-key", key)
-            .set(
-                "Content-Type",
-                &format!("multipart/form-data; boundary={boundary}"),
-            )
-            .send_bytes(&body)
-            .map_err(|e| format!("Sarvam request failed: {e}"))?;
+        // Sarvam intermittently 5xxs / stalls: bounded timeout + one retry so the
+        // mic either transcribes or surfaces a real error instead of hanging.
+        let send = || {
+            ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .post("https://api.sarvam.ai/speech-to-text")
+                .set("api-subscription-key", key)
+                .set(
+                    "Content-Type",
+                    &format!("multipart/form-data; boundary={boundary}"),
+                )
+                .send_bytes(&body)
+        };
+        let resp = match send() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) if (500..600).contains(&code) => {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                send().map_err(|e| format!("Sarvam request failed: {e}"))?
+            }
+            Err(ureq::Error::Transport(_)) => {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                send().map_err(|e| format!("Sarvam request failed: {e}"))?
+            }
+            Err(e) => return Err(format!("Sarvam request failed: {e}")),
+        };
         // `into_json` needs ureq's json feature (not enabled here); parse the body
         // string with serde_json instead.
         let text = resp.into_string().map_err(|e| e.to_string())?;

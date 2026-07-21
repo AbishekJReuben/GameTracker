@@ -1178,3 +1178,59 @@ substituted for the app identifier).
   `onTaskRemoved` AlarmManager restart bring the service back after a kill /
   reboot / swiping the app out of Recents. Don't remove any of these.
 
+### Notes rebrand (July 2026) — folders, edits, ordering, battery (do not regress)
+
+The clipboard is now presented as **Notes** everywhere (desktop `/clipboard` page,
+desktop overlay, companion tab, Android dock). All four screens share the same
+feature set: compose (+draft), search, All/Text/Images chips, folder chips,
+per-row copy/edit/folder/pin/share/delete.
+
+- **Wire timestamp shape is `yyyy-MM-ddTHH:mm:ss.SSSZ` (UTC millis + literal Z)
+  from EVERY producer.** JS `toISOString()` already emits it; Rust uses
+  `format("%Y-%m-%dT%H:%M:%S%.3fZ")` (a bare `to_rfc3339()` ends in `+00:00`,
+  which the dock's parser rejected → items fell back to "now" and ordering
+  scrambled); the dock's `isoNow()` formats in the **UTC** timezone (it used to
+  format LOCAL time and append 'Z' — the original cross-device ordering bug).
+  `parseIsoMs` still accepts every legacy shape (Z, ±HH:MM, any fraction length).
+- **Edit = re-`add` under the SAME itemId.** The relay upserts (rev bumps),
+  **preserves the row's original `created_utc`** (both in the DB and the
+  broadcast), and every client replaces its copy by id. Desktop:
+  `clipboard_update_text` (marks unsynced → the sync engine re-uploads);
+  companion: `editText`; dock: ✎ puts the note in the composer, Add becomes Save.
+  Desktop DB `upsert` mirrors the created-preserving conflict clause.
+- **`folder` field** ('' = unfiled) on relay/desktop-DB/clients; a bare
+  `{t:"folder", itemId, folder}` WS message moves an item (like `pin`). New items
+  adopt the folder currently being viewed. Desktop migration **v24**; relay does
+  an idempotent `ALTER TABLE`.
+- **The dock APPLIES its own catch-up echoes.** After a service restart the
+  in-memory list is empty; skipping own-device items made everything sent from
+  the dock vanish. Dedupe by id; just don't fire the new-item attention for own
+  items. The dock Add/paste paths use ONE id + timestamp for the local entry and
+  the wire item (they used to differ → phantom duplicates after restarts).
+- **Image thumbs are lazy.** The notice inserts the row immediately (right
+  position, placeholder art); the blob is downloaded only when the dock renders
+  the row. Background reconnects must NOT re-download blobs (battery/data).
+- **Battery:** OkHttp `pingInterval` 90s (Cloudflare idle-drops WS at ~100s — do
+  not exceed), reconnect backoff ≤8s for 6 attempts then up to 5 min, reset by
+  the connectivity callback + a SCREEN_ON/USER_PRESENT receiver.
+- **Fullscreen hiding:** Android uses a 1px overlay **insets probe** — status bar
+  hidden ⇒ foreground app is immersive ⇒ hide the edge pin (restore on bars
+  back). Desktop spawns `spawn_fullscreen_guard` (2s poll): foreground window
+  covering its monitor (not our pid, not Progman/WorkerW) hides the overlay
+  window and shows it again after.
+- **Desktop overlay is user-resizable while expanded** (`setResizable(true)` on
+  expand, size persisted in `gt.clip.overlaySize`, resizable off for the bubble).
+- **Drafts persist**: dock composer → prefs `draftText`; webview composers →
+  localStorage `gt.clip.draft.{app,overlay,companion}` via Composer's `draftKey`.
+- **Voice input is dual-engine.** Sarvam when a key is configured (now with 30s
+  timeout + one retry on 5xx/transport, real error surfaced); otherwise the
+  dock uses Android's built-in `SpeechRecognizer` (manifest needs the
+  `android.speech.RecognitionService` `<queries>` entry — patch-android.mjs) and
+  the web Composer uses the Web Speech API. The mic button is always present on
+  the dock.
+- **Remote PiP/audio:** entering Android PiP resets zoom/pan to fit (restored on
+  exit), hides all remaining overlays (cursor/toasts/reconnect), and requests a
+  DIRECT keyframe (`gt:pip` listener in cloud.ts). DIRECT audio resumes via a
+  gesture-armed `resumeAudioCtx()` — `AudioContext.resume()` silently failing
+  before the first tap was the "no sound until I toggle audio" bug.
+

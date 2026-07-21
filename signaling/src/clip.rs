@@ -59,6 +59,9 @@ impl ClipState {
             "#,
         )
         .expect("init clip schema");
+        // Additive migration: folder/list label for the notes rebrand. Ignore the
+        // "duplicate column" error on an already-migrated store.
+        let _ = conn.execute("ALTER TABLE items ADD COLUMN folder TEXT", []);
         Arc::new(Self {
             db: Mutex::new(conn),
             blob_dir: data_dir.join("clip-blobs"),
@@ -95,15 +98,18 @@ impl ClipState {
             .get("pinned")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let folder = item.get("folder").and_then(|v| v.as_str());
+        // NOTE: created_utc is NOT updated on conflict — an edit (re-add with the
+        // same itemId) keeps the item's original position in time.
         conn.execute(
             "INSERT INTO items
                 (clip_id, item_id, rev, device_id, device_name, kind, mime, size,
-                 created_utc, text_cipher, has_blob, deleted, pinned)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)
+                 created_utc, text_cipher, has_blob, deleted, pinned, folder)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13)
              ON CONFLICT(clip_id, item_id) DO UPDATE SET
                 rev=excluded.rev, text_cipher=excluded.text_cipher,
                 has_blob=excluded.has_blob, pinned=excluded.pinned, size=excluded.size,
-                mime=excluded.mime, deleted=0",
+                mime=excluded.mime, folder=excluded.folder, deleted=0",
             rusqlite::params![
                 clip_id,
                 item_id,
@@ -116,10 +122,21 @@ impl ClipState {
                 created,
                 text_cipher,
                 has_blob as i64,
-                pinned as i64
+                pinned as i64,
+                folder
             ],
         )
         .ok()?;
+        // Preserve the ORIGINAL created_utc in the broadcast (an edit's payload may
+        // carry a slightly different one; the row is authoritative).
+        let created_row: Option<String> = conn
+            .query_row(
+                "SELECT created_utc FROM items WHERE clip_id=?1 AND item_id=?2",
+                rusqlite::params![clip_id, item_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
         Some(row_notice(
             rev,
             &item_id,
@@ -128,11 +145,12 @@ impl ClipState {
             kind,
             mime,
             size,
-            created,
+            created_row.as_deref().or(created),
             text_cipher,
             has_blob,
             false,
             pinned,
+            folder,
         ))
     }
 
@@ -169,6 +187,23 @@ impl ClipState {
         Some(json!({ "t":"item", "rev":rev, "itemId":item_id, "pinned":pinned }))
     }
 
+    /// Move an item to a folder (or clear it with an empty string). Bare metadata
+    /// update, like `set_pinned` — no content fields ride along.
+    fn set_folder(&self, clip_id: &str, item_id: &str, folder: &str) -> Option<serde_json::Value> {
+        let conn = self.db.lock().ok()?;
+        let rev = Self::next_rev(&conn);
+        let changed = conn
+            .execute(
+                "UPDATE items SET folder=?3, rev=?4 WHERE clip_id=?1 AND item_id=?2",
+                rusqlite::params![clip_id, item_id, folder, rev],
+            )
+            .ok()?;
+        if changed == 0 {
+            return None;
+        }
+        Some(json!({ "t":"item", "rev":rev, "itemId":item_id, "folder":folder }))
+    }
+
     /// Every change with `rev > since`, oldest first (the catch-up burst).
     fn items_since(&self, clip_id: &str, since: i64) -> Vec<serde_json::Value> {
         let Ok(conn) = self.db.lock() else {
@@ -176,7 +211,7 @@ impl ClipState {
         };
         let Ok(mut stmt) = conn.prepare(
             "SELECT rev, item_id, device_id, device_name, kind, mime, size, created_utc,
-                    text_cipher, has_blob, deleted, pinned
+                    text_cipher, has_blob, deleted, pinned, folder
              FROM items WHERE clip_id=?1 AND rev>?2 ORDER BY rev ASC",
         ) else {
             return Vec::new();
@@ -195,6 +230,7 @@ impl ClipState {
                 r.get::<_, i64>(9)? != 0,
                 r.get::<_, i64>(10)? != 0,
                 r.get::<_, i64>(11)? != 0,
+                r.get::<_, Option<String>>(12)?.as_deref(),
             ))
         });
         match rows {
@@ -282,6 +318,7 @@ fn row_notice(
     has_blob: bool,
     deleted: bool,
     pinned: bool,
+    folder: Option<&str>,
 ) -> serde_json::Value {
     json!({
         "t": "item",
@@ -297,6 +334,7 @@ fn row_notice(
         "hasBlob": has_blob,
         "deleted": deleted,
         "pinned": pinned,
+        "folder": folder,
     })
 }
 
@@ -361,6 +399,16 @@ pub async fn handle(socket: WebSocket, clip_id: String, state: Arc<ClipState>) {
                     v.get("pinned").and_then(|s| s.as_bool()),
                 ) {
                     if let Some(notice) = state.set_pinned(&clip_id, id, p) {
+                        state.broadcast(&clip_id, peer, &notice);
+                    }
+                }
+            }
+            Some("folder") => {
+                if let (Some(id), Some(f)) = (
+                    v.get("itemId").and_then(|s| s.as_str()),
+                    v.get("folder").and_then(|s| s.as_str()),
+                ) {
+                    if let Some(notice) = state.set_folder(&clip_id, id, f) {
                         state.broadcast(&clip_id, peer, &notice);
                     }
                 }
@@ -455,6 +503,31 @@ mod tests {
         let replay = s.items_since("c", 0);
         assert!(replay[0].get("pinned").unwrap().as_bool().unwrap());
         assert!(s.set_pinned("c", "nope", true).is_none());
+    }
+
+    #[test]
+    fn folder_roundtrip_and_edit_keeps_created() {
+        let s = temp_state("folder");
+        s.upsert("c", &text_item("a", "d")).unwrap();
+        // Bare folder move.
+        let n = s.set_folder("c", "a", "work").unwrap();
+        assert_eq!(n.get("folder").unwrap().as_str().unwrap(), "work");
+        let replay = s.items_since("c", 0);
+        assert_eq!(replay[0].get("folder").unwrap().as_str().unwrap(), "work");
+        // An edit (re-add, same id, different createdUtc + folder in payload)
+        // keeps the ORIGINAL created_utc but applies the new folder.
+        let mut edited = text_item("a", "d");
+        edited["textCipher"] = json!("BBBB");
+        edited["createdUtc"] = json!("2030-01-01T00:00:00.000Z");
+        edited["folder"] = json!("notes");
+        let n2 = s.upsert("c", &edited).unwrap();
+        assert_eq!(
+            n2.get("createdUtc").unwrap().as_str().unwrap(),
+            "2026-07-20T00:00:00.000Z"
+        );
+        assert_eq!(n2.get("folder").unwrap().as_str().unwrap(), "notes");
+        assert_eq!(n2.get("textCipher").unwrap().as_str().unwrap(), "BBBB");
+        assert!(s.set_folder("c", "nope", "x").is_none());
     }
 
     #[test]

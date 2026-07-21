@@ -29,6 +29,9 @@ pub struct ClipItem {
     /// "desktop" | "android" | "manual" | "share"
     pub source: String,
     pub pinned: bool,
+    /// Folder/list label for the notes view ("" = unfiled).
+    #[serde(default)]
+    pub folder: String,
     #[serde(default)]
     pub deleted: bool,
     #[serde(default)]
@@ -54,6 +57,8 @@ pub struct ClipInput {
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
     pub synced: bool,
 }
 
@@ -71,28 +76,33 @@ fn from_row(r: &Row) -> rusqlite::Result<ClipItem> {
         device_name: r.get("device_name")?,
         source: r.get("source")?,
         pinned: r.get::<_, i64>("pinned")? != 0,
+        folder: r.get::<_, Option<String>>("folder")?.unwrap_or_default(),
         deleted: r.get::<_, i64>("deleted")? != 0,
         synced: r.get::<_, i64>("synced")? != 0,
     })
 }
 
 const COLS: &str = "id, kind, text, image_path, thumb_path, mime, size, created_utc, \
-                    device_id, device_name, source, pinned, deleted, synced";
+                    device_id, device_name, source, pinned, folder, deleted, synced";
 
 /// Insert (or replace, idempotent by id) an item. Used for both local captures
 /// and applied remote items — `id` is the dedupe key so a re-delivered remote
 /// item can't duplicate.
 pub fn upsert(pool: &DbPool, i: &ClipInput) -> AppResult<()> {
     let conn = pool.get()?;
+    // NOTE: created_utc is NOT updated on conflict — an edit (re-delivery with the
+    // same id) keeps the item's original position in time. `deleted` resets to 0 so
+    // a re-add revives a tombstone (matches the relay's behavior).
     conn.execute(
         "INSERT INTO clipboard_items
             (id, kind, text, image_path, thumb_path, mime, size, created_utc,
-             device_id, device_name, source, pinned, deleted, synced)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13)
+             device_id, device_name, source, pinned, folder, deleted, synced)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?14,0,?13)
          ON CONFLICT(id) DO UPDATE SET
             text=excluded.text, image_path=excluded.image_path,
             thumb_path=excluded.thumb_path, mime=excluded.mime, size=excluded.size,
-            pinned=excluded.pinned, synced=excluded.synced",
+            pinned=excluded.pinned, folder=excluded.folder, deleted=0,
+            synced=excluded.synced",
         rusqlite::params![
             i.id,
             i.kind,
@@ -107,9 +117,45 @@ pub fn upsert(pool: &DbPool, i: &ClipInput) -> AppResult<()> {
             i.source,
             i.pinned as i64,
             i.synced as i64,
+            i.folder,
         ],
     )?;
     Ok(())
+}
+
+/// Edit a text item in place (notes). Marks it unsynced so the JS sync engine
+/// re-uploads it (same id → the relay upserts + rebroadcasts to other devices).
+pub fn update_text(pool: &DbPool, id: &str, text: &str) -> AppResult<bool> {
+    let conn = pool.get()?;
+    let changed = conn.execute(
+        "UPDATE clipboard_items SET text = ?2, size = ?3, synced = 0
+         WHERE id = ?1 AND deleted = 0 AND kind = 'text'",
+        rusqlite::params![id, text, text.len() as i64],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Move an item to a folder ('' = unfiled).
+pub fn set_folder(pool: &DbPool, id: &str, folder: &str) -> AppResult<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE clipboard_items SET folder = ?2 WHERE id = ?1",
+        rusqlite::params![id, folder],
+    )?;
+    Ok(())
+}
+
+/// Distinct non-empty folder names across live items (for the filter chips),
+/// alphabetical.
+pub fn list_folders(pool: &DbPool) -> AppResult<Vec<String>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT folder FROM clipboard_items
+         WHERE deleted = 0 AND folder IS NOT NULL AND folder != ''
+         ORDER BY folder COLLATE NOCASE ASC",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(Result::ok).collect())
 }
 
 pub fn get(pool: &DbPool, id: &str) -> AppResult<Option<ClipItem>> {

@@ -545,6 +545,11 @@ export class CloudConn {
     // link dead and force a visible reconnect. Give the link a fresh window and
     // probe it immediately instead.
     document.addEventListener("visibilitychange", this.onVisibility);
+    // Android PiP: entering the mini window keeps decode running (the gates check
+    // __GT_PIP_ACTIVE__), but frames may have been skipped between "hidden" and
+    // the PiP flag landing — ask for a keyframe so the floating window repaints
+    // immediately instead of waiting out the (long) DIRECT GOP.
+    window.addEventListener("gt:pip", this.onPipChange);
     // Flat Quest Control uses WebCodecs like the phone; ImmersiveScreen textures
     // the RTC video element, so enter VR must fall back and exit can re-opt-in.
     this.unsubImmersive = onImmersiveActiveChange((active) => {
@@ -652,6 +657,15 @@ export class CloudConn {
     this.resetStreamDefaults();
     this.forceRebuild("manual tune reset");
   }
+
+  private onPipChange = (event: Event) => {
+    if (this.closed) return;
+    const active = !!(event as CustomEvent<{ active?: boolean }>).detail?.active;
+    if (active && this.wcActive) {
+      this.wcAwaitKey = true;
+      this.wcRequestKeyframe();
+    }
+  };
 
   private onVisibility = () => {
     if (document.visibilityState !== "visible" || this.closed) return;
@@ -1322,7 +1336,10 @@ export class CloudConn {
           this.audioCtx = new AudioContext();
         }
       }
-      await this.audioCtx.resume().catch(() => {});
+      // A fresh AudioContext often starts "suspended" (autoplay policy). Resume
+      // through the gesture-armed path so first-connect audio actually plays
+      // instead of silently staying suspended until the user toggles sound.
+      await this.resumeAudioCtx();
       if (!this.audioWorkletReady) {
         await this.audioCtx.audioWorklet.addModule(audioFeederWorkletUrl);
         this.audioWorkletReady = true;
@@ -1597,12 +1614,43 @@ export class CloudConn {
     }
   }
 
+  /** True while the DIRECT AudioContext should be playing (mirrors the sound
+   *  toggle so a deferred/gesture resume knows the user's intent). */
+  private audioWantPlaying = false;
+  private audioGestureArmed = false;
+
   /** Mute/unmute DIRECT audio playback (RTC path still uses the <audio> element). */
   setAudioMuted(muted: boolean) {
+    this.audioWantPlaying = !muted;
     if (this.audioCtx) {
       if (muted) this.audioCtx.suspend().catch(() => {});
-      else this.audioCtx.resume().catch(() => {});
+      else void this.resumeAudioCtx();
     }
+  }
+
+  /** Resume the DIRECT AudioContext, and if the platform blocks it (no user
+   *  gesture yet — standard autoplay policy on a fresh page), retry on the FIRST
+   *  tap. This is the "no sound until I toggle audio off/on" fix: resume() was
+   *  failing silently at connect time and nothing ever retried. */
+  private async resumeAudioCtx() {
+    const ctx = this.audioCtx;
+    if (!ctx) return;
+    try {
+      await ctx.resume();
+    } catch {
+      /* fall through to the gesture retry */
+    }
+    if (ctx.state !== "suspended" || this.audioGestureArmed) return;
+    this.audioGestureArmed = true;
+    const retry = () => {
+      this.audioGestureArmed = false;
+      if (!this.audioWantPlaying || !this.audioCtx) return;
+      this.audioCtx.resume().catch(() => {
+        /* still blocked — the next setAudioMuted(false) re-arms */
+      });
+    };
+    window.addEventListener("pointerdown", retry, { once: true, capture: true });
+    window.addEventListener("keydown", retry, { once: true, capture: true });
   }
 
   /** Live audio-path telemetry for the HUD. */
@@ -2925,6 +2973,7 @@ export class CloudConn {
     // (mount/unmount), but a session close must never strand a held lock.
     void setStreamPowerActive(false);
     document.removeEventListener("visibilitychange", this.onVisibility);
+    window.removeEventListener("gt:pip", this.onPipChange);
     this.unsubImmersive?.();
     this.unsubImmersive = null;
     // Tell the host we're leaving on purpose so it stops capturing immediately

@@ -142,10 +142,16 @@ public class ClipboardService extends Service {
   private MediaRecorder recorder;
   private File audioFile;
   private boolean recording;
-  // Cap the reconnect backoff low: the user needs near-real-time sync (a dropped
-  // link must recover within ~10s), so we never let the exponential backoff grow
-  // past this. The connectivity callback also short-circuits it on network return.
-  private static final long MAX_RECONNECT_MS = 8_000;
+  // Reconnect backoff: fast (≤8s) for the first few attempts so a blip recovers
+  // near-instantly, then escalating to 5 min for a host that stays unreachable
+  // (PC asleep / tunnel down). The old flat 8s cap woke the radio ~7×/min forever
+  // — the single biggest battery cost while backgrounded. The connectivity
+  // callback and the screen-on receiver reset to fast the moment either fires.
+  private static final long MAX_RECONNECT_FAST_MS = 8_000;
+  private static final long MAX_RECONNECT_SLOW_MS = 300_000;
+  private static final int FAST_ATTEMPTS = 6;
+  private int reconnectFails;
+  private android.content.BroadcastReceiver screenOnReceiver;
 
   private String getSyncStatusText() {
     if (cryptoKey == null) return "Set key in app";
@@ -180,10 +186,11 @@ public class ClipboardService extends Service {
   static final class ClipEntry {
     final String id;
     final String kind;
-    final String text;
+    String text;         // editable (notes) — updated in place by edits
     final long createdAtMs;
     final String deviceId;
     boolean pinned;      // toggled by the pin button / relay pin notices
+    String folder = "";  // folder/list label ("" = unfiled)
     boolean pendingDelete; // armed by a first tap on ✕ (two-tap confirm)
     String mime = "image/png"; // for images (used when sharing)
     ClipEntry(String id, String kind, String text, long createdAtMs, String deviceId) {
@@ -356,15 +363,16 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Send a text item to the relay over the open WebSocket. Mirrors the JS add
-   *  payload exactly (the relay upserts + broadcasts to other devices). No-op if
-   *  the socket isn't open or encryption failed. */
-  private void sendTextItem(String text) {
+  /** Send a text item (new or edited) to the relay over the open WebSocket.
+   *  Mirrors the JS add payload exactly (the relay upserts by id + broadcasts to
+   *  other devices; created_utc is preserved server-side on an edit). The caller
+   *  supplies the id/timestamp so the LOCAL entry and the wire item are the same
+   *  element on every device. No-op if the socket isn't open or encryption failed. */
+  private void sendTextItem(String id, String text, String createdUtc, String folder,
+      boolean pinned) {
     if (socket == null || text == null || text.isEmpty()) return;
     String cipher = encryptText(text);
     if (cipher == null) return;
-    String id = UUID.randomUUID().toString();
-    String now = isoNow();
     String nativeDeviceId = (deviceId == null ? "" : deviceId) + "-native";
     try {
       JSONObject item = new JSONObject();
@@ -374,8 +382,9 @@ public class ClipboardService extends Service {
       item.put("kind", "text");
       item.put("mime", "text/plain");
       item.put("size", text.length());
-      item.put("createdUtc", now);
-      item.put("pinned", false);
+      item.put("createdUtc", createdUtc);
+      item.put("pinned", pinned);
+      item.put("folder", folder == null ? "" : folder);
       item.put("textCipher", cipher);
       item.put("hasBlob", false);
       JSONObject msg = new JSONObject();
@@ -386,8 +395,17 @@ public class ClipboardService extends Service {
     }
   }
 
+  /** RFC3339 UTC with millisecond precision + literal Z — the ONE wire shape all
+   *  clients emit. The old version formatted in LOCAL time but appended 'Z',
+   *  which put every dock-sent item hours off and broke cross-device ordering. */
   private static String isoNow() {
-    return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).format(new Date());
+    return isoFromMs(System.currentTimeMillis());
+  }
+
+  private static String isoFromMs(long ms) {
+    SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+    f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+    return f.format(new Date(ms));
   }
 
   // ---- sync socket ----------------------------------------------------------
@@ -427,12 +445,16 @@ public class ClipboardService extends Service {
     boolean urlChanged = !newUrl.equals(socketUrl);
     socketUrl = newUrl;
     if (http == null) {
+      // 90s pings: Cloudflare drops idle WS at ~100s, so this is the least-
+      // frequent keep-alive that still holds the tunnel — 3× fewer radio wakes
+      // than the old 30s.
       http = new OkHttpClient.Builder()
-          .pingInterval(30, TimeUnit.SECONDS)
+          .pingInterval(90, TimeUnit.SECONDS)
           .retryOnConnectionFailure(true)
           .build();
     }
     registerNetworkCallback();
+    registerScreenOnReceiver();
     if (urlChanged && socket != null) {
       // Config changed under a live (or half-open) socket — replace it now.
       forceReconnect();
@@ -468,11 +490,31 @@ public class ClipboardService extends Service {
     }
   }
 
+  /** Screen-on = the user is back: snap out of the slow backoff immediately so
+   *  the dock is fresh by the time they can tap it. */
+  private void registerScreenOnReceiver() {
+    if (screenOnReceiver != null) return;
+    screenOnReceiver = new android.content.BroadcastReceiver() {
+      @Override public void onReceive(Context ctx, Intent intent) {
+        if (socket == null) forceReconnect();
+      }
+    };
+    try {
+      android.content.IntentFilter f = new android.content.IntentFilter();
+      f.addAction(Intent.ACTION_SCREEN_ON);
+      f.addAction(Intent.ACTION_USER_PRESENT);
+      registerReceiver(screenOnReceiver, f);
+    } catch (Exception ignored) {
+      screenOnReceiver = null;
+    }
+  }
+
   /** Drop any stale socket and reconnect now, resetting the backoff. Safe to call
    *  from the connectivity callback thread — the actual connect hops to `main`. */
   private void forceReconnect() {
     if (stopping) return;
     reconnectMs = 1000;
+    reconnectFails = 0;
     main.removeCallbacks(reconnect);
     main.post(() -> {
       if (stopping) return;
@@ -490,6 +532,7 @@ public class ClipboardService extends Service {
     socket = http.newWebSocket(new Request.Builder().url(socketUrl).build(), new WebSocketListener() {
       @Override public void onOpen(WebSocket ws, Response response) {
         reconnectMs = 1000;
+        reconnectFails = 0;
         socketConnected = true;
         main.post(ClipboardService.this::refreshStatusIfOpen);
         // Request the FULL history (since=0), not just items newer than the last
@@ -521,8 +564,10 @@ public class ClipboardService extends Service {
 
   private void scheduleReconnect() {
     if (stopping) return;
-    long delay = reconnectMs;
-    reconnectMs = Math.min(reconnectMs * 2, MAX_RECONNECT_MS);
+    reconnectFails++;
+    long cap = reconnectFails <= FAST_ATTEMPTS ? MAX_RECONNECT_FAST_MS : MAX_RECONNECT_SLOW_MS;
+    long delay = Math.min(reconnectMs, cap);
+    reconnectMs = Math.min(reconnectMs * 2, cap);
     main.removeCallbacks(reconnect);
     main.postDelayed(reconnect, delay);
   }
@@ -560,39 +605,78 @@ public class ClipboardService extends Service {
         main.post(this::refreshPanelIfOpen);
         return;
       }
-      // Skip echo of native service's own items.
+      // A bare folder move ({t:item, itemId, folder} with no content).
+      if (!v.has("kind") && v.has("folder")) {
+        String folder = v.optString("folder", "");
+        synchronized (this) {
+          for (ClipEntry e : items) if (id.equals(e.id)) e.folder = folder;
+        }
+        main.post(this::refreshPanelIfOpen);
+        return;
+      }
+      // Our own items come back on every since=0 catch-up. They are NOT noise:
+      // after a service restart the in-memory list is empty, and skipping them
+      // meant everything ever sent from this dock vanished from it. Apply them
+      // like any other item (dedupe by id keeps live echoes harmless) — just
+      // don't fire the "new item" attention for our own content.
       String nativeDeviceId = (deviceId == null ? "" : deviceId) + "-native";
-      if (nativeDeviceId.equals(v.optString("deviceId"))) return;
+      boolean own = nativeDeviceId.equals(v.optString("deviceId"));
       long created = parseIsoMs(v.optString("createdUtc", ""));
       String dev = v.optString("deviceId", "");
       boolean pinned = v.optBoolean("pinned", false);
+      String folder = v.optString("folder", "");
       if ("image".equals(v.optString("kind"))) {
-        // Images render as thumbnails: fetch the ciphertext blob, decrypt, decode a
-        // downscaled bitmap on the WS thread. sortItemsLocked keeps ordering right
-        // even though the bitmap lands asynchronously.
-        if (v.optBoolean("hasBlob", false)) {
-          fetchImageThumb(id, created, dev, v.optString("mime", "image/png"), pinned);
+        if (!v.optBoolean("hasBlob", false)) return;
+        // Insert the row IMMEDIATELY (correct position in the list); the bitmap
+        // is fetched lazily — only when the dock actually renders the row. This
+        // stops every background reconnect from re-downloading image blobs
+        // (the old behavior burned battery + data on each catch-up).
+        boolean existed;
+        synchronized (this) {
+          existed = removeByIdLocked(id);
+          ClipEntry e = new ClipEntry(id, "image", null, created, dev);
+          e.pinned = pinned;
+          e.folder = folder;
+          e.mime = v.optString("mime", "image/png");
+          items.add(e);
+          sortItemsLocked();
+          trimItemsLocked();
         }
+        if (!own && !existed) main.post(this::showNewItemAttention);
+        main.post(this::refreshPanelIfOpen);
         return;
       }
       String cipher = v.optString("textCipher", "");
       String plain = decryptText(cipher);
       if (plain == null) return;
+      boolean existed;
       synchronized (this) {
-        // Dedupe by id (rev-driven re-broadcasts happen).
-        for (int i = items.size() - 1; i >= 0; i--) {
-          if (id.equals(items.get(i).id)) items.remove(i);
-        }
+        // Dedupe by id (rev-driven re-broadcasts + edits happen).
+        existed = removeByIdLocked(id);
         ClipEntry e = new ClipEntry(id, "text", plain, created, dev);
         e.pinned = pinned;
+        e.folder = folder;
         items.add(e);
         sortItemsLocked();
         trimItemsLocked();
       }
-      main.post(this::showNewItemAttention);
+      if (!own && !existed) main.post(this::showNewItemAttention);
       main.post(this::refreshPanelIfOpen);
     } catch (Exception ignored) {
     }
+  }
+
+  /** Remove any entry with this id (and its cached thumb is kept — same image).
+   *  Returns true when one existed. Caller holds `this`. */
+  private boolean removeByIdLocked(String id) {
+    boolean existed = false;
+    for (int i = items.size() - 1; i >= 0; i--) {
+      if (id.equals(items.get(i).id)) {
+        items.remove(i);
+        existed = true;
+      }
+    }
+    return existed;
   }
 
   /** Evict past MAX_ITEMS (oldest, unpinned first), dropping the cached thumbnail so
@@ -607,45 +691,41 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Download → decrypt → downscale one image blob, then insert its row. Runs on the
-   *  OkHttp callback thread (already a background thread). Best-effort. */
-  private void fetchImageThumb(String id, long created, String dev, String mime, boolean pinned) {
+  /** Thumb downloads currently in flight (dedupe). Guarded by `this`. */
+  private final java.util.HashSet<String> thumbFetching = new java.util.HashSet<>();
+
+  /** LAZY: download → decrypt → downscale one image blob into {@link #thumbs}.
+   *  Called only when the dock actually renders the row, so background catch-ups
+   *  never re-download blobs. Best-effort; refreshes the panel when done. */
+  private void fetchImageThumb(String id) {
     if (http == null || clipSpace.isEmpty() || httpBase.isEmpty()) return;
-    // Already have it? Just make sure the row exists.
     synchronized (this) {
-      if (thumbs.containsKey(id)) return;
+      if (thumbs.containsKey(id) || !thumbFetching.add(id)) return;
     }
     String url = httpBase + "/clip/blob/" + clipSpace + "/" + id;
     try {
       http.newCall(new Request.Builder().url(url).build()).enqueue(new okhttp3.Callback() {
-        @Override public void onFailure(okhttp3.Call call, java.io.IOException e) { }
+        @Override public void onFailure(okhttp3.Call call, java.io.IOException e) {
+          synchronized (ClipboardService.this) { thumbFetching.remove(id); }
+        }
         @Override public void onResponse(okhttp3.Call call, Response resp) {
+          Bitmap bmp = null;
           try (Response r = resp) {
-            if (!r.isSuccessful() || r.body() == null) return;
-            byte[] cipher = r.body().bytes();
-            byte[] raw = decryptBytes(cipher);
-            if (raw == null) return;
-            Bitmap bmp = decodeThumb(raw);
-            if (bmp == null) return;
-            synchronized (ClipboardService.this) {
-              for (int i = items.size() - 1; i >= 0; i--) {
-                if (id.equals(items.get(i).id)) items.remove(i);
-              }
-              thumbs.put(id, bmp);
-              ClipEntry e = new ClipEntry(id, "image", null, created, dev);
-              e.pinned = pinned;
-              e.mime = mime == null ? "image/png" : mime;
-              items.add(e);
-              sortItemsLocked();
-              trimItemsLocked();
+            if (r.isSuccessful() && r.body() != null) {
+              byte[] raw = decryptBytes(r.body().bytes());
+              if (raw != null) bmp = decodeThumb(raw);
             }
-            main.post(ClipboardService.this::showNewItemAttention);
-            main.post(ClipboardService.this::refreshPanelIfOpen);
           } catch (Exception ignored) {
           }
+          synchronized (ClipboardService.this) {
+            thumbFetching.remove(id);
+            if (bmp != null) thumbs.put(id, bmp);
+          }
+          if (bmp != null) main.post(ClipboardService.this::refreshPanelIfOpen);
         }
       });
     } catch (Exception ignored) {
+      synchronized (this) { thumbFetching.remove(id); }
     }
   }
 
@@ -680,8 +760,8 @@ public class ClipboardService extends Service {
         ? new Notification.Builder(this, CHANNEL)
         : new Notification.Builder(this);
     nm.notify(NOTIF_ID, b.setSmallIcon(base.getSmallIcon())
-        .setContentTitle("New shared clipboard item")
-        .setContentText("Tap the bubble to view and copy it")
+        .setContentTitle("New shared note")
+        .setContentText("Tap the edge pin to view and copy it")
         .setOngoing(true)
         .setOnlyAlertOnce(false)
         .build());
@@ -695,26 +775,49 @@ public class ClipboardService extends Service {
     return out.toString();
   }
 
-  /** Parse an RFC3339/ISO-8601 UTC timestamp (e.g. 2026-07-20T10:51:50.565Z) to
-   *  epoch ms. Handles the fractional-seconds form the JS/desktop sides emit AND a
-   *  plain seconds form, so ordering-by-time is exact (millisecond precision matters
-   *  when several clips land in the same second). Falls back to now on failure. */
+  /** Parse an RFC3339/ISO-8601 timestamp to epoch ms. Handles EVERY shape the
+   *  fleet has ever emitted: 'Z' or '±HH:MM'/'±HHMM' offsets (chrono's
+   *  to_rfc3339 ends in "+00:00" — the old parser rejected those, every desktop
+   *  item fell back to "now", and the dock's ordering scrambled on each replay),
+   *  plus any fractional-second precision (0–9 digits, normalized to millis).
+   *  Falls back to now only when nothing parses. */
   private static long parseIsoMs(String s) {
     if (s == null || s.isEmpty()) return System.currentTimeMillis();
-    String t = s.replace('T', ' ');
-    if (t.endsWith("Z")) t = t.substring(0, t.length() - 1);
-    String[] patterns = {"yyyy-MM-dd HH:mm:ss.SSS", "yyyy-MM-dd HH:mm:ss"};
-    for (String p : patterns) {
-      try {
-        java.text.SimpleDateFormat f = new java.text.SimpleDateFormat(p, java.util.Locale.US);
-        f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
-        f.setLenient(false);
-        return f.parse(t).getTime();
-      } catch (Exception ignored) {
-        // try next pattern
+    try {
+      String t = s.trim().replace('T', ' ');
+      long offsetMs = 0;
+      if (t.endsWith("Z") || t.endsWith("z")) {
+        t = t.substring(0, t.length() - 1);
+      } else {
+        // A '+'/'-' past the date part is a zone offset (date dashes sit at 4 & 7).
+        int idx = Math.max(t.lastIndexOf('+'), t.lastIndexOf('-'));
+        if (idx > 10) {
+          String z = t.substring(idx).replace(":", "");
+          t = t.substring(0, idx);
+          if (z.length() >= 5) {
+            int sign = z.charAt(0) == '-' ? -1 : 1;
+            int hh = Integer.parseInt(z.substring(1, 3));
+            int mm = Integer.parseInt(z.substring(3, 5));
+            offsetMs = sign * (hh * 3600000L + mm * 60000L);
+          }
+        }
       }
+      // Normalize fractional seconds to exactly 3 digits.
+      String frac = "000";
+      int dot = t.indexOf('.');
+      if (dot >= 0) {
+        String f = t.substring(dot + 1).replaceAll("[^0-9]", "");
+        t = t.substring(0, dot);
+        frac = (f + "000").substring(0, 3);
+      }
+      java.text.SimpleDateFormat fmt =
+          new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US);
+      fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+      fmt.setLenient(false);
+      return fmt.parse(t + "." + frac).getTime() - offsetMs;
+    } catch (Exception ignored) {
+      return System.currentTimeMillis();
     }
-    return System.currentTimeMillis();
   }
 
   // ---- images (dock) --------------------------------------------------------
@@ -738,28 +841,6 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Read an image the OS clipboard currently holds (Android grants clipboard reads
-   *  while an app/overlay of ours is in the foreground) and sync it. Best-effort:
-   *  toasts guidance if the clipboard has no image. */
-  private void pasteImageFromClipboard() {
-    try {
-      ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-      if (cm == null || !cm.hasPrimaryClip()) { toast("Copy an image first, then tap ＋ Image"); return; }
-      ClipData clip = cm.getPrimaryClip();
-      if (clip == null || clip.getItemCount() == 0) { toast("Copy an image first"); return; }
-      android.net.Uri uri = clip.getItemAt(0).getUri();
-      if (uri == null) { toast("No image on the clipboard"); return; }
-      String mime = getContentResolver().getType(uri);
-      if (mime == null || !mime.startsWith("image/")) { toast("Clipboard isn't an image"); return; }
-      final String fmime = mime;
-      byte[] raw = readAll(uri);
-      if (raw == null || raw.length == 0) { toast("Couldn't read the image"); return; }
-      sendImageItem(raw, fmime);
-    } catch (Exception e) {
-      toast("Couldn't paste image");
-    }
-  }
-
   private byte[] readAll(android.net.Uri uri) {
     try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
       if (in == null) return null;
@@ -773,6 +854,11 @@ public class ClipboardService extends Service {
     }
   }
 
+  /** The folder new items adopt: the folder currently being viewed (All → unfiled). */
+  private String currentComposeFolder() {
+    return dockFolderFilter == null ? "" : dockFolderFilter;
+  }
+
   /** Encrypt + upload an image blob, then broadcast an `add` over the WS. Inserts an
    *  optimistic local thumbnail row so the dock reflects it at once. */
   private void sendImageItem(byte[] raw, String mime) {
@@ -784,6 +870,7 @@ public class ClipboardService extends Service {
     final String id = UUID.randomUUID().toString();
     final String now = isoNow();
     final String nd = (deviceId == null ? "" : deviceId) + "-native";
+    final String folder = currentComposeFolder();
     final Bitmap thumb = decodeThumb(raw);
     final int size = raw.length;
     // Upload the blob first (HTTP), then announce it (WS).
@@ -808,6 +895,7 @@ public class ClipboardService extends Service {
             item.put("size", size);
             item.put("createdUtc", now);
             item.put("pinned", false);
+            item.put("folder", folder);
             item.put("hasBlob", true);
             JSONObject msg = new JSONObject();
             msg.put("t", "add");
@@ -817,6 +905,7 @@ public class ClipboardService extends Service {
               if (thumb != null) thumbs.put(id, thumb);
               ClipEntry e = new ClipEntry(id, "image", null, parseIsoMs(now), nd);
               e.mime = mime == null ? "image/png" : mime;
+              e.folder = folder;
               items.add(e);
               sortItemsLocked();
               trimItemsLocked();
@@ -927,17 +1016,39 @@ public class ClipboardService extends Service {
 
   // ---- voice to text (dock mic) ---------------------------------------------
 
-  /** Toggle native recording. First tap records (MediaRecorder → m4a); second tap
-   *  stops and transcribes via Sarvam, appending the result to the composer. Needs
-   *  RECORD_AUDIO — if not granted, routes the user to the app to grant it. */
+  /** Live built-in recognition session (keyless path). Main-thread only. */
+  private android.speech.SpeechRecognizer speechRec;
+  private boolean nativeListening;
+
+  private boolean hasSarvamKey() {
+    return sarvamKey != null && !sarvamKey.trim().isEmpty();
+  }
+
+  /** Toggle voice input. With a Sarvam key: record (m4a) → Sarvam transcribe (the
+   *  keyed path, better for long dictation). Without one: the phone's BUILT-IN
+   *  SpeechRecognizer, so the mic always works. Needs RECORD_AUDIO — if not
+   *  granted, routes the user to the app to grant it. */
   private void toggleMic(Button micBtn) {
+    if (nativeListening) {
+      // Gentle stop: let onResults/onError deliver the transcript, then clean up.
+      main.post(() -> {
+        try {
+          if (speechRec != null) speechRec.stopListening();
+        } catch (Exception ignored) {
+        }
+      });
+      return;
+    }
     if (recording) { stopRecordingAndTranscribe(micBtn); return; }
-    if (sarvamKey == null || sarvamKey.trim().isEmpty()) { toast("Add a Sarvam key in Settings"); return; }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
         && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
       toast("Grant microphone access in the app, then try again");
       openApp();
+      return;
+    }
+    if (!hasSarvamKey()) {
+      startNativeStt(micBtn);
       return;
     }
     try {
@@ -952,7 +1063,7 @@ public class ClipboardService extends Service {
       recorder.prepare();
       recorder.start();
       recording = true;
-      micBtn.setText("■ Stop");
+      micBtn.setText("■");
       toast("Recording… tap to stop");
     } catch (Exception e) {
       recording = false;
@@ -963,7 +1074,7 @@ public class ClipboardService extends Service {
 
   private void stopRecordingAndTranscribe(Button micBtn) {
     recording = false;
-    micBtn.setText("… transcribing");
+    micBtn.setText("…");
     try {
       if (recorder != null) { recorder.stop(); }
     } catch (Exception ignored) {
@@ -972,13 +1083,13 @@ public class ClipboardService extends Service {
     final File f = audioFile;
     final EditText composer = dockComposer;
     if (f == null || !f.exists() || http == null) {
-      micBtn.setText("🎤 Speak");
+      micBtn.setText("🎤");
       return;
     }
     new Thread(() -> {
       String text = transcribeViaSarvam(f);
       main.post(() -> {
-        if (dockMic instanceof Button) ((Button) dockMic).setText("🎤 Speak");
+        if (dockMic instanceof Button) ((Button) dockMic).setText("🎤");
         if (text != null && !text.isEmpty() && composer != null) {
           String cur = composer.getText().toString();
           composer.setText(cur.isEmpty() ? text : cur + " " + text);
@@ -1023,6 +1134,89 @@ public class ClipboardService extends Service {
     recorder = null;
   }
 
+  /** Built-in (on-device / Google) speech recognition — the keyless voice path.
+   *  Appends the final transcript to the composer, same as the Sarvam flow. */
+  private void startNativeStt(Button micBtn) {
+    main.post(() -> {
+      try {
+        if (!android.speech.SpeechRecognizer.isRecognitionAvailable(this)) {
+          toast("No speech engine on this phone — add a Sarvam key in Settings");
+          return;
+        }
+        // Inline cleanup of any stale session (must NOT go through stopNativeStt —
+        // its posted runnable would land after this one and undo the fresh state).
+        try {
+          if (speechRec != null) speechRec.destroy();
+        } catch (Exception ignored) {
+        }
+        speechRec = null;
+        speechRec = android.speech.SpeechRecognizer.createSpeechRecognizer(this);
+        Intent intent = new Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+            android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
+        speechRec.setRecognitionListener(new android.speech.RecognitionListener() {
+          @Override public void onReadyForSpeech(android.os.Bundle params) {}
+          @Override public void onBeginningOfSpeech() {}
+          @Override public void onRmsChanged(float rmsdB) {}
+          @Override public void onBufferReceived(byte[] buffer) {}
+          @Override public void onEndOfSpeech() {
+            if (micBtn != null) micBtn.setText("…");
+          }
+          @Override public void onError(int error) {
+            boolean noSpeech = error == android.speech.SpeechRecognizer.ERROR_NO_MATCH
+                || error == android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT;
+            if (!noSpeech) toast("Speech recognition failed (" + error + ")");
+            else toast("Didn't catch that — try again");
+            finishNativeStt(micBtn);
+          }
+          @Override public void onResults(android.os.Bundle results) {
+            ArrayList<String> out = results == null ? null
+                : results.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION);
+            if (out != null && !out.isEmpty() && dockComposer != null) {
+              String cur = dockComposer.getText().toString();
+              String t = out.get(0);
+              dockComposer.setText(cur.isEmpty() ? t : cur + " " + t);
+              dockComposer.setSelection(dockComposer.getText().length());
+            }
+            finishNativeStt(micBtn);
+          }
+          @Override public void onPartialResults(android.os.Bundle partialResults) {}
+          @Override public void onEvent(int eventType, android.os.Bundle params) {}
+        });
+        nativeListening = true;
+        if (micBtn != null) micBtn.setText("■");
+        speechRec.startListening(intent);
+        toast("Listening…");
+      } catch (Exception e) {
+        finishNativeStt(micBtn);
+        toast("Mic unavailable");
+      }
+    });
+  }
+
+  private void finishNativeStt(Button micBtn) {
+    nativeListening = false;
+    if (micBtn != null) micBtn.setText("🎤");
+    else if (dockMic instanceof Button) ((Button) dockMic).setText("🎤");
+    try {
+      if (speechRec != null) speechRec.destroy();
+    } catch (Exception ignored) {
+    }
+    speechRec = null;
+  }
+
+  /** Hard-stop + tear down the built-in recognizer (service destroy / restart). */
+  private void stopNativeStt() {
+    main.post(() -> {
+      try {
+        if (speechRec != null) speechRec.cancel();
+      } catch (Exception ignored) {
+      }
+      finishNativeStt(dockMic instanceof Button ? (Button) dockMic : null);
+    });
+  }
+
   // ---- foreground service / notification ------------------------------------
 
   private void startForegroundNotif() {
@@ -1047,7 +1241,7 @@ public class ClipboardService extends Service {
     NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
     if (nm == null) return;
     NotificationChannel ch =
-        new NotificationChannel(CHANNEL, "Shared clipboard", NotificationManager.IMPORTANCE_MIN);
+        new NotificationChannel(CHANNEL, "Shared notes", NotificationManager.IMPORTANCE_MIN);
     ch.setShowBadge(false);
     nm.createNotificationChannel(ch);
   }
@@ -1063,8 +1257,8 @@ public class ClipboardService extends Service {
             ? new Notification.Builder(this, CHANNEL)
             : new Notification.Builder(this);
     return b.setSmallIcon(getApplicationInfo().icon)
-        .setContentTitle("Shared clipboard")
-        .setContentText("Tap the bubble to view recent clips")
+        .setContentTitle("Shared notes")
+        .setContentText("Tap the edge pin to view recent notes")
         .setContentIntent(pi)
         .setOngoing(true)
         .build();
@@ -1119,6 +1313,65 @@ public class ClipboardService extends Service {
       bubble = view;
     } catch (Exception ignored) {
     }
+    addFullscreenProbe();
+  }
+
+  // ---- fullscreen detection (hide the pin over games / fullscreen video) -----
+
+  /** Invisible 1px overlay whose window insets track the system bars: when the
+   *  foreground app goes immersive-fullscreen (game, video player) the status
+   *  bar hides, this probe's insets go to zero, and we hide the pin so nothing
+   *  floats over the content. It returns the moment the bars come back. */
+  private View fsProbe;
+  private boolean hiddenForFullscreen;
+
+  private void addFullscreenProbe() {
+    if (fsProbe != null || wm == null) return;
+    try {
+      View probe = new View(this);
+      int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+          ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+          : WindowManager.LayoutParams.TYPE_PHONE;
+      WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+          1,
+          WindowManager.LayoutParams.MATCH_PARENT,
+          type,
+          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+              | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+              | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+          PixelFormat.TRANSLUCENT);
+      lp.gravity = Gravity.TOP | Gravity.START;
+      probe.setOnApplyWindowInsetsListener((v, insets) -> {
+        boolean fullscreen;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+          fullscreen = !insets.isVisible(android.view.WindowInsets.Type.statusBars());
+        } else {
+          fullscreen = insets.getSystemWindowInsetTop() == 0;
+        }
+        setHiddenForFullscreen(fullscreen);
+        return insets;
+      });
+      wm.addView(probe, lp);
+      fsProbe = probe;
+    } catch (Exception ignored) {
+      fsProbe = null;
+    }
+  }
+
+  private void setHiddenForFullscreen(boolean fullscreen) {
+    if (hiddenForFullscreen == fullscreen) return;
+    hiddenForFullscreen = fullscreen;
+    main.post(() -> {
+      if (bubble == null) return;
+      if (fullscreen) {
+        bubble.animate().alpha(0f).setDuration(180)
+            .withEndAction(() -> { if (hiddenForFullscreen && bubble != null) bubble.setVisibility(View.GONE); })
+            .start();
+      } else {
+        bubble.setVisibility(View.VISIBLE);
+        bubble.animate().alpha(0.9f).setDuration(180).start();
+      }
+    });
   }
 
   /** Flat rounded tab, rounded only on the inner side, low-opacity accent. */
@@ -1209,11 +1462,21 @@ public class ClipboardService extends Service {
   // ---- side dock ------------------------------------------------------------
 
   private EditText dockComposer; // live handle so the mic can append transcripts
-  private View dockMic;          // shown only when a Sarvam key is configured
+  private View dockMic;          // mic button (Sarvam-keyed or built-in recognizer)
+  private Button dockAddBtn;     // flips Add ↔ Save while editing a note
   private String dockFilter = ""; // native search text
   // Filter chip: "" = all, "text", "image". Mirrors the desktop panel's All / Text /
   // Images tabs so the floating dock has the same content-type filtering.
   private String dockFilterKind = "";
+  // Folder filter: null = All, "" = Unfiled, else a folder name. New items adopt
+  // the folder being viewed (see currentComposeFolder). Parity with the app screens.
+  private String dockFolderFilter = null;
+  private LinearLayout dockFolderStrip; // rebuilt when folders change
+  // Note editing: non-null while the composer is editing this entry in place.
+  private String dockEditingId = null;
+  // Folder chooser: non-null while the list shows "move to folder" options for
+  // this entry instead of the history.
+  private String folderPickForId = null;
   // Lazy render window: only the first N matching rows are inflated as Views; grows
   // by RENDER_PAGE as the user scrolls near the bottom so a 300-item history doesn't
   // inflate hundreds of rows up front. Reset when the filter/search changes.
@@ -1258,16 +1521,16 @@ public class ClipboardService extends Service {
 
     // Search box (parity with the app screen's history filter).
     final EditText searchField = new EditText(this);
-    searchField.setHint("Search history");
+    searchField.setHint("Search notes");
     searchField.setHintTextColor(0xFF64748B);
     searchField.setTextColor(0xFFE2E8F0);
-    searchField.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    searchField.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
     searchField.setSingleLine(true);
     GradientDrawable sBg = new GradientDrawable();
     sBg.setColor(0x14FFFFFF);
-    sBg.setCornerRadius(dp(10));
+    sBg.setCornerRadius(dp(9));
     searchField.setBackground(sBg);
-    searchField.setPadding(dp(10), dp(6), dp(10), dp(6));
+    searchField.setPadding(dp(9), dp(4), dp(9), dp(4));
     searchField.addTextChangedListener(new android.text.TextWatcher() {
       @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
       @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
@@ -1279,13 +1542,17 @@ public class ClipboardService extends Service {
     });
     LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    searchLp.topMargin = dp(8);
+    searchLp.topMargin = dp(6);
     root.addView(searchField, searchLp);
 
     // All / Text / Images filter strip — parity with the desktop panel's tabs so
     // the dock can browse by content type. Each chip resets the render window so
     // switching filter shows the top of the new set.
     root.addView(buildFilterStrip());
+
+    // Folder chips (All · Unfiled · one per folder) — the notes "lists" selector,
+    // parity with the app screens. Hidden until a folder exists.
+    root.addView(buildFolderStrip());
 
     // Scrollable history.
     ScrollView scroll = new ScrollView(this);
@@ -1378,7 +1645,7 @@ public class ClipboardService extends Service {
     header.addView(icon, iconLp);
 
     TextView title = new TextView(this);
-    title.setText("Clipboard");
+    title.setText("Notes");
     title.setTextColor(Color.WHITE);
     title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
     title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
@@ -1441,8 +1708,12 @@ public class ClipboardService extends Service {
       chip.setText(labels[i]);
       chip.setAllCaps(false);
       chip.setStateListAnimator(null);
-      chip.setPadding(0, dp(4), 0, dp(4));
-      chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+      chip.setPadding(0, dp(2), 0, dp(2));
+      chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+      chip.setMinWidth(0);
+      chip.setMinimumWidth(0);
+      chip.setMinHeight(0);
+      chip.setMinimumHeight(0);
       LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(
           0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
       if (i > 0) chipLp.leftMargin = dp(2);
@@ -1476,7 +1747,131 @@ public class ClipboardService extends Service {
     b.setBackground(bg);
   }
 
-  /** Composer row: text field + image button + mic (key-gated) + Add. */
+  /** Horizontally-scrollable folder chips (All · Unfiled · one per folder). */
+  private View buildFolderStrip() {
+    android.widget.HorizontalScrollView sv = new android.widget.HorizontalScrollView(this);
+    sv.setHorizontalScrollBarEnabled(false);
+    LinearLayout strip = new LinearLayout(this);
+    strip.setOrientation(LinearLayout.HORIZONTAL);
+    sv.addView(strip);
+    dockFolderStrip = strip;
+    populateFolderStrip();
+    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    lp.topMargin = dp(5);
+    sv.setLayoutParams(lp);
+    return sv;
+  }
+
+  /** (Re)build the folder chips to match the current folder set + selection.
+   *  Must run on the main thread. */
+  private void populateFolderStrip() {
+    LinearLayout strip = dockFolderStrip;
+    if (strip == null) return;
+    strip.removeAllViews();
+    ArrayList<String> folders;
+    synchronized (this) {
+      folders = foldersLocked();
+    }
+    if (folders.isEmpty() && dockFolderFilter == null) return; // nothing to filter
+    addFolderChip(strip, "All", null);
+    addFolderChip(strip, "Unfiled", "");
+    for (String f : folders) addFolderChip(strip, f, f);
+  }
+
+  private void addFolderChip(LinearLayout strip, String label, String value) {
+    Button chip = new Button(this);
+    chip.setText(label);
+    chip.setAllCaps(false);
+    chip.setStateListAnimator(null);
+    chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    chip.setPadding(dp(8), dp(2), dp(8), dp(2));
+    chip.setMinWidth(0);
+    chip.setMinimumWidth(0);
+    chip.setMinHeight(0);
+    chip.setMinimumHeight(0);
+    boolean active = value == null ? dockFolderFilter == null : value.equals(dockFolderFilter);
+    GradientDrawable bg = new GradientDrawable();
+    bg.setCornerRadius(dp(8));
+    bg.setColor(active ? 0xFF7C5CFF : 0x10FFFFFF);
+    chip.setBackground(bg);
+    chip.setTextColor(active ? Color.WHITE : 0xFF94A3B8);
+    chip.setOnClickListener((v) -> {
+      dockFolderFilter = value;
+      renderLimit = RENDER_PAGE;
+      populateFolderStrip();
+      refreshPanelIfOpen();
+    });
+    LinearLayout.LayoutParams lp =
+        new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(24));
+    if (strip.getChildCount() > 0) lp.leftMargin = dp(4);
+    strip.addView(chip, lp);
+  }
+
+  /** Rebuild the folder chips from any thread. */
+  private void rebuildFolderStripIfOpen() {
+    main.post(this::populateFolderStrip);
+  }
+
+  /** Every distinct non-empty folder across items, alphabetical. Caller holds `this`. */
+  private ArrayList<String> foldersLocked() {
+    java.util.TreeSet<String> set = new java.util.TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+    for (ClipEntry e : items) {
+      if (e.folder != null && !e.folder.trim().isEmpty()) set.add(e.folder.trim());
+    }
+    return new ArrayList<>(set);
+  }
+
+  /** Move an entry to a folder ('' = unfiled) locally + broadcast the bare folder
+   *  notice (relay flips + rebroadcasts — same shape as pin). */
+  private void moveToFolder(ClipEntry e, String folder) {
+    if (e == null) return;
+    e.folder = folder == null ? "" : folder;
+    try {
+      JSONObject m = new JSONObject();
+      m.put("t", "folder");
+      m.put("itemId", e.id);
+      m.put("folder", e.folder);
+      if (socket != null) socket.send(m.toString());
+    } catch (Exception ignored) {
+    }
+    folderPickForId = null;
+    rebuildFolderStripIfOpen();
+    refreshPanelIfOpen();
+    toast(e.folder.isEmpty() ? "Removed from folder" : "Moved to " + e.folder);
+  }
+
+  /** Insert + send a brand-new text note (composer Add, paste, share). The LOCAL
+   *  entry and the wire item share ONE id + timestamp, so every device holds the
+   *  exact same element and ordering matches everywhere. */
+  private void addTextLocalAndSend(String t) {
+    String id = UUID.randomUUID().toString();
+    long nowMs = System.currentTimeMillis();
+    String folder = currentComposeFolder();
+    sendTextItem(id, t, isoFromMs(nowMs), folder, false);
+    synchronized (this) {
+      ClipEntry e = new ClipEntry(id, "text", t, nowMs,
+          (deviceId == null ? "" : deviceId) + "-native");
+      e.folder = folder;
+      items.add(e);
+      sortItemsLocked();
+      trimItemsLocked();
+    }
+    refreshPanelIfOpen();
+  }
+
+  /** Begin editing a text note in the composer (Add becomes Save). */
+  private void startEditEntry(ClipEntry e) {
+    if (e == null || dockComposer == null || !"text".equals(e.kind)) return;
+    dockEditingId = e.id;
+    dockComposer.setText(e.text == null ? "" : e.text);
+    dockComposer.setSelection(dockComposer.getText().length());
+    dockComposer.requestFocus();
+    if (dockAddBtn != null) dockAddBtn.setText("Save");
+    toast("Editing — Save when done");
+  }
+
+  /** Composer row: text field + paste/upload/mic + Add (compact). */
   private LinearLayout buildDockComposer() {
     LinearLayout wrap = new LinearLayout(this);
     wrap.setOrientation(LinearLayout.VERTICAL);
@@ -1487,16 +1882,33 @@ public class ClipboardService extends Service {
 
     final EditText composer = new EditText(this);
     dockComposer = composer;
-    composer.setHint("Type or dictate…");
+    composer.setHint("Type a note…");
     composer.setHintTextColor(0xFF64748B);
     composer.setTextColor(0xFFE2E8F0);
-    composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+    composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
     composer.setMaxLines(3);
     GradientDrawable fieldBg = new GradientDrawable();
     fieldBg.setColor(0x14FFFFFF);
     fieldBg.setCornerRadius(dp(10));
     composer.setBackground(fieldBg);
-    composer.setPadding(dp(10), dp(8), dp(10), dp(8));
+    composer.setPadding(dp(9), dp(6), dp(9), dp(6));
+    // Restore the unsent draft (survives dock close / service restart) and keep
+    // it persisted on every keystroke. Edits don't touch the draft slot.
+    String draft = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+        .getString("draftText", "");
+    if (draft != null && !draft.isEmpty()) {
+      composer.setText(draft);
+      composer.setSelection(composer.getText().length());
+    }
+    composer.addTextChangedListener(new android.text.TextWatcher() {
+      @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+      @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+      @Override public void afterTextChanged(android.text.Editable s) {
+        if (dockEditingId != null) return; // edits are not drafts
+        getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+            .edit().putString("draftText", s.toString()).apply();
+      }
+    });
     // Keyboard image paste (Gboard rich content): on Android 12+ the IME can hand
     // image URIs straight to the focused EditText via OnReceiveContentListener.
     // Without this, pasting an image from the keyboard does nothing in the
@@ -1539,60 +1951,115 @@ public class ClipboardService extends Service {
     actionsLp.topMargin = dp(6);
     actions.setLayoutParams(actionsLp);
 
-    // Paste from the OS clipboard (parity with the desktop composer's "Paste Image"
-    // button). Best-effort — toasts guidance if there's no image on the clipboard.
+    // Compact action row: paste (text OR image) · upload · mic · Add/Save.
     Button pasteBtn = new Button(this);
-    pasteBtn.setText("📋 Paste");
-    styleBtn(pasteBtn, false);
-    pasteBtn.setOnClickListener((v) -> pasteImageFromClipboard());
-    actions.addView(pasteBtn, new LinearLayout.LayoutParams(0, dp(34), 1f));
+    pasteBtn.setText("📋");
+    styleCompactBtn(pasteBtn, false);
+    pasteBtn.setOnClickListener((v) -> pasteFromClipboard());
+    actions.addView(pasteBtn, new LinearLayout.LayoutParams(dp(38), dp(28)));
 
     // Upload button: opens the photo gallery via a transparent proxy Activity
     // (services can't get an Activity result callback). Picks an image, hands the
     // content:// URI back here via ACTION_UPLOAD_IMAGE. Full-res image sync.
     Button uploadBtn = new Button(this);
-    uploadBtn.setText("🖼 Upload");
-    styleBtn(uploadBtn, false);
+    uploadBtn.setText("🖼");
+    styleCompactBtn(uploadBtn, false);
     uploadBtn.setOnClickListener((v) -> launchImagePicker());
-    LinearLayout.LayoutParams uploadLp = new LinearLayout.LayoutParams(0, dp(34), 1f);
-    uploadLp.leftMargin = dp(6);
+    LinearLayout.LayoutParams uploadLp = new LinearLayout.LayoutParams(dp(38), dp(28));
+    uploadLp.leftMargin = dp(4);
     actions.addView(uploadBtn, uploadLp);
 
-    // Mic button (only when a Sarvam key is set — matches the desktop's gating).
+    // Mic: Sarvam when a key is set; the phone's built-in recognizer otherwise —
+    // so voice input always exists.
     Button mic = new Button(this);
     mic.setText("🎤");
-    styleBtn(mic, false);
+    styleCompactBtn(mic, false);
     dockMic = mic;
-    mic.setVisibility(sarvamKey != null && !sarvamKey.trim().isEmpty() ? View.VISIBLE : View.GONE);
     mic.setOnClickListener((v) -> toggleMic((Button) v));
-    LinearLayout.LayoutParams micLp = new LinearLayout.LayoutParams(dp(46), dp(34));
-    micLp.leftMargin = dp(6);
+    LinearLayout.LayoutParams micLp = new LinearLayout.LayoutParams(dp(38), dp(28));
+    micLp.leftMargin = dp(4);
     actions.addView(mic, micLp);
 
+    View spacer = new View(this);
+    actions.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
+
     Button addBtn = new Button(this);
-    addBtn.setText("Add");
-    styleBtn(addBtn, true);
+    dockAddBtn = addBtn;
+    addBtn.setText(dockEditingId != null ? "Save" : "Add");
+    styleCompactBtn(addBtn, true);
     addBtn.setOnClickListener((v) -> {
       String t = composer.getText().toString().trim();
       if (t.isEmpty()) return;
-      sendTextItem(t);
-      synchronized (this) {
-        String nd = (deviceId == null ? "" : deviceId) + "-native";
-        ClipEntry e = new ClipEntry(UUID.randomUUID().toString(), "text", t, System.currentTimeMillis(), nd);
-        items.add(e);
-        sortItemsLocked();
-        trimItemsLocked();
+      if (dockEditingId != null) {
+        // Save an in-place edit: same id + original timestamp → every device
+        // replaces its copy without changing the note's position.
+        ClipEntry target = null;
+        synchronized (this) {
+          for (ClipEntry e : items) {
+            if (dockEditingId.equals(e.id)) { target = e; break; }
+          }
+        }
+        if (target != null) {
+          target.text = t;
+          sendTextItem(target.id, t, isoFromMs(target.createdAtMs), target.folder, target.pinned);
+        }
+        dockEditingId = null;
+        addBtn.setText("Add");
+        String saved = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+            .getString("draftText", "");
+        composer.setText(saved == null ? "" : saved);
+        refreshPanelIfOpen();
+        toast("Saved");
+        return;
       }
+      addTextLocalAndSend(t);
       composer.setText("");
-      refreshPanelIfOpen();
+      getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+          .edit().remove("draftText").apply();
+      rebuildFolderStripIfOpen();
       toast("Sent");
     });
-    LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(64), dp(34));
-    addLp.leftMargin = dp(6);
+    LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(54), dp(28));
+    addLp.leftMargin = dp(4);
     actions.addView(addBtn, addLp);
 
     wrap.addView(actions);
     return wrap;
+  }
+
+  /** Paste whatever the OS clipboard holds: an image → image note, else text →
+   *  text note (deduped against the newest note so re-taps don't spam). */
+  private void pasteFromClipboard() {
+    try {
+      ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+      if (cm == null || !cm.hasPrimaryClip()) { toast("Clipboard is empty"); return; }
+      ClipData clip = cm.getPrimaryClip();
+      if (clip == null || clip.getItemCount() == 0) { toast("Clipboard is empty"); return; }
+      ClipData.Item it = clip.getItemAt(0);
+      android.net.Uri uri = it.getUri();
+      if (uri != null) {
+        String mime = getContentResolver().getType(uri);
+        if (mime != null && mime.startsWith("image/")) {
+          byte[] raw = readAll(uri);
+          if (raw != null && raw.length > 0) { sendImageItem(raw, mime); return; }
+        }
+      }
+      CharSequence cs = it.coerceToText(this);
+      String text = cs == null ? "" : cs.toString().trim();
+      if (text.isEmpty()) { toast("Nothing to paste"); return; }
+      synchronized (this) {
+        for (ClipEntry e : items) {
+          if ("text".equals(e.kind)) {
+            if (text.equals(e.text)) { toast("Already the latest note"); return; }
+            break; // only compare against the newest text note
+          }
+        }
+      }
+      addTextLocalAndSend(text);
+      toast("Pasted");
+    } catch (Exception e) {
+      toast("Couldn't paste");
+    }
   }
 
   /** Launch the system photo picker (or open the gallery as a fallback on older
@@ -1621,20 +2088,20 @@ public class ClipboardService extends Service {
 
     Button copyLast = new Button(this);
     copyLast.setText("Copy last");
-    styleBtn(copyLast, true);
+    styleCompactBtn(copyLast, true);
     copyLast.setOnClickListener((v) -> {
       String t = newestText();
       if (t == null) { toast("Nothing to copy yet"); return; }
       setOsClipboard(t);
       toast("Copied");
     });
-    footer.addView(copyLast, new LinearLayout.LayoutParams(0, dp(38), 1f));
+    footer.addView(copyLast, new LinearLayout.LayoutParams(0, dp(30), 1f));
 
     Button openApp = new Button(this);
     openApp.setText("Open app");
-    styleBtn(openApp, false);
-    LinearLayout.LayoutParams openLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
-    openLp.leftMargin = dp(8);
+    styleCompactBtn(openApp, false);
+    LinearLayout.LayoutParams openLp = new LinearLayout.LayoutParams(0, dp(30), 1f);
+    openLp.leftMargin = dp(6);
     openApp.setOnClickListener((v) -> { hidePanel(); openApp(); });
     footer.addView(openApp, openLp);
     return footer;
@@ -1663,7 +2130,11 @@ public class ClipboardService extends Service {
     panelStatusText = null;
     dockComposer = null;
     dockMic = null;
+    dockAddBtn = null;
     dockScroll = null;
+    dockFolderStrip = null;
+    dockEditingId = null;
+    folderPickForId = null;
     final boolean right = pinOnRight;
     final int w = p.getWidth();
     p.animate()
@@ -1679,26 +2150,30 @@ public class ClipboardService extends Service {
         .start();
   }
 
-  /** If the panel is open, rebuild its list to reflect new/deleted/filtered items. */
+  /** If the panel is open, rebuild its list to reflect new/deleted/filtered items.
+   *  Also keeps the folder chips in step (folders appear/disappear with items). */
   private void refreshPanelIfOpen() {
     if (panel == null || panelList == null) return;
+    populateFolderStrip();
     panelList.removeAllViews();
     renderList(panelList);
   }
 
-  /** If the composer is open, reflect a Sarvam-key change (mic visibility). */
-  private void refreshComposerIfOpen() {
-    if (dockMic != null) {
-      dockMic.setVisibility(sarvamKey != null && !sarvamKey.trim().isEmpty() ? View.VISIBLE : View.GONE);
-    }
-  }
+  /** No-op hook kept for startSync (mic is always visible now — Sarvam when a key
+   *  is set, the built-in recognizer otherwise). */
+  private void refreshComposerIfOpen() {}
 
-  /** Items that pass BOTH the search text filter and the All/Text/Images kind
-   *  filter, in display order (pinned first, then newest). Caller holds `this`. */
+  /** Items that pass the search text filter, the All/Text/Images kind filter AND
+   *  the folder filter, in display order (pinned first, then newest). Caller holds
+   *  `this`. */
   private ArrayList<ClipEntry> filteredLocked() {
     ArrayList<ClipEntry> out = new ArrayList<>();
     for (ClipEntry e : items) {
       if (!dockFilterKind.isEmpty() && !dockFilterKind.equals(e.kind)) continue;
+      if (dockFolderFilter != null) {
+        String f = e.folder == null ? "" : e.folder;
+        if (!dockFolderFilter.equals(f)) continue;
+      }
       if (dockFilter.isEmpty()) { out.add(e); continue; }
       if ("text".equals(e.kind) && e.text != null
           && e.text.toLowerCase(Locale.US).contains(dockFilter)) {
@@ -1720,6 +2195,21 @@ public class ClipboardService extends Service {
    *  approaches the bottom. Text rows tap-to-copy; image rows show a thumbnail.
    *  Each row carries a Pin and a Share action (parity with the desktop panel). */
   private void renderList(LinearLayout list) {
+    // Folder-chooser mode: a row's 📁 was tapped — show the move targets instead
+    // of the history until a pick or cancel.
+    if (folderPickForId != null) {
+      ClipEntry target = null;
+      synchronized (this) {
+        for (ClipEntry e : items) {
+          if (folderPickForId.equals(e.id)) { target = e; break; }
+        }
+      }
+      if (target != null) {
+        renderFolderChooser(list, target);
+        return;
+      }
+      folderPickForId = null;
+    }
     ArrayList<ClipEntry> snapshot;
     synchronized (this) {
       snapshot = filteredLocked();
@@ -1781,7 +2271,19 @@ public class ClipboardService extends Service {
         iv.setAdjustViewBounds(true);
         iv.setMaxHeight(dp(160));
         iv.setScaleType(ImageView.ScaleType.FIT_START);
-        if (bmp != null) iv.setImageBitmap(bmp);
+        if (bmp != null) {
+          iv.setImageBitmap(bmp);
+        } else {
+          // Row exists before its bitmap: kick the lazy fetch and show a soft
+          // placeholder until refreshPanelIfOpen repaints with the thumb.
+          GradientDrawable ph = new GradientDrawable();
+          ph.setColor(0x22FFFFFF);
+          ph.setCornerRadius(dp(8));
+          iv.setBackground(ph);
+          iv.setMinimumHeight(dp(72));
+          iv.setMinimumWidth(dp(120));
+          fetchImageThumb(e.id);
+        }
         row.addView(iv, new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         row.addView(buildMetaActionsRow(e, "Image · " + relativeTime(e.createdAtMs, now)));
@@ -1837,62 +2339,139 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** The thin meta + actions row under each clip: relative time on the left, a
-   *  pin toggle and a share button on the right (parity with the desktop panel's
-   *  per-row Pin / Share buttons). Returns a horizontal LinearLayout. */
+  /** One borderless glyph action button for a row's meta strip. */
+  private Button rowActionBtn(String glyph, int color, View.OnClickListener onClick) {
+    Button b = new Button(this);
+    b.setText(glyph);
+    b.setTextColor(color);
+    b.setBackgroundColor(Color.TRANSPARENT);
+    b.setAllCaps(false);
+    b.setStateListAnimator(null);
+    b.setPadding(dp(4), dp(2), dp(4), dp(2));
+    b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    b.setMinWidth(0);
+    b.setMinimumWidth(0);
+    b.setMinHeight(0);
+    b.setMinimumHeight(0);
+    b.setOnClickListener(onClick);
+    return b;
+  }
+
+  /** The thin meta + actions row under each clip: folder + relative time on the
+   *  left; edit (text) / folder / pin / share / delete on the right (parity with
+   *  the app screens' per-row actions). Returns a horizontal LinearLayout. */
   private LinearLayout buildMetaActionsRow(final ClipEntry e, String metaText) {
     LinearLayout row = new LinearLayout(this);
     row.setOrientation(LinearLayout.HORIZONTAL);
     row.setGravity(Gravity.CENTER_VERTICAL);
 
     TextView meta = new TextView(this);
-    meta.setText(metaText);
+    String folderTag = (e.folder != null && !e.folder.isEmpty()) ? ("📁" + e.folder + " · ") : "";
+    meta.setText(folderTag + metaText);
     meta.setTextColor(0xFF64748B);
     meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    meta.setSingleLine(true);
+    meta.setEllipsize(android.text.TextUtils.TruncateAt.END);
     LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
         0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
     metaLp.topMargin = dp(4);
     row.addView(meta, metaLp);
 
-    Button pin = new Button(this);
-    pin.setText(e.pinned ? "📌" : "📍");
-    pin.setTextColor(e.pinned ? 0xFF7C5CFF : 0xFF94A3B8);
-    pin.setBackgroundColor(Color.TRANSPARENT);
-    pin.setAllCaps(false);
-    pin.setStateListAnimator(null);
-    pin.setPadding(dp(6), dp(2), dp(6), dp(2));
-    pin.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-    pin.setOnClickListener((v) -> togglePin(e));
-    LinearLayout.LayoutParams pinLp = new LinearLayout.LayoutParams(dp(40), dp(28));
-    pinLp.leftMargin = dp(4);
-    row.addView(pin, pinLp);
+    LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(dp(30), dp(26));
+    btnLp.leftMargin = dp(2);
 
-    Button share = new Button(this);
-    share.setText("↗");
-    share.setTextColor(0xFF94A3B8);
-    share.setBackgroundColor(Color.TRANSPARENT);
-    share.setAllCaps(false);
-    share.setStateListAnimator(null);
-    share.setPadding(dp(6), dp(2), dp(6), dp(2));
-    share.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-    share.setOnClickListener((v) -> shareEntry(e));
-    LinearLayout.LayoutParams shareLp = new LinearLayout.LayoutParams(dp(36), dp(28));
-    shareLp.leftMargin = dp(2);
-    row.addView(share, shareLp);
-
-    Button del = new Button(this);
-    del.setText("✕");
-    del.setTextColor(0xFFF87171);
-    del.setBackgroundColor(Color.TRANSPARENT);
-    del.setAllCaps(false);
-    del.setStateListAnimator(null);
-    del.setPadding(dp(6), dp(2), dp(6), dp(2));
-    del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-    del.setOnClickListener((v) -> confirmDelete(e));
-    LinearLayout.LayoutParams delLp = new LinearLayout.LayoutParams(dp(34), dp(28));
-    delLp.leftMargin = dp(2);
-    row.addView(del, delLp);
+    if ("text".equals(e.kind)) {
+      row.addView(rowActionBtn("✎", 0xFF94A3B8, (v) -> startEditEntry(e)),
+          new LinearLayout.LayoutParams(dp(30), dp(26)));
+    }
+    Button folderBtn = rowActionBtn("📁", 0xFF94A3B8, (v) -> {
+      folderPickForId = e.id;
+      refreshPanelIfOpen();
+    });
+    row.addView(folderBtn, new LinearLayout.LayoutParams(btnLp));
+    Button pin = rowActionBtn(e.pinned ? "📌" : "📍",
+        e.pinned ? 0xFF7C5CFF : 0xFF94A3B8, (v) -> togglePin(e));
+    row.addView(pin, new LinearLayout.LayoutParams(btnLp));
+    Button share = rowActionBtn("↗", 0xFF94A3B8, (v) -> shareEntry(e));
+    row.addView(share, new LinearLayout.LayoutParams(btnLp));
+    Button del = rowActionBtn("✕", 0xFFF87171, (v) -> confirmDelete(e));
+    row.addView(del, new LinearLayout.LayoutParams(btnLp));
     return row;
+  }
+
+  /** Replace the history with the "move to folder" targets for one entry:
+   *  No folder · every existing folder · a new-folder field · Cancel. */
+  private void renderFolderChooser(LinearLayout list, final ClipEntry target) {
+    TextView title = new TextView(this);
+    title.setText("Move to folder");
+    title.setTextColor(Color.WHITE);
+    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+    title.setPadding(dp(4), dp(6), dp(4), dp(8));
+    list.addView(title);
+
+    ArrayList<String> folders;
+    synchronized (this) {
+      folders = foldersLocked();
+    }
+    addChooserRow(list, "○  No folder", () -> moveToFolder(target, ""));
+    for (final String f : folders) {
+      addChooserRow(list, "📁  " + f, () -> moveToFolder(target, f));
+    }
+
+    // New-folder row: name + create.
+    LinearLayout newRow = new LinearLayout(this);
+    newRow.setOrientation(LinearLayout.HORIZONTAL);
+    newRow.setGravity(Gravity.CENTER_VERTICAL);
+    final EditText name = new EditText(this);
+    name.setHint("New folder…");
+    name.setHintTextColor(0xFF64748B);
+    name.setTextColor(0xFFE2E8F0);
+    name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+    name.setSingleLine(true);
+    GradientDrawable nBg = new GradientDrawable();
+    nBg.setColor(0x14FFFFFF);
+    nBg.setCornerRadius(dp(9));
+    name.setBackground(nBg);
+    name.setPadding(dp(9), dp(5), dp(9), dp(5));
+    newRow.addView(name, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+    Button create = new Button(this);
+    create.setText("Create");
+    styleCompactBtn(create, true);
+    create.setOnClickListener((v) -> {
+      String n = name.getText().toString().trim();
+      if (!n.isEmpty()) moveToFolder(target, n);
+    });
+    LinearLayout.LayoutParams createLp = new LinearLayout.LayoutParams(dp(64), dp(28));
+    createLp.leftMargin = dp(6);
+    newRow.addView(create, createLp);
+    LinearLayout.LayoutParams newRowLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    newRowLp.topMargin = dp(4);
+    newRowLp.bottomMargin = dp(4);
+    list.addView(newRow, newRowLp);
+
+    addChooserRow(list, "Cancel", () -> {
+      folderPickForId = null;
+      refreshPanelIfOpen();
+    });
+  }
+
+  private void addChooserRow(LinearLayout list, String label, final Runnable onPick) {
+    TextView row = new TextView(this);
+    row.setText(label);
+    row.setTextColor(0xFFE2E8F0);
+    row.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+    GradientDrawable bg = new GradientDrawable();
+    bg.setColor(0x14FFFFFF);
+    bg.setCornerRadius(dp(10));
+    row.setBackground(bg);
+    row.setPadding(dp(11), dp(9), dp(11), dp(9));
+    row.setOnClickListener((v) -> onPick.run());
+    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    lp.bottomMargin = dp(5);
+    list.addView(row, lp);
   }
 
   /** Delete an item locally + broadcast the deletion to other devices (parity
@@ -1980,6 +2559,19 @@ public class ClipboardService extends Service {
     b.setStateListAnimator(null);
   }
 
+  /** Tighter variant for the composer/footer rows — the dock's controls must stay
+   *  small so the history owns the space. */
+  private void styleCompactBtn(Button b, boolean primary) {
+    styleBtn(b, primary);
+    GradientDrawable bg = (GradientDrawable) b.getBackground();
+    bg.setCornerRadius(dp(8));
+    b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+    b.setMinWidth(0);
+    b.setMinimumWidth(0);
+    b.setMinHeight(0);
+    b.setMinimumHeight(0);
+  }
+
   private String newestText() {
     synchronized (this) {
       for (ClipEntry e : items) {
@@ -2052,6 +2644,8 @@ public class ClipboardService extends Service {
         it.put("id", e.id);
         it.put("text", e.text);
         it.put("createdAtMs", e.createdAtMs);
+        it.put("pinned", e.pinned);
+        it.put("folder", e.folder == null ? "" : e.folder);
         arr.put(it);
       }
       o.put("items", arr);
@@ -2108,6 +2702,10 @@ public class ClipboardService extends Service {
       try { cm.unregisterNetworkCallback(netCallback); } catch (Exception ignored) {}
     }
     netCallback = null;
+    if (screenOnReceiver != null) {
+      try { unregisterReceiver(screenOnReceiver); } catch (Exception ignored) {}
+      screenOnReceiver = null;
+    }
     if (recording) { try { if (recorder != null) recorder.stop(); } catch (Exception ignored) {} }
     recording = false;
     safeReleaseRecorder();
@@ -2133,5 +2731,13 @@ public class ClipboardService extends Service {
       }
       bubble = null;
     }
+    if (fsProbe != null && wm != null) {
+      try {
+        wm.removeView(fsProbe);
+      } catch (Exception ignored) {
+      }
+      fsProbe = null;
+    }
+    stopNativeStt();
   }
 }

@@ -74,7 +74,7 @@ const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "timeline", label: "Time", icon: Clock },
   { id: "collection", label: "Wins", icon: Trophy },
   { id: "music", label: "Music", icon: Headphones },
-  { id: "clipboard", label: "Clips", icon: ClipboardList },
+  { id: "clipboard", label: "Notes", icon: ClipboardList },
   { id: "control", label: "Remote", icon: MonitorSmartphone },
   { id: "system", label: "System", icon: Cpu },
   { id: "settings", label: "More", icon: SettingsIcon },

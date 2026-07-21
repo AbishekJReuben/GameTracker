@@ -39,6 +39,7 @@ type Notice = {
   hasBlob?: boolean;
   deleted?: boolean;
   pinned?: boolean;
+  folder?: string | null;
 };
 
 class ClipSyncManager {
@@ -116,6 +117,11 @@ class ClipSyncManager {
     );
     this.unlisteners.push(
       await listen<string>("clipboard://delete", (e) => this.sendDelete(e.payload)),
+    );
+    this.unlisteners.push(
+      await listen<[string, string]>("clipboard://folder", (e) =>
+        this.sendFolder(e.payload[0], e.payload[1]),
+      ),
     );
     // Reconnect immediately when the network comes back or the window becomes
     // visible — don't wait out the (now short) backoff for events the user can
@@ -279,6 +285,12 @@ class ClipSyncManager {
       this.onChange?.();
       return;
     }
+    // A bare folder move (no content fields).
+    if (v.kind === undefined && v.folder !== undefined) {
+      await clip.setFolder(v.itemId, v.folder ?? "", false).catch(() => {});
+      this.onChange?.();
+      return;
+    }
     if (!this.key) return;
     try {
       if (v.kind === "image" && v.hasBlob) {
@@ -295,6 +307,7 @@ class ClipSyncManager {
             deviceName: v.deviceName ?? null,
             source: v.deviceName ? "android" : "remote",
             pinned: v.pinned ?? false,
+            folder: v.folder ?? "",
           },
           true,
         );
@@ -310,6 +323,7 @@ class ClipSyncManager {
             deviceName: v.deviceName ?? null,
             source: v.deviceName ? "android" : "remote",
             pinned: v.pinned ?? false,
+            folder: v.folder ?? "",
           },
           true,
         );
@@ -345,6 +359,7 @@ class ClipSyncManager {
               size: item.size,
               createdUtc: item.createdUtc,
               pinned: item.pinned,
+              folder: item.folder ?? "",
               hasBlob: true,
             },
           }),
@@ -363,6 +378,7 @@ class ClipSyncManager {
               size: item.size,
               createdUtc: item.createdUtc,
               pinned: item.pinned,
+              folder: item.folder ?? "",
               textCipher: cipher,
               hasBlob: false,
             },
@@ -381,6 +397,10 @@ class ClipSyncManager {
 
   sendPin(id: string, pinned: boolean): void {
     if (this.ready()) this.ws!.send(JSON.stringify({ t: "pin", itemId: id, pinned }));
+  }
+
+  sendFolder(id: string, folder: string): void {
+    if (this.ready()) this.ws!.send(JSON.stringify({ t: "folder", itemId: id, folder }));
   }
 
   private async flushBacklog(): Promise<void> {

@@ -1,12 +1,24 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ClipboardList, ClipboardPaste, Check, Layers, BatteryCharging, Bell, Power, Search, Trash2 } from "lucide-react";
+import {
+  NotebookPen,
+  ClipboardPaste,
+  ImageDown,
+  Check,
+  Layers,
+  BatteryCharging,
+  Bell,
+  Power,
+  Search,
+  Trash2,
+} from "lucide-react";
 import { isTauri } from "@/lib/tauri";
 import { cn } from "@/lib/cn";
 import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { EmptyState } from "@/components/ui";
-import { Composer } from "@/features/clipboard/Composer";
+import { Composer, type ComposerEdit } from "@/features/clipboard/Composer";
 import { ClipboardList as ClipList } from "@/features/clipboard/ClipboardList";
+import { FolderChips } from "@/features/clipboard/ClipboardPanel";
 import { useCompanionClip, companionTranscribe, LS_SARVAM_KEY } from "../clipboardCompanion";
 import type { ClipItem } from "@/lib/clip";
 
@@ -49,12 +61,14 @@ function PermRow({
 export default function ClipboardScreen() {
   const s = useCompanionClip();
   const [perms, setPerms] = useState({ overlay: true, battery: true, notif: true });
-  const [captured, setCaptured] = useState(false);
+  const [pasted, setPasted] = useState<"" | "text" | "image" | "none">("");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
+  const [folderFilter, setFolderFilter] = useState<string | null>(null);
+  const [editing, setEditing] = useState<ComposerEdit | null>(null);
   const android = isTauri();
-  // Mic is available whenever a Sarvam key is saved on this device (synced from the
-  // PC or entered in Settings). Matches the desktop's key-gated voice-to-text.
+  // Sarvam mic is available whenever a key is saved on this device; the Composer
+  // also offers the browser's built-in recognition when present.
   const sttEnabled = !!(localStorage.getItem(LS_SARVAM_KEY) || "").trim();
 
   const refreshPerms = async () => {
@@ -74,11 +88,6 @@ export default function ClipboardScreen() {
   useEffect(() => {
     s.init();
     refreshPerms();
-    // Capture the current clipboard when the screen opens (only readable while the
-    // app is foregrounded — this is what the bubble-tap flow relies on).
-    void s.captureClipboard().then((t) => {
-      if (t) return s.addText(t);
-    });
     const onFocus = () => refreshPerms();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
@@ -99,18 +108,51 @@ export default function ClipboardScreen() {
     refreshPerms();
   };
 
-  const captureNow = async () => {
-    const t = await s.captureClipboard();
-    if (t) {
-      await s.addText(t);
-      setCaptured(true);
-      setTimeout(() => setCaptured(false), 1200);
-    }
+  const flashPasted = (kind: "text" | "image" | "none") => {
+    setPasted(kind);
+    setTimeout(() => setPasted(""), 1400);
   };
+
+  /** Paste TEXT from the OS clipboard as a note (deduped against the newest note). */
+  const pasteText = async () => {
+    const t = (await s.captureClipboard()).trim();
+    if (!t) {
+      flashPasted("none");
+      return;
+    }
+    const newest = s.items.find((i) => i.kind === "text");
+    if (newest?.text === t) {
+      flashPasted("text"); // already the latest note — treat as done, no dupe
+      return;
+    }
+    await s.addText(t, folderFilter || "");
+    flashPasted("text");
+  };
+
+  /** Paste an IMAGE from the OS clipboard. */
+  const pasteImage = async () => {
+    const dataUrl = await s.captureClipboardImage();
+    if (!dataUrl) {
+      flashPasted("none");
+      return;
+    }
+    await s.addImage(dataUrl, folderFilter || "");
+    flashPasted("image");
+  };
+
+  const folders = useMemo(() => {
+    const set = new Set<string>();
+    for (const i of s.items) {
+      const f = (i.folder ?? "").trim();
+      if (f) set.add(f);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [s.items]);
 
   const q = search.trim().toLowerCase();
   const match = (i: ClipItem) => {
     if (filter !== "all" && i.kind !== filter) return false;
+    if (folderFilter !== null && (i.folder ?? "") !== folderFilter) return false;
     if (!q) return true;
     return (i.text ?? "").toLowerCase().includes(q) || (i.deviceName ?? "").toLowerCase().includes(q);
   };
@@ -119,15 +161,19 @@ export default function ClipboardScreen() {
   const needsSetup = android && (!perms.overlay || !perms.battery || !perms.notif);
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3 p-3">
+    <div className="flex h-full min-h-0 flex-col gap-2.5 p-3">
       <div className="flex items-center gap-2">
         <span className="grid h-8 w-8 place-items-center rounded-xl bg-accent-sheen text-white">
-          <ClipboardList className="h-4 w-4" />
+          <NotebookPen className="h-4 w-4" />
         </span>
         <div>
-          <div className="text-base font-800 text-ink">Clipboard</div>
+          <div className="text-base font-800 text-ink">Notes</div>
           <div className="text-[11px] text-ink-dim">
-            {s.ready ? (s.connected ? `Synced${new Set(s.items.map(i => i.deviceId)).size > 0 ? ` · ${new Set(s.items.map(i => i.deviceId)).size} device${new Set(s.items.map(i => i.deviceId)).size === 1 ? "" : "s"}` : ""}` : "Connecting…") : "Set your key in More → Remote to sync"}
+            {s.ready
+              ? s.connected
+                ? `Synced · ${new Set(s.items.map((i) => i.deviceId)).size || 1} device${new Set(s.items.map((i) => i.deviceId)).size === 1 ? "" : "s"}`
+                : "Connecting…"
+              : "Set your key in More → Remote to sync"}
           </div>
         </div>
       </div>
@@ -138,7 +184,7 @@ export default function ClipboardScreen() {
           <PermRow
             icon={<Layers className="h-4 w-4" />}
             title="Draw over apps"
-            desc="The floating bubble on top of everything."
+            desc="The floating notes dock on top of everything."
             granted={perms.overlay}
             onGrant={() => invoke("clipboard_request_overlay")}
           />
@@ -163,37 +209,50 @@ export default function ClipboardScreen() {
       )}
 
       <Composer
-        onAddText={s.addText}
-        onAddImage={(b64) => s.addImage(b64)}
+        onAddText={(t) => void s.addText(t, folderFilter || "")}
+        onAddImage={(b64) => void s.addImage(b64, folderFilter || "")}
         sttEnabled={sttEnabled}
         transcribe={companionTranscribe}
+        draftKey="gt.clip.draft.companion"
+        editing={editing}
+        onSaveEdit={(id, text) => void s.editText(id, text)}
+        onCancelEdit={() => setEditing(null)}
       />
 
-      <button
-        onClick={captureNow}
-        className="flex items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.03] py-2 text-sm font-600 text-ink-soft active:scale-[0.99]"
-      >
-        {captured ? <Check className="h-4 w-4 text-emerald-400" /> : <ClipboardPaste className="h-4 w-4" />}
-        {captured ? "Added" : "Add from clipboard"}
-      </button>
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={pasteText}
+          className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] py-1.5 text-[11px] font-600 text-ink-soft active:scale-[0.98]"
+        >
+          {pasted === "text" ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <ClipboardPaste className="h-3.5 w-3.5" />}
+          {pasted === "text" ? "Added" : pasted === "none" ? "Clipboard empty" : "Paste text"}
+        </button>
+        <button
+          onClick={pasteImage}
+          className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] py-1.5 text-[11px] font-600 text-ink-soft active:scale-[0.98]"
+        >
+          {pasted === "image" ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <ImageDown className="h-3.5 w-3.5" />}
+          {pasted === "image" ? "Added" : "Paste image"}
+        </button>
+      </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1.5">
         <div className="relative flex-1">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-faint" />
+          <Search className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-ink-faint" />
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search history"
-            className="input w-full py-1.5 pl-8 text-xs"
+            placeholder="Search notes"
+            className="input w-full py-1 pl-6 text-[11px]"
           />
         </div>
-        <div className="flex rounded-lg bg-white/[0.04] p-0.5">
+        <div className="flex shrink-0 rounded-lg bg-white/[0.04] p-0.5">
           {FILTERS.map((f) => (
             <button
               key={f}
               onClick={() => setFilter(f)}
               className={cn(
-                "rounded-md px-2.5 py-1 text-[11px] font-600 capitalize transition-colors",
+                "rounded-md px-1.5 py-0.5 text-[10px] font-600 capitalize transition-colors",
                 filter === f ? "bg-white/10 text-ink" : "text-ink-dim hover:text-ink-soft",
               )}
             >
@@ -203,14 +262,16 @@ export default function ClipboardScreen() {
         </div>
       </div>
 
+      <FolderChips folders={folders} active={folderFilter} onPick={setFolderFilter} />
+
       <div className="min-h-0 flex-1 overflow-y-auto">
         {pinned.length === 0 && rest.length === 0 ? (
           <EmptyState
-            icon={<ClipboardList className="h-6 w-6" />}
+            icon={<NotebookPen className="h-6 w-6" />}
             title={s.items.length === 0 ? "Nothing here yet" : "No matches"}
             message={
               s.items.length === 0
-                ? "Copy on your PC and it appears here, or add something above."
+                ? "Copy on your PC and it appears here, or jot a note above."
                 : "Try a different search or filter."
             }
           />
@@ -223,6 +284,9 @@ export default function ClipboardScreen() {
             onCopy={s.copy}
             onDelete={s.remove}
             onTogglePin={s.togglePin}
+            onEdit={(item) => item.kind === "text" && setEditing({ id: item.id, text: item.text ?? "" })}
+            onMoveToFolder={(id, folder) => void s.moveToFolder(id, folder)}
+            folders={folders}
             onLoadMore={() => {}}
             compact
           />
@@ -232,7 +296,7 @@ export default function ClipboardScreen() {
       {s.items.length > 0 && (
         <button
           onClick={() => {
-            if (confirm("Clear this device's clipboard history view? (Other devices keep theirs.)")) {
+            if (confirm("Clear this device's notes view? (Other devices keep theirs.)")) {
               for (const it of [...s.items]) void s.remove(it.id);
             }
           }}

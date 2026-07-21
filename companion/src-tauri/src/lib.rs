@@ -40,6 +40,7 @@ pub fn run() {
             clipboard::clipboard_notif_status,
             clipboard::clipboard_request_notif,
             clipboard::clipboard_read,
+            clipboard::clipboard_read_image,
             clipboard::clipboard_write,
             clipboard::clipboard_service_snapshot,
             clipboard::speech_to_text,

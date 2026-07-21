@@ -2506,6 +2506,8 @@ pub struct ClipAddInput {
     pub device_id: Option<String>,
     pub device_name: Option<String>,
     pub pinned: Option<bool>,
+    /// Folder/list label for the notes view ("" = unfiled).
+    pub folder: Option<String>,
 }
 
 fn decode_b64(s: &str) -> AppResult<Vec<u8>> {
@@ -2575,9 +2577,13 @@ pub fn clipboard_add(
 ) -> AppResult<ClipItem> {
     let remote = remote.unwrap_or(false);
     let id = input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Millisecond-precision UTC with a literal Z — the ONE timestamp shape every
+    // client (JS toISOString, Android SimpleDateFormat) emits and parses. A bare
+    // to_rfc3339() ends in "+00:00" with nanosecond precision, which the Android
+    // dock's parser rejected — those items fell back to "now" and sorted wrong.
     let created_utc = input
         .created_utc
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
     let device_id = input
         .device_id
         .unwrap_or_else(|| crate::clipboard::device_id(&state.pool));
@@ -2620,6 +2626,7 @@ pub fn clipboard_add(
         device_name,
         source,
         pinned: input.pinned.unwrap_or(false),
+        folder: input.folder.unwrap_or_default(),
         synced: remote, // remote items are already on the relay
     };
 
@@ -2663,6 +2670,53 @@ pub fn clipboard_set_pinned(
     let _ = app.emit("clipboard://changed", ());
     let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
     Ok(())
+}
+
+/// Edit a text item's content in place (notes). Emits `clipboard://item` so the
+/// JS sync engine re-uploads it under the SAME id — the relay upserts and every
+/// other device replaces its copy while keeping the original timestamp/position.
+#[tauri::command]
+pub fn clipboard_update_text(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+    text: String,
+) -> AppResult<ClipItem> {
+    if !clip_store::update_text(&state.pool, &id, &text)? {
+        return Err(AppError::msg("item not found or not editable"));
+    }
+    let saved = clip_store::get(&state.pool, &id)?
+        .ok_or_else(|| AppError::msg("clip item vanished after edit"))?;
+    let _ = app.emit("clipboard://item", &saved);
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://item", &saved);
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(saved)
+}
+
+/// Move an item to a folder ('' = unfiled). `propagate` sends the bare folder
+/// notice over the relay (false when applying a remote move).
+#[tauri::command]
+pub fn clipboard_set_folder(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+    folder: String,
+    propagate: Option<bool>,
+) -> AppResult<()> {
+    clip_store::set_folder(&state.pool, &id, &folder)?;
+    if propagate.unwrap_or(true) {
+        let _ = app.emit("clipboard://folder", &(id, folder));
+    }
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(())
+}
+
+/// Distinct folder names across live items (for the filter chips).
+#[tauri::command]
+pub fn clipboard_folders(state: State<AppState>) -> AppResult<Vec<String>> {
+    clip_store::list_folders(&state.pool)
 }
 
 #[tauri::command]
@@ -2828,14 +2882,40 @@ pub async fn speech_to_text(
         body.extend_from_slice(b"\r\n");
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
-        let resp = ureq::post("https://api.sarvam.ai/speech-to-text")
-            .set("api-subscription-key", &key)
-            .set(
-                "Content-Type",
-                &format!("multipart/form-data; boundary={boundary}"),
-            )
-            .send_bytes(&body)
-            .map_err(|e| AppError::msg(format!("Sarvam request failed: {e}")))?;
+        // Sarvam intermittently 5xxs / stalls; a bounded timeout + one retry turns
+        // "mic silently does nothing" into a reliable transcribe (or a real error).
+        let send = || {
+            ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .post("https://api.sarvam.ai/speech-to-text")
+                .set("api-subscription-key", &key)
+                .set(
+                    "Content-Type",
+                    &format!("multipart/form-data; boundary={boundary}"),
+                )
+                .send_bytes(&body)
+        };
+        let resp = match send() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) if (500..600).contains(&code) => {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                send().map_err(|e| AppError::msg(format!("Sarvam request failed: {e}")))
+                    .or_else(|first| {
+                        // Surface the original server body if the retry also failed.
+                        let body = r.into_string().unwrap_or_default();
+                        Err(AppError::msg(format!(
+                            "{first} (server said: {})",
+                            body.chars().take(200).collect::<String>()
+                        )))
+                    })?
+            }
+            Err(ureq::Error::Transport(_)) => {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                send().map_err(|e| AppError::msg(format!("Sarvam request failed: {e}")))?
+            }
+            Err(e) => return Err(AppError::msg(format!("Sarvam request failed: {e}"))),
+        };
         let json: serde_json::Value = resp
             .into_json()
             .map_err(|e| AppError::msg(e.to_string()))?;
