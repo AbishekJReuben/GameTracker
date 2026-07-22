@@ -1287,6 +1287,10 @@ export function ControlScreen({
         /* video-only stream */
       });
       v.play?.().catch(() => {});
+      // Persistent tracks can already have a decoded frame before remount, in
+      // which case no new loadeddata edge is guaranteed.
+      if (v.readyState >= 2 && v.videoWidth > 0) setHasFrame(true);
+      else v.requestVideoFrameCallback?.(() => setHasFrame(true));
     };
     // Cloud: the screen arrives as a hardware-decoded WebRTC video track.
     const unsubStream = link.onStream((stream) => bindStream(stream, true));
@@ -1303,9 +1307,9 @@ export function ControlScreen({
     const unsubEvent = link.onEvent((e) => {
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
       else if (e.event === "cursor") {
-        const cur = e as { kind?: string; x?: number; y?: number };
+        const cur = e as { kind?: string; x?: number; y?: number; source?: "desktop" | "remote" };
         setCursorKind(String(cur.kind || "arrow"));
-        if (Number.isFinite(cur.x) && Number.isFinite(cur.y)) {
+        if (cur.source !== "remote" && Number.isFinite(cur.x) && Number.isFinite(cur.y)) {
           followHostCursor(cur.x!, cur.y!);
         }
       }

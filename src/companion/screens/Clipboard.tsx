@@ -18,7 +18,7 @@ import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { EmptyState } from "@/components/ui";
 import { Composer, type ComposerEdit } from "@/features/clipboard/Composer";
 import { ClipboardList as ClipList } from "@/features/clipboard/ClipboardList";
-import { FolderChips } from "@/features/clipboard/ClipboardPanel";
+import { TagChips } from "@/features/clipboard/ClipboardPanel";
 import { useCompanionClip, companionTranscribe, LS_SARVAM_KEY } from "../clipboardCompanion";
 import type { ClipItem } from "@/lib/clip";
 
@@ -64,7 +64,7 @@ export default function ClipboardScreen() {
   const [pasted, setPasted] = useState<"" | "text" | "image" | "none">("");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
-  const [folderFilter, setFolderFilter] = useState<string | null>(null);
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [editing, setEditing] = useState<ComposerEdit | null>(null);
   const android = isTauri();
   // Sarvam mic is available whenever a key is saved on this device; the Composer
@@ -125,7 +125,7 @@ export default function ClipboardScreen() {
       flashPasted("text"); // already the latest note — treat as done, no dupe
       return;
     }
-    await s.addText(t, folderFilter || "");
+    await s.addText(t, tagFilter ? [tagFilter] : []);
     flashPasted("text");
   };
 
@@ -136,18 +136,20 @@ export default function ClipboardScreen() {
       flashPasted("none");
       return;
     }
-    await s.addImage(dataUrl, folderFilter || "");
+    await s.addImage(dataUrl, tagFilter ? [tagFilter] : []);
     flashPasted("image");
   };
 
-  const folders = s.folders;
+  const tags = s.tags;
 
   const q = search.trim().toLowerCase();
   const match = (i: ClipItem) => {
     if (filter !== "all" && i.kind !== filter) return false;
-    if (folderFilter !== null && (i.folder ?? "") !== folderFilter) return false;
+    if (tagFilter !== null && !(i.tags ?? []).some((t) => t.toLowerCase() === tagFilter.toLowerCase())) return false;
     if (!q) return true;
-    return (i.text ?? "").toLowerCase().includes(q) || (i.deviceName ?? "").toLowerCase().includes(q);
+    return (i.text ?? "").toLowerCase().includes(q) ||
+      (i.deviceName ?? "").toLowerCase().includes(q) ||
+      (i.tags ?? []).some((tag) => tag.toLowerCase().includes(q));
   };
   const pinned = s.items.filter((i) => i.pinned && match(i));
   const rest = s.items.filter((i) => !i.pinned && match(i));
@@ -202,8 +204,8 @@ export default function ClipboardScreen() {
       )}
 
       <Composer
-        onAddText={(t) => void s.addText(t, folderFilter || "")}
-        onAddImage={(b64) => void s.addImage(b64, folderFilter || "")}
+        onAddText={(t) => void s.addText(t, tagFilter ? [tagFilter] : [])}
+        onAddImage={(b64) => void s.addImage(b64, tagFilter ? [tagFilter] : [])}
         sttEnabled={sttEnabled}
         transcribe={companionTranscribe}
         draftKey="gt.clip.draft.companion"
@@ -255,13 +257,7 @@ export default function ClipboardScreen() {
         </div>
       </div>
 
-      <FolderChips
-        folders={folders}
-        active={folderFilter}
-        onPick={setFolderFilter}
-        onCreate={(name) => void s.createFolder(name)}
-        onDelete={(name) => void s.deleteFolder(name)}
-      />
+      <TagChips tags={tags} active={tagFilter} onPick={setTagFilter} />
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {pinned.length === 0 && rest.length === 0 ? (
@@ -284,8 +280,8 @@ export default function ClipboardScreen() {
             onDelete={s.remove}
             onTogglePin={s.togglePin}
             onEdit={(item) => item.kind === "text" && setEditing({ id: item.id, text: item.text ?? "" })}
-            onMoveToFolder={(id, folder) => void s.moveToFolder(id, folder)}
-            folders={folders}
+            onSetTags={(id, tags) => void s.setTags(id, tags)}
+            knownTags={tags}
             onLoadMore={() => {}}
             compact
             showHistory

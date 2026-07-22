@@ -503,6 +503,8 @@ pub fn run() {
             commands::clipboard_update_text,
             commands::clipboard_set_folder,
             commands::clipboard_folders,
+            commands::clipboard_tags,
+            commands::clipboard_set_tags,
             commands::clipboard_create_folder,
             commands::clipboard_delete_folder,
             commands::clipboard_apply_folder,

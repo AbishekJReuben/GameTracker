@@ -40,6 +40,7 @@ type Notice = {
   deleted?: boolean;
   pinned?: boolean;
   folder?: string | null;
+  tags?: string[] | null;
   copies?: string[] | null;
 };
 
@@ -122,6 +123,11 @@ class ClipSyncManager {
     this.unlisteners.push(
       await listen<[string, string]>("clipboard://folder", (e) =>
         this.sendFolder(e.payload[0], e.payload[1]),
+      ),
+    );
+    this.unlisteners.push(
+      await listen<[string, string[]]>("clipboard://tags", (e) =>
+        this.sendTags(e.payload[0], e.payload[1]),
       ),
     );
     // Reconnect immediately when the network comes back or the window becomes
@@ -306,7 +312,12 @@ class ClipSyncManager {
     }
     // A bare folder move (no content fields).
     if (v.kind === undefined && v.folder !== undefined) {
-      await clip.setFolder(v.itemId, v.folder ?? "", false).catch(() => {});
+      await clip.setTags(v.itemId, v.folder ? [v.folder] : [], false).catch(() => {});
+      this.onChange?.();
+      return;
+    }
+    if (v.kind === undefined && Array.isArray(v.tags)) {
+      await clip.setTags(v.itemId, v.tags, false).catch(() => {});
       this.onChange?.();
       return;
     }
@@ -327,6 +338,7 @@ class ClipSyncManager {
             source: v.deviceName ? "android" : "remote",
             pinned: v.pinned ?? false,
             folder: v.folder ?? "",
+            tags: v.tags ?? (v.folder ? [v.folder] : []),
             copies: v.copies ?? undefined,
           },
           true,
@@ -344,6 +356,7 @@ class ClipSyncManager {
             source: v.deviceName ? "android" : "remote",
             pinned: v.pinned ?? false,
             folder: v.folder ?? "",
+            tags: v.tags ?? (v.folder ? [v.folder] : []),
             copies: v.copies ?? undefined,
           },
           true,
@@ -421,6 +434,7 @@ class ClipSyncManager {
               createdUtc: item.createdUtc,
               pinned: item.pinned,
               folder: item.folder ?? "",
+              tags: item.tags ?? [],
               copies: item.copies ?? [],
               hasBlob: true,
             },
@@ -441,6 +455,7 @@ class ClipSyncManager {
               createdUtc: item.createdUtc,
               pinned: item.pinned,
               folder: item.folder ?? "",
+              tags: item.tags ?? [],
               copies: item.copies ?? [],
               textCipher: cipher,
               hasBlob: false,
@@ -464,6 +479,10 @@ class ClipSyncManager {
 
   sendFolder(id: string, folder: string): void {
     if (this.ready()) this.ws!.send(JSON.stringify({ t: "folder", itemId: id, folder }));
+  }
+
+  sendTags(id: string, tags: string[]): void {
+    if (this.ready()) this.ws!.send(JSON.stringify({ t: "tags", itemId: id, tags }));
   }
 
   private async flushBacklog(): Promise<void> {

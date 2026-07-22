@@ -1222,6 +1222,19 @@ export class CloudConn {
     this.sinkActive = active;
     if (!active) this.stallTicks = 0;
     if (!active) this.wcStallTicks = 0;
+    if (active) {
+      // The connection and native decoder outlive the Control route. Replay
+      // their state when the screen remounts so it cannot wait on a stale edge.
+      queueMicrotask(() => {
+        if (!this.sinkActive) return;
+        this.emitStream();
+        if (this.wcActive) {
+          this.emitEvent({ event: "wc", active: true, native: this.wcNative });
+          this.wcAwaitKey = true;
+          this.wcRequestKeyframe();
+        }
+      });
+    }
   }
 
   // ---- WebCodecs direct-video path ------------------------------------------

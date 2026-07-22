@@ -26,6 +26,7 @@ export interface ClipItem {
   pinned: boolean;
   /** Folder/list label for the notes view ("" = unfiled). */
   folder?: string;
+  tags?: string[];
   /** Every UTC timestamp this exact content was copied/added (dedup history).
    *  Shown on the app screens; usually a single entry. */
   copies?: string[];
@@ -46,6 +47,7 @@ export interface ClipAddInput {
   deviceName?: string | null;
   pinned?: boolean;
   folder?: string;
+  tags?: string[];
   copies?: string[];
 }
 
@@ -74,6 +76,9 @@ export const clip = {
   setFolder: (id: string, folder: string, propagate = true) =>
     invoke<void>("clipboard_set_folder", { id, folder, propagate }),
   folders: () => invoke<string[]>("clipboard_folders"),
+  tags: () => invoke<string[]>("clipboard_tags"),
+  setTags: (id: string, tags: string[], propagate = true) =>
+    invoke<string[]>("clipboard_set_tags", { id, tags, propagate }),
   /** Create an empty folder that syncs to every device. */
   createFolder: (name: string) => invoke<void>("clipboard_create_folder", { name }),
   /** Delete a folder everywhere (its notes move to unfiled). */

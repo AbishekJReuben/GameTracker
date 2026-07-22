@@ -2508,6 +2508,9 @@ pub struct ClipAddInput {
     pub pinned: Option<bool>,
     /// Folder/list label for the notes view ("" = unfiled).
     pub folder: Option<String>,
+    /// Current multi-tag labels. Missing means a legacy client; its folder is
+    /// promoted to one tag.
+    pub tags: Option<Vec<String>>,
     /// Copy-history timestamps (present when applying a remote item that carries
     /// a merged dedup history).
     pub copies: Option<Vec<String>>,
@@ -2625,6 +2628,10 @@ pub fn clipboard_add(
         )
     };
 
+    let legacy_folder = input.folder.unwrap_or_default();
+    let tags = input.tags.unwrap_or_else(|| {
+        if legacy_folder.trim().is_empty() { Vec::new() } else { vec![legacy_folder.clone()] }
+    });
     let item = ClipInput {
         id,
         kind: input.kind,
@@ -2638,7 +2645,8 @@ pub fn clipboard_add(
         device_name,
         source,
         pinned: input.pinned.unwrap_or(false),
-        folder: input.folder.unwrap_or_default(),
+        folder: legacy_folder,
+        tags,
         content_hash,
         copies: input.copies.unwrap_or_default(),
         synced: remote, // remote items are already on the relay
@@ -2736,6 +2744,28 @@ pub fn clipboard_set_folder(
 #[tauri::command]
 pub fn clipboard_folders(state: State<AppState>) -> AppResult<Vec<String>> {
     clip_store::list_folders(&state.pool)
+}
+
+#[tauri::command]
+pub fn clipboard_tags(state: State<AppState>) -> AppResult<Vec<String>> {
+    clip_store::list_tags(&state.pool)
+}
+
+#[tauri::command]
+pub fn clipboard_set_tags(
+    state: State<AppState>,
+    app: tauri::AppHandle,
+    id: String,
+    tags: Vec<String>,
+    propagate: Option<bool>,
+) -> AppResult<Vec<String>> {
+    let tags = clip_store::set_tags(&state.pool, &id, tags)?;
+    if propagate.unwrap_or(true) {
+        let _ = app.emit("clipboard://tags", &(id.clone(), tags.clone()));
+    }
+    let _ = app.emit("clipboard://changed", ());
+    let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
+    Ok(tags)
 }
 
 /// Create an (empty) folder that syncs to every device. Stored as a kind='folder'

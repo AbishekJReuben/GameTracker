@@ -445,6 +445,9 @@ export function startHost(opts: HostOptions): () => void {
   let lastTextField = false;
   let lastCursorKind = "";
   let lastCursorPos: [number, number] | null = null;
+  // Phone-injected motion is visible to the same cursor poller as a physical
+  // mouse. Remember its short echo window so the guest does not follow itself.
+  let lastRemotePointerAt = 0;
   let sigBackoff = 1000;
   let sigRetry: number | null = null;
   // Set when the signaling server evicted us because ANOTHER host joined our
@@ -848,7 +851,8 @@ export function startHost(opts: HostOptions): () => void {
         if (kind !== lastCursorKind || (pos && (!lastCursorPos || Math.abs(pos[0] - lastCursorPos[0]) > 0.0005 || Math.abs(pos[1] - lastCursorPos[1]) > 0.0005))) {
           lastCursorKind = kind;
           lastCursorPos = pos;
-          dataCh.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1] }));
+          const source = Date.now() - lastRemotePointerAt < 700 ? "remote" : "desktop";
+          dataCh.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1], source }));
         }
       } catch {
         /* ignore */
@@ -2734,6 +2738,11 @@ export function startHost(opts: HostOptions): () => void {
         }
         // Everything else is an input event — never inject before authorization.
         if (!authorized) return;
+        if (msg && (msg.type === "move" || msg.type === "moverel" ||
+          ((msg.type === "click" || msg.type === "down" || msg.type === "up") &&
+            (Number.isFinite(msg.x) || Number.isFinite(msg.y))))) {
+          lastRemotePointerAt = Date.now();
+        }
         if (opts.fixedMonitor != null) api.remoteInjectOn(opts.fixedMonitor, msg);
         else api.remoteInject(msg);
         // A click can move focus into (or out of) a PC text field. Poll focus a few
@@ -2891,7 +2900,8 @@ export function startHost(opts: HostOptions): () => void {
           if (kind !== lastCursorKind || (pos && (!lastCursorPos || Math.abs(pos[0] - lastCursorPos[0]) > 0.0005 || Math.abs(pos[1] - lastCursorPos[1]) > 0.0005))) {
             lastCursorKind = kind;
             lastCursorPos = pos;
-            if (data.readyState === "open") data.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1] }));
+            const source = Date.now() - lastRemotePointerAt < 700 ? "remote" : "desktop";
+            if (data.readyState === "open") data.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1], source }));
           }
         } catch {
           /* ignore */

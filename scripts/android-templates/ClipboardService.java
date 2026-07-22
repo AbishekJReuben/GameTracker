@@ -125,6 +125,18 @@ public class ClipboardService extends Service {
   // Which screen edge the pin/dock lives on. The dock slides in from this side.
   private boolean pinOnRight = true;
   private final Handler main = new Handler(Looper.getMainLooper());
+  // Relay history is delivered one item at a time. Coalescing its redraws keeps
+  // the floating dock's input responsive while socket and crypto work stay off
+  // the main thread.
+  private boolean panelRefreshQueued;
+  private final Runnable renderPanel = () -> {
+    panelRefreshQueued = false;
+    if (panel != null && panelList != null) {
+      populateFolderStrip();
+      panelList.removeAllViews();
+      renderList(panelList);
+    }
+  };
   private OkHttpClient http;
   private WebSocket socket;
   private long reconnectMs = 1000;
@@ -191,6 +203,7 @@ public class ClipboardService extends Service {
     final String deviceId;
     boolean pinned;      // toggled by the pin button / relay pin notices
     String folder = "";  // folder/list label ("" = unfiled)
+    final ArrayList<String> tags = new ArrayList<>();
     boolean pendingDelete; // armed by a first tap on ✕ (two-tap confirm)
     String mime = "image/png"; // for images (used when sharing)
     ClipEntry(String id, String kind, String text, long createdAtMs, String deviceId) {
@@ -368,7 +381,7 @@ public class ClipboardService extends Service {
    *  other devices; created_utc is preserved server-side on an edit). The caller
    *  supplies the id/timestamp so the LOCAL entry and the wire item are the same
    *  element on every device. No-op if the socket isn't open or encryption failed. */
-  private void sendTextItem(String id, String text, String createdUtc, String folder,
+  private void sendTextItem(String id, String text, String createdUtc, ArrayList<String> tags,
       boolean pinned) {
     if (socket == null || text == null || text.isEmpty()) return;
     String cipher = encryptText(text);
@@ -384,7 +397,8 @@ public class ClipboardService extends Service {
       item.put("size", text.length());
       item.put("createdUtc", createdUtc);
       item.put("pinned", pinned);
-      item.put("folder", folder == null ? "" : folder);
+      item.put("tags", new org.json.JSONArray(tags == null ? new ArrayList<>() : tags));
+      item.put("folder", tags == null || tags.isEmpty() ? "" : tags.get(0));
       item.put("textCipher", cipher);
       item.put("hasBlob", false);
       JSONObject msg = new JSONObject();
@@ -393,6 +407,28 @@ public class ClipboardService extends Service {
       socket.send(msg.toString());
     } catch (Exception ignored) {
     }
+  }
+
+  private static ArrayList<String> tagsFrom(JSONObject value) {
+    ArrayList<String> out = new ArrayList<>();
+    org.json.JSONArray arr = value.optJSONArray("tags");
+    if (arr != null) {
+      for (int i = 0; i < arr.length(); i++) {
+        String tag = arr.optString(i, "").trim();
+        boolean duplicate = false;
+        for (String existing : out) if (existing.equalsIgnoreCase(tag)) duplicate = true;
+        if (!tag.isEmpty() && !duplicate) out.add(tag);
+      }
+    }
+    String legacy = value.optString("folder", "").trim();
+    if (out.isEmpty() && !legacy.isEmpty()) out.add(legacy);
+    return out;
+  }
+
+  private static boolean hasTag(ClipEntry entry, String tag) {
+    if (entry == null || tag == null) return false;
+    for (String value : entry.tags) if (value.equalsIgnoreCase(tag)) return true;
+    return false;
   }
 
   /** RFC3339 UTC with millisecond precision + literal Z — the ONE wire shape all
@@ -605,11 +641,29 @@ public class ClipboardService extends Service {
         main.post(this::refreshPanelIfOpen);
         return;
       }
+      // A bare multi-tag update. The legacy folder mirror remains accepted below
+      // so older installed companions can still interoperate during rollout.
+      if (!v.has("kind") && v.has("tags")) {
+        ArrayList<String> tags = tagsFrom(v);
+        synchronized (this) {
+          for (ClipEntry e : items) if (id.equals(e.id)) {
+            e.tags.clear();
+            e.tags.addAll(tags);
+            e.folder = tags.isEmpty() ? "" : tags.get(0);
+          }
+        }
+        main.post(this::refreshPanelIfOpen);
+        return;
+      }
       // A bare folder move ({t:item, itemId, folder} with no content).
       if (!v.has("kind") && v.has("folder")) {
         String folder = v.optString("folder", "");
         synchronized (this) {
-          for (ClipEntry e : items) if (id.equals(e.id)) e.folder = folder;
+          for (ClipEntry e : items) if (id.equals(e.id)) {
+            e.folder = folder;
+            e.tags.clear();
+            if (!folder.isEmpty()) e.tags.add(folder);
+          }
         }
         main.post(this::refreshPanelIfOpen);
         return;
@@ -625,6 +679,7 @@ public class ClipboardService extends Service {
       String dev = v.optString("deviceId", "");
       boolean pinned = v.optBoolean("pinned", false);
       String folder = v.optString("folder", "");
+      ArrayList<String> tags = tagsFrom(v);
       if ("image".equals(v.optString("kind"))) {
         if (!v.optBoolean("hasBlob", false)) return;
         // Insert the row IMMEDIATELY (correct position in the list); the bitmap
@@ -637,6 +692,7 @@ public class ClipboardService extends Service {
           ClipEntry e = new ClipEntry(id, "image", null, created, dev);
           e.pinned = pinned;
           e.folder = folder;
+          e.tags.addAll(tags);
           e.mime = v.optString("mime", "image/png");
           items.add(e);
           sortItemsLocked();
@@ -656,6 +712,7 @@ public class ClipboardService extends Service {
         ClipEntry e = new ClipEntry(id, "text", plain, created, dev);
         e.pinned = pinned;
         e.folder = folder;
+        e.tags.addAll(tags);
         items.add(e);
         sortItemsLocked();
         trimItemsLocked();
@@ -855,8 +912,10 @@ public class ClipboardService extends Service {
   }
 
   /** The folder new items adopt: the folder currently being viewed (All → unfiled). */
-  private String currentComposeFolder() {
-    return dockFolderFilter == null ? "" : dockFolderFilter;
+  private ArrayList<String> currentComposeTags() {
+    ArrayList<String> tags = new ArrayList<>();
+    if (dockFolderFilter != null && !dockFolderFilter.isEmpty()) tags.add(dockFolderFilter);
+    return tags;
   }
 
   /** Encrypt + upload an image blob, then broadcast an `add` over the WS. Inserts an
@@ -870,7 +929,8 @@ public class ClipboardService extends Service {
     final String id = UUID.randomUUID().toString();
     final String now = isoNow();
     final String nd = (deviceId == null ? "" : deviceId) + "-native";
-    final String folder = currentComposeFolder();
+    final ArrayList<String> tags = currentComposeTags();
+    final String folder = tags.isEmpty() ? "" : tags.get(0);
     final Bitmap thumb = decodeThumb(raw);
     final int size = raw.length;
     // Upload the blob first (HTTP), then announce it (WS).
@@ -896,6 +956,7 @@ public class ClipboardService extends Service {
             item.put("createdUtc", now);
             item.put("pinned", false);
             item.put("folder", folder);
+            item.put("tags", new org.json.JSONArray(tags));
             item.put("hasBlob", true);
             JSONObject msg = new JSONObject();
             msg.put("t", "add");
@@ -906,6 +967,7 @@ public class ClipboardService extends Service {
               ClipEntry e = new ClipEntry(id, "image", null, parseIsoMs(now), nd);
               e.mime = mime == null ? "image/png" : mime;
               e.folder = folder;
+              e.tags.addAll(tags);
               items.add(e);
               sortItemsLocked();
               trimItemsLocked();
@@ -1483,8 +1545,8 @@ public class ClipboardService extends Service {
   // Filter chip: "" = all, "text", "image". Mirrors the desktop panel's All / Text /
   // Images tabs so the floating dock has the same content-type filtering.
   private String dockFilterKind = "";
-  // Folder filter: null = All, "" = Unfiled, else a folder name. New items adopt
-  // the folder being viewed (see currentComposeFolder). Parity with the app screens.
+  // Tag filter: null = All, "" = Untagged, else a tag. New items inherit the
+  // selected tag, and each existing item can hold multiple tags.
   private String dockFolderFilter = null;
   private LinearLayout dockFolderStrip; // rebuilt when folders change
   // Note editing: non-null while the composer is editing this entry in place.
@@ -1513,7 +1575,7 @@ public class ClipboardService extends Service {
     }
 
     DisplayMetrics m = getResources().getDisplayMetrics();
-    final int widthPx = Math.min(dp(340), m.widthPixels - dp(40));
+    final int widthPx = Math.min(dp(372), m.widthPixels - dp(24));
     final int heightPx = m.heightPixels;
 
     LinearLayout root = new LinearLayout(this);
@@ -1521,22 +1583,22 @@ public class ClipboardService extends Service {
     GradientDrawable card = new GradientDrawable();
     // Translucent frosted fill (not fully transparent) so text stays readable over
     // whatever app is behind. Rounded only on the inner edge (it hugs a screen side).
-    card.setColor(0xF00B0E17);
+    card.setColor(0xF70A0D17);
     float r = dp(22);
     card.setCornerRadii(pinOnRight
         ? new float[] {r, r, 0, 0, 0, 0, r, r}
         : new float[] {0, 0, r, r, r, r, 0, 0});
-    card.setStroke(dp(1), 0x24FFFFFF);
+    card.setStroke(dp(1), 0x557C5CFF);
     root.setBackground(card);
     root.setElevation(dp(16));
-    root.setPadding(dp(14), dp(14), dp(14), dp(14));
+    root.setPadding(dp(14), dp(16), dp(14), dp(14));
 
     root.addView(buildDockHeader());
     root.addView(buildDockComposer());
 
     // Search box (parity with the app screen's history filter).
     final EditText searchField = new EditText(this);
-    searchField.setHint("Search notes");
+    searchField.setHint("Search notes, links and tags");
     searchField.setHintTextColor(0xFF64748B);
     searchField.setTextColor(0xFFE2E8F0);
     searchField.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
@@ -1796,7 +1858,7 @@ public class ClipboardService extends Service {
     }
     if (folders.isEmpty() && dockFolderFilter == null) return; // nothing to filter
     addFolderChip(strip, "All", null);
-    addFolderChip(strip, "Unfiled", "");
+    addFolderChip(strip, "Untagged", "");
     for (String f : folders) addFolderChip(strip, f, f);
   }
 
@@ -1838,28 +1900,38 @@ public class ClipboardService extends Service {
   private ArrayList<String> foldersLocked() {
     java.util.TreeSet<String> set = new java.util.TreeSet<>(String.CASE_INSENSITIVE_ORDER);
     for (ClipEntry e : items) {
-      if (e.folder != null && !e.folder.trim().isEmpty()) set.add(e.folder.trim());
+      for (String tag : e.tags) if (!tag.trim().isEmpty()) set.add(tag.trim());
     }
     return new ArrayList<>(set);
   }
 
   /** Move an entry to a folder ('' = unfiled) locally + broadcast the bare folder
    *  notice (relay flips + rebroadcasts — same shape as pin). */
-  private void moveToFolder(ClipEntry e, String folder) {
+  private void toggleTag(ClipEntry e, String tag) {
     if (e == null) return;
-    e.folder = folder == null ? "" : folder;
+    String clean = tag == null ? "" : tag.trim();
+    if (clean.isEmpty()) return;
+    boolean removed = false;
+    for (int i = e.tags.size() - 1; i >= 0; i--) {
+      if (e.tags.get(i).equalsIgnoreCase(clean)) {
+        e.tags.remove(i);
+        removed = true;
+      }
+    }
+    if (!removed) e.tags.add(clean);
+    e.folder = e.tags.isEmpty() ? "" : e.tags.get(0);
     try {
       JSONObject m = new JSONObject();
-      m.put("t", "folder");
+      m.put("t", "tags");
       m.put("itemId", e.id);
+      m.put("tags", new org.json.JSONArray(e.tags));
       m.put("folder", e.folder);
       if (socket != null) socket.send(m.toString());
     } catch (Exception ignored) {
     }
-    folderPickForId = null;
     rebuildFolderStripIfOpen();
     refreshPanelIfOpen();
-    toast(e.folder.isEmpty() ? "Removed from folder" : "Moved to " + e.folder);
+    toast(removed ? "Tag removed" : "Tag added");
   }
 
   /** Insert + send a brand-new text note (composer Add, paste, share). The LOCAL
@@ -1868,12 +1940,14 @@ public class ClipboardService extends Service {
   private void addTextLocalAndSend(String t) {
     String id = UUID.randomUUID().toString();
     long nowMs = System.currentTimeMillis();
-    String folder = currentComposeFolder();
-    sendTextItem(id, t, isoFromMs(nowMs), folder, false);
+    ArrayList<String> tags = currentComposeTags();
+    String folder = tags.isEmpty() ? "" : tags.get(0);
+    sendTextItem(id, t, isoFromMs(nowMs), tags, false);
     synchronized (this) {
       ClipEntry e = new ClipEntry(id, "text", t, nowMs,
           (deviceId == null ? "" : deviceId) + "-native");
       e.folder = folder;
+      e.tags.addAll(tags);
       items.add(e);
       sortItemsLocked();
       trimItemsLocked();
@@ -1892,7 +1966,8 @@ public class ClipboardService extends Service {
     toast("Editing — Save when done");
   }
 
-  /** Composer row: text field + paste/upload/mic + Add (compact). */
+  /** Composer keeps text and actions on one row while short, then grows with its
+   * content up to five lines without moving the controls out of reach. */
   private LinearLayout buildDockComposer() {
     LinearLayout wrap = new LinearLayout(this);
     wrap.setOrientation(LinearLayout.VERTICAL);
@@ -1907,7 +1982,11 @@ public class ClipboardService extends Service {
     composer.setHintTextColor(0xFF64748B);
     composer.setTextColor(0xFFE2E8F0);
     composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-    composer.setMaxLines(3);
+    composer.setSingleLine(false);
+    composer.setMinLines(1);
+    composer.setMaxLines(5);
+    composer.setHorizontallyScrolling(false);
+    composer.setGravity(Gravity.TOP | Gravity.START);
     GradientDrawable fieldBg = new GradientDrawable();
     fieldBg.setColor(0x14FFFFFF);
     fieldBg.setCornerRadius(dp(10));
@@ -1961,16 +2040,18 @@ public class ClipboardService extends Service {
         // Some OEM builds ship a broken impl; the other two upload paths still work.
       }
     }
-    wrap.addView(composer, new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-
     LinearLayout actions = new LinearLayout(this);
     actions.setOrientation(LinearLayout.HORIZONTAL);
-    actions.setGravity(Gravity.CENTER_VERTICAL);
+    actions.setGravity(Gravity.BOTTOM | Gravity.CENTER_VERTICAL);
     LinearLayout.LayoutParams actionsLp = new LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
     actionsLp.topMargin = dp(6);
     actions.setLayoutParams(actionsLp);
+
+    LinearLayout.LayoutParams composerLp = new LinearLayout.LayoutParams(
+        0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+    composerLp.rightMargin = dp(4);
+    actions.addView(composer, composerLp);
 
     // Compact action row: paste (text OR image) · upload · mic · Add/Save.
     Button pasteBtn = new Button(this);
@@ -2001,9 +2082,6 @@ public class ClipboardService extends Service {
     micLp.leftMargin = dp(4);
     actions.addView(mic, micLp);
 
-    View spacer = new View(this);
-    actions.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
-
     Button addBtn = new Button(this);
     dockAddBtn = addBtn;
     addBtn.setText(dockEditingId != null ? "Save" : "Add");
@@ -2022,7 +2100,8 @@ public class ClipboardService extends Service {
         }
         if (target != null) {
           target.text = t;
-          sendTextItem(target.id, t, isoFromMs(target.createdAtMs), target.folder, target.pinned);
+          sendTextItem(target.id, t, isoFromMs(target.createdAtMs),
+              new ArrayList<>(target.tags), target.pinned);
         }
         dockEditingId = null;
         addBtn.setText("Add");
@@ -2156,6 +2235,8 @@ public class ClipboardService extends Service {
     dockFolderStrip = null;
     dockEditingId = null;
     folderPickForId = null;
+    panelRefreshQueued = false;
+    main.removeCallbacks(renderPanel);
     final boolean right = pinOnRight;
     // Fall back to the laid-out width if getWidth() is 0 (rapid open→close before
     // a layout pass) — a 0 slide would just alpha-blink instead of sliding out.
@@ -2178,13 +2259,16 @@ public class ClipboardService extends Service {
         .start();
   }
 
-  /** If the panel is open, rebuild its list to reflect new/deleted/filtered items.
-   *  Also keeps the folder chips in step (folders appear/disappear with items). */
+  /** If the panel is open, batch history refreshes so a cold relay replay never
+   * rebuilds the entire view tree once per received item. */
   private void refreshPanelIfOpen() {
-    if (panel == null || panelList == null) return;
-    populateFolderStrip();
-    panelList.removeAllViews();
-    renderList(panelList);
+    if (Looper.myLooper() != Looper.getMainLooper()) {
+      main.post(this::refreshPanelIfOpen);
+      return;
+    }
+    if (panel == null || panelList == null || panelRefreshQueued) return;
+    panelRefreshQueued = true;
+    main.postDelayed(renderPanel, 48);
   }
 
   /** No-op hook kept for startSync (mic is always visible now — Sarvam when a key
@@ -2199,13 +2283,19 @@ public class ClipboardService extends Service {
     for (ClipEntry e : items) {
       if (!dockFilterKind.isEmpty() && !dockFilterKind.equals(e.kind)) continue;
       if (dockFolderFilter != null) {
-        String f = e.folder == null ? "" : e.folder;
-        if (!dockFolderFilter.equals(f)) continue;
+        if (dockFolderFilter.isEmpty()) {
+          if (!e.tags.isEmpty()) continue;
+        } else if (!hasTag(e, dockFolderFilter)) continue;
       }
       if (dockFilter.isEmpty()) { out.add(e); continue; }
       if ("text".equals(e.kind) && e.text != null
           && e.text.toLowerCase(Locale.US).contains(dockFilter)) {
         out.add(e);
+        continue;
+      }
+      for (String tag : e.tags) if (tag.toLowerCase(Locale.US).contains(dockFilter)) {
+        out.add(e);
+        break;
       }
     }
     return out;
@@ -2332,26 +2422,34 @@ public class ClipboardService extends Service {
       row.addView(body);
 
       final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
-      row.addView(buildMetaActionsRow(e,
-          relativeTime(e.createdAtMs, now) + (longText ? "  ·  hold to expand" : "")));
+      row.addView(buildMetaActionsRow(e, relativeTime(e.createdAtMs, now)));
 
       final boolean[] expanded = {false};
+      final TextView expand = new TextView(this);
+      if (longText) {
+        expand.setText("Show more  ↓");
+        expand.setTextColor(0xFFA78BFA);
+        expand.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        expand.setTypeface(expand.getTypeface(), android.graphics.Typeface.BOLD);
+        expand.setGravity(Gravity.CENTER_VERTICAL);
+        expand.setPadding(0, dp(7), 0, dp(2));
+        row.addView(expand, new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(30)));
+      }
+      final Runnable toggleExpanded = () -> {
+        if (!longText) return;
+        expanded[0] = !expanded[0];
+        body.setMaxLines(expanded[0] ? Integer.MAX_VALUE : collapsedLines);
+        body.setEllipsize(expanded[0] ? null : android.text.TextUtils.TruncateAt.END);
+        expand.setText(expanded[0] ? "Show less  ↑" : "Show more  ↓");
+      };
+      expand.setOnClickListener((v) -> toggleExpanded.run());
       row.setOnClickListener((v) -> {
         setOsClipboard(fullText);
         toast("Copied");
       });
       row.setOnLongClickListener((v) -> {
-        expanded[0] = !expanded[0];
-        body.setMaxLines(expanded[0] ? Integer.MAX_VALUE : collapsedLines);
-        // Rebuild the meta row so its hint text updates ("hold to collapse" etc.).
-        LinearLayout parent = (LinearLayout) v;
-        if (parent.getChildCount() >= 2 && parent.getChildAt(1) instanceof LinearLayout) {
-          parent.removeViewAt(1);
-          parent.addView(buildMetaActionsRow(e,
-              relativeTime(e.createdAtMs, now)
-                  + (expanded[0] ? "  ·  hold to collapse" : (longText ? "  ·  hold to expand" : ""))),
-              1);
-        }
+        toggleExpanded.run();
         return true;
       });
       list.addView(row, rowLp);
@@ -2381,7 +2479,11 @@ public class ClipboardService extends Service {
     b.setMinimumWidth(0);
     b.setMinHeight(0);
     b.setMinimumHeight(0);
-    b.setOnClickListener(onClick);
+    b.setContentDescription(glyph);
+    b.setOnClickListener((v) -> {
+      v.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
+      onClick.onClick(v);
+    });
     return b;
   }
 
@@ -2394,8 +2496,14 @@ public class ClipboardService extends Service {
     row.setGravity(Gravity.CENTER_VERTICAL);
 
     TextView meta = new TextView(this);
-    String folderTag = (e.folder != null && !e.folder.isEmpty()) ? ("📁" + e.folder + " · ") : "";
-    meta.setText(folderTag + metaText);
+    StringBuilder tagText = new StringBuilder();
+    for (int i = 0; i < Math.min(2, e.tags.size()); i++) {
+      if (i > 0) tagText.append("  ");
+      tagText.append("#").append(e.tags.get(i));
+    }
+    if (e.tags.size() > 2) tagText.append(" +").append(e.tags.size() - 2);
+    if (tagText.length() > 0) tagText.append("  ·  ");
+    meta.setText(tagText.toString() + metaText);
     meta.setTextColor(0xFF64748B);
     meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
     meta.setSingleLine(true);
@@ -2405,14 +2513,14 @@ public class ClipboardService extends Service {
     metaLp.topMargin = dp(4);
     row.addView(meta, metaLp);
 
-    LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(dp(30), dp(26));
+    LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(dp(34), dp(30));
     btnLp.leftMargin = dp(2);
 
     if ("text".equals(e.kind)) {
       row.addView(rowActionBtn("✎", 0xFF94A3B8, (v) -> startEditEntry(e)),
-          new LinearLayout.LayoutParams(dp(30), dp(26)));
+          new LinearLayout.LayoutParams(dp(34), dp(30)));
     }
-    Button folderBtn = rowActionBtn("📁", 0xFF94A3B8, (v) -> {
+    Button folderBtn = rowActionBtn("#", e.tags.isEmpty() ? 0xFF94A3B8 : 0xFFA78BFA, (v) -> {
       folderPickForId = e.id;
       refreshPanelIfOpen();
     });
@@ -2431,7 +2539,7 @@ public class ClipboardService extends Service {
    *  No folder · every existing folder · a new-folder field · Cancel. */
   private void renderFolderChooser(LinearLayout list, final ClipEntry target) {
     TextView title = new TextView(this);
-    title.setText("Move to folder");
+    title.setText("Tags  ·  choose as many as you like");
     title.setTextColor(Color.WHITE);
     title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
     title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
@@ -2442,9 +2550,9 @@ public class ClipboardService extends Service {
     synchronized (this) {
       folders = foldersLocked();
     }
-    addChooserRow(list, "○  No folder", () -> moveToFolder(target, ""));
     for (final String f : folders) {
-      addChooserRow(list, "📁  " + f, () -> moveToFolder(target, f));
+      addChooserRow(list, (hasTag(target, f) ? "✓  " : "○  ") + f,
+          () -> toggleTag(target, f));
     }
 
     // New-folder row: name + create.
@@ -2452,7 +2560,7 @@ public class ClipboardService extends Service {
     newRow.setOrientation(LinearLayout.HORIZONTAL);
     newRow.setGravity(Gravity.CENTER_VERTICAL);
     final EditText name = new EditText(this);
-    name.setHint("New folder…");
+    name.setHint("New tag…");
     name.setHintTextColor(0xFF64748B);
     name.setTextColor(0xFFE2E8F0);
     name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
@@ -2468,7 +2576,7 @@ public class ClipboardService extends Service {
     styleCompactBtn(create, true);
     create.setOnClickListener((v) -> {
       String n = name.getText().toString().trim();
-      if (!n.isEmpty()) moveToFolder(target, n);
+      if (!n.isEmpty()) toggleTag(target, n);
     });
     LinearLayout.LayoutParams createLp = new LinearLayout.LayoutParams(dp(64), dp(28));
     createLp.leftMargin = dp(6);
@@ -2479,7 +2587,7 @@ public class ClipboardService extends Service {
     newRowLp.bottomMargin = dp(4);
     list.addView(newRow, newRowLp);
 
-    addChooserRow(list, "Cancel", () -> {
+    addChooserRow(list, "Done", () -> {
       folderPickForId = null;
       refreshPanelIfOpen();
     });
@@ -2674,6 +2782,7 @@ public class ClipboardService extends Service {
         it.put("createdAtMs", e.createdAtMs);
         it.put("pinned", e.pinned);
         it.put("folder", e.folder == null ? "" : e.folder);
+        it.put("tags", new org.json.JSONArray(e.tags));
         arr.put(it);
       }
       o.put("items", arr);

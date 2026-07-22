@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Send, ImagePlus, Mic, Square, Loader2, Check, X } from "lucide-react";
 import { cn } from "@/lib/cn";
@@ -81,6 +81,17 @@ export function Composer({
   // Web Speech is the built-in fallback (and an option even when Sarvam is set).
   const builtinAvailable = !!nativeSpeech();
   const micAvailable = sttEnabled || builtinAvailable;
+
+  // A note starts as a compact, single-line affordance and only claims vertical
+  // space when its actual content needs it. Measuring after React commits keeps
+  // typing responsive and avoids a layout animation for every keystroke.
+  useLayoutEffect(() => {
+    const area = areaRef.current;
+    if (!area) return;
+    area.style.height = "0px";
+    area.style.height = `${Math.min(area.scrollHeight, 160)}px`;
+    area.style.overflowY = area.scrollHeight > 160 ? "auto" : "hidden";
+  }, [text]);
 
   // Draft persistence: mirror unsent text (not edits) to localStorage.
   useEffect(() => {
@@ -276,9 +287,9 @@ export function Composer({
           }
           if (e.key === "Escape" && editing) onCancelEdit?.();
         }}
-        rows={2}
+        rows={1}
         placeholder={placeholder}
-        className="max-h-40 min-h-[2.5rem] w-full resize-none bg-transparent px-2 py-1 text-sm text-ink outline-none placeholder:text-ink-faint"
+        className="max-h-40 min-h-[2.5rem] w-full resize-none bg-transparent px-2 py-1 text-sm leading-6 text-ink outline-none placeholder:text-ink-faint"
       />
       <div className="flex items-center justify-between gap-1.5 px-0.5 pt-1">
         <div className="flex min-w-0 items-center gap-0.5">

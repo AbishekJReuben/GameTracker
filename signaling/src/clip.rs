@@ -66,6 +66,11 @@ impl ClipState {
         // exact content was copied/added (the dedup-to-top history). Client owns
         // the merge; the relay just stores + echoes the array verbatim.
         let _ = conn.execute("ALTER TABLE items ADD COLUMN copies TEXT", []);
+        let _ = conn.execute("ALTER TABLE items ADD COLUMN tags TEXT", []);
+        let _ = conn.execute(
+            "UPDATE items SET tags=json_array(folder) WHERE tags IS NULL AND folder IS NOT NULL AND folder != ''",
+            [],
+        );
         Arc::new(Self {
             db: Mutex::new(conn),
             blob_dir: data_dir.join("clip-blobs"),
@@ -103,6 +108,12 @@ impl ClipState {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let folder = item.get("folder").and_then(|v| v.as_str());
+        let tags = item
+            .get("tags")
+            .filter(|v| v.is_array())
+            .map(|v| v.to_string())
+            .or_else(|| folder.filter(|v| !v.trim().is_empty()).map(|v| json!([v]).to_string()))
+            .unwrap_or_else(|| "[]".to_string());
         // `copies` rides as a JSON array (of copy timestamps). Store its text
         // verbatim; the client is the source of truth for the merged history.
         let copies = item.get("copies").filter(|v| v.is_array()).map(|v| v.to_string());
@@ -112,13 +123,13 @@ impl ClipState {
         conn.execute(
             "INSERT INTO items
                 (clip_id, item_id, rev, device_id, device_name, kind, mime, size,
-                 created_utc, text_cipher, has_blob, deleted, pinned, folder, copies)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13,?14)
+                 created_utc, text_cipher, has_blob, deleted, pinned, folder, copies, tags)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13,?14,?15)
              ON CONFLICT(clip_id, item_id) DO UPDATE SET
                 rev=excluded.rev, text_cipher=excluded.text_cipher,
                 has_blob=excluded.has_blob, pinned=excluded.pinned, size=excluded.size,
                 mime=excluded.mime, folder=excluded.folder, deleted=0,
-                created_utc=excluded.created_utc, copies=excluded.copies",
+                created_utc=excluded.created_utc, copies=excluded.copies, tags=excluded.tags",
             rusqlite::params![
                 clip_id,
                 item_id,
@@ -134,6 +145,7 @@ impl ClipState {
                 pinned as i64,
                 folder,
                 copies,
+                tags,
             ],
         )
         .ok()?;
@@ -152,6 +164,7 @@ impl ClipState {
             pinned,
             folder,
             copies.as_deref(),
+            Some(&tags),
         ))
     }
 
@@ -193,16 +206,31 @@ impl ClipState {
     fn set_folder(&self, clip_id: &str, item_id: &str, folder: &str) -> Option<serde_json::Value> {
         let conn = self.db.lock().ok()?;
         let rev = Self::next_rev(&conn);
+        let tags = if folder.trim().is_empty() { json!([]) } else { json!([folder]) };
         let changed = conn
             .execute(
-                "UPDATE items SET folder=?3, rev=?4 WHERE clip_id=?1 AND item_id=?2",
-                rusqlite::params![clip_id, item_id, folder, rev],
+                "UPDATE items SET folder=?3, tags=?4, rev=?5 WHERE clip_id=?1 AND item_id=?2",
+                rusqlite::params![clip_id, item_id, folder, tags.to_string(), rev],
             )
             .ok()?;
         if changed == 0 {
             return None;
         }
-        Some(json!({ "t":"item", "rev":rev, "itemId":item_id, "folder":folder }))
+        Some(json!({ "t":"item", "rev":rev, "itemId":item_id, "folder":folder, "tags":tags }))
+    }
+
+    fn set_tags(&self, clip_id: &str, item_id: &str, tags: &serde_json::Value) -> Option<serde_json::Value> {
+        if !tags.is_array() { return None; }
+        let conn = self.db.lock().ok()?;
+        let rev = Self::next_rev(&conn);
+        let tags_text = tags.to_string();
+        let folder = tags.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("");
+        let changed = conn.execute(
+            "UPDATE items SET tags=?3, folder=?4, rev=?5 WHERE clip_id=?1 AND item_id=?2",
+            rusqlite::params![clip_id, item_id, tags_text, folder, rev],
+        ).ok()?;
+        if changed == 0 { return None; }
+        Some(json!({ "t":"item", "rev":rev, "itemId":item_id, "tags":tags, "folder":folder }))
     }
 
     /// Every change with `rev > since`, oldest first (the catch-up burst).
@@ -212,7 +240,7 @@ impl ClipState {
         };
         let Ok(mut stmt) = conn.prepare(
             "SELECT rev, item_id, device_id, device_name, kind, mime, size, created_utc,
-                    text_cipher, has_blob, deleted, pinned, folder, copies
+                    text_cipher, has_blob, deleted, pinned, folder, copies, tags
              FROM items WHERE clip_id=?1 AND rev>?2 ORDER BY rev ASC",
         ) else {
             return Vec::new();
@@ -233,6 +261,7 @@ impl ClipState {
                 r.get::<_, i64>(11)? != 0,
                 r.get::<_, Option<String>>(12)?.as_deref(),
                 r.get::<_, Option<String>>(13)?.as_deref(),
+                r.get::<_, Option<String>>(14)?.as_deref(),
             ))
         });
         match rows {
@@ -322,10 +351,14 @@ fn row_notice(
     pinned: bool,
     folder: Option<&str>,
     copies: Option<&str>,
+    tags: Option<&str>,
 ) -> serde_json::Value {
     // `copies` is stored as a JSON-array string; emit it back as real JSON so the
     // client gets an array (not a string). Anything unparseable → null.
     let copies_json = copies
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .filter(|v| v.is_array());
+    let tags_json = tags
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .filter(|v| v.is_array());
     json!({
@@ -344,6 +377,7 @@ fn row_notice(
         "pinned": pinned,
         "folder": folder,
         "copies": copies_json,
+        "tags": tags_json,
     })
 }
 
@@ -418,6 +452,13 @@ pub async fn handle(socket: WebSocket, clip_id: String, state: Arc<ClipState>) {
                     v.get("folder").and_then(|s| s.as_str()),
                 ) {
                     if let Some(notice) = state.set_folder(&clip_id, id, f) {
+                        state.broadcast(&clip_id, peer, &notice);
+                    }
+                }
+            }
+            Some("tags") => {
+                if let (Some(id), Some(tags)) = (v.get("itemId").and_then(|s| s.as_str()), v.get("tags")) {
+                    if let Some(notice) = state.set_tags(&clip_id, id, tags) {
                         state.broadcast(&clip_id, peer, &notice);
                     }
                 }
@@ -555,6 +596,21 @@ mod tests {
         // Replay carries the array back as real JSON.
         let replay = s.items_since("c", 0);
         assert_eq!(replay[0].get("copies").unwrap().as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn multiple_tags_roundtrip_and_replace_atomically() {
+        let s = temp_state("tags");
+        let mut it = text_item("a", "d");
+        it["tags"] = json!(["work", "urgent"]);
+        let added = s.upsert("c", &it).unwrap();
+        assert_eq!(added["tags"], json!(["work", "urgent"]));
+
+        let changed = s.set_tags("c", "a", &json!(["ideas", "later", "mobile"])).unwrap();
+        assert_eq!(changed["tags"], json!(["ideas", "later", "mobile"]));
+        assert_eq!(changed["folder"], json!("ideas"));
+        let replay = s.items_since("c", 0);
+        assert_eq!(replay[0]["tags"], json!(["ideas", "later", "mobile"]));
     }
 
     #[test]

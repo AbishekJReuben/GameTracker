@@ -32,6 +32,9 @@ pub struct ClipItem {
     /// Folder/list label for the notes view ("" = unfiled).
     #[serde(default)]
     pub folder: String,
+    /// Many-to-many labels. `folder` remains as a legacy wire fallback only.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Stable fingerprint of the content (text/image bytes) for dedup. Not shown.
     #[serde(default)]
     pub content_hash: Option<String>,
@@ -66,6 +69,8 @@ pub struct ClipInput {
     #[serde(default)]
     pub folder: String,
     #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
     pub content_hash: Option<String>,
     #[serde(default)]
     pub copies: Vec<String>,
@@ -95,7 +100,35 @@ fn copies_json(copies: &[String]) -> String {
     serde_json::to_string(copies).unwrap_or_else(|_| "[]".into())
 }
 
+fn parse_tags(raw: Option<String>, legacy_folder: &str) -> Vec<String> {
+    let mut tags = raw
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default();
+    if tags.is_empty() && !legacy_folder.trim().is_empty() {
+        tags.push(legacy_folder.trim().to_string());
+    }
+    normalize_tags(tags)
+}
+
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() || out.iter().any(|v: &String| v.eq_ignore_ascii_case(tag)) {
+            continue;
+        }
+        out.push(tag.to_string());
+        if out.len() >= 24 { break; }
+    }
+    out
+}
+
+fn tags_json(tags: &[String]) -> String {
+    serde_json::to_string(&normalize_tags(tags.to_vec())).unwrap_or_else(|_| "[]".into())
+}
+
 fn from_row(r: &Row) -> rusqlite::Result<ClipItem> {
+    let folder = r.get::<_, Option<String>>("folder")?.unwrap_or_default();
     Ok(ClipItem {
         id: r.get("id")?,
         kind: r.get("kind")?,
@@ -109,7 +142,8 @@ fn from_row(r: &Row) -> rusqlite::Result<ClipItem> {
         device_name: r.get("device_name")?,
         source: r.get("source")?,
         pinned: r.get::<_, i64>("pinned")? != 0,
-        folder: r.get::<_, Option<String>>("folder")?.unwrap_or_default(),
+        tags: parse_tags(r.get::<_, Option<String>>("tags")?, &folder),
+        folder,
         content_hash: r.get::<_, Option<String>>("content_hash")?,
         copies: parse_copies(r.get::<_, Option<String>>("copies")?),
         deleted: r.get::<_, i64>("deleted")? != 0,
@@ -118,7 +152,7 @@ fn from_row(r: &Row) -> rusqlite::Result<ClipItem> {
 }
 
 const COLS: &str = "id, kind, text, image_path, thumb_path, mime, size, created_utc, \
-                    device_id, device_name, source, pinned, folder, content_hash, copies, \
+                    device_id, device_name, source, pinned, folder, tags, content_hash, copies, \
                     deleted, synced";
 
 /// Item lists never surface folder entities (kind='folder' rows are the synced
@@ -144,13 +178,13 @@ pub fn upsert(pool: &DbPool, i: &ClipInput) -> AppResult<()> {
     conn.execute(
         "INSERT INTO clipboard_items
             (id, kind, text, image_path, thumb_path, mime, size, created_utc,
-             device_id, device_name, source, pinned, folder, content_hash, copies,
+             device_id, device_name, source, pinned, folder, tags, content_hash, copies,
              deleted, synced)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?14,?15,?16,0,?13)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?14,?17,?15,?16,0,?13)
          ON CONFLICT(id) DO UPDATE SET
             text=excluded.text, image_path=excluded.image_path,
             thumb_path=excluded.thumb_path, mime=excluded.mime, size=excluded.size,
-            pinned=excluded.pinned, folder=excluded.folder,
+            pinned=excluded.pinned, folder=excluded.folder, tags=excluded.tags,
             content_hash=excluded.content_hash, copies=excluded.copies,
             created_utc=excluded.created_utc, deleted=0, synced=excluded.synced",
         rusqlite::params![
@@ -170,6 +204,7 @@ pub fn upsert(pool: &DbPool, i: &ClipInput) -> AppResult<()> {
             i.folder,
             i.content_hash,
             copies_json(&copies),
+            tags_json(&i.tags),
         ],
     )?;
     Ok(())
@@ -237,12 +272,42 @@ pub fn update_text(pool: &DbPool, id: &str, text: &str, now: &str) -> AppResult<
 
 /// Move an item to a folder ('' = unfiled).
 pub fn set_folder(pool: &DbPool, id: &str, folder: &str) -> AppResult<()> {
+    let tags = if folder.trim().is_empty() { Vec::new() } else { vec![folder.trim().to_string()] };
     let conn = pool.get()?;
     conn.execute(
-        "UPDATE clipboard_items SET folder = ?2 WHERE id = ?1",
-        rusqlite::params![id, folder],
+        "UPDATE clipboard_items SET folder = ?2, tags = ?3 WHERE id = ?1",
+        rusqlite::params![id, folder, tags_json(&tags)],
     )?;
     Ok(())
+}
+
+/// Replace an item's tag set atomically. Folder is mirrored to the first tag for
+/// old clients, while current clients read the full JSON list.
+pub fn set_tags(pool: &DbPool, id: &str, tags: Vec<String>) -> AppResult<Vec<String>> {
+    let tags = normalize_tags(tags);
+    let folder = tags.first().cloned().unwrap_or_default();
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE clipboard_items SET tags = ?2, folder = ?3 WHERE id = ?1",
+        rusqlite::params![id, tags_json(&tags), folder],
+    )?;
+    Ok(tags)
+}
+
+pub fn list_tags(pool: &DbPool) -> AppResult<Vec<String>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT tags, folder FROM clipboard_items WHERE deleted = 0 AND kind != 'folder'",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    let mut out: Vec<String> = Vec::new();
+    for row in rows.flatten() {
+        for tag in parse_tags(row.0, row.1.as_deref().unwrap_or_default()) {
+            if !out.iter().any(|v| v.eq_ignore_ascii_case(&tag)) { out.push(tag); }
+        }
+    }
+    out.sort_by_key(|v| v.to_lowercase());
+    Ok(out)
 }
 
 /// Every folder name to show as a chip: the union of (a) folders that live items
@@ -298,6 +363,7 @@ pub fn create_folder(
         source: "folder".into(),
         pinned: false,
         folder: name.to_string(),
+        tags: Vec::new(),
         content_hash: None,
         copies: Vec::new(),
         synced: false,
@@ -339,6 +405,7 @@ pub fn apply_folder_entity(
         source: "folder".into(),
         pinned: false,
         folder: name.to_string(),
+        tags: Vec::new(),
         content_hash: None,
         copies: Vec::new(),
         synced: true, // already on the relay

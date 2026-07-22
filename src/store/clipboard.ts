@@ -14,15 +14,15 @@ interface ClipStore {
   pinned: ClipItem[];
   filter: ClipFilter;
   search: string;
-  /** Folder filter: null = all folders, "" = unfiled, else a folder name. */
-  folderFilter: string | null;
-  folders: string[];
+  /** null = all; a tag name filters items containing that tag. */
+  tagFilter: string | null;
+  tags: string[];
   loading: boolean;
   hasMore: boolean;
 
   setFilter: (f: ClipFilter) => void;
   setSearch: (s: string) => void;
-  setFolderFilter: (f: string | null) => void;
+  setTagFilter: (f: string | null) => void;
 
   load: () => Promise<void>;
   loadMore: () => Promise<void>;
@@ -31,9 +31,7 @@ interface ClipStore {
   addText: (text: string) => Promise<void>;
   addImage: (imageBase64: string, mime?: string) => Promise<void>;
   editText: (id: string, text: string) => Promise<void>;
-  moveToFolder: (id: string, folder: string) => Promise<void>;
-  createFolder: (name: string) => Promise<void>;
-  deleteFolder: (name: string) => Promise<void>;
+  setTags: (id: string, tags: string[]) => Promise<void>;
   copy: (id: string) => Promise<void>;
   remove: (id: string) => Promise<void>;
   togglePin: (item: ClipItem) => Promise<void>;
@@ -45,25 +43,25 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   pinned: [],
   filter: "all",
   search: "",
-  folderFilter: null,
-  folders: [],
+  tagFilter: null,
+  tags: [],
   loading: false,
   hasMore: false,
 
   setFilter: (filter) => set({ filter }),
   setSearch: (search) => set({ search }),
-  setFolderFilter: (folderFilter) => set({ folderFilter }),
+  setTagFilter: (tagFilter) => set({ tagFilter }),
 
   load: async () => {
     if (get().loading) return;
     set({ loading: true });
     try {
-      const [pinned, items, folders] = await Promise.all([
+      const [pinned, items, tags] = await Promise.all([
         clip.pinned(),
         clip.list(undefined, PAGE),
-        clip.folders().catch(() => []),
+        clip.tags().catch(() => []),
       ]);
-      set({ pinned, items, folders, hasMore: items.length >= PAGE, loading: false });
+      set({ pinned, items, tags, hasMore: items.length >= PAGE, loading: false });
     } catch {
       set({ loading: false });
     }
@@ -88,35 +86,35 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   // list from growing unbounded on every push.
   refresh: async () => {
     try {
-      const [pinned, items, folders] = await Promise.all([
+      const [pinned, items, tags] = await Promise.all([
         clip.pinned(),
         clip.list(undefined, PAGE),
-        clip.folders().catch(() => []),
+        clip.tags().catch(() => []),
       ]);
-      set({ pinned, items, folders, hasMore: items.length >= PAGE });
+      set({ pinned, items, tags, hasMore: items.length >= PAGE });
     } catch {
       /* ignore */
     }
   },
 
-  // New notes land in the folder currently being viewed (if any), so "add to a
-  // folder" is as simple as opening that folder first.
+  // A note created while filtering a tag inherits that tag.
   addText: async (text) => {
     const t = text.trim();
     if (!t) return;
-    const folder = get().folderFilter || "";
-    await clip.add({ kind: "text", text: t, source: "manual", folder });
+    const tags = get().tagFilter ? [get().tagFilter!] : [];
+    await clip.add({ kind: "text", text: t, source: "manual", tags, folder: tags[0] ?? "" });
     await get().refresh();
   },
 
   addImage: async (imageBase64, mime) => {
-    const folder = get().folderFilter || "";
+    const tags = get().tagFilter ? [get().tagFilter!] : [];
     await clip.add({
       kind: "image",
       imageBase64,
       mime: mime ?? "image/png",
       source: "manual",
-      folder,
+      tags,
+      folder: tags[0] ?? "",
     });
     await get().refresh();
   },
@@ -128,23 +126,8 @@ export const useClipboard = create<ClipStore>((set, get) => ({
     await get().refresh();
   },
 
-  moveToFolder: async (id, folder) => {
-    await clip.setFolder(id, folder);
-    await get().refresh();
-  },
-
-  createFolder: async (name) => {
-    const n = name.trim();
-    if (!n) return;
-    await clip.createFolder(n);
-    // Open the new folder so the next note lands in it.
-    set({ folderFilter: n });
-    await get().refresh();
-  },
-
-  deleteFolder: async (name) => {
-    await clip.deleteFolder(name);
-    set((s) => ({ folderFilter: s.folderFilter === name ? null : s.folderFilter }));
+  setTags: async (id, tags) => {
+    await clip.setTags(id, tags);
     await get().refresh();
   },
 
@@ -173,21 +156,23 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   },
 }));
 
-/** Items after search + type + folder filters (pinned first, then the paged list, deduped). */
+/** Items after search + type + tag filters (pinned first, then the paged list, deduped). */
 export function visibleClips(s: {
   items: ClipItem[];
   pinned: ClipItem[];
   filter: ClipFilter;
   search: string;
-  folderFilter?: string | null;
+  tagFilter?: string | null;
 }): { pinned: ClipItem[]; rest: ClipItem[] } {
   const q = s.search.trim().toLowerCase();
-  const ff = s.folderFilter ?? null;
+  const tf = s.tagFilter ?? null;
   const match = (i: ClipItem) => {
     if (s.filter !== "all" && i.kind !== s.filter) return false;
-    if (ff !== null && (i.folder ?? "") !== ff) return false;
+    if (tf !== null && !(i.tags ?? []).some((t) => t.toLowerCase() === tf.toLowerCase())) return false;
     if (!q) return true;
-    return (i.text ?? "").toLowerCase().includes(q) || (i.deviceName ?? "").toLowerCase().includes(q);
+    return (i.text ?? "").toLowerCase().includes(q) ||
+      (i.deviceName ?? "").toLowerCase().includes(q) ||
+      (i.tags ?? []).some((tag) => tag.toLowerCase().includes(q));
   };
   const pinnedIds = new Set(s.pinned.map((p) => p.id));
   return {

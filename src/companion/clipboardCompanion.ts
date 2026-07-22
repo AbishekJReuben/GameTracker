@@ -58,7 +58,7 @@ export async function companionTranscribe(audioB64: string, mime: string): Promi
 interface CompanionClipState {
   items: ClipItem[];
   /** Folder names to show as chips: item memberships ∪ empty-folder entities. */
-  folders: string[];
+  tags: string[];
   connected: boolean;
   ready: boolean; // has a secret key configured
   deviceId: string;
@@ -67,11 +67,12 @@ interface CompanionClipState {
   /** Inject a secret received from the host (post-approval) and (re)connect.
    *  Idempotent — a no-op if this secret is already active. */
   setSecret: (secret: string) => Promise<void>;
-  addText: (text: string, folder?: string) => Promise<void>;
-  addImage: (dataUrl: string, folder?: string) => Promise<void>;
+  addText: (text: string, tags?: string[]) => Promise<void>;
+  addImage: (dataUrl: string, tags?: string[]) => Promise<void>;
   /** Edit a text note in place — bumps it to the top, synced to all devices. */
   editText: (id: string, text: string) => Promise<void>;
   moveToFolder: (id: string, folder: string) => Promise<void>;
+  setTags: (id: string, tags: string[]) => Promise<void>;
   createFolder: (name: string) => Promise<void>;
   deleteFolder: (name: string) => Promise<void>;
   copy: (id: string) => Promise<void>;
@@ -129,6 +130,12 @@ function folderNames(map: Map<string, ClipItem>, entities: Map<string, string>):
   return [...set].sort((a, b) => a.localeCompare(b));
 }
 
+function tagNames(map: Map<string, ClipItem>): string[] {
+  const tags = new Set<string>();
+  for (const item of map.values()) for (const tag of item.tags ?? []) if (tag.trim()) tags.add(tag.trim());
+  return [...tags].sort((a, b) => a.localeCompare(b));
+}
+
 /** Content key for in-memory dedup: identical text / identical image data URL
  *  maps to the same existing note (bumped to the top instead of duplicated). */
 function contentKey(kind: string, text?: string | null, image?: string | null): string {
@@ -141,7 +148,7 @@ const folderEntities = new Map<string, string>();
 
 export const useCompanionClip = create<CompanionClipState>((set, get) => {
   const publish = () =>
-    set({ items: sortItems(items), folders: folderNames(items, folderEntities) });
+    set({ items: sortItems(items), tags: tagNames(items) });
 
   const ready = () => !!ws && ws.readyState === WebSocket.OPEN && !!key;
 
@@ -198,7 +205,13 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     }
     // A bare folder move (no content fields).
     if (v.kind === undefined && v.folder !== undefined && existing) {
-      items.set(v.itemId, { ...existing, folder: v.folder ?? "" });
+      const folder = v.folder ?? "";
+      items.set(v.itemId, { ...existing, folder, tags: folder ? [folder] : [] });
+      publish();
+      return;
+    }
+    if (v.kind === undefined && Array.isArray(v.tags) && existing) {
+      items.set(v.itemId, { ...existing, tags: v.tags });
       publish();
       return;
     }
@@ -220,6 +233,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         source: v.deviceName ? "desktop" : "remote",
         pinned: v.pinned ?? false,
         folder: v.folder ?? "",
+        tags: Array.isArray(v.tags) ? v.tags : (v.folder ? [v.folder] : []),
         copies: v.copies ?? undefined,
       };
       if (v.kind === "image" && v.hasBlob) {
@@ -364,6 +378,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
             createdUtc: now,
             pinned: item.pinned,
             folder: item.folder ?? "",
+            tags: item.tags ?? [],
             copies,
             hasBlob: true,
           },
@@ -383,6 +398,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
             createdUtc: now,
             pinned: item.pinned,
             folder: item.folder ?? "",
+            tags: item.tags ?? [],
             copies,
             textCipher: await encryptText(key, item.text ?? ""),
             hasBlob: false,
@@ -394,7 +410,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
 
   return {
     items: [],
-    folders: [],
+    tags: [],
     connected: false,
     ready: false,
     deviceId: "",
@@ -424,6 +440,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
                     source: "android",
                     pinned: !!e.pinned,
                     folder: e.folder || "",
+                    tags: Array.isArray(e.tags) ? e.tags : (e.folder ? [e.folder] : []),
                   });
                 }
               }
@@ -477,7 +494,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       set({ connected: false });
     },
 
-    addText: async (text, folder) => {
+    addText: async (text, tags = []) => {
       const t = text.trim();
       if (!t || !key) return;
       const now = new Date().toISOString();
@@ -503,7 +520,8 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         deviceName: "Phone",
         source: "android",
         pinned: false,
-        folder: folder ?? "",
+        folder: tags[0] ?? "",
+        tags,
         copies: [now],
       };
       await addLocal(item, {
@@ -515,14 +533,15 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         size: t.length,
         createdUtc: now,
         pinned: false,
-        folder: folder ?? "",
+        folder: tags[0] ?? "",
+        tags,
         copies: [now],
         textCipher: await encryptText(key, t),
         hasBlob: false,
       });
     },
 
-    addImage: async (dataUrl, folder) => {
+    addImage: async (dataUrl, tags = []) => {
       if (!key) return;
       const now = new Date().toISOString();
       // Dedup: an identical image bumps the existing note to the top.
@@ -551,7 +570,8 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         deviceName: "Phone",
         source: "android",
         pinned: false,
-        folder: folder ?? "",
+        folder: tags[0] ?? "",
+        tags,
         copies: [now],
       };
       await addLocal(item, {
@@ -563,7 +583,8 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         size: raw.length,
         createdUtc: now,
         pinned: false,
-        folder: folder ?? "",
+        folder: tags[0] ?? "",
+        tags,
         copies: [now],
         hasBlob: true,
       });
@@ -585,6 +606,15 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       items.set(id, { ...cur, folder });
       publish();
       if (ready()) ws!.send(JSON.stringify({ t: "folder", itemId: id, folder }));
+    },
+
+    setTags: async (id, tags) => {
+      const cur = items.get(id);
+      if (!cur) return;
+      const clean = [...new Set(tags.map((t) => t.trim()).filter(Boolean))];
+      items.set(id, { ...cur, tags: clean, folder: clean[0] ?? "" });
+      publish();
+      if (ready()) ws!.send(JSON.stringify({ t: "tags", itemId: id, tags: clean }));
     },
 
     createFolder: async (name) => {

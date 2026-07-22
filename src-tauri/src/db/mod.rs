@@ -488,6 +488,21 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 25;
     }
 
+    if version < 26 {
+        // Notes use many-to-many tags now. Preserve every existing folder as the
+        // item's first tag so upgrading never loses organization.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE clipboard_items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+            UPDATE clipboard_items
+               SET tags = json_array(folder)
+             WHERE kind != 'folder' AND folder IS NOT NULL AND folder != '';
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 26;")?;
+        version = 26;
+    }
+
     let _ = version;
     Ok(())
 }

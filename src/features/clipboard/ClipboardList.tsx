@@ -15,6 +15,10 @@ import {
   Folder,
   FolderPlus,
   History,
+  Globe2,
+  ExternalLink,
+  Tag,
+  Tags,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { relativeTime } from "@/lib/format";
@@ -26,6 +30,52 @@ function haptic() {
     navigator.vibrate?.(8);
   } catch {
     /* ignore */
+  }
+}
+
+function TagPicker({ current, known, onChange, onClose }: { current: string[]; known: string[]; onChange: (tags: string[]) => void; onClose: () => void }) {
+  const [name, setName] = useState("");
+  const all = Array.from(new Set([...known, ...current])).filter(Boolean);
+  const has = (tag: string) => current.some((t) => t.toLowerCase() === tag.toLowerCase());
+  const toggle = (tag: string) => onChange(has(tag) ? current.filter((t) => t.toLowerCase() !== tag.toLowerCase()) : [...current, tag]);
+  const add = () => {
+    const tag = name.trim();
+    if (tag && !has(tag)) onChange([...current, tag]);
+    setName("");
+  };
+  return (
+    <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
+      <div className="mt-1 flex flex-wrap items-center gap-1 rounded-xl border border-accent-2/15 bg-white/[0.04] p-1.5">
+        {all.map((tag) => (
+          <button key={tag} onClick={() => toggle(tag)} className={cn("flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-600", has(tag) ? "bg-accent-2/25 text-ink" : "text-ink-dim hover:bg-white/10")}>
+            <Tag className="h-2.5 w-2.5" /> {tag} {has(tag) && <Check className="h-2.5 w-2.5" />}
+          </button>
+        ))}
+        <form className="flex items-center gap-1" onSubmit={(e) => { e.preventDefault(); add(); }}>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="New tag…" className="w-24 rounded-md bg-white/[0.06] px-2 py-1 text-[10px] text-ink outline-none" />
+          <button type="submit" disabled={!name.trim()} className="rounded-md px-2 py-1 text-[10px] font-700 text-accent-3 disabled:opacity-40">Add</button>
+        </form>
+        <button onClick={onClose} className="ml-auto rounded-md px-2 py-1 text-[10px] font-700 text-ink-soft hover:bg-white/10">Done</button>
+      </div>
+    </motion.div>
+  );
+}
+
+/** A safe, zero-network link summary. It gives a pasted URL a recognizable
+ * identity immediately; opening/copying never waits on a metadata fetch. */
+function linkSummary(text?: string | null): { url: string; host: string; title: string } | null {
+  const raw = text?.match(/https?:\/\/[^\s<>()]+/i)?.[0];
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    const path = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "");
+    return {
+      url: raw,
+      host: url.hostname.replace(/^www\./, ""),
+      title: path ? path.replace(/[-_]+/g, " ").replace(/\/+/, " · ") : "Open link",
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -140,6 +190,8 @@ export function ClipRow({
   onEdit,
   onMoveToFolder,
   folders,
+  onSetTags,
+  knownTags,
   compact,
   showHistory,
 }: {
@@ -150,6 +202,8 @@ export function ClipRow({
   onEdit?: (item: ClipItem) => void;
   onMoveToFolder?: (id: string, folder: string) => void;
   folders?: string[];
+  onSetTags?: (id: string, tags: string[]) => void;
+  knownTags?: string[];
   compact?: boolean;
   /** App screens (not the floating panels) show every date this exact item was
    *  copied. Off in the overlay/dock. */
@@ -160,6 +214,7 @@ export function ClipRow({
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
+  const [tagsOpen, setTagsOpen] = useState(false);
   const [datesOpen, setDatesOpen] = useState(false);
   const textRef = useRef<HTMLParagraphElement>(null);
   // Distinct copy timestamps, newest first; only meaningful when the same content
@@ -181,6 +236,7 @@ export function ClipRow({
   const full = clipAssetUrl(item.imagePath ?? item.thumbPath);
   const isImage = item.kind === "image";
   const collapsedLines = compact ? 3 : 5;
+  const link = !isImage ? linkSummary(item.text) : null;
 
   // Detect whether the collapsed text actually overflows, so the "Show more"
   // affordance only appears when there's genuinely more to reveal.
@@ -221,6 +277,7 @@ export function ClipRow({
             )}
           />
         ) : (
+          <>
           <p
             ref={textRef}
             className={cn(
@@ -239,6 +296,19 @@ export function ClipRow({
           >
             {item.text || "(empty)"}
           </p>
+          {link && (
+            <span className="mt-2 flex items-center gap-2 rounded-xl border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-2 text-left">
+              <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-cyan-300/10 text-cyan-200">
+                <Globe2 className="h-3.5 w-3.5" />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[11px] font-700 capitalize text-ink">{link.title}</span>
+                <span className="block truncate text-[10px] text-cyan-200/70">{link.host}</span>
+              </span>
+              <ExternalLink className="h-3.5 w-3.5 shrink-0 text-cyan-200/70" />
+            </span>
+          )}
+          </>
         )}
       </button>
 
@@ -259,12 +329,9 @@ export function ClipRow({
           </span>
         )}
         <span className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden text-[10px] text-ink-faint">
-          {(item.folder ?? "") !== "" && (
-            <span className="flex shrink-0 items-center gap-0.5 rounded bg-accent-2/15 px-1 py-px text-accent-2">
-              <Folder className="h-2.5 w-2.5" />
-              <span className="max-w-[7rem] truncate">{item.folder}</span>
-            </span>
-          )}
+          {(item.tags ?? []).slice(0, compact ? 2 : 4).map((tag) => (
+            <span key={tag} className="flex shrink-0 items-center gap-0.5 rounded bg-accent-2/15 px-1 py-px text-accent-2"><Tag className="h-2.5 w-2.5" /><span className="max-w-[6rem] truncate">{tag}</span></span>
+          ))}
           {item.deviceName && <span className="truncate">{item.deviceName}</span>}
           <span className="text-white/15">·</span>
           <span className="shrink-0">{relativeTime(item.createdUtc)}</span>
@@ -336,6 +403,11 @@ export function ClipRow({
                   <Folder className={cn("h-4 w-4", folderOpen && "text-accent-2")} />
                 </IconBtn>
               )}
+              {onSetTags && (
+                <IconBtn label="Edit tags" onClick={() => setTagsOpen((v) => !v)}>
+                  <Tags className={cn("h-4 w-4", tagsOpen && "text-accent-2")} />
+                </IconBtn>
+              )}
               <IconBtn label="Share" onClick={() => shareClip(item, doCopy)}>
                 <Share2 className="h-4 w-4" />
               </IconBtn>
@@ -360,6 +432,10 @@ export function ClipRow({
             onClose={() => setFolderOpen(false)}
           />
         )}
+      </AnimatePresence>
+
+      <AnimatePresence initial={false}>
+        {tagsOpen && onSetTags && <TagPicker current={item.tags ?? []} known={knownTags ?? []} onChange={(tags) => onSetTags(item.id, tags)} onClose={() => setTagsOpen(false)} />}
       </AnimatePresence>
 
       <AnimatePresence initial={false}>
@@ -426,6 +502,8 @@ export function ClipboardList({
   onEdit,
   onMoveToFolder,
   folders,
+  onSetTags,
+  knownTags,
   onLoadMore,
   compact,
   showHistory,
@@ -440,6 +518,8 @@ export function ClipboardList({
   onEdit?: (item: ClipItem) => void;
   onMoveToFolder?: (id: string, folder: string) => void;
   folders?: string[];
+  onSetTags?: (id: string, tags: string[]) => void;
+  knownTags?: string[];
   onLoadMore: () => void;
   compact?: boolean;
   showHistory?: boolean;
@@ -474,6 +554,8 @@ export function ClipboardList({
                 onEdit={onEdit}
                 onMoveToFolder={onMoveToFolder}
                 folders={folders}
+                onSetTags={onSetTags}
+                knownTags={knownTags}
                 compact={compact}
                 showHistory={showHistory}
               />
@@ -493,6 +575,8 @@ export function ClipboardList({
             onEdit={onEdit}
             onMoveToFolder={onMoveToFolder}
             folders={folders}
+            onSetTags={onSetTags}
+            knownTags={knownTags}
             compact={compact}
             showHistory={showHistory}
           />
