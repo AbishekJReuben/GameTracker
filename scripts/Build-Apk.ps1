@@ -140,7 +140,7 @@ $zipalign  = Join-Path $bt.FullName 'zipalign.exe'
 $apksigner = Join-Path $bt.FullName 'apksigner.bat'
 $keystore  = Join-Path $env:USERPROFILE '.android\debug.keystore'
 if (-not (Test-Path $keystore)) {
-    throw "Debug keystore not found at $keystore. Create one with: keytool -genkey -v -keystore $keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname `"CN=Android Debug`""
+    throw ("Debug keystore not found at " + $keystore + ' . Create one with: keytool -genkey -v -keystore ' + $keystore + ' -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug"')
 }
 Write-Host "Signing with build-tools $($bt.Name) + debug keystore."
 

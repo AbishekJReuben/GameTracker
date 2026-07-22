@@ -22,6 +22,7 @@ export interface ShareStats {
   etaSeconds: number | null;
   peakSpeedBps: number;
   peer: string | null;
+  transportDetail?: string;
   detail?: string;
 }
 
@@ -59,8 +60,12 @@ const WRITE_BATCH = 1024 * 1024;
 // mobile Chromium). Keep a conservative window and explicitly account for the
 // next frame before enqueuing it; this prevents a full queue from aborting a
 // live transfer.
-const HIGH_WATER = 2 * 1024 * 1024;
-const LOW_WATER = 512 * 1024;
+// A two-megabyte window caps a 1-second Wi-Fi/Internet path at roughly
+// 2 MB/s even when both connections are fast. Keep a materially larger BDP
+// window for desktop browsers; `sendFrame()` still catches a platform's real
+// SCTP queue limit and backs off instead of failing the transfer.
+const HIGH_WATER = 16 * 1024 * 1024;
+const LOW_WATER = 4 * 1024 * 1024;
 const DONE_FRAME_ID = 0xffff_ffff;
 
 function roomCode(): string {
@@ -139,13 +144,27 @@ class Telemetry {
   private timer: number | null = null;
   private lastAt = performance.now();
   private lastBytes = 0;
+  private lastTransportBytes: number | null = null;
+  private transportDetail = "candidate pair pending";
   private pingId = 0;
-  constructor(private pc: () => RTCPeerConnection | null, totalBytes: number, private onStats: (s: ShareStats) => void) {
+  constructor(private pc: () => RTCPeerConnection | null, totalBytes: number, private direction: "send" | "receive", private onStats: (s: ShareStats) => void) {
     this.stats = { state: "connecting", route: "connecting", sentBytes: 0, receivedBytes: 0, totalBytes, speedBps: 0, peakSpeedBps: 0, rttMs: null, bufferedBytes: 0, etaSeconds: null, peer: null };
   }
   set(patch: Partial<ShareStats>) { this.stats = { ...this.stats, ...patch }; this.emit(); }
-  addSent(bytes: number) { this.stats.sentBytes += bytes; this.emit(); }
-  addReceived(bytes: number) { this.stats.receivedBytes += bytes; this.emit(); }
+  // A 60 KiB frame can arrive hundreds of times per second. Rendering React
+  // telemetry for every one of those frames steals time from SCTP and is most
+  // visible on a browser using the in-memory download fallback. The 1 Hz stats
+  // sampler below still exposes exact totals, live speed, peak and ETA.
+  addSent(bytes: number) { this.stats.sentBytes += bytes; }
+  addReceived(bytes: number) { this.stats.receivedBytes += bytes; }
+  /** Every browser receiver is a new transfer session, never a continuation. */
+  resetTransfer() {
+    this.stats = { ...this.stats, state: "ready", sentBytes: 0, receivedBytes: 0, speedBps: 0, peakSpeedBps: 0, bufferedBytes: 0, etaSeconds: null, rttMs: null };
+    this.lastAt = performance.now();
+    this.lastBytes = 0;
+    this.lastTransportBytes = null;
+    this.emit();
+  }
   // File bytes can delay a control-channel pong behind SCTP's shared queue.
   // The selected ICE candidate-pair RTT collected below is the real network RTT.
   onPong(_sentAt: number) { /* getStats() owns rttMs */ }
@@ -154,14 +173,10 @@ class Telemetry {
       const now = performance.now();
       const moved = this.stats.sentBytes + this.stats.receivedBytes;
       const elapsed = Math.max(0.001, (now - this.lastAt) / 1000);
-      const speedBps = Math.max(0, (moved - this.lastBytes) / elapsed);
+      let speedBps = Math.max(0, (moved - this.lastBytes) / elapsed);
       this.lastAt = now;
       this.lastBytes = moved;
-      const done = Math.max(this.stats.sentBytes, this.stats.receivedBytes);
-      this.stats.speedBps = speedBps;
-      this.stats.peakSpeedBps = Math.max(this.stats.peakSpeedBps, speedBps);
       this.stats.bufferedBytes = data()?.bufferedAmount ?? 0;
-      this.stats.etaSeconds = speedBps > 0 ? Math.max(0, (this.stats.totalBytes - done) / speedBps) : null;
       jsonSend(control(), { t: "ping", id: ++this.pingId, sentAt: now });
       const pc = this.pc();
       if (pc) {
@@ -174,14 +189,30 @@ class Telemetry {
             const relay = local?.candidateType === "relay" || remote?.candidateType === "relay";
             this.stats.route = relay ? "relayed" : "direct";
             if (typeof r.currentRoundTripTime === "number") this.stats.rttMs = r.currentRoundTripTime * 1000;
+            // App-level bytes are counted when `send()` queues them, which can
+            // make a congested receiver look impossibly fast. Candidate-pair
+            // bytes are the bytes WebRTC actually put on the selected path.
+            const transportBytes = this.direction === "send" ? r.bytesSent : r.bytesReceived;
+            if (typeof transportBytes === "number") {
+              if (this.lastTransportBytes !== null) speedBps = Math.max(0, (transportBytes - this.lastTransportBytes) / elapsed);
+              this.lastTransportBytes = transportBytes;
+            }
+            const candidate = `${local?.candidateType || "?"}/${local?.protocol || "?"} → ${remote?.candidateType || "?"}/${remote?.protocol || "?"}`;
+            const bandwidth = this.direction === "send" ? r.availableOutgoingBitrate : r.availableIncomingBitrate;
+            this.transportDetail = `path=${candidate}; wireBytes=${Math.round(transportBytes || 0)}; estimatedBandwidth=${typeof bandwidth === "number" ? Math.round(bandwidth) : "n/a"}; rtt=${typeof r.currentRoundTripTime === "number" ? Math.round(r.currentRoundTripTime * 1000) : "n/a"}ms`;
           });
         } catch { /* transient browser stats failure */ }
       }
+      const done = Math.max(this.stats.sentBytes, this.stats.receivedBytes);
+      this.stats.speedBps = speedBps;
+      this.stats.peakSpeedBps = Math.max(this.stats.peakSpeedBps, speedBps);
+      this.stats.etaSeconds = speedBps > 0 ? Math.max(0, (this.stats.totalBytes - done) / speedBps) : null;
       this.emit();
     }, 1000);
   }
   stop() { if (this.timer !== null) window.clearInterval(this.timer); this.timer = null; }
   snapshot() { return { ...this.stats }; }
+  diagnostics() { return this.transportDetail; }
   private emit() { this.onStats({ ...this.stats }); }
 }
 
@@ -218,7 +249,7 @@ export async function hostSavedShare(
     events.push(`${new Date().toISOString()} ${message}`);
     if (events.length > 80) events.shift();
   };
-  const telemetry = new Telemetry(() => pc, manifest.totalBytes, options.onStats);
+  const telemetry = new Telemetry(() => pc, manifest.totalBytes, "send", options.onStats);
   const sig = new Signaling(signalUrl, room, "host");
 
   const fail = (message: string) => {
@@ -348,7 +379,11 @@ export async function hostSavedShare(
         const msg = JSON.parse(String(event.data)) as Control;
         if (msg.t === "accept") {
           accepted = true;
-          void (async () => { await beginAudit(msg.name); await transfer(); })();
+          void (async () => {
+            await beginAudit(msg.name);
+            telemetry.resetTransfer();
+            await transfer();
+          })();
         }
         else if (msg.t === "ping") jsonSend(control, { t: "pong", id: msg.id, sentAt: msg.sentAt });
         else if (msg.t === "pong") telemetry.onPong(msg.sentAt);
@@ -383,7 +418,7 @@ export async function hostSavedShare(
   telemetry.start(() => control, () => data);
   return {
     room, link, manifest, saved,
-    logs() { return ["GameTracker Share sender diagnostics", `share=${saved.id}`, `room=${room}`, `signal=${signalUrl}`, ...events, `state=${JSON.stringify(telemetry.snapshot())}`].join("\n"); },
+    logs() { return ["GameTracker Share sender diagnostics", `share=${saved.id}`, `room=${room}`, `signal=${signalUrl}`, `transport=${telemetry.diagnostics()}`, ...events, `state=${JSON.stringify(telemetry.snapshot())}`].join("\n"); },
     stop() { stopped = true; void finishAudit("cancelled", "Sender revoked or stopped this share."); telemetry.stop(); telemetry.set({ state: "closed" }); releasePeer(); sig.close(); },
   };
 }
@@ -391,7 +426,9 @@ export async function hostSavedShare(
 type Destination =
   | { kind: "file"; writer: FileSystemWritableFileStream }
   | { kind: "directory"; root: FileSystemDirectoryHandle; writers: Map<number, FileSystemWritableFileStream> }
-  | { kind: "memory"; chunks: Map<number, ArrayBuffer[]> };
+  // Keep views of the received frames instead of copying every 60 KiB payload.
+  // This is the compatibility path for browsers without File System Access.
+  | { kind: "memory"; chunks: Map<number, BlobPart[]> };
 
 type PendingWrite = {
   item: PublicItem;
@@ -450,7 +487,7 @@ export async function joinShare(
     events.push(`${new Date().toISOString()} ${message}`);
     if (events.length > 80) events.shift();
   };
-  const telemetry = new Telemetry(() => pc, 0, options.onStats);
+  const telemetry = new Telemetry(() => pc, 0, "receive", options.onStats);
   const sig = new Signaling(signalUrl, room, "guest");
 
   const onControl = (event: MessageEvent) => {
@@ -492,6 +529,15 @@ export async function joinShare(
     if (frame.id === DONE_FRAME_ID) { await finish(true); return; }
     const item = manifest.items.find((v) => v.id === frame.id);
     if (!item || frame.offset + frame.bytes.byteLength > item.size) throw new Error("Received an invalid file chunk.");
+    if (destination.kind === "memory") {
+      const chunks = destination.chunks.get(item.id) || [];
+      // RTC delivers an ArrayBuffer here; TypeScript's newer typed-array
+      // generic is wider than BlobPart even though this runtime value is safe.
+      chunks.push(frame.bytes as unknown as BlobPart);
+      destination.chunks.set(item.id, chunks);
+      telemetry.addReceived(frame.bytes.byteLength);
+      return;
+    }
     const writer = await writerFor(destination, item);
     if (writer) {
       let pending = pendingWrites.get(item.id);
@@ -508,11 +554,6 @@ export async function joinShare(
       pending.chunks.push(frame.bytes);
       pending.bytes += frame.bytes.byteLength;
       if (pending.bytes >= WRITE_BATCH) await flushWrite(pending);
-    }
-    else if (destination.kind === "memory") {
-      const chunks = destination.chunks.get(item.id) || [];
-      chunks.push(new Uint8Array(frame.bytes).buffer);
-      destination.chunks.set(item.id, chunks);
     }
     telemetry.addReceived(frame.bytes.byteLength);
   };
@@ -553,7 +594,17 @@ export async function joinShare(
         if (event.channel.label === "share-control") { control = event.channel; control.onmessage = onControl; }
         if (event.channel.label === "share-data") {
           data = event.channel; data.binaryType = "arraybuffer";
-          data.onmessage = (ev) => { writeChain = writeChain.then(() => writeFrame(ev.data as ArrayBuffer)).catch((e) => { options.onError(String(e)); jsonSend(control, { t: "error", message: String(e) }); }); };
+          data.onmessage = (ev) => {
+            const frame = ev.data as ArrayBuffer;
+            // A memory fallback does not need disk ordering or async writes.
+            // Processing it inline avoids thousands of Promise turns per file,
+            // which was throttling cross-PC receivers to about 1 MB/s.
+            if (destination?.kind === "memory") {
+              void writeFrame(frame).catch((e) => { options.onError(String(e)); jsonSend(control, { t: "error", message: String(e) }); });
+            } else {
+              writeChain = writeChain.then(() => writeFrame(frame)).catch((e) => { options.onError(String(e)); jsonSend(control, { t: "error", message: String(e) }); });
+            }
+          };
         }
       };
       await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
@@ -571,11 +622,11 @@ export async function joinShare(
     async accept(name?: string) {
       if (!manifest || !control || control.readyState !== "open") throw new Error("Waiting for sender manifest.");
       destination = await chooseDestination(manifest);
-      log(`destination selected: ${destination.kind}`);
+      log(`destination selected: ${destination.kind}${destination.kind === "memory" ? " (browser has no direct-to-disk File System Access; this can limit large-transfer speed)" : ""}`);
       telemetry.set({ state: "transferring", peer: name || "GameTracker sender" });
       jsonSend(control, { t: "accept", name });
     },
-    logs() { return ["GameTracker Share receiver diagnostics", `room=${room}`, `signal=${signalUrl}`, ...events, `state=${JSON.stringify(telemetry.snapshot())}`].join("\n"); },
+    logs() { return ["GameTracker Share receiver diagnostics", `room=${room}`, `signal=${signalUrl}`, `transport=${telemetry.diagnostics()}`, `savePath=${destination?.kind || "not selected"}`, ...events, `state=${JSON.stringify(telemetry.snapshot())}`].join("\n"); },
     close() { stopped = true; telemetry.stop(); data?.close(); control?.close(); pc?.close(); sig.close(); },
   };
 }

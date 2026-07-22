@@ -354,6 +354,7 @@ pub fn run() {
             commands::set_setting,
             commands::complete_onboarding,
             commands::link_preview,
+            commands::open_external_link,
             commands::share_prepare,
             commands::share_read_chunk,
             commands::share_create,

@@ -52,6 +52,7 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -170,6 +171,10 @@ public class ClipboardService extends Service {
   private ConnectivityManager.NetworkCallback netCallback;
   // Decoded image thumbnails, keyed by item id. Bounded by MAX_ITEMS eviction.
   private final HashMap<String, Bitmap> thumbs = new HashMap<>();
+  // The dock rebuilds rows frequently; cache preview metadata and coalesce
+  // requests so refreshes cannot create endless loading requests.
+  private final HashMap<String, LinkPreviewInfo> linkPreviewCache = new HashMap<>();
+  private final HashSet<String> linkPreviewLoading = new HashSet<>();
   // Native voice capture (dock mic).
   private MediaRecorder recorder;
   private File audioFile;
@@ -234,6 +239,18 @@ public class ClipboardService extends Service {
       this.text = text;
       this.createdAtMs = createdAtMs;
       this.deviceId = deviceId;
+    }
+  }
+
+  /** Cached native link-card metadata. Kept deliberately small: card artwork is
+   * fetched separately and may legitimately be unavailable on privacy-focused sites. */
+  static final class LinkPreviewInfo {
+    final String title;
+    final String description;
+    final String image;
+    final String host;
+    LinkPreviewInfo(String title, String description, String image, String host) {
+      this.title = title; this.description = description; this.image = image; this.host = host;
     }
   }
   private final ArrayList<ClipEntry> items = new ArrayList<>();
@@ -1570,6 +1587,7 @@ public class ClipboardService extends Service {
   private View dockMic;          // mic button (Sarvam-keyed or built-in recognizer)
   private Button dockAddBtn;     // flips Add ↔ Save while editing a note
   private String dockFilter = ""; // native search text
+  private boolean dockShowLinkPreviews = true;
   // Filter chip: "" = all, "text", "image". Mirrors the desktop panel's All / Text /
   // Images tabs so the floating dock has the same content-type filtering.
   private String dockFilterKind = "";
@@ -1600,6 +1618,8 @@ public class ClipboardService extends Service {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(this)) {
       return;
     }
+    dockShowLinkPreviews = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+        .getBoolean("dockShowLinkPreviews", true);
 
     DisplayMetrics m = getResources().getDisplayMetrics();
     final int widthPx = Math.min(dp(372), m.widthPixels - dp(24));
@@ -1783,6 +1803,22 @@ public class ClipboardService extends Service {
     flip.setPadding(0, 0, 0, 0);
     flip.setOnClickListener((v) -> flipSide());
     header.addView(flip, new LinearLayout.LayoutParams(dp(36), dp(30)));
+
+    Button previews = new Button(this);
+    previews.setText(dockShowLinkPreviews ? "Preview on" : "Preview off");
+    previews.setTextColor(dockShowLinkPreviews ? 0xFF67E8F9 : 0xFF64748B);
+    previews.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+    previews.setAllCaps(false);
+    previews.setStateListAnimator(null);
+    previews.setBackgroundColor(Color.TRANSPARENT);
+    previews.setPadding(0, 0, 0, 0);
+    previews.setOnClickListener((v) -> {
+      dockShowLinkPreviews = !dockShowLinkPreviews;
+      getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE).edit()
+          .putBoolean("dockShowLinkPreviews", dockShowLinkPreviews).apply();
+      refreshPanelIfOpen();
+    });
+    header.addView(previews, new LinearLayout.LayoutParams(dp(72), dp(30)));
 
     Button close = new Button(this);
     close.setText("✕");
@@ -2394,34 +2430,67 @@ public class ClipboardService extends Service {
     GradientDrawable bg = new GradientDrawable(); bg.setColor(0x1638BDF8); bg.setCornerRadius(dp(9)); card.setBackground(bg);
     card.setOnClickListener((v) -> { try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); } catch (Exception ignored) {} });
     LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT); lp.topMargin = dp(6); parent.addView(card, lp);
+    LinkPreviewInfo cached;
+    synchronized (this) { cached = linkPreviewCache.get(url); }
+    if (cached != null) {
+      card.setText(cached.title + (cached.description.isEmpty() ? "" : "\n" + cached.description) + "\n" + cached.host);
+      fetchLinkArt(cached.image == null ? "https://www.google.com/s2/favicons?domain=" + Uri.encode(cached.host) + "&sz=128" : cached.image, card);
+      return;
+    }
+    synchronized (this) {
+      // A row can be rebuilt while the same preview is loading. Show a stable
+      // domain card instead of starting another request (or showing a stuck spinner).
+      if (!linkPreviewLoading.add(url)) { card.setText(hostForLink(url)); return; }
+    }
     new Thread(() -> {
       String title = null, description = null, image = null;
-      try (Response response = http.newCall(new Request.Builder().url(url).header("User-Agent", "GameTracker-LinkPreview/1.0").build()).execute()) {
-        String page = response.body() == null ? "" : response.body().string();
+      try (Response response = previewHttp().newCall(new Request.Builder().url(url)
+          .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Safari/537.36")
+          .header("Accept", "text/html,application/xhtml+xml").build()).execute()) {
+        String page = readPreviewHtml(response);
         title = htmlMeta(page, "og:title"); description = htmlMeta(page, "og:description"); image = htmlMeta(page, "og:image");
         if (image == null) image = htmlMeta(page, "twitter:image");
         if (title == null) title = htmlMeta(page, "twitter:title");
         if (description == null) description = htmlMeta(page, "twitter:description");
       } catch (Exception ignored) {}
-      final String host; try { host = Uri.parse(url).getHost(); } catch (Exception e) { main.post(() -> card.setText(url)); return; }
-      final String t = title == null || title.trim().isEmpty() ? host : title.trim();
+      final String host; try { host = Uri.parse(url).getHost(); } catch (Exception e) { main.post(() -> { synchronized (this) { linkPreviewLoading.remove(url); } card.setText(url); }); return; }
+      final String t = title == null || title.trim().isEmpty() ? (host == null ? hostForLink(url) : host) : title.trim();
       final String d = description == null ? "" : description.trim();
-      final String art = image == null ? "https://www.google.com/s2/favicons?domain=" + host + "&sz=128" : image;
-      main.post(() -> { card.setText(t + (d.isEmpty() ? "" : "\n" + d) + "\n" + host); fetchLinkArt(art, card); });
+      final String art = image == null ? null : absoluteLink(url, image);
+      final LinkPreviewInfo info = new LinkPreviewInfo(t, d, art, host == null ? hostForLink(url) : host);
+      main.post(() -> { synchronized (this) { linkPreviewLoading.remove(url); linkPreviewCache.put(url, info); } card.setText(info.title + (info.description.isEmpty() ? "" : "\n" + info.description) + "\n" + info.host); fetchLinkArt(info.image == null ? "https://www.google.com/s2/favicons?domain=" + Uri.encode(info.host) + "&sz=128" : info.image, card); });
     }, "gt-link-preview").start();
   }
 
+  private OkHttpClient previewHttp() { return http.newBuilder().callTimeout(8, TimeUnit.SECONDS).connectTimeout(5, TimeUnit.SECONDS).readTimeout(6, TimeUnit.SECONDS).followRedirects(true).followSslRedirects(true).build(); }
+  private static String hostForLink(String url) { try { String host = Uri.parse(url).getHost(); return host == null || host.isEmpty() ? url : host; } catch (Exception ignored) { return url; } }
+  private static String readPreviewHtml(Response response) throws java.io.IOException { if (!response.isSuccessful() || response.body() == null) return ""; java.io.InputStream in = response.body().byteStream(); java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[8192]; int remaining = 384 * 1024, count; while (remaining > 0 && (count = in.read(buf, 0, Math.min(buf.length, remaining))) != -1) { out.write(buf, 0, count); remaining -= count; } return new String(out.toByteArray(), StandardCharsets.UTF_8); }
+  private static String absoluteLink(String base, String value) { try { String resolved = new java.net.URI(base).resolve(value.trim()).toString(); return resolved.startsWith("https://") || resolved.startsWith("http://") ? resolved : null; } catch (Exception ignored) { return null; } }
+
   private static String htmlMeta(String html, String key) {
     if (html == null) return null;
-    Pattern p = Pattern.compile("<meta[^>]+(?:property|name)\\s*=\\s*['\\\"]" + Pattern.quote(key) + "['\\\"][^>]+content\\s*=\\s*['\\\"]([^'\\\"]+)", Pattern.CASE_INSENSITIVE);
-    Matcher m = p.matcher(html); return m.find() ? m.group(1).replace("&amp;", "&") : null;
+    Matcher tags = Pattern.compile("<meta\\b[^>]*>", Pattern.CASE_INSENSITIVE).matcher(html);
+    while (tags.find()) {
+      String tag = tags.group();
+      String name = htmlAttr(tag, "property"); if (name == null) name = htmlAttr(tag, "name");
+      if (name != null && key.equalsIgnoreCase(name)) {
+        String content = htmlAttr(tag, "content");
+        if (content != null && !content.trim().isEmpty()) return content.trim().replace("&amp;", "&");
+      }
+    }
+    return null;
+  }
+
+  private static String htmlAttr(String tag, String name) {
+    Matcher m = Pattern.compile("\\b" + Pattern.quote(name) + "\\s*=\\s*(['\\\"])(.*?)\\1", Pattern.CASE_INSENSITIVE).matcher(tag);
+    return m.find() ? m.group(2) : null;
   }
 
   private void fetchLinkArt(String url, TextView card) {
     if (url == null || url.isEmpty()) return;
     new Thread(() -> {
       Bitmap bmp = null;
-      try (Response response = http.newCall(new Request.Builder().url(url).build()).execute()) {
+      try (Response response = previewHttp().newCall(new Request.Builder().url(url).build()).execute()) {
         if (response.isSuccessful() && response.body() != null) bmp = decodeThumb(response.body().bytes());
       } catch (Exception ignored) {}
       final Bitmap art = bmp;
@@ -2551,7 +2620,7 @@ public class ClipboardService extends Service {
       row.addView(body);
 
       String link = firstHttpLink(fullText);
-      if (link != null) addLinkPreview(row, link);
+      if (link != null && dockShowLinkPreviews) addLinkPreview(row, link);
 
       final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
       row.addView(buildMetaActionsRow(e, relativeTime(e.createdAtMs, now)));

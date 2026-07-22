@@ -25,6 +25,20 @@ pub async fn link_preview(url: String) -> AppResult<crate::link_preview::LinkPre
     run_blocking(move || crate::link_preview::fetch(url).map_err(AppError::msg)).await
 }
 
+/// Open a link through the application handle rather than the calling WebView.
+/// The clipboard overlay is a transparent, always-on-top WebView, where a normal
+/// popup/openUrl call may be suppressed or appear behind the overlay.
+#[tauri::command]
+pub fn open_external_link(app: tauri::AppHandle, url: String) -> AppResult<()> {
+    let parsed = url::Url::parse(&url).map_err(|_| AppError::msg("Invalid link"))?;
+    if !matches!(parsed.scheme(), "http" | "https" | "mailto") {
+        return Err(AppError::msg("Only web and email links can be opened."));
+    }
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| AppError::msg(format!("Could not open link: {e}")))
+}
+
 /// Run blocking work (network / file I/O) off Tauri's main thread so the UI never
 /// janks while a command is in flight. The online-fetch commands use this so that
 /// opening a game or pressing "Get data" no longer freezes the app.
