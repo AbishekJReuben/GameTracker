@@ -35,6 +35,7 @@ import ClipboardPage from "./routes/Clipboard";
 import SharePage from "./routes/Share";
 import ClipboardOverlay from "./features/clipboard/ClipboardOverlay";
 import { ClipSyncEngine } from "./features/clipboard/ClipSyncEngine";
+import { ShareHostManager } from "./components/ShareHostManager";
 
 let didLanding = false;
 
@@ -86,6 +87,7 @@ function AppShell() {
       <JukeboxFloater />
       <RemoteHostManager />
       <ClipSyncEngine />
+      <ShareHostManager />
       <RemoteApprovalModal />
       <GameModal />
       <DropZone />

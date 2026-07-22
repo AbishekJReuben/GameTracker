@@ -43,7 +43,13 @@ function isPcOnlyCommand(cmd: string): boolean {
     "remote_set_cloud",
     "remote_regen_code",
     "share_prepare",
-    "share_read_chunk"
+    "share_read_chunk",
+    "share_create",
+    "share_list",
+    "share_revoke",
+    "share_sessions",
+    "share_session_start",
+    "share_session_finish"
   ];
   return pcOnly.includes(cmd);
 }
@@ -1260,6 +1266,13 @@ export const api = {
   sharePrepare: (paths: string[]) => call<ShareManifest>("share_prepare", { paths }),
   shareReadChunk: (sourcePath: string, offset: number, length: number) =>
     call<Uint8Array>("share_read_chunk", { sourcePath, offset, length }),
+  shareCreate: (room: string, paths: string[]) => call<SavedShare>("share_create", { room, paths }),
+  shareList: () => call<SavedShare[]>("share_list"),
+  shareRevoke: (id: string) => call<void>("share_revoke", { id }),
+  shareSessions: (shareId: string) => call<ShareDownloadSession[]>("share_sessions", { shareId }),
+  shareSessionStart: (shareId: string, peerName: string | undefined, totalBytes: number) =>
+    call<ShareDownloadSession>("share_session_start", { shareId, peerName, totalBytes }),
+  shareSessionFinish: (session: ShareDownloadSession) => call<void>("share_session_finish", { session }),
 };
 
 export interface RemoteMonitor {
@@ -1356,6 +1369,35 @@ export interface ShareManifest {
   items: ShareItem[];
   totalBytes: number;
   skipped: string[];
+}
+
+/** Persisted sender-only direct-share record. The room is the durable URL id. */
+export interface SavedShare {
+  id: string;
+  room: string;
+  title: string;
+  manifest: ShareManifest;
+  createdUtc: string;
+  updatedUtc: string;
+  revoked: boolean;
+  downloadCount: number;
+  lastDownloadUtc: string | null;
+}
+
+export interface ShareDownloadSession {
+  id: string;
+  shareId: string;
+  startedUtc: string;
+  endedUtc: string | null;
+  state: string;
+  peerName: string | null;
+  route: string | null;
+  bytesTransferred: number;
+  totalBytes: number;
+  averageSpeedBps: number;
+  peakSpeedBps: number;
+  rttMs: number | null;
+  error: string | null;
 }
 
 /** Convert a stored absolute file path to a webview-loadable asset URL. */

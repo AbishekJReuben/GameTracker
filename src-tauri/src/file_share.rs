@@ -4,16 +4,19 @@
 //! the desktop user deliberately added to a manifest.
 
 use crate::error::{AppError, AppResult};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub const MAX_MANIFEST_ITEMS: usize = 100_000;
-pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
+/// This limits privileged disk reads, not WebRTC packet size. The frontend
+/// splits each read into <=60 KiB SCTP frames, avoiding a Tauri IPC round trip
+/// for every network frame.
+pub const MAX_CHUNK_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareItem {
     pub id: u32,
@@ -25,7 +28,7 @@ pub struct ShareItem {
     pub modified_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareManifest {
     pub items: Vec<ShareItem>,

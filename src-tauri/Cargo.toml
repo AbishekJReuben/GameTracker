@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.9.77"
+version = "3.9.78"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -40,6 +40,8 @@ parking_lot = "0.12"
 once_cell = "1"
 tokio = { version = "1", features = ["full"] }
 image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg", "bmp"] }
+scraper = "0.23"
+url = "2"
 
 # Remote-access server (companion phone app over Tailscale/LAN).
 axum = { version = "0.7", features = ["ws"] }

@@ -6,6 +6,7 @@ pub mod models;
 pub mod music;
 pub mod playlists;
 pub mod screenshots;
+pub mod shares;
 pub mod sessions;
 pub mod settings;
 pub mod stats;
@@ -501,6 +502,46 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         )?;
         conn.execute_batch("PRAGMA user_version = 26;")?;
         version = 26;
+    }
+
+    if version < 27 {
+        // Direct shares are permanent local capabilities until revoked. The
+        // source manifest stays on the sender; session rows are audit metadata
+        // only and never contain file bytes or receiver IP addresses.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE file_shares (
+                id                TEXT PRIMARY KEY,
+                room              TEXT NOT NULL UNIQUE,
+                title             TEXT NOT NULL,
+                manifest_json     TEXT NOT NULL,
+                created_utc       TEXT NOT NULL,
+                updated_utc       TEXT NOT NULL,
+                revoked           INTEGER NOT NULL DEFAULT 0,
+                download_count    INTEGER NOT NULL DEFAULT 0,
+                last_download_utc TEXT
+            );
+            CREATE INDEX idx_file_shares_updated ON file_shares(updated_utc DESC);
+            CREATE TABLE file_share_sessions (
+                id                 TEXT PRIMARY KEY,
+                share_id           TEXT NOT NULL REFERENCES file_shares(id) ON DELETE CASCADE,
+                started_utc        TEXT NOT NULL,
+                ended_utc          TEXT,
+                state              TEXT NOT NULL,
+                peer_name          TEXT,
+                route              TEXT,
+                bytes_transferred  INTEGER NOT NULL DEFAULT 0,
+                total_bytes        INTEGER NOT NULL DEFAULT 0,
+                average_speed_bps  REAL NOT NULL DEFAULT 0,
+                peak_speed_bps     REAL NOT NULL DEFAULT 0,
+                rtt_ms             REAL,
+                error              TEXT
+            );
+            CREATE INDEX idx_file_share_sessions_share ON file_share_sessions(share_id, started_utc DESC);
+            "#,
+        )?;
+        conn.execute_batch("PRAGMA user_version = 27;")?;
+        version = 27;
     }
 
     let _ = version;

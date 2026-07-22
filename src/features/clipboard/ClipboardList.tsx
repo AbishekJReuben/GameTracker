@@ -15,8 +15,6 @@ import {
   Folder,
   FolderPlus,
   History,
-  Globe2,
-  ExternalLink,
   Tag,
   Tags,
 } from "lucide-react";
@@ -24,6 +22,7 @@ import { cn } from "@/lib/cn";
 import { relativeTime } from "@/lib/format";
 import { clipAssetUrl, type ClipItem } from "@/lib/clip";
 import { Skeleton } from "@/components/ui";
+import { firstHttpUrl, LinkPreview } from "@/lib/linkPreview";
 
 function haptic() {
   try {
@@ -237,7 +236,7 @@ export function ClipRow({
   const isImage = item.kind === "image";
   // The desktop floating panel has room for real context before expansion.
   const collapsedLines = compact ? 6 : 5;
-  const link = !isImage ? linkSummary(item.text) : null;
+  const link = !isImage ? firstHttpUrl(item.text) : null;
 
   // Detect whether the collapsed text actually overflows, so the "Show more"
   // affordance only appears when there's genuinely more to reveal.
@@ -263,11 +262,7 @@ export function ClipRow({
       )}
     >
       {/* content — the primary element */}
-      <button
-        onClick={doCopy}
-        className="block min-w-0 text-left"
-        title="Click to copy"
-      >
+      <div className="block min-w-0 text-left">
         {isImage ? (
           <img
             src={(expanded ? full : thumb) ?? undefined}
@@ -297,21 +292,10 @@ export function ClipRow({
           >
             {item.text || "(empty)"}
           </p>
-          {link && (
-            <span className="mt-2 flex items-center gap-2 rounded-xl border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-2 text-left">
-              <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-cyan-300/10 text-cyan-200">
-                <Globe2 className="h-3.5 w-3.5" />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-[11px] font-700 capitalize text-ink">{link.title}</span>
-                <span className="block truncate text-[10px] text-cyan-200/70">{link.host}</span>
-              </span>
-              <ExternalLink className="h-3.5 w-3.5 shrink-0 text-cyan-200/70" />
-            </span>
-          )}
+          {link && <LinkPreview url={link} />}
           </>
         )}
-      </button>
+      </div>
 
       {/* footer: expand affordance + muted metadata + actions */}
       <div className="flex items-center gap-2">
@@ -481,7 +465,6 @@ function IconBtn({
   return (
     <motion.button
       whileTap={{ scale: 0.88 }}
-      onPointerDown={(e) => e.preventDefault()}
       onClick={onClick}
       title={label}
       aria-label={label}

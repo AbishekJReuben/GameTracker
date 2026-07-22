@@ -2,7 +2,7 @@ use crate::content_audit;
 use crate::content_repair;
 use crate::db::models::{GameDto, GameInput, ScreenshotDto, SessionDto, SessionFilter};
 use crate::db::stats::{AppsOverview, CatalogAnalytics, Dashboard, DayValue, Insights, TagStat};
-use crate::db::{games, screenshots, sessions, settings, stats};
+use crate::db::{games, screenshots, sessions, settings, shares, stats};
 use crate::detect::{self, Candidate};
 use crate::error::{AppError, AppResult};
 use crate::file_share;
@@ -19,6 +19,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use tauri::{Emitter, State};
 use tauri_plugin_opener::OpenerExt;
+
+#[tauri::command]
+pub async fn link_preview(url: String) -> AppResult<crate::link_preview::LinkPreview> {
+    run_blocking(move || crate::link_preview::fetch(url).map_err(AppError::msg)).await
+}
 
 /// Run blocking work (network / file I/O) off Tauri's main thread so the UI never
 /// janks while a command is in flight. The online-fetch commands use this so that
@@ -59,11 +64,38 @@ pub async fn share_prepare(paths: Vec<String>) -> AppResult<file_share::ShareMan
     run_blocking(move || file_share::prepare(paths)).await
 }
 
-/// Read one bounded slice for the WebRTC sender. The frontend never hands this
-/// path to a receiver; only manifest metadata crosses the peer connection.
+/// Read a bounded disk batch for the WebRTC sender. The frontend never hands
+/// this path to a receiver; only manifest metadata crosses the peer connection.
 #[tauri::command]
 pub async fn share_read_chunk(source_path: String, offset: u64, length: u32) -> AppResult<Vec<u8>> {
     run_blocking(move || file_share::read_chunk(source_path, offset, length)).await
+}
+
+/// Create one durable direct-share capability. The permanent room id is safe
+/// to put in the URL fragment; the local manifest is never exposed by the API.
+#[tauri::command]
+pub async fn share_create(state: State<'_, AppState>, room: String, paths: Vec<String>) -> AppResult<shares::SavedShare> {
+    let pool = state.pool.clone();
+    run_blocking(move || shares::create(&pool, room, paths)).await
+}
+
+#[tauri::command]
+pub fn share_list(state: State<AppState>) -> AppResult<Vec<shares::SavedShare>> { shares::list(&state.pool) }
+
+#[tauri::command]
+pub fn share_revoke(state: State<AppState>, id: String) -> AppResult<()> { shares::revoke(&state.pool, &id) }
+
+#[tauri::command]
+pub fn share_sessions(state: State<AppState>, share_id: String) -> AppResult<Vec<shares::ShareDownloadSession>> { shares::sessions(&state.pool, &share_id) }
+
+#[tauri::command]
+pub fn share_session_start(state: State<AppState>, share_id: String, peer_name: Option<String>, total_bytes: u64) -> AppResult<shares::ShareDownloadSession> {
+    shares::start_session(&state.pool, &share_id, peer_name, total_bytes)
+}
+
+#[tauri::command]
+pub fn share_session_finish(state: State<AppState>, session: shares::ShareDownloadSession) -> AppResult<()> {
+    shares::finish_session(&state.pool, session)
 }
 
 // ---------- games ----------

@@ -18,6 +18,7 @@ import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.BitmapDrawable;
 import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -53,6 +54,8 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.TimeUnit;
 import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
@@ -89,6 +92,7 @@ import org.json.JSONObject;
  * `iv(12) || ciphertext+tag(16)`; text payloads are base64-encoded on the wire.
  */
 public class ClipboardService extends Service {
+  private static final Pattern HTTP_LINK = Pattern.compile("https?://[^\\s<>()]+", Pattern.CASE_INSENSITIVE);
   public static final String ACTION_START = "__PACKAGE__.CLIP_START";
   public static final String ACTION_STOP = "__PACKAGE__.CLIP_STOP";
   /** Service action: a content URI for an image the user just picked via the
@@ -2007,6 +2011,11 @@ public class ClipboardService extends Service {
     composer.setTextColor(0xFFE2E8F0);
     composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
     composer.setSingleLine(false);
+    // Overlay windows do not inherit the Activity's usual text-selection setup.
+    // Keep the editable field focusable/long-clickable so Android shows Select,
+    // Copy, Paste and Share in the native floating context toolbar.
+    composer.setTextIsSelectable(true);
+    composer.setLongClickable(true);
     composer.setMinLines(1);
     composer.setMaxLines(5);
     composer.setHorizontallyScrolling(false);
@@ -2367,6 +2376,64 @@ public class ClipboardService extends Service {
     return filteredLocked().size();
   }
 
+  private String firstHttpLink(String text) {
+    if (text == null) return null;
+    Matcher m = HTTP_LINK.matcher(text);
+    return m.find() ? m.group() : null;
+  }
+
+  /** Native overlay counterpart to the web link card. OG image wins, then a
+   * Twitter-card image, then the site's favicon. The card itself opens the URL. */
+  private void addLinkPreview(LinearLayout parent, final String url) {
+    final TextView card = new TextView(this);
+    card.setText("Loading link preview…");
+    card.setTextColor(0xFFBAE6FD);
+    card.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+    card.setMaxLines(3);
+    card.setPadding(dp(9), dp(7), dp(9), dp(7));
+    GradientDrawable bg = new GradientDrawable(); bg.setColor(0x1638BDF8); bg.setCornerRadius(dp(9)); card.setBackground(bg);
+    card.setOnClickListener((v) -> { try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); } catch (Exception ignored) {} });
+    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT); lp.topMargin = dp(6); parent.addView(card, lp);
+    new Thread(() -> {
+      String title = null, description = null, image = null;
+      try (Response response = http.newCall(new Request.Builder().url(url).header("User-Agent", "GameTracker-LinkPreview/1.0").build()).execute()) {
+        String page = response.body() == null ? "" : response.body().string();
+        title = htmlMeta(page, "og:title"); description = htmlMeta(page, "og:description"); image = htmlMeta(page, "og:image");
+        if (image == null) image = htmlMeta(page, "twitter:image");
+        if (title == null) title = htmlMeta(page, "twitter:title");
+        if (description == null) description = htmlMeta(page, "twitter:description");
+      } catch (Exception ignored) {}
+      final String host; try { host = Uri.parse(url).getHost(); } catch (Exception e) { main.post(() -> card.setText(url)); return; }
+      final String t = title == null || title.trim().isEmpty() ? host : title.trim();
+      final String d = description == null ? "" : description.trim();
+      final String art = image == null ? "https://www.google.com/s2/favicons?domain=" + host + "&sz=128" : image;
+      main.post(() -> { card.setText(t + (d.isEmpty() ? "" : "\n" + d) + "\n" + host); fetchLinkArt(art, card); });
+    }, "gt-link-preview").start();
+  }
+
+  private static String htmlMeta(String html, String key) {
+    if (html == null) return null;
+    Pattern p = Pattern.compile("<meta[^>]+(?:property|name)\\s*=\\s*['\\\"]" + Pattern.quote(key) + "['\\\"][^>]+content\\s*=\\s*['\\\"]([^'\\\"]+)", Pattern.CASE_INSENSITIVE);
+    Matcher m = p.matcher(html); return m.find() ? m.group(1).replace("&amp;", "&") : null;
+  }
+
+  private void fetchLinkArt(String url, TextView card) {
+    if (url == null || url.isEmpty()) return;
+    new Thread(() -> {
+      Bitmap bmp = null;
+      try (Response response = http.newCall(new Request.Builder().url(url).build()).execute()) {
+        if (response.isSuccessful() && response.body() != null) bmp = decodeThumb(response.body().bytes());
+      } catch (Exception ignored) {}
+      final Bitmap art = bmp;
+      if (art != null) main.post(() -> {
+        BitmapDrawable d = new BitmapDrawable(getResources(), art);
+        d.setBounds(0, 0, dp(52), dp(52));
+        card.setCompoundDrawables(d, null, null, null);
+        card.setCompoundDrawablePadding(dp(8));
+      });
+    }, "gt-link-art").start();
+  }
+
   /** Populate the list with the matching items (search + kind filter), rendering
    *  only the first {@link #renderLimit} rows so a 300-item history doesn't inflate
    *  hundreds of views up front — the scroll listener grows renderLimit as the user
@@ -2479,7 +2546,12 @@ public class ClipboardService extends Service {
       body.setMaxLines(collapsedLines);
       body.setEllipsize(android.text.TextUtils.TruncateAt.END);
       body.setLineSpacing(dp(1), 1f);
+      // Explicit for overlay windows: enables handles + Android's selection toolbar.
+      body.setTextIsSelectable(true);
       row.addView(body);
+
+      String link = firstHttpLink(fullText);
+      if (link != null) addLinkPreview(row, link);
 
       final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
       row.addView(buildMetaActionsRow(e, relativeTime(e.createdAtMs, now)));
@@ -2504,10 +2576,7 @@ public class ClipboardService extends Service {
         expand.setText(expanded[0] ? "Show less  ↑" : "Show more  ↓");
       };
       expand.setOnClickListener((v) -> toggleExpanded.run());
-      row.setOnClickListener((v) -> {
-        setOsClipboard(fullText);
-        toast("Copied");
-      });
+      // Selecting or pressing the row never copies. Use the explicit Copy action.
       row.setOnLongClickListener((v) -> {
         toggleExpanded.run();
         return true;
@@ -2577,6 +2646,10 @@ public class ClipboardService extends Service {
     btnLp.leftMargin = dp(2);
 
     if ("text".equals(e.kind)) {
+      row.addView(rowActionBtn("Copy", 0xFF67E8F9, (v) -> {
+        setOsClipboard(e.text == null ? "" : e.text);
+        toast("Copied");
+      }), new LinearLayout.LayoutParams(dp(48), dp(30)));
       row.addView(rowActionBtn("✎", 0xFF94A3B8, (v) -> startEditEntry(e)),
           new LinearLayout.LayoutParams(dp(34), dp(30)));
     }

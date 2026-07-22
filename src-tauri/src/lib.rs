@@ -14,6 +14,7 @@ mod hltb;
 mod icons;
 mod importer;
 mod launcher_catalog;
+mod link_preview;
 mod metadata;
 #[cfg(windows)]
 mod registry;
@@ -352,8 +353,15 @@ pub fn run() {
             commands::get_settings,
             commands::set_setting,
             commands::complete_onboarding,
+            commands::link_preview,
             commands::share_prepare,
             commands::share_read_chunk,
+            commands::share_create,
+            commands::share_list,
+            commands::share_revoke,
+            commands::share_sessions,
+            commands::share_session_start,
+            commands::share_session_finish,
             commands::list_games,
             commands::get_game,
             commands::save_game,

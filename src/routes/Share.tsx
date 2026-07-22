@@ -1,146 +1,41 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Activity, Check, Copy, Files, FolderOpen, Gauge, Link2, Radio, ShieldCheck, Timer, Wifi, X, Zap } from "lucide-react";
+import { Activity, Check, Clipboard, Copy, Files, FolderOpen, Gauge, History, Link2, Radio, ShieldCheck, Timer, Wifi, X, Zap } from "lucide-react";
 import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
 import { Badge, SectionTitle } from "@/components/ui";
 import { useApp } from "@/store/app";
 import { useSettings } from "@/lib/queries";
 import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
-import { hostShare, type ShareHost, type ShareStats } from "@/lib/fileShare";
-import type { ShareManifest } from "@/lib/api";
+import { type ShareHost, type ShareStats } from "@/lib/fileShare";
+import { api, type SavedShare, type ShareDownloadSession, type ShareManifest } from "@/lib/api";
+import { shareRuntime } from "@/lib/shareRuntime";
 import { dur } from "@/lib/format";
 
-function bytes(value = 0): string {
-  if (!Number.isFinite(value) || value <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
-  return `${(value / 1024 ** index).toFixed(index ? (value / 1024 ** index >= 100 ? 0 : 1) : 0)} ${units[index]}`;
-}
-
-function rate(value = 0) { return value > 0 ? `${bytes(value)}/s` : "â€”"; }
-function eta(value: number | null) { return value == null || !Number.isFinite(value) ? "Calculating" : dur(value, { compact: true }); }
-
-const IDLE: ShareStats = {
-  state: "waiting", route: "connecting", sentBytes: 0, receivedBytes: 0, totalBytes: 0,
-  speedBps: 0, rttMs: null, bufferedBytes: 0, etaSeconds: null, peer: null,
-};
+function bytes(value = 0) { if (!Number.isFinite(value) || value <= 0) return "0 B"; const u = ["B", "KB", "MB", "GB", "TB"]; const i = Math.min(u.length - 1, Math.floor(Math.log(value) / Math.log(1024))); const n = value / 1024 ** i; return `${n.toFixed(i ? (n >= 100 ? 0 : 1) : 0)} ${u[i]}`; }
+function rate(value = 0) { return value > 0 ? `${bytes(value)}/s` : "—"; }
+const IDLE: ShareStats = { state: "waiting", route: "connecting", sentBytes: 0, receivedBytes: 0, totalBytes: 0, speedBps: 0, peakSpeedBps: 0, rttMs: null, bufferedBytes: 0, etaSeconds: null, peer: null };
 
 export default function SharePage() {
-  const { data: settings } = useSettings();
-  const toast = useApp((s) => s.pushToast);
-  const [host, setHost] = useState<ShareHost | null>(null);
-  const [manifest, setManifest] = useState<ShareManifest | null>(null);
-  const [stats, setStats] = useState<ShareStats>(IDLE);
-  const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const { data: settings } = useSettings(); const toast = useApp((s) => s.pushToast);
+  const [host, setHost] = useState<ShareHost | null>(null); const [manifest, setManifest] = useState<ShareManifest | null>(null); const [stats, setStats] = useState(IDLE); const [saved, setSaved] = useState<SavedShare[]>([]); const [sessions, setSessions] = useState<ShareDownloadSession[]>([]); const [busy, setBusy] = useState(false); const [copied, setCopied] = useState(false);
   const signalUrl = settings?.remote_signal_url || DEFAULT_SIGNAL_URL;
-
-  useEffect(() => () => host?.stop(), [host]);
-
-  const start = useCallback(async (paths: string[]) => {
-    if (!paths.length || busy) return;
-    setBusy(true);
-    setStats(IDLE);
-    host?.stop();
-    try {
-      const next = await hostShare(paths, {
-        signalUrl,
-        onStats: setStats,
-        onManifest: setManifest,
-      });
-      setHost(next);
-      toast({ kind: "success", title: "Share link ready", message: "Keep GameTracker open while a receiver downloads." });
-    } catch (error) {
-      toast({ kind: "info", title: "Couldn't create share", message: String(error) });
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, host, signalUrl, toast]);
-
-  const pickFiles = async () => {
-    const picked = await open({ multiple: true, directory: false, title: "Choose files to share" });
-    const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
-    await start(paths as string[]);
-  };
-  const pickFolder = async () => {
-    const picked = await open({ multiple: false, directory: true, title: "Choose a folder to share" });
-    if (picked) await start([picked as string]);
-  };
-  const copyLink = async () => {
-    if (!host) return;
-    try {
-      await navigator.clipboard.writeText(host.link);
-      setCopied(true); window.setTimeout(() => setCopied(false), 1600);
-      toast({ kind: "success", title: "Link copied" });
-    } catch { toast({ kind: "info", title: "Copy unavailable", message: host.link }); }
-  };
-  const stop = () => { host?.stop(); setHost(null); setStats(IDLE); toast({ kind: "info", title: "Share revoked" }); };
-  const progress = stats.totalBytes ? Math.min(100, (stats.sentBytes / stats.totalBytes) * 100) : 0;
-  const routeColor = stats.route === "direct" ? "#34d399" : stats.route === "relayed" ? "#fbbf24" : "#94a3b8";
-  const itemsLabel = useMemo(() => manifest ? `${manifest.items.length} ${manifest.items.length === 1 ? "file" : "files"}` : "No selection", [manifest]);
-
-  return (
-    <Page title="Share" subtitle="Send any file or folder straight from this PC with a browser link">
-      {!host ? (
-        <Panel panelKey="share.create" className="relative overflow-hidden p-7">
-          <div className="pointer-events-none absolute -right-20 -top-24 h-72 w-72 rounded-full bg-accent-1/15 blur-3xl" />
-          <div className="relative mx-auto flex max-w-2xl flex-col items-center py-7 text-center">
-            <span className="grid h-16 w-16 place-items-center rounded-3xl bg-accent-sheen shadow-glow"><Link2 className="h-8 w-8 text-white" /></span>
-            <h2 className="mt-5 font-display text-2xl font-800 tracking-tight text-ink">Create a direct share link</h2>
-            <p className="mt-2 max-w-xl text-sm leading-6 text-ink-dim">Files stream from your PC to the recipient’s browser. GameTracker uses a direct encrypted route when possible and only relays encrypted traffic when the network requires it.</p>
-            <div className="mt-7 flex flex-wrap justify-center gap-3">
-              <button className="btn-primary flex items-center gap-2" disabled={busy} onClick={pickFiles}><Files className="h-4 w-4" /> {busy ? "Preparing…" : "Add files"}</button>
-              <button className="btn-ghost flex items-center gap-2" disabled={busy} onClick={pickFolder}><FolderOpen className="h-4 w-4" /> Add folder</button>
-            </div>
-            <div className="mt-8 grid w-full grid-cols-1 gap-3 text-left sm:grid-cols-3">
-              <Info icon={<ShieldCheck className="h-4 w-4" />} title="Encrypted" text="WebRTC encryption end to end" />
-              <Info icon={<Zap className="h-4 w-4" />} title="Direct first" text="Best speed on LAN and the internet" />
-              <Info icon={<Radio className="h-4 w-4" />} title="Live telemetry" text="Speed, ping, route, and progress" />
-            </div>
-          </div>
-        </Panel>
-      ) : (
-        <>
-          <Panel panelKey="share.live" className="mb-5 overflow-hidden p-0">
-            <div className="relative p-5 sm:p-6">
-              <div className="flex flex-wrap items-start justify-between gap-5">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2"><Badge color={routeColor}><span className="h-1.5 w-1.5 rounded-full" style={{ background: routeColor, boxShadow: `0 0 8px ${routeColor}` }} /> {stats.route === "relayed" ? "Relayed" : stats.route === "direct" ? "Direct" : "Waiting for route"}</Badge><Badge color="#60a5fa">{itemsLabel}</Badge></div>
-                  <h2 className="mt-3 font-display text-xl font-800 text-ink">{stats.state === "waiting" ? "Waiting for someone to open the link" : stats.state === "complete" ? "Transfer complete" : stats.state === "transferring" ? "Sending securely" : "Connecting receiver"}</h2>
-                  <p className="mt-1 text-sm text-ink-dim">{stats.detail || (stats.peer ? `Connected to ${stats.peer}` : "The link works while this share stays open.")}</p>
-                </div>
-                <div className="flex gap-2"><button className="btn-ghost flex items-center gap-2" onClick={copyLink}>{copied ? <Check className="h-4 w-4 text-green" /> : <Copy className="h-4 w-4" />}{copied ? "Copied" : "Copy link"}</button><button className="btn-subtle flex items-center gap-2 text-pink" onClick={stop}><X className="h-4 w-4" /> Revoke</button></div>
-              </div>
-              <div className="mt-5 rounded-2xl border border-line bg-bg-900/70 p-3 font-mono text-xs text-ink-soft break-all select-all">{host.link}</div>
-              <div className="mt-5 h-2 overflow-hidden rounded-full bg-white/[0.06]"><div className="h-full rounded-full bg-accent-sheen transition-[width] duration-500" style={{ width: `${progress}%` }} /></div>
-              <div className="mt-2 flex justify-between text-xs text-ink-dim"><span>{bytes(stats.sentBytes)} of {bytes(stats.totalBytes)}</span><span>{progress.toFixed(1)}%</span></div>
-            </div>
-          </Panel>
-
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            <Metric icon={<Gauge />} label="Upload speed" value={rate(stats.speedBps)} detail="Live one-second window" color="#22d3ee" />
-            <Metric icon={<Activity />} label="Ping / RTT" value={stats.rttMs == null ? "â€”" : `${Math.round(stats.rttMs)} ms`} detail={stats.route === "relayed" ? "Via TURN relay" : "Current WebRTC path"} color="#a78bfa" />
-            <Metric icon={<Wifi />} label="Send buffer" value={bytes(stats.bufferedBytes)} detail="Queued without blocking the UI" color="#fbbf24" />
-            <Metric icon={<Timer />} label="ETA" value={eta(stats.etaSeconds)} detail={stats.state === "complete" ? "Verified delivery finished" : "At current transfer speed"} color="#34d399" />
-          </div>
-
-          <Panel panelKey="share.contents" className="mt-5 p-5">
-            <SectionTitle title="Share contents" subtitle={`${bytes(manifest?.totalBytes)} total · ${itemsLabel}`} right={<Badge color="#60a5fa">Sender only</Badge>} />
-            <div className="max-h-64 overflow-y-auto rounded-xl border border-line bg-bg-900/45">
-              {manifest?.items.map((item) => <div key={item.id} className="flex items-center justify-between gap-4 border-b border-line px-4 py-2.5 last:border-0"><span className="min-w-0 truncate text-sm text-ink-soft">{item.path}</span><span className="shrink-0 text-xs text-ink-dim">{bytes(item.size)}</span></div>)}
-            </div>
-            {!!manifest?.skipped.length && <p className="mt-3 text-xs text-amber">{manifest.skipped.length} unreadable or linked entries were skipped for safety.</p>}
-          </Panel>
-        </>
-      )}
-    </Page>
-  );
+  const sync = useCallback(() => { const entries = shareRuntime.snapshot(); setSaved(entries.map((v) => v.saved)); if (host) { const found = entries.find((v) => v.host === host); if (found) setStats(found.stats); } }, [host]);
+  useEffect(() => { const off = shareRuntime.subscribe(sync); void shareRuntime.restore(signalUrl).then(sync); return off; }, [signalUrl, sync]);
+  useEffect(() => { if (!host) { setSessions([]); return; } void api.shareSessions(host.saved.id).then(setSessions).catch(() => setSessions([])); }, [host, stats.state]);
+  const start = useCallback(async (paths: string[]) => { if (!paths.length || busy) return; setBusy(true); try { const next = await shareRuntime.create(paths, signalUrl); setHost(next); setManifest(next.manifest); setStats(shareRuntime.get(next.saved.id)?.stats || IDLE); toast({ kind: "success", title: "Permanent share link ready", message: "It remains available while GameTracker runs, until you revoke it." }); } catch (error) { toast({ kind: "info", title: "Couldn't create share", message: String(error) }); } finally { setBusy(false); } }, [busy, signalUrl, toast]);
+  const pick = async (folder = false) => { const picked = await open({ multiple: !folder, directory: folder, title: folder ? "Choose a folder to share" : "Choose files to share" }); const paths = Array.isArray(picked) ? picked : picked ? [picked] : []; await start(paths as string[]); };
+  const openSaved = async (share: SavedShare) => { const next = await shareRuntime.open(share, signalUrl); setHost(next); setManifest(next.manifest); setStats(shareRuntime.get(share.id)?.stats || IDLE); };
+  const copy = async (text: string, label: string) => { try { await navigator.clipboard.writeText(text); setCopied(true); window.setTimeout(() => setCopied(false), 1500); toast({ kind: "success", title: `${label} copied` }); } catch { toast({ kind: "info", title: "Copy unavailable", message: text }); } };
+  const revoke = async () => { if (!host) return; await shareRuntime.revoke(host.saved.id); setHost(null); setManifest(null); setStats(IDLE); toast({ kind: "info", title: "Share revoked", message: "Its permanent link is now disabled." }); };
+  const progress = stats.totalBytes ? Math.min(100, stats.sentBytes / stats.totalBytes * 100) : 0; const route = stats.route === "direct" ? "Direct P2P" : stats.route === "relayed" ? "Encrypted relay" : "Waiting";
+  const files = useMemo(() => manifest ? `${manifest.items.length} ${manifest.items.length === 1 ? "file" : "files"}` : "", [manifest]);
+  return <Page title="Share" subtitle="Permanent direct links, rich telemetry, and a sender-side download audit">
+    <Panel panelKey="share.create" className="relative overflow-hidden p-6"><div className="pointer-events-none absolute -right-20 -top-20 h-64 w-64 rounded-full bg-accent-1/20 blur-3xl" /><div className="relative flex flex-wrap items-center justify-between gap-5"><div><Badge color="#34d399"><ShieldCheck className="h-3.5 w-3.5" /> Encrypted, direct-first</Badge><h2 className="mt-3 font-display text-2xl font-800 text-ink">Create a permanent share link</h2><p className="mt-1 max-w-2xl text-sm text-ink-dim">The link and audit history stay on this PC until revoked. Files stream directly; GameTracker must be running for recipients to download.</p></div><div className="flex gap-2"><button className="btn-primary flex gap-2" disabled={busy} onClick={() => void pick()}><Files className="h-4 w-4" />{busy ? "Preparing…" : "Add files"}</button><button className="btn-ghost flex gap-2" disabled={busy} onClick={() => void pick(true)}><FolderOpen className="h-4 w-4" />Folder</button></div></div></Panel>
+    {host && <><Panel panelKey="share.live" className="mt-5 overflow-hidden p-0"><div className="p-6"><div className="flex flex-wrap justify-between gap-4"><div><div className="flex gap-2"><Badge color={stats.route === "direct" ? "#34d399" : "#fbbf24"}><Radio className="h-3.5 w-3.5" /> {route}</Badge><Badge color="#60a5fa">{files}</Badge></div><h2 className="mt-3 font-display text-xl font-800">{stats.state === "transferring" ? "Sending securely" : stats.state === "complete" ? "Transfer complete" : "Link is standing by"}</h2><p className="mt-1 text-sm text-ink-dim">{stats.detail || "A new browser can reuse this same link at any time."}</p></div><div className="flex flex-wrap gap-2"><button className="btn-ghost flex gap-2" onClick={() => void copy(host.link, "Link")}>{copied ? <Check className="h-4 w-4 text-green" /> : <Copy className="h-4 w-4" />}Copy link</button><button className="btn-ghost flex gap-2" onClick={() => void copy(host.logs(), "Diagnostics")}><Clipboard className="h-4 w-4" />Logs</button><button className="btn-subtle flex gap-2 text-pink" onClick={() => void revoke()}><X className="h-4 w-4" />Revoke</button></div></div><div className="mt-5 rounded-xl border border-line bg-bg-900/60 p-3 font-mono text-xs text-ink-soft break-all">{host.link}</div><div className="mt-5 h-2 overflow-hidden rounded-full bg-white/[.06]"><div className="h-full rounded-full bg-accent-sheen transition-[width] duration-500" style={{ width: `${progress}%` }} /></div><div className="mt-2 flex justify-between text-xs text-ink-dim"><span>{bytes(stats.sentBytes)} / {bytes(stats.totalBytes)}</span><span>{progress.toFixed(1)}%</span></div></div></Panel>
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Metric icon={<Gauge />} label="Live speed" value={rate(stats.speedBps)} detail={`Peak ${rate(stats.peakSpeedBps)}`} /><Metric icon={<Activity />} label="Ping / RTT" value={stats.rttMs == null ? "—" : `${Math.round(stats.rttMs)} ms`} detail="Selected WebRTC path" /><Metric icon={<Wifi />} label="Send buffer" value={bytes(stats.bufferedBytes)} detail="Backpressure protected" /><Metric icon={<Timer />} label="ETA" value={stats.etaSeconds == null ? "Calculating" : dur(stats.etaSeconds, { compact: true })} detail="At current rate" /></div>
+      <Panel panelKey="share.history" className="mt-5 p-5"><SectionTitle title="Individual download sessions" subtitle="Final outcome, peak speed, route, and RTT for each receiver." right={<Badge color="#a78bfa"><History className="h-3.5 w-3.5" /> {sessions.length}</Badge>} /><div className="max-h-60 overflow-y-auto rounded-xl border border-line bg-bg-900/45">{!sessions.length && <p className="px-4 py-5 text-sm text-ink-dim">No completed downloads yet.</p>}{sessions.map((s) => <div className="flex flex-wrap justify-between gap-3 border-b border-line px-4 py-3 last:border-0" key={s.id}><div><p className="text-sm font-700 text-ink-soft">{s.state === "complete" ? "Completed download" : s.state}</p><p className="mt-1 text-xs text-ink-dim">{new Date(s.startedUtc).toLocaleString()} · {s.route || "route unknown"}{s.error ? ` · ${s.error}` : ""}</p></div><div className="text-right text-xs text-ink-dim"><p className="font-700 text-ink-soft">{bytes(s.bytesTransferred)} · {rate(s.peakSpeedBps)}</p><p>{s.rttMs == null ? "—" : `${Math.round(s.rttMs)} ms`} RTT</p></div></div>)}</div></Panel></>}
+    <Panel panelKey="share.saved" className="mt-5 p-5"><SectionTitle title="Saved share links" subtitle="Open a share to inspect it, copy its diagnostics, or revoke it." right={<Badge color="#34d399">{saved.length} active</Badge>} /><div className="grid gap-3 md:grid-cols-2">{!saved.length && <p className="text-sm text-ink-dim">Your permanent shares will appear here.</p>}{saved.map((share) => <button className="rounded-2xl border border-line bg-bg-900/45 p-4 text-left transition hover:border-accent-3/50" key={share.id} onClick={() => void openSaved(share)}><div className="flex justify-between gap-3"><span className="truncate text-sm font-800 text-ink">{share.title}</span><Badge color="#60a5fa">{share.downloadCount} downloads</Badge></div><p className="mt-2 text-xs text-ink-dim">{bytes(share.manifest.totalBytes)} · {share.manifest.items.length} files · {share.lastDownloadUtc ? `last ${new Date(share.lastDownloadUtc).toLocaleDateString()}` : "not downloaded yet"}</p><p className="mt-3 truncate font-mono text-[10px] text-ink-faint">…/share#{share.room}</p></button>)}</div></Panel>
+  </Page>;
 }
-
-function Info({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) {
-  return <div className="rounded-2xl border border-line bg-bg-900/55 p-3"><span className="text-accent-3">{icon}</span><div className="mt-2 text-xs font-800 text-ink">{title}</div><div className="mt-0.5 text-[11px] text-ink-dim">{text}</div></div>;
-}
-function Metric({ icon, label, value, detail, color }: { icon: React.ReactElement; label: string; value: string; detail: string; color: string }) {
-  return <Panel panelKey={`share.metric.${label}`} className="p-4"><div className="flex items-center gap-2 text-xs font-800 uppercase tracking-wider text-ink-dim">{<span style={{ color }}>{icon}</span>}{label}</div><div className="mt-3 font-display text-xl font-800 text-ink">{value}</div><div className="mt-1 text-[11px] text-ink-dim">{detail}</div></Panel>;
-}
+function Metric({ icon, label, value, detail }: { icon: React.ReactElement; label: string; value: string; detail: string }) { return <Panel panelKey={`share.metric.${label}`} className="p-4"><div className="flex gap-2 text-xs font-800 uppercase tracking-wider text-ink-dim"><span className="text-accent-3">{icon}</span>{label}</div><div className="mt-3 font-display text-xl font-800">{value}</div><p className="mt-1 text-[11px] text-ink-dim">{detail}</p></Panel>; }

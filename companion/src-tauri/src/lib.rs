@@ -8,6 +8,8 @@
 
 mod clipboard;
 mod decoder;
+#[path = "../../../src-tauri/src/link_preview.rs"]
+mod link_preview;
 mod pip;
 mod update;
 
@@ -44,7 +46,13 @@ pub fn run() {
             clipboard::clipboard_write,
             clipboard::clipboard_service_snapshot,
             clipboard::speech_to_text,
+            link_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running GameTracker Remote");
+}
+
+#[tauri::command]
+async fn link_preview(url: String) -> Result<link_preview::LinkPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || link_preview::fetch(url)).await.map_err(|e| e.to_string())?
 }

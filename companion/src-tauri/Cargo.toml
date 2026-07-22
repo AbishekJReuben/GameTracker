@@ -1,6 +1,6 @@
 [package]
 name = "gametracker-companion"
-version = "3.9.77"
+version = "3.9.78"
 description = "GameTracker Remote — phone companion"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -29,6 +29,8 @@ ureq = { version = "2", features = ["tls", "gzip"] }
 sha2 = "0.10"
 # Decodes the base64 audio the webview records before POSTing it to Sarvam STT.
 base64 = "0.22"
+scraper = "0.23"
+url = "2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
