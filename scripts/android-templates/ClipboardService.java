@@ -119,6 +119,7 @@ public class ClipboardService extends Service {
   private WindowManager.LayoutParams bubbleLp;
   private View panel;
   private LinearLayout panelList; // the row container inside the panel's ScrollView
+  private ScrollView dockScroll;
   private TextView panelStatusText; // status label in floating panel header
   private boolean socketConnected;
   private WindowManager.LayoutParams panelLp;
@@ -129,12 +130,27 @@ public class ClipboardService extends Service {
   // the floating dock's input responsive while socket and crypto work stay off
   // the main thread.
   private boolean panelRefreshQueued;
+  /** Timestamp of the last list gesture; never rebuild rows under an active fling. */
+  private long lastDockScrollAt;
   private final Runnable renderPanel = () -> {
     panelRefreshQueued = false;
     if (panel != null && panelList != null) {
+      // A full row rebuild is intentionally deferred until a fling settles. It
+      // keeps the compositor's scroll path free even while a relay catch-up or
+      // image thumbnail completion is arriving in the background.
+      long sinceScroll = SystemClock.uptimeMillis() - lastDockScrollAt;
+      if (sinceScroll < 180) {
+        panelRefreshQueued = false;
+        main.postDelayed(this::refreshPanelIfOpen, 180 - sinceScroll);
+        return;
+      }
+      int oldY = dockScroll == null ? 0 : dockScroll.getScrollY();
       populateFolderStrip();
       panelList.removeAllViews();
       renderList(panelList);
+      if (dockScroll != null && oldY > 0) {
+        dockScroll.post(() -> dockScroll.scrollTo(0, oldY));
+      }
     }
   };
   private OkHttpClient http;
@@ -199,7 +215,9 @@ public class ClipboardService extends Service {
     final String id;
     final String kind;
     String text;         // editable (notes) — updated in place by edits
-    final long createdAtMs;
+    // A save/edit is a meaningful touch, so it gets a fresh timestamp and moves
+    // this entry to the top on every device.
+    long createdAtMs;
     final String deviceId;
     boolean pinned;      // toggled by the pin button / relay pin notices
     String folder = "";  // folder/list label ("" = unfiled)
@@ -1558,7 +1576,6 @@ public class ClipboardService extends Service {
   // by RENDER_PAGE as the user scrolls near the bottom so a 300-item history doesn't
   // inflate hundreds of rows up front. Reset when the filter/search changes.
   private int renderLimit = RENDER_PAGE;
-  private ScrollView dockScroll;
 
   /** Slide the dock in from the pin's edge. Full-height, translucent-frosted, with
    *  the same features as the app screen: compose (text + image + mic), search,
@@ -1637,6 +1654,7 @@ public class ClipboardService extends Service {
     // Lazy-render: as the user approaches the bottom, grow the render window by
     // RENDER_PAGE so a 300-item history doesn't inflate hundreds of views up front.
     scroll.getViewTreeObserver().addOnScrollChangedListener(() -> {
+      lastDockScrollAt = SystemClock.uptimeMillis();
       if (dockScroll == null || panelList == null) return;
       View child = dockScroll.getChildAt(0);
       if (child == null) return;
@@ -2040,7 +2058,7 @@ public class ClipboardService extends Service {
         // Some OEM builds ship a broken impl; the other two upload paths still work.
       }
     }
-    LinearLayout actions = new LinearLayout(this);
+    final LinearLayout actions = new LinearLayout(this);
     actions.setOrientation(LinearLayout.HORIZONTAL);
     actions.setGravity(Gravity.BOTTOM | Gravity.CENTER_VERTICAL);
     LinearLayout.LayoutParams actionsLp = new LinearLayout.LayoutParams(
@@ -2048,17 +2066,24 @@ public class ClipboardService extends Service {
     actionsLp.topMargin = dp(6);
     actions.setLayoutParams(actionsLp);
 
-    LinearLayout.LayoutParams composerLp = new LinearLayout.LayoutParams(
+    final LinearLayout.LayoutParams composerLp = new LinearLayout.LayoutParams(
         0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
     composerLp.rightMargin = dp(4);
     actions.addView(composer, composerLp);
+
+    final LinearLayout controls = new LinearLayout(this);
+    controls.setOrientation(LinearLayout.HORIZONTAL);
+    controls.setGravity(Gravity.CENTER_VERTICAL);
+    final LinearLayout.LayoutParams controlsLp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    controlsLp.leftMargin = dp(4);
 
     // Compact action row: paste (text OR image) · upload · mic · Add/Save.
     Button pasteBtn = new Button(this);
     pasteBtn.setText("📋");
     styleCompactBtn(pasteBtn, false);
     pasteBtn.setOnClickListener((v) -> pasteFromClipboard());
-    actions.addView(pasteBtn, new LinearLayout.LayoutParams(dp(38), dp(28)));
+    controls.addView(pasteBtn, new LinearLayout.LayoutParams(dp(38), dp(28)));
 
     // Upload button: opens the photo gallery via a transparent proxy Activity
     // (services can't get an Activity result callback). Picks an image, hands the
@@ -2069,7 +2094,7 @@ public class ClipboardService extends Service {
     uploadBtn.setOnClickListener((v) -> launchImagePicker());
     LinearLayout.LayoutParams uploadLp = new LinearLayout.LayoutParams(dp(38), dp(28));
     uploadLp.leftMargin = dp(4);
-    actions.addView(uploadBtn, uploadLp);
+    controls.addView(uploadBtn, uploadLp);
 
     // Mic: Sarvam when a key is set; the phone's built-in recognizer otherwise —
     // so voice input always exists.
@@ -2080,7 +2105,7 @@ public class ClipboardService extends Service {
     mic.setOnClickListener((v) -> toggleMic((Button) v));
     LinearLayout.LayoutParams micLp = new LinearLayout.LayoutParams(dp(38), dp(28));
     micLp.leftMargin = dp(4);
-    actions.addView(mic, micLp);
+    controls.addView(mic, micLp);
 
     Button addBtn = new Button(this);
     dockAddBtn = addBtn;
@@ -2100,6 +2125,8 @@ public class ClipboardService extends Service {
         }
         if (target != null) {
           target.text = t;
+          target.createdAtMs = System.currentTimeMillis();
+          synchronized (this) { sortItemsLocked(); }
           sendTextItem(target.id, t, isoFromMs(target.createdAtMs),
               new ArrayList<>(target.tags), target.pinned);
         }
@@ -2121,7 +2148,34 @@ public class ClipboardService extends Service {
     });
     LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(54), dp(28));
     addLp.leftMargin = dp(4);
-    actions.addView(addBtn, addLp);
+    controls.addView(addBtn, addLp);
+    actions.addView(controls, controlsLp);
+
+    final boolean[] composerExpanded = {composer.getText().length() > 0};
+    final Runnable reflowComposer = () -> {
+      boolean expanded = composer.getText().length() > 0;
+      if (composerExpanded[0] == expanded) return;
+      composerExpanded[0] = expanded;
+      actions.setOrientation(expanded ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
+      composerLp.width = expanded ? LinearLayout.LayoutParams.MATCH_PARENT : 0;
+      composerLp.weight = expanded ? 0f : 1f;
+      composerLp.rightMargin = expanded ? 0 : dp(4);
+      controlsLp.topMargin = expanded ? dp(5) : 0;
+      controlsLp.leftMargin = expanded ? 0 : dp(4);
+      composer.setMaxLines(expanded ? 5 : 1);
+      actions.requestLayout();
+    };
+    composer.addTextChangedListener(new android.text.TextWatcher() {
+      @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+      @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+      @Override public void afterTextChanged(android.text.Editable s) { reflowComposer.run(); }
+    });
+    if (composerExpanded[0]) {
+      composerExpanded[0] = false;
+      reflowComposer.run();
+    } else {
+      composer.setMaxLines(1);
+    }
 
     wrap.addView(actions);
     return wrap;

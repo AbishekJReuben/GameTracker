@@ -235,7 +235,8 @@ export function ClipRow({
   const thumb = clipAssetUrl(item.thumbPath ?? item.imagePath);
   const full = clipAssetUrl(item.imagePath ?? item.thumbPath);
   const isImage = item.kind === "image";
-  const collapsedLines = compact ? 3 : 5;
+  // The desktop floating panel has room for real context before expansion.
+  const collapsedLines = compact ? 6 : 5;
   const link = !isImage ? linkSummary(item.text) : null;
 
   // Detect whether the collapsed text actually overflows, so the "Show more"
@@ -250,12 +251,12 @@ export function ClipRow({
 
   return (
     <motion.div
-      layout
-      initial={{ opacity: 0, y: 6, scale: 0.98 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.15 } }}
-      transition={{ type: "spring", stiffness: 420, damping: 32 }}
-      whileHover={{ y: -1 }}
+      layout={!compact}
+      initial={compact ? false : { opacity: 0, y: 6, scale: 0.98 }}
+      animate={compact ? undefined : { opacity: 1, y: 0, scale: 1 }}
+      exit={compact ? undefined : { opacity: 0, scale: 0.96, transition: { duration: 0.15 } }}
+      transition={compact ? { duration: 0 } : { type: "spring", stiffness: 420, damping: 32 }}
+      whileHover={compact ? undefined : { y: -1 }}
       className={cn(
         "group relative flex flex-col gap-1.5 rounded-2xl border border-white/[0.06] bg-white/[0.03]",
         "px-3 py-2.5 backdrop-blur-sm transition-colors hover:border-white/10 hover:bg-white/[0.05]",

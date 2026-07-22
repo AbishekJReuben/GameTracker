@@ -49,6 +49,7 @@ export function Composer({
   editing,
   onSaveEdit,
   onCancelEdit,
+  compact = false,
 }: {
   onAddText: (text: string) => void;
   onAddImage: (b64: string, mime?: string) => void;
@@ -64,6 +65,8 @@ export function Composer({
   editing?: ComposerEdit | null;
   onSaveEdit?: (id: string, text: string) => void;
   onCancelEdit?: () => void;
+  /** Floating panels start as a one-line composer, then claim full width once typed. */
+  compact?: boolean;
 }) {
   const [text, setText] = useState(() =>
     draftKey ? localStorage.getItem(draftKey) ?? "" : "",
@@ -258,6 +261,7 @@ export function Composer({
     <div
       className={cn(
         "rounded-2xl border bg-white/[0.03] p-2 backdrop-blur-sm transition-colors",
+        compact && !text ? "flex items-center gap-1" : "",
         editing ? "border-accent-2/50" : "border-white/10 focus-within:border-accent-3/40",
       )}
     >
@@ -289,9 +293,12 @@ export function Composer({
         }}
         rows={1}
         placeholder={placeholder}
-        className="max-h-40 min-h-[2.5rem] w-full resize-none bg-transparent px-2 py-1 text-sm leading-6 text-ink outline-none placeholder:text-ink-faint"
+        className={cn(
+          "max-h-40 min-h-[2.5rem] resize-none bg-transparent px-2 py-1 text-sm leading-6 text-ink outline-none placeholder:text-ink-faint",
+          compact && !text ? "min-w-0 flex-1" : "w-full",
+        )}
       />
-      <div className="flex items-center justify-between gap-1.5 px-0.5 pt-1">
+      <div className={cn("flex items-center justify-between gap-1.5 px-0.5", compact && !text ? "shrink-0 pt-0" : "pt-1")}>
         <div className="flex min-w-0 items-center gap-0.5">
           {!editing && (
             <>

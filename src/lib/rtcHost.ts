@@ -442,6 +442,7 @@ export function startHost(opts: HostOptions): () => void {
   let audioCtx: AudioContext | null = null;
   let audioNode: AudioWorkletNode | null = null;
   let focusTimer: number | null = null;
+  let visibilityRecoveryCleanup: (() => void) | null = null;
   let lastTextField = false;
   let lastCursorKind = "";
   let lastCursorPos: [number, number] | null = null;
@@ -881,6 +882,8 @@ export function startHost(opts: HostOptions): () => void {
   };
 
   const teardownPeer = () => {
+    visibilityRecoveryCleanup?.();
+    visibilityRecoveryCleanup = null;
     if (focusTimer) {
       clearInterval(focusTimer);
       focusTimer = null;
@@ -1590,6 +1593,34 @@ export function startHost(opts: HostOptions): () => void {
       } catch (e) {
         console.warn("[remote] capture restart after rebuild failed:", e);
       }
+    };
+
+    // WebView2 can throttle the host page while its window is minimized. The
+    // native capture keeps running, but the browser-side video pipeline may wake
+    // with a stale generator/encoder queue. Re-prime capture and request a fresh
+    // keyframe immediately when the page returns instead of waiting for the
+    // periodic watchdog (or making the user reconnect/restart the app).
+    let lastVisibilityRecovery = 0;
+    const recoverAfterVisibility = () => {
+      if (document.visibilityState !== "visible" || !authorized || pc !== myPc) return;
+      const now = Date.now();
+      if (now - lastVisibilityRecovery < 1500) return;
+      lastVisibilityRecovery = now;
+      void (async () => {
+        try {
+          stopCapture();
+          await startVideoCapture?.();
+          await api.remoteRequestKeyframe();
+        } catch (e) {
+          console.warn("[remote] visibility recovery failed:", e);
+        }
+      })();
+    };
+    document.addEventListener("visibilitychange", recoverAfterVisibility);
+    window.addEventListener("focus", recoverAfterVisibility);
+    visibilityRecoveryCleanup = () => {
+      document.removeEventListener("visibilitychange", recoverAfterVisibility);
+      window.removeEventListener("focus", recoverAfterVisibility);
     };
 
     const authorize = async () => {

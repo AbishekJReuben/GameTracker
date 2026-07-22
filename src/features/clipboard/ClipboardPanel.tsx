@@ -67,6 +67,7 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
         editing={editing}
         onSaveEdit={(id, text) => void s.editText(id, text)}
         onCancelEdit={() => setEditing(null)}
+        compact={compact}
       />
       <div className="flex items-center gap-1.5">
         <div className="relative flex-1">
@@ -80,7 +81,7 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
         </div>
       </div>
       <TagChips tags={s.tags} active={s.tagFilter} onPick={s.setTagFilter} />
-      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pr-1">
+      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain pr-1 [scrollbar-gutter:stable]">
         {pinned.length === 0 && rest.length === 0 && !s.loading ? (
           <EmptyState icon={<NotebookPen className="h-6 w-6" />} title="Nothing here yet" message="Copy anything or jot a note above. Add as many tags as you need and it syncs everywhere." />
         ) : (
