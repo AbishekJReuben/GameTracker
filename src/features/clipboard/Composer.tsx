@@ -91,10 +91,21 @@ export function Composer({
   useLayoutEffect(() => {
     const area = areaRef.current;
     if (!area) return;
+    // At the compact empty/non-empty boundary the field changes from a narrow
+    // flex item to full width. Do not preserve a height measured against the
+    // old narrow width (the wrapped placeholder made the empty viewport huge).
+    if (compact && !text) {
+      area.style.height = "2.5rem";
+      area.style.overflowY = "hidden";
+      return;
+    }
     area.style.height = "0px";
-    area.style.height = `${Math.min(area.scrollHeight, 160)}px`;
-    area.style.overflowY = area.scrollHeight > 160 ? "auto" : "hidden";
-  }, [text]);
+    const frame = requestAnimationFrame(() => {
+      area.style.height = `${Math.min(area.scrollHeight, 160)}px`;
+      area.style.overflowY = area.scrollHeight > 160 ? "auto" : "hidden";
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [text, compact]);
 
   // Draft persistence: mirror unsent text (not edits) to localStorage.
   useEffect(() => {

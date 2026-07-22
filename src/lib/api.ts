@@ -41,7 +41,9 @@ function isPcOnlyCommand(cmd: string): boolean {
     "remote_set_show_uac",
     "remote_regen_pin",
     "remote_set_cloud",
-    "remote_regen_code"
+    "remote_regen_code",
+    "share_prepare",
+    "share_read_chunk"
   ];
   return pcOnly.includes(cmd);
 }
@@ -1253,6 +1255,11 @@ export const api = {
   remoteInjectOn: (monitor: number, event: Record<string, unknown>) =>
     call<void>("remote_inject_on", { monitor, event }),
   remoteGamepadAvailable: () => call<boolean>("remote_gamepad_available"),
+  // Direct browser Share. Rust owns selected-file reads; this only returns a
+  // frozen manifest or one bounded WebRTC payload at a time.
+  sharePrepare: (paths: string[]) => call<ShareManifest>("share_prepare", { paths }),
+  shareReadChunk: (sourcePath: string, offset: number, length: number) =>
+    call<Uint8Array>("share_read_chunk", { sourcePath, offset, length }),
 };
 
 export interface RemoteMonitor {
@@ -1332,6 +1339,23 @@ export interface TempGrant {
 export interface RemoteGrants {
   trusted: TrustedDevice[];
   temporary: TempGrant[];
+}
+
+/** A sender-local entry selected for the direct browser Share feature. */
+export interface ShareItem {
+  id: number;
+  /** Receiver-visible relative path. */
+  path: string;
+  /** Desktop-only path; never sent to a receiver. */
+  sourcePath: string;
+  size: number;
+  modifiedMs: number | null;
+}
+
+export interface ShareManifest {
+  items: ShareItem[];
+  totalBytes: number;
+  skipped: string[];
 }
 
 /** Convert a stored absolute file path to a webview-loadable asset URL. */

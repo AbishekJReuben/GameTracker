@@ -1491,8 +1491,14 @@ public class ClipboardService extends Service {
     private int startX, startY;
     private float touchX, touchY;
     private long downTime;
-    private boolean moved;
-    private boolean opened;
+    private boolean movedBeforeHold;
+    private boolean holding;
+    private boolean touchActive;
+    private final Runnable armDrag = () -> {
+      if (!touchActive || movedBeforeHold || bubble == null) return;
+      holding = true;
+      bubble.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
+    };
 
     @Override
     public boolean onTouch(View v, MotionEvent e) {
@@ -1504,23 +1510,23 @@ public class ClipboardService extends Service {
           touchX = e.getRawX();
           touchY = e.getRawY();
           downTime = System.currentTimeMillis();
-          moved = false;
-          opened = false;
-          v.animate().alpha(1f).scaleX(1.15f).setDuration(120).start();
+          movedBeforeHold = false;
+          holding = false;
+          touchActive = true;
+          main.postDelayed(armDrag, 420);
           return true;
         case MotionEvent.ACTION_MOVE: {
           int dx = (int) (e.getRawX() - touchX);
           int dy = (int) (e.getRawY() - touchY);
-          if (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6)) moved = true;
-          // A decisive inward swipe opens the dock (right pin → swipe left, and
-          // vice-versa). Only fire once per gesture.
-          boolean inward = pinOnRight ? dx < -dp(28) : dx > dp(28);
-          if (!opened && inward && Math.abs(dx) > Math.abs(dy)) {
-            opened = true;
-            showPanel();
+          if (!holding) {
+            if (Math.abs(dx) > dp(8) || Math.abs(dy) > dp(8)) {
+              movedBeforeHold = true;
+              main.removeCallbacks(armDrag);
+            }
             return true;
           }
-          // Otherwise slide vertically along the edge (x stays pinned to the side).
+          // After the haptic-confirmed hold, drag vertically while staying pinned
+          // to the edge. There is intentionally no swipe-to-open gesture here.
           bubbleLp.y = Math.max(0, Math.min(m.heightPixels - dp(PIN_HEIGHT), startY + dy));
           try {
             wm.updateViewLayout(bubble, bubbleLp);
@@ -1530,12 +1536,12 @@ public class ClipboardService extends Service {
         }
         case MotionEvent.ACTION_UP:
         case MotionEvent.ACTION_CANCEL:
-          v.animate().alpha(0.9f).scaleX(1f).setDuration(160).start();
-          if (opened) return true;
-          if (!moved && System.currentTimeMillis() - downTime < 400) {
-            showPanel();
-          } else {
+          touchActive = false;
+          main.removeCallbacks(armDrag);
+          if (holding) {
             settlePin();
+          } else if (!movedBeforeHold && System.currentTimeMillis() - downTime < 420) {
+            showPanel();
           }
           return true;
         default:

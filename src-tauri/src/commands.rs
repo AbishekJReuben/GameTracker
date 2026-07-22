@@ -5,6 +5,7 @@ use crate::db::stats::{AppsOverview, CatalogAnalytics, Dashboard, DayValue, Insi
 use crate::db::{games, screenshots, sessions, settings, stats};
 use crate::detect::{self, Candidate};
 use crate::error::{AppError, AppResult};
+use crate::file_share;
 use crate::hltb;
 use crate::importer::{self, ImportSummary};
 use crate::metadata;
@@ -47,6 +48,22 @@ pub fn set_setting(state: State<AppState>, key: String, value: String) -> AppRes
 #[tauri::command]
 pub fn complete_onboarding(state: State<AppState>) -> AppResult<()> {
     settings::set(&state.pool, "onboarded", "true")
+}
+
+// ---------- direct file sharing ----------
+
+/// Build a frozen, receiver-safe file manifest from explicit user-picked roots.
+/// Directory walking and metadata reads are intentionally off the UI thread.
+#[tauri::command]
+pub async fn share_prepare(paths: Vec<String>) -> AppResult<file_share::ShareManifest> {
+    run_blocking(move || file_share::prepare(paths)).await
+}
+
+/// Read one bounded slice for the WebRTC sender. The frontend never hands this
+/// path to a receiver; only manifest metadata crosses the peer connection.
+#[tauri::command]
+pub async fn share_read_chunk(source_path: String, offset: u64, length: u32) -> AppResult<Vec<u8>> {
+    run_blocking(move || file_share::read_chunk(source_path, offset, length)).await
 }
 
 // ---------- games ----------

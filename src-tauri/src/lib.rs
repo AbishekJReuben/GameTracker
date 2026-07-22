@@ -7,6 +7,7 @@ mod db;
 mod detect;
 mod embed;
 mod error;
+mod file_share;
 mod gog;
 mod gog_auth;
 mod hltb;
@@ -351,6 +352,8 @@ pub fn run() {
             commands::get_settings,
             commands::set_setting,
             commands::complete_onboarding,
+            commands::share_prepare,
+            commands::share_read_chunk,
             commands::list_games,
             commands::get_game,
             commands::save_game,

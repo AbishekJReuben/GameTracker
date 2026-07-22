@@ -32,6 +32,7 @@ import TagsPage from "./routes/Tags";
 import SuggestedPage from "./routes/Suggested";
 import SettingsPage from "./routes/Settings";
 import ClipboardPage from "./routes/Clipboard";
+import SharePage from "./routes/Share";
 import ClipboardOverlay from "./features/clipboard/ClipboardOverlay";
 import { ClipSyncEngine } from "./features/clipboard/ClipSyncEngine";
 
@@ -141,6 +142,7 @@ export default function App() {
         <Route path="/suggested" element={<SuggestedPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="/clipboard" element={<ClipboardPage />} />
+        <Route path="/share" element={<SharePage />} />
       </Route>
     </Routes>
   );

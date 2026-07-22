@@ -78,6 +78,7 @@ async fn main() {
     let static_dir = quest_static_dir();
     let companion = PathBuf::from(format!("{static_dir}/companion.html"));
     let quest = PathBuf::from(format!("{static_dir}/quest.html"));
+    let share = PathBuf::from(format!("{static_dir}/share.html"));
     let serve = ServeDir::new(&static_dir).fallback(ServeFile::new(companion.clone()));
     println!("serving discovery clients from {static_dir}");
 
@@ -104,6 +105,16 @@ async fn main() {
         })
         .route("/companion/", {
             let p = companion.clone();
+            get(move || serve_html(p.clone()))
+        })
+        // Public, install-free file receiver. The opaque share capability lives
+        // in the URL fragment, so it never reaches this rendezvous server.
+        .route("/share", {
+            let p = share.clone();
+            get(move || serve_html(p.clone()))
+        })
+        .route("/share/", {
+            let p = share.clone();
             get(move || serve_html(p.clone()))
         })
         .with_state(state)

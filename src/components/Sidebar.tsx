@@ -1,6 +1,6 @@
 import { NavLink, useLocation } from "react-router-dom";
 import { motion } from "motion/react";
-import { LayoutDashboard, Library, CalendarRange, Trophy, Settings, Gamepad2, Tag, Compass, AppWindow, Cpu, Headphones, Smartphone, NotebookPen } from "lucide-react";
+import { LayoutDashboard, Library, CalendarRange, Trophy, Settings, Gamepad2, Tag, Compass, AppWindow, Cpu, Headphones, Smartphone, NotebookPen, Send } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useRemoteOnly } from "@/lib/queries";
 import { routeAllowed } from "@/lib/setupMode";
@@ -17,6 +17,7 @@ const NAV = [
   { to: "/timeline", label: "Timeline", icon: CalendarRange },
   { to: "/music", label: "Music", icon: Headphones },
   { to: "/clipboard", label: "Notes", icon: NotebookPen },
+  { to: "/share", label: "Share", icon: Send },
   { to: "/remote", label: "Remote", icon: Smartphone },
   { to: "/collection", label: "Collection", icon: Trophy },
   { to: "/suggested", label: "Suggested", icon: Compass },

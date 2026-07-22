@@ -32,20 +32,23 @@ function Get-NewestWriteTime([string[]]$paths) {
     return $newest
 }
 
-# Build discovery clients (companion + quest into signaling/static) when missing
+# Build discovery clients (companion + quest + public Share into signaling/static) when missing
 # OR when source is newer than the published static HTML — otherwise browsers /
 # Quest keep running a stale bundle while the APK has the latest Control/cloud.
 $staticCompanion = Join-Path $here "static\companion.html"
 $staticQuest = Join-Path $here "static\quest.html"
-$needsBuild = -not (Test-Path $staticCompanion) -or -not (Test-Path $staticQuest)
+$staticShare = Join-Path $here "static\share.html"
+$needsBuild = -not (Test-Path $staticCompanion) -or -not (Test-Path $staticQuest) -or -not (Test-Path $staticShare)
 if (-not $needsBuild) {
-    $staticAge = Get-NewestWriteTime @($staticCompanion, $staticQuest)
+    $staticAge = Get-NewestWriteTime @($staticCompanion, $staticQuest, $staticShare)
     $srcAge = Get-NewestWriteTime @(
         (Join-Path $repo "src\companion"),
         (Join-Path $repo "src\quest"),
+        (Join-Path $repo "src\share"),
         (Join-Path $repo "src\lib"),
         (Join-Path $repo "companion.html"),
         (Join-Path $repo "quest.html"),
+        (Join-Path $repo "share.html"),
         (Join-Path $repo "vite.quest.config.ts"),
         (Join-Path $repo "package.json")
     )

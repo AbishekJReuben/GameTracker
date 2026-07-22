@@ -33,6 +33,7 @@ export default defineConfig(async () => ({
       input: {
         companion: path.resolve(__dirname, "companion.html"),
         quest: path.resolve(__dirname, "quest.html"),
+        share: path.resolve(__dirname, "share.html"),
       },
     },
   },

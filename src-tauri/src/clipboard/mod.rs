@@ -197,7 +197,7 @@ fn spawn_fullscreen_guard(app: AppHandle) {
                 hidden_for_fs = false;
                 continue;
             };
-            let fs = foreground_is_fullscreen();
+            let fs = fullscreen_on_overlay_monitor(&win);
             if fs && !hidden_for_fs {
                 if win.hide().is_ok() {
                     hidden_for_fs = true;
@@ -217,10 +217,10 @@ fn spawn_fullscreen_guard(app: AppHandle) {
 /// exclusive fullscreen). The desktop shell (Progman/WorkerW) and our own windows
 /// never count.
 #[cfg(windows)]
-fn foreground_is_fullscreen() -> bool {
-    use windows::Win32::Foundation::RECT;
+fn fullscreen_on_overlay_monitor(win: &tauri::WebviewWindow) -> bool {
+    use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
@@ -258,7 +258,13 @@ fn foreground_is_fullscreen() -> bool {
             return false;
         }
         let m = info.rcMonitor;
-        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+        if !(rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom) {
+            return false;
+        }
+        let Ok(pos) = win.outer_position() else {
+            return false;
+        };
+        MonitorFromPoint(POINT { x: pos.x, y: pos.y }, MONITOR_DEFAULTTONEAREST) == mon
     }
 }
 
