@@ -96,6 +96,13 @@ import org.json.JSONObject;
  */
 public class ClipboardService extends Service {
   private static final Pattern HTTP_LINK = Pattern.compile("https?://[^\\s<>()]+", Pattern.CASE_INSENSITIVE);
+  /** Recognized TLDs, so a bare host (amazon.in/dp/…) previews but a file name
+   *  (main.rs) or a version (3.9.81) does not. Mirrors the web client's list. */
+  private static final String TLDS =
+      "com|in|org|net|io|gg|dev|app|co|me|ai|tv|xyz|uk|us|edu|gov|info|biz|online|site|shop|store|cloud|page|link|live|news|blog|game|games|gl|ly|be|to|sh|fm|so|it|de|fr|jp|au|ca|nl|se|no|es|br|ru|cn|pl|ch|at|dk|fi|ie|nz|za|kr|tw|hk|sg|ae|id|my|ph|th|vn|pk|bd|lk|np";
+  private static final Pattern BARE_LINK = Pattern.compile(
+      "(?<![\\w@./-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+(?:" + TLDS + "))(?![a-z])(?:[:/?#][^\\s<>()]*)?",
+      Pattern.CASE_INSENSITIVE);
   public static final String ACTION_START = "__PACKAGE__.CLIP_START";
   public static final String ACTION_STOP = "__PACKAGE__.CLIP_STOP";
   /** Service action: a content URI for an image the user just picked via the
@@ -294,6 +301,7 @@ public class ClipboardService extends Service {
     Button folderBtn;     // rebind updates colour
     String linkUrl;       // url the current linkCard shows ("" = none)
     boolean linkPreviewOn;// dockShowLinkPreviews at last bind (card reconciles on change)
+    String monoLabel;     // "Error"/"Code"/"Shell"/… when the body is monospaced, else null
     String lastBody;      // body text last bound (skip re-setText/Linkify when unchanged)
     boolean lastHadLink;  // whether lastBody had an http link (drives configureBody)
     String lastMeta;      // meta text last bound (skip re-setText when unchanged)
@@ -2469,10 +2477,147 @@ public class ClipboardService extends Service {
     return filteredLocked().size();
   }
 
-  private String firstHttpLink(String text) {
+  // --- content classification -------------------------------------------------
+  // A deliberately smaller sibling of the web client's classifier (src/lib/
+  // clipContent.ts). The dock only needs to answer "should this be monospaced,
+  // and what do I call it" — the web panel does the syntax colouring.
+
+  private static final Pattern CMD_LINE = Pattern.compile(
+      "^(?:sudo\\s+)?(?:npm|npx|pnpm|yarn|bun|git|cargo|rustup|python3?|pip3?|node|deno|go|docker|kubectl|adb|gradlew|\\./gradlew|mvn|curl|wget|ssh|scp|cd|ls|dir|cat|echo|mkdir|rm|cp|mv|touch|chmod|winget|choco|brew|apt|apt-get|dotnet|java|javac|tsc|vite|make|cmake|ffmpeg|tar|zip|unzip|powershell|pwsh|bash|sh)\\b");
+  private static final Pattern PATH_LINE = Pattern.compile(
+      "^(?:[A-Za-z]:[\\\\/][^\\n:*?\"<>|]*|\\\\\\\\[^\\n]+|(?:~|\\.{0,2})/[^\\s\\n:*?\"<>|]+)$");
+  private static final Pattern DIFF_LINE = Pattern.compile(
+      "^(?:diff --git |@@ -\\d+(?:,\\d+)? \\+\\d+(?:,\\d+)? @@|(?:---|\\+\\+\\+) )", Pattern.MULTILINE);
+  private static final Pattern[] LOG_MARKERS = {
+      Pattern.compile("^\\s*at\\s+[\\w$.<>]+\\s*\\(", Pattern.MULTILINE),
+      Pattern.compile("^\\s*File\\s+\"[^\"]+\",\\s+line\\s+\\d+", Pattern.MULTILINE),
+      Pattern.compile("^Traceback \\(most recent call last\\)", Pattern.MULTILINE),
+      Pattern.compile("^\\s*Caused by:", Pattern.MULTILINE),
+      Pattern.compile("\\b[A-Z]\\w*(?:Error|Exception)\\b\\s*:"),
+      Pattern.compile("^error\\[E\\d{2,4}\\]", Pattern.MULTILINE),
+      Pattern.compile("^error TS\\d{4}", Pattern.MULTILINE),
+      Pattern.compile("panicked at"),
+      Pattern.compile("^(?:FAILURE|BUILD FAILED|FAILED|\\* What went wrong:)", Pattern.MULTILINE),
+      Pattern.compile("^\\s*\\[?\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}", Pattern.MULTILINE),
+      Pattern.compile("^\\s*===.*===\\s*$", Pattern.MULTILINE),
+      Pattern.compile("^\\s*(?:Failed to |Uncaught |Unhandled |Warning: |ERROR|FATAL)", Pattern.MULTILINE),
+      Pattern.compile("^[^\\n]{0,80}\\bdiagnostics\\b[^\\n]{0,40}$", Pattern.MULTILINE | Pattern.CASE_INSENSITIVE),
+  };
+  private static final Pattern FAILED_WORD =
+      Pattern.compile("\\b\\w*(?:error|exception)\\b|\\b(?:failed|failure|panicked|fatal)\\b", Pattern.CASE_INSENSITIVE);
+  private static final Pattern CODE_WORD = Pattern.compile(
+      "\\b(?:function|const|let|var|def|fn|class|struct|impl|public|private|import|export|return|if|else|for|while)\\b");
+
+  /** Badge for a note that should render monospaced, or null for ordinary text. */
+  private static String monoLabel(String text) {
+    if (text == null) return null;
+    String raw = text.trim();
+    if (raw.isEmpty()) return null;
+    String[] lines = raw.split("\n", -1);
+    boolean single = lines.length == 1;
+
+    if (single && raw.equals(firstLinkOnly(raw))) return null; // a lone URL keeps its card
+    if (single && PATH_LINE.matcher(raw).matches()) return "Path";
+    if (single && raw.length() < 400 && CMD_LINE.matcher(raw).find()) return "Shell";
+    if (raw.startsWith("{") || raw.startsWith("[")) {
+      if (raw.endsWith("}") || raw.endsWith("]")) return "JSON";
+    }
+
+    boolean failed = FAILED_WORD.matcher(raw).find();
+    double prose = proseRatio(lines);
+    for (Pattern p : LOG_MARKERS) {
+      if (p.matcher(raw).find()) {
+        if (prose <= 0.6 || machineRatio(lines) > 0.2) return failed ? "Error" : "Log";
+        break;
+      }
+    }
+    if (DIFF_LINE.matcher(raw).find()) return "Diff";
+    if (prose > 0.45) return null;
+    if (!single && codeScore(raw, lines) >= 3) return "Code";
+    if (!single && failed) return failed ? "Error" : "Log";
+    return null;
+  }
+
+  /** The URL when the note is nothing but a link, else null. */
+  private static String firstLinkOnly(String raw) {
+    Matcher m = HTTP_LINK.matcher(raw);
+    if (m.find() && m.start() == 0 && m.end() == raw.length()) return raw;
+    Matcher b = BARE_LINK.matcher(raw);
+    if (b.find() && b.start() == 0 && b.end() == raw.length()) return raw;
+    return null;
+  }
+
+  private static double proseRatio(String[] lines) {
+    int total = 0, prosey = 0;
+    for (String l : lines) {
+      if (l.trim().isEmpty()) continue;
+      total++;
+      int alpha = 0;
+      for (String w : l.trim().split("\\s+")) if (w.matches("[A-Za-z][A-Za-z']*")) alpha++;
+      if ((alpha >= 4 && l.matches(".*[.!?,;:]\\s*")) || alpha >= 6) prosey++;
+    }
+    return total == 0 ? 0 : (double) prosey / total;
+  }
+
+  private static double machineRatio(String[] lines) {
+    int total = 0, hits = 0;
+    for (String l : lines) {
+      if (l.trim().isEmpty()) continue;
+      total++;
+      for (Pattern p : LOG_MARKERS) if (p.matcher(l).find()) { hits++; break; }
+    }
+    return total == 0 ? 0 : (double) hits / total;
+  }
+
+  private static int codeScore(String raw, String[] lines) {
+    int total = 0, dense = 0, indented = 0;
+    for (String l : lines) {
+      if (l.trim().isEmpty()) continue;
+      total++;
+      if (l.matches(".*[{};()\\[\\]=<>].*")) dense++;
+      if (l.startsWith("  ") || l.startsWith("\t")) indented++;
+    }
+    if (total == 0) return 0;
+    double d = (double) dense / total, i = (double) indented / total;
+    int score = 0;
+    if (d > 0.45) score += 2;
+    if (d > 0.7) score += 1;
+    if (i > 0.25) score += 1;
+    if (Pattern.compile(";\\s*$", Pattern.MULTILINE).matcher(raw).find()) score += 1;
+    if (Pattern.compile("^\\s*(?://|#|/\\*|\\*)", Pattern.MULTILINE).matcher(raw).find()) score += 1;
+    if (CODE_WORD.matcher(raw).find()) score += 1;
+    int words = 0, alpha = 0;
+    for (String w : raw.split("\\s+")) { if (w.isEmpty()) continue; words++; if (w.matches("[A-Za-z']{2,}")) alpha++; }
+    if (words > 0 && (double) alpha / words > 0.8) score -= 3;
+    return score;
+  }
+
+  /** First link in the note, accepting scheme-less hosts (which is how most
+   *  links arrive from share sheets and pasted product pages). Returns an
+   *  absolute URL, or null when there is nothing link-shaped. */
+  private static String firstHttpLink(String text) {
     if (text == null) return null;
     Matcher m = HTTP_LINK.matcher(text);
-    return m.find() ? m.group() : null;
+    if (m.find()) return trimLinkTail(m.group());
+    Matcher bare = BARE_LINK.matcher(text);
+    if (bare.find()) return "https://" + trimLinkTail(bare.group());
+    return null;
+  }
+
+  /** Sentence punctuation is almost never part of the link. */
+  private static String trimLinkTail(String url) {
+    String out = url;
+    while (out.length() > 1 && ".,;:!?'\"".indexOf(out.charAt(out.length() - 1)) >= 0) {
+      out = out.substring(0, out.length() - 1);
+    }
+    while (out.endsWith(")") && count(out, '(') < count(out, ')')) out = out.substring(0, out.length() - 1);
+    return out;
+  }
+
+  private static int count(String s, char c) {
+    int n = 0;
+    for (int i = 0; i < s.length(); i++) if (s.charAt(i) == c) n++;
+    return n;
   }
 
   /** Native overlay counterpart to the web link card. OG image wins, then a
@@ -2930,6 +3075,7 @@ public class ClipboardService extends Service {
     h.lastMeta = null;
     h.linkUrl = null;
     h.linkPreviewOn = false;
+    h.monoLabel = null;
     h.expanded = false;
   }
 
@@ -3069,23 +3215,42 @@ public class ClipboardService extends Service {
     syncLinkCard(h, box, fullText);
 
     // --- meta + actions -------------------------------------------------------
-    bindMetaActionsRow(h.metaRow, h, relativeTime(e.createdAtMs, now));
+    // The content type earns its place in the meta line: it is the one thing the
+    // row can't show any other way once the body is just monospaced text.
+    String meta = relativeTime(e.createdAtMs, now);
+    if (h.monoLabel != null) meta = h.monoLabel + " · " + meta;
+    bindMetaActionsRow(h.metaRow, h, meta);
 
     // --- show more / less -----------------------------------------------------
-    final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
-    if (longText) {
-      if (h.expand.getParent() != box) {
-        box.addView(h.expand, new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, dp(30)));
+    h.body.setMaxLines(h.expanded ? Integer.MAX_VALUE : COLLAPSED_LINES);
+    h.body.setEllipsize(h.expanded ? null : android.text.TextUtils.TruncateAt.END);
+    syncExpandAffordance(h, box);
+  }
+
+  /** Show "Show more" only when the collapsed body is genuinely truncated.
+   *  A character-count guess gets this wrong constantly — the same note is one
+   *  line on a wide dock and three on a narrow one — so this asks the finished
+   *  layout whether it had to ellipsize, which is only knowable after measure. */
+  private void syncExpandAffordance(final RowHolder h, final LinearLayout box) {
+    h.body.post(() -> {
+      if (h.body == null || h.expand == null) return;
+      boolean truncated = h.expanded;
+      android.text.Layout layout = h.body.getLayout();
+      if (!truncated && layout != null) {
+        int last = layout.getLineCount() - 1;
+        truncated = last >= 0 && (layout.getEllipsisCount(last) > 0 || layout.getLineCount() > COLLAPSED_LINES);
       }
-      // Reflect the entry's current expanded state.
-      h.body.setMaxLines(h.expanded ? Integer.MAX_VALUE : COLLAPSED_LINES);
-      h.body.setEllipsize(h.expanded ? null : android.text.TextUtils.TruncateAt.END);
-      h.expand.setText(h.expanded ? "Show less  ↑" : "Show more  ↓");
-    } else if (h.expand.getParent() == box) {
-      box.removeView(h.expand);
-      h.expanded = false;
-    }
+      if (truncated) {
+        if (h.expand.getParent() != box) {
+          box.addView(h.expand, new LinearLayout.LayoutParams(
+              LinearLayout.LayoutParams.MATCH_PARENT, dp(30)));
+        }
+        h.expand.setText(h.expanded ? "Show less  ↑" : "Show more  ↓");
+      } else if (h.expand.getParent() == box) {
+        box.removeView(h.expand);
+        h.expanded = false;
+      }
+    });
   }
 
   /** Set the body text and choose its link behaviour for the current preview mode.
@@ -3100,6 +3265,28 @@ public class ClipboardService extends Service {
     h.linkPreviewOn = dockShowLinkPreviews;
     boolean tapLink = !dockShowLinkPreviews && h.lastHadLink;
     body.setText(fullText);
+
+    // Code, logs, commands and paths read as themselves: monospaced, a size down,
+    // on a slightly recessed panel. Lines still wrap — the dock is too narrow for
+    // horizontal scrolling to be anything but a trap.
+    h.monoLabel = monoLabel(fullText);
+    if (h.monoLabel != null) {
+      body.setTypeface(android.graphics.Typeface.MONOSPACE);
+      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+      body.setTextColor("Error".equals(h.monoLabel) ? 0xFFFECDD3 : 0xFFE2E8F0);
+      GradientDrawable panel = new GradientDrawable();
+      panel.setColor(0x33000000);
+      panel.setCornerRadius(dp(8));
+      body.setBackground(panel);
+      body.setPadding(dp(8), dp(6), dp(8), dp(6));
+    } else {
+      body.setTypeface(android.graphics.Typeface.DEFAULT);
+      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+      body.setTextColor(0xFFF1F5F9);
+      body.setBackground(null);
+      body.setPadding(0, 0, 0, 0);
+    }
+
     if (tapLink) {
       // setText clears prior Linkify spans; re-apply, then make them clickable.
       Linkify.addLinks(body, Linkify.WEB_URLS);

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Copy,
@@ -23,6 +23,8 @@ import { relativeTime } from "@/lib/format";
 import { clipAssetUrl, type ClipItem } from "@/lib/clip";
 import { Skeleton } from "@/components/ui";
 import { firstHttpUrl, LinkPreview } from "@/lib/linkPreview";
+import { classifyClip } from "@/lib/clipContent";
+import { ClipBody } from "./ClipBody";
 
 function haptic() {
   try {
@@ -218,7 +220,7 @@ export function ClipRow({
   const [folderOpen, setFolderOpen] = useState(false);
   const [tagsOpen, setTagsOpen] = useState(false);
   const [datesOpen, setDatesOpen] = useState(false);
-  const textRef = useRef<HTMLParagraphElement>(null);
+  const textRef = useRef<HTMLElement>(null);
   // Distinct copy timestamps, newest first; only meaningful when the same content
   // was copied more than once.
   const copyDates = Array.from(new Set(item.copies ?? []))
@@ -239,14 +241,30 @@ export function ClipRow({
   const isImage = item.kind === "image";
   // The desktop floating panel has room for real context before expansion.
   const collapsedLines = compact ? 6 : 5;
-  const link = !isImage ? firstHttpUrl(item.text) : null;
+  // What this note *is* — drives both the body rendering and whether a preview
+  // card belongs underneath it.
+  const content = useMemo(() => classifyClip(item.text), [item.text]);
+  // Only prose and bare links get a preview card. A URL buried in a stack trace
+  // or a config file is a detail of the snippet, not the point of the note.
+  const link = !isImage && (content.kind === "link" || content.kind === "text") ? firstHttpUrl(item.text) : null;
 
-  // Detect whether the collapsed text actually overflows, so the "Show more"
+  // Detect whether the collapsed body actually overflows, so the "More"
   // affordance only appears when there's genuinely more to reveal.
+  //
+  // This has to survive a resize, not just mount: the floating panel's window
+  // tweens open from the 76px bubble, so a row measured at mount is measured at
+  // ~30px wide, where even "npm run dev" wraps to several lines and looks
+  // clamped forever. Re-measuring on every size change is what fixes that.
   useLayoutEffect(() => {
-    if (isImage || expanded) return;
+    if (isImage) return;
     const el = textRef.current;
-    if (el) setClamped(el.scrollHeight - el.clientHeight > 2);
+    if (!el) return;
+    const measure = () => setClamped(el.scrollHeight - el.clientHeight > 2);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
   }, [item.text, isImage, expanded, compact]);
 
   // Collapsed image cap, matching the max-h-32 below (Tailwind 8rem).
@@ -294,24 +312,13 @@ export function ClipRow({
           />
         ) : (
           <>
-          <p
+          <ClipBody
             ref={textRef}
-            className={cn(
-              "m-0 whitespace-pre-wrap break-words text-[13.5px] leading-relaxed text-ink",
-              expanded ? "max-h-[52vh] overflow-y-auto pr-1" : "overflow-hidden",
-            )}
-            style={
-              expanded
-                ? undefined
-                : ({
-                    display: "-webkit-box",
-                    WebkitBoxOrient: "vertical",
-                    WebkitLineClamp: collapsedLines,
-                  } as React.CSSProperties)
-            }
-          >
-            {item.text || "(empty)"}
-          </p>
+            text={item.text || "(empty)"}
+            content={content}
+            expanded={expanded}
+            collapsedLines={collapsedLines}
+          />
           {link && <LinkPreview url={link} />}
           </>
         )}

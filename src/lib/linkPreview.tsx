@@ -6,11 +6,10 @@ import { openExternalUrl as openWithDesktop } from "@/lib/tauri";
 
 export type LinkPreviewData = { url: string; host: string; title: string; description?: string | null; imageUrl?: string | null; faviconUrl?: string | null; source: "openGraph" | "twitterCard" | "favicon" };
 
-export function firstHttpUrl(text?: string | null): string | null {
-  const raw = text?.match(/https?:\/\/[^\s<>()]+/i)?.[0];
-  if (!raw) return null;
-  try { return new URL(raw).toString(); } catch { return null; }
-}
+// Link detection lives with the rest of the content classification (it also has
+// to recognize scheme-less hosts like `amazon.in/dp/…`). Re-exported here so the
+// existing import sites keep working.
+export { firstHttpUrl } from "@/lib/clipContent";
 
 /** Opens through Tauri on desktop/Android, with a browser fallback for web builds. */
 export async function openExternalUrl(url: string) {
