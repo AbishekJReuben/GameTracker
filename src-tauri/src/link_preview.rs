@@ -98,11 +98,54 @@ fn youtube_preview(url: &Url, id: &str, agent: &ureq::Agent) -> LinkPreview {
     }
 }
 
+/// Preview for a URL that points straight at an image file.
+fn direct_image(url: &Url) -> Option<LinkPreview> {
+    let path = url.path().to_ascii_lowercase();
+    let ext = path.rsplit('.').next()?;
+    if !matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "bmp") { return None; }
+    let host = url.host_str()?.trim_start_matches("www.").to_string();
+    let name = url.path_segments()?.next_back()?.to_string();
+    Some(LinkPreview {
+        url: url.to_string(),
+        host: host.clone(),
+        title: name,
+        description: None,
+        image_url: Some(url.to_string()),
+        favicon_url: Some(format!("{}/favicon.ico", url.origin().ascii_serialization())),
+        source: "openGraph".into(),
+    })
+}
+
+/// Product image for an Amazon `/dp/<ASIN>` or `/gp/product/<ASIN>` URL.
+fn amazon_image(url: &Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !host.contains("amazon.") { return None; }
+    let mut segments = url.path_segments()?.peekable();
+    let mut asin = None;
+    while let Some(seg) = segments.next() {
+        if matches!(seg, "dp" | "product" | "gp") {
+            if let Some(next) = segments.peek() {
+                let candidate = next.trim();
+                if candidate.len() == 10 && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    asin = Some(candidate.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    Some(format!("https://images-na.ssl-images-amazon.com/images/P/{}.01._SCLZZZZZZZ_.jpg", asin?))
+}
+
 pub fn fetch(raw: String) -> Result<LinkPreview, String> {
     let mut url = safe_url(&raw)?;
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(8)).redirects(0).build();
     if let Some(id) = youtube_id(&url) {
         return Ok(youtube_preview(&url, &id, &agent));
+    }
+    // A link that *is* an image previews as that image. Fetching it as HTML would
+    // download the whole file only to produce a card titled with the host.
+    if let Some(preview) = direct_image(&url) {
+        return Ok(preview);
     }
     let mut html = String::new();
     for _ in 0..4 {
@@ -111,8 +154,26 @@ pub fn fetch(raw: String) -> Result<LinkPreview, String> {
             .set("User-Agent", UA)
             .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .set("Accept-Language", "en-US,en;q=0.9")
+            // Retail and CDN edges profile more than the UA string; without the
+            // fetch-metadata headers a request is obviously automated and gets a
+            // stub page back. `identity` because this agent can't decompress.
+            .set("Accept-Encoding", "identity")
+            .set("Sec-Fetch-Dest", "document")
+            .set("Sec-Fetch-Mode", "navigate")
+            .set("Sec-Fetch-Site", "none")
+            .set("Sec-Fetch-User", "?1")
+            .set("Upgrade-Insecure-Requests", "1")
             .call()
         {
+            // ureq only reports 4xx/5xx as `Err(Status)`, so a redirect arrives
+            // here as a perfectly successful response whose body is the "301 Moved
+            // Permanently" stub — which is exactly what the card ended up showing.
+            // Redirects are followed by hand (rather than by ureq) so every hop is
+            // re-checked by `safe_url` and can't be aimed at a private address.
+            Ok(response) if (300..400).contains(&response.status()) => {
+                let next = absolute(&url, response.header("Location")).ok_or("Invalid redirect")?;
+                url = safe_url(&next)?;
+            }
             Ok(response) => {
                 // Bytes, not read_to_string: a single invalid UTF-8 byte anywhere in
                 // the page would otherwise fail the whole preview.
@@ -148,6 +209,27 @@ pub fn fetch(raw: String) -> Result<LinkPreview, String> {
     let icon_sel = Selector::parse("link[rel]").map_err(|e| e.to_string())?;
     let favicon = doc.select(&icon_sel).find_map(|n| n.value().attr("rel").filter(|r| r.to_ascii_lowercase().contains("icon")).and_then(|_| absolute(&url, n.value().attr("href"))));
     let host = url.host_str().unwrap_or_default().trim_start_matches("www.").to_string();
-    let (image_url, source) = if og_image.is_some() { (og_image, "openGraph") } else if twitter_image.is_some() { (twitter_image, "twitterCard") } else { (None, "favicon") };
-    Ok(LinkPreview { url: url.to_string(), host: host.clone(), title: og_title.or(twitter_title).or(page_title).unwrap_or_else(|| host.clone()), description: og_description.or(twitter_description).or(meta_description), image_url, favicon_url: favicon.or_else(|| Some(format!("{}/favicon.ico", url.origin().ascii_serialization()))), source: source.into() })
+    // Older sites publish no card tags at all but do declare `rel=image_src`.
+    let image_src = doc
+        .select(&icon_sel)
+        .find(|n| n.value().attr("rel").is_some_and(|r| r.eq_ignore_ascii_case("image_src")))
+        .and_then(|n| absolute(&url, n.value().attr("href")));
+    let (image_url, source) = if og_image.is_some() {
+        (og_image, "openGraph")
+    } else if twitter_image.is_some() {
+        (twitter_image, "twitterCard")
+    } else if image_src.is_some() {
+        (image_src, "openGraph")
+    } else if let Some(image) = amazon_image(&url) {
+        // Amazon deliberately ships no og:image, but every product image is
+        // addressable by ASIN — the same trick the chat apps' crawlers use.
+        (Some(image), "openGraph")
+    } else {
+        (None, "favicon")
+    };
+    let title = og_title.or(twitter_title).or(page_title).unwrap_or_else(|| host.clone());
+    // Plenty of pages set description to the title verbatim; showing it twice
+    // just wastes the card's second line.
+    let description = og_description.or(twitter_description).or(meta_description).filter(|d| d != &title);
+    Ok(LinkPreview { url: url.to_string(), host: host.clone(), title, description, image_url, favicon_url: favicon.or_else(|| Some(format!("{}/favicon.ico", url.origin().ascii_serialization()))), source: source.into() })
 }

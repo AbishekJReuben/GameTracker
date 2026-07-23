@@ -4,7 +4,8 @@
 // instead of the word-wrapped mush a <p> makes of an 80-column stack trace.
 import { forwardRef } from "react";
 import { cn } from "@/lib/cn";
-import { tokenizeCode, logSeverity, type ClipContent } from "@/lib/clipContent";
+import { tokenizeCode, logSeverity, linkSegments, type ClipContent } from "@/lib/clipContent";
+import { openExternalUrl } from "@/lib/linkPreview";
 
 const TOKEN_CLASS: Record<string, string> = {
   plain: "",
@@ -44,6 +45,41 @@ function CodeLines({ text }: { text: string }) {
   );
 }
 
+/**
+ * Prose with its URLs turned into real links — blue and underlined, the way a
+ * link is supposed to look, whether it's the whole note or buried mid-sentence.
+ * Opening goes through the same native handler the preview card uses, so it
+ * works from the overlay WebView too.
+ */
+function ProseText({ text }: { text: string }) {
+  const segments = linkSegments(text);
+  if (segments.length === 1 && !segments[0].url) return <>{text}</>;
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.url ? (
+          <a
+            key={i}
+            href={seg.url}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void openExternalUrl(seg.url!);
+            }}
+            title={seg.url}
+            className="cursor-pointer text-sky-400 underline decoration-sky-400/45 underline-offset-2 transition-colors hover:text-sky-300 hover:decoration-sky-300"
+          >
+            {seg.text}
+          </a>
+        ) : (
+          <span key={i}>{seg.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
 function LogLines({ text }: { text: string }) {
   return (
     <>
@@ -77,7 +113,11 @@ export const ClipBody = forwardRef<HTMLElement, ClipBodyProps>(function ClipBody
       <p
         ref={ref as React.Ref<HTMLParagraphElement>}
         className={cn(
-          "m-0 whitespace-pre-wrap break-words text-[13.5px] leading-relaxed text-ink",
+          // Prose wants a little more air and a slightly softer ink than UI text:
+          // these notes are read, not scanned. `break-words` (not `break-all`)
+          // keeps words whole and only breaks the 300-character tracking URLs.
+          "m-0 whitespace-pre-wrap break-words text-[13.5px] leading-[1.65] tracking-[0.006em] text-ink/95",
+          "[hyphens:auto] [overflow-wrap:anywhere]",
           expanded ? "max-h-[52vh] overflow-y-auto pr-1" : "overflow-hidden",
         )}
         style={
@@ -86,7 +126,7 @@ export const ClipBody = forwardRef<HTMLElement, ClipBodyProps>(function ClipBody
             : ({ display: "-webkit-box", WebkitBoxOrient: "vertical", WebkitLineClamp: collapsedLines } as React.CSSProperties)
         }
       >
-        {text || "(empty)"}
+        <ProseText text={text || "(empty)"} />
       </p>
     );
   }

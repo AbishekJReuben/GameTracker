@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { motion } from "motion/react";
-import { Search, NotebookPen, Tag } from "lucide-react";
+import { Search, NotebookPen, Tag, Link2, Code2, Braces, AlertTriangle, TerminalSquare, FolderTree, AlignLeft } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { classifyClip, type ClipContentKind } from "@/lib/clipContent";
 import { useClipboard, visibleClips, type ClipFilter } from "@/store/clipboard";
 import { EmptyState } from "@/components/ui";
 import { Composer, type ComposerEdit } from "./Composer";
@@ -45,6 +46,64 @@ export function TagChips({
   );
 }
 
+/** Content-type chips. Only kinds actually present are offered — an empty
+ *  "Commands" filter is a dead end, not a feature. */
+export function TypeChips({
+  items,
+  active,
+  onPick,
+}: {
+  items: ClipItem[];
+  active: ClipContentKind | null;
+  onPick: (kind: ClipContentKind | null) => void;
+}) {
+  const present = useMemo(() => {
+    const counts = new Map<ClipContentKind, number>();
+    for (const i of items) {
+      if (i.kind !== "text") continue;
+      const k = classifyClip(i.text).kind;
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+    return TYPES.filter((t) => (counts.get(t.kind) ?? 0) > 0).map((t) => ({ ...t, count: counts.get(t.kind)! }));
+  }, [items]);
+  // One kind covering everything is the same as no filter at all.
+  if (present.length < 2) return null;
+  return (
+    <div className="flex items-center gap-0.5 overflow-x-auto rounded-lg bg-white/[0.03] p-0.5 [scrollbar-width:none]">
+      <button
+        onClick={() => onPick(null)}
+        className={cn("shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-600", active === null ? "bg-accent-3/25 text-ink" : "text-ink-dim hover:text-ink-soft")}
+      >
+        Any
+      </button>
+      {present.map(({ kind, label, Icon, count }) => (
+        <button
+          key={kind}
+          onClick={() => onPick(active === kind ? null : kind)}
+          title={`${count} ${label.toLowerCase()}`}
+          className={cn(
+            "flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-600 transition-colors",
+            active === kind ? "bg-accent-3/25 text-ink" : "text-ink-dim hover:bg-white/[0.06] hover:text-ink-soft",
+          )}
+        >
+          <Icon className="h-2.5 w-2.5" /> {label}
+          <span className="tabular-nums text-ink-faint">{count}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+const TYPES: { kind: ClipContentKind; label: string; Icon: typeof Link2 }[] = [
+  { kind: "link", label: "Links", Icon: Link2 },
+  { kind: "code", label: "Code", Icon: Code2 },
+  { kind: "json", label: "JSON", Icon: Braces },
+  { kind: "log", label: "Logs", Icon: AlertTriangle },
+  { kind: "command", label: "Commands", Icon: TerminalSquare },
+  { kind: "path", label: "Paths", Icon: FolderTree },
+  { kind: "text", label: "Notes", Icon: AlignLeft },
+];
+
 export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.desktop" }: { compact?: boolean; sttEnabled: boolean; draftKey?: string }) {
   const s = useClipboard();
   const [editing, setEditing] = useState<ComposerEdit | null>(null);
@@ -65,7 +124,7 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
     const t = window.setTimeout(() => void s.ensureMatches(), s.search ? 250 : 0);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tagFilter, s.filter, s.search]);
+  }, [s.tagFilter, s.typeFilter, s.filter, s.search]);
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
@@ -91,13 +150,14 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
         </div>
       </div>
       <TagChips tags={s.tags} active={s.tagFilter} onPick={s.setTagFilter} />
+      <TypeChips items={[...s.pinned, ...s.items]} active={s.typeFilter} onPick={s.setTypeFilter} />
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain pr-1 [scrollbar-gutter:stable]">
         {pinned.length === 0 && rest.length === 0 && !s.loading ? (
           <EmptyState icon={<NotebookPen className="h-6 w-6" />} title="Nothing here yet" message="Copy anything or jot a note above. Add as many tags as you need and it syncs everywhere." />
         ) : (
           // Keyed on the active filter so switching tags crossfades the list
           // instead of hard-cutting between two unrelated sets of rows.
-          <motion.div key={`${s.tagFilter ?? "all"}·${s.filter}`} initial={{ opacity: 0.35 }} animate={{ opacity: 1 }} transition={{ duration: 0.18, ease: "easeOut" }}>
+          <motion.div key={`${s.tagFilter ?? "all"}·${s.typeFilter ?? "any"}·${s.filter}`} initial={{ opacity: 0.35 }} animate={{ opacity: 1 }} transition={{ duration: 0.18, ease: "easeOut" }}>
           <ClipboardList
             pinned={pinned} rest={rest} loading={s.loading} hasMore={s.hasMore}
             onCopy={s.copy} onDelete={s.remove} onTogglePin={s.togglePin}

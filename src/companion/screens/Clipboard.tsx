@@ -18,7 +18,8 @@ import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { EmptyState } from "@/components/ui";
 import { Composer, type ComposerEdit } from "@/features/clipboard/Composer";
 import { ClipboardList as ClipList } from "@/features/clipboard/ClipboardList";
-import { TagChips } from "@/features/clipboard/ClipboardPanel";
+import { TagChips, TypeChips } from "@/features/clipboard/ClipboardPanel";
+import { classifyClip, type ClipContentKind } from "@/lib/clipContent";
 import { useCompanionClip, companionTranscribe, LS_SARVAM_KEY } from "../clipboardCompanion";
 import type { ClipItem } from "@/lib/clip";
 
@@ -65,6 +66,7 @@ export default function ClipboardScreen() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [typeFilter, setTypeFilter] = useState<ClipContentKind | null>(null);
   const [editing, setEditing] = useState<ComposerEdit | null>(null);
   const android = isTauri();
   // Sarvam mic is available whenever a key is saved on this device; the Composer
@@ -146,6 +148,7 @@ export default function ClipboardScreen() {
   const match = (i: ClipItem) => {
     if (filter !== "all" && i.kind !== filter) return false;
     if (tagFilter !== null && !(i.tags ?? []).some((t) => t.toLowerCase() === tagFilter.toLowerCase())) return false;
+    if (typeFilter !== null && (i.kind !== "text" || classifyClip(i.text).kind !== typeFilter)) return false;
     if (!q) return true;
     return (i.text ?? "").toLowerCase().includes(q) ||
       (i.deviceName ?? "").toLowerCase().includes(q) ||
@@ -258,6 +261,7 @@ export default function ClipboardScreen() {
       </div>
 
       <TagChips tags={tags} active={tagFilter} onPick={setTagFilter} />
+      <TypeChips items={s.items} active={typeFilter} onPick={setTypeFilter} />
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {pinned.length === 0 && rest.length === 0 ? (

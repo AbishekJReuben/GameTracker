@@ -55,6 +55,43 @@ function trimUrlTail(raw: string): string {
   return out;
 }
 
+/** A run of text, flagged as either a link or ordinary prose. */
+export type TextSegment = { text: string; url?: string };
+
+const SCHEME_URL_G = new RegExp(SCHEME_URL.source, "gi");
+const BARE_URL_G = new RegExp(BARE_URL.source, "gi");
+
+/**
+ * Split prose into plain runs and link runs, so a paragraph can render its URLs
+ * as real links without the caller resorting to `dangerouslySetInnerHTML`.
+ */
+export function linkSegments(text: string): TextSegment[] {
+  const hits: { start: number; end: number; url: string }[] = [];
+  for (const re of [SCHEME_URL_G, BARE_URL_G]) {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text))) {
+      const start = m.index;
+      const end = start + m[0].length;
+      // The scheme pass runs first and wins; skip anything it already claimed.
+      if (hits.some((h) => start < h.end && end > h.start)) continue;
+      const url = firstHttpUrl(m[0]);
+      if (url) hits.push({ start, end: start + trimUrlTail(m[0]).length, url });
+    }
+  }
+  if (!hits.length) return [{ text }];
+  hits.sort((a, b) => a.start - b.start);
+  const out: TextSegment[] = [];
+  let at = 0;
+  for (const h of hits) {
+    if (h.start > at) out.push({ text: text.slice(at, h.start) });
+    out.push({ text: text.slice(h.start, h.end), url: h.url });
+    at = h.end;
+  }
+  if (at < text.length) out.push({ text: text.slice(at) });
+  return out;
+}
+
 /**
  * First link in the text as an absolute URL, accepting bare hosts. Returns null
  * when there is nothing link-shaped, so callers can skip the preview entirely.
@@ -161,7 +198,22 @@ const LANGUAGES: { label: string; id: string; hints: RegExp[] }[] = [
   { label: "Java", id: "java", hints: [/\b(?:public|private|protected)\s+(?:static\s+)?(?:final\s+)?[\w<>\[\]]+\s+\w+\s*\(/, /\bnew\s+[A-Z]\w*\s*\(/, /\bimport\s+(?:java|android|androidx)\./, /@Override\b/] },
   { label: "Kotlin", id: "kt", hints: [/\bfun\s+\w+\s*\(/, /\bval\s+\w+\s*[:=]/, /\bvar\s+\w+\s*:\s*\w+/, /\bcompanion\s+object\b/] },
   { label: "Python", id: "py", hints: [/^\s*def\s+\w+\s*\(/m, /^\s*from\s+[\w.]+\s+import\b/m, /^\s*import\s+\w+$/m, /\bself\./, /\belif\b/, /:\s*$/m] },
-  { label: "C#", id: "cs", hints: [/\busing\s+System\b/, /\bnamespace\s+\w+/, /\bvar\s+\w+\s*=\s*new\b/, /\bpublic\s+class\b/] },
+  {
+    label: "C#",
+    id: "cs",
+    hints: [
+      /\busing\s+System(?:\.\w+)*\s*;/,
+      /\bnamespace\s+[\w.]+/,
+      /\bvar\s+\w+\s*=\s*new\b/,
+      /\b(?:public|private|internal|protected)\s+(?:static\s+|sealed\s+|partial\s+|abstract\s+)*(?:class|record|struct|interface)\b/,
+      /\[(?:Serializable|Obsolete|TestMethod|HttpGet|HttpPost|Fact|Theory)\]/,
+      /\bpublic\s+[\w<>\[\]?]+\s+\w+\s*\{\s*get;\s*(?:set;|init;)?/, // auto-property
+      /\bstring\[\]\s+args\b/,
+      /\basync\s+Task(?:<[^>]+>)?\s+\w+\s*\(/,
+      /\bConsole\.(?:WriteLine|Write|ReadLine)\s*\(/,
+      /\?\?=|=>\s*\w+\s*;|\bnameof\s*\(|\bIEnumerable<|\bList<\w+>\s+\w+\s*=/,
+    ],
+  },
   { label: "Go", id: "go", hints: [/\bfunc\s+\w*\s*\(/, /\bpackage\s+main\b/, /:=/, /\bimport\s+\(/] },
   { label: "SQL", id: "sql", hints: [/\bselect\b[\s\S]*\bfrom\b/i, /\binsert\s+into\b/i, /\bcreate\s+table\b/i, /\bwhere\b.*\band\b/i] },
   { label: "HTML", id: "html", hints: [/<\/(?:div|span|p|a|body|html|section|button)>/i, /<!DOCTYPE html>/i, /<[a-z]+\s+[\w-]+=["']/i] },
@@ -231,8 +283,26 @@ function isJson(text: string): boolean {
 
 /* -------------------------------------------------------------- classify --- */
 
+// Classification is pure and gets called from render paths (the list re-filters
+// on every keystroke), so results are memoized by text. Bounded, because note
+// bodies run to tens of kilobytes.
+const CLASSIFY_CACHE = new Map<string, ClipContent>();
+const CLASSIFY_CACHE_MAX = 400;
+
 /** Decide how a note should be presented. Never throws. */
 export function classifyClip(text?: string | null): ClipContent {
+  const key = text ?? "";
+  const hit = CLASSIFY_CACHE.get(key);
+  if (hit) return hit;
+  const result = classifyUncached(text);
+  if (CLASSIFY_CACHE.size >= CLASSIFY_CACHE_MAX) {
+    CLASSIFY_CACHE.delete(CLASSIFY_CACHE.keys().next().value!);
+  }
+  CLASSIFY_CACHE.set(key, result);
+  return result;
+}
+
+function classifyUncached(text?: string | null): ClipContent {
   const raw = (text ?? "").trim();
   if (!raw) return { kind: "text", mono: false };
   const lines = raw.split("\n");
@@ -303,7 +373,7 @@ export function classifyClip(text?: string | null): ClipContent {
 export type Token = { text: string; type: "plain" | "comment" | "string" | "number" | "keyword" | "punct" | "meta" };
 
 const KEYWORDS = new RegExp(
-  String.raw`\b(?:abstract|any|as|async|await|bool|boolean|break|case|catch|class|const|constructor|continue|crate|def|default|delete|do|double|elif|else|enum|except|export|extends|extern|false|final|finally|float|fn|for|from|func|function|if|impl|implements|import|in|instanceof|int|interface|is|let|lambda|match|mod|module|mut|namespace|new|None|not|null|nullptr|number|object|or|override|package|pass|private|protected|pub|public|raise|readonly|record|ref|return|self|static|str|string|struct|super|switch|this|throw|throws|trait|true|try|type|typeof|union|unsafe|use|val|var|void|when|where|while|with|yield)\b`,
+  String.raw`\b(?:abstract|any|as|async|await|base|bool|boolean|break|case|catch|char|class|const|constructor|continue|crate|decimal|def|default|delete|do|double|elif|else|enum|event|except|export|extends|extern|false|final|finally|float|fn|for|foreach|from|func|function|get|goto|if|impl|implements|import|in|init|instanceof|int|interface|internal|is|let|lambda|lock|long|match|mod|module|mut|namespace|new|None|not|null|nullptr|number|object|operator|or|out|override|package|params|partial|pass|private|protected|pub|public|raise|readonly|record|ref|return|sealed|self|set|short|static|str|string|struct|super|switch|this|throw|throws|trait|true|try|type|typeof|union|unsafe|use|using|val|var|virtual|void|when|where|while|with|yield)\b`,
 );
 
 // One pass, alternation ordered so comments and strings win over everything.

@@ -3,6 +3,7 @@
 
 import { create } from "zustand";
 import { clip, type ClipItem, type ClipKind } from "@/lib/clip";
+import { classifyClip, type ClipContentKind } from "@/lib/clipContent";
 import { clipSync } from "@/lib/clipboardSync";
 
 const PAGE = 40;
@@ -16,6 +17,8 @@ interface ClipStore {
   search: string;
   /** null = all; a tag name filters items containing that tag. */
   tagFilter: string | null;
+  /** null = all; otherwise only notes of that content kind (links, code, …). */
+  typeFilter: ClipContentKind | null;
   tags: string[];
   loading: boolean;
   hasMore: boolean;
@@ -23,6 +26,7 @@ interface ClipStore {
   setFilter: (f: ClipFilter) => void;
   setSearch: (s: string) => void;
   setTagFilter: (f: string | null) => void;
+  setTypeFilter: (f: ClipContentKind | null) => void;
 
   load: () => Promise<void>;
   loadMore: () => Promise<void>;
@@ -46,6 +50,7 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   filter: "all",
   search: "",
   tagFilter: null,
+  typeFilter: null,
   tags: [],
   loading: false,
   hasMore: false,
@@ -53,6 +58,7 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   setFilter: (filter) => set({ filter }),
   setSearch: (search) => set({ search }),
   setTagFilter: (tagFilter) => set({ tagFilter }),
+  setTypeFilter: (typeFilter) => set({ typeFilter }),
 
   load: async () => {
     if (get().loading) return;
@@ -179,19 +185,23 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   },
 }));
 
-/** Items after search + type + tag filters (pinned first, then the paged list, deduped). */
+/** Items after search + kind + tag + content-type filters (pinned first, then the paged list, deduped). */
 export function visibleClips(s: {
   items: ClipItem[];
   pinned: ClipItem[];
   filter: ClipFilter;
   search: string;
   tagFilter?: string | null;
+  typeFilter?: ClipContentKind | null;
 }): { pinned: ClipItem[]; rest: ClipItem[] } {
   const q = s.search.trim().toLowerCase();
   const tf = s.tagFilter ?? null;
+  const yf = s.typeFilter ?? null;
   const match = (i: ClipItem) => {
     if (s.filter !== "all" && i.kind !== s.filter) return false;
     if (tf !== null && !(i.tags ?? []).some((t) => t.toLowerCase() === tf.toLowerCase())) return false;
+    // Images have no text to classify; a content-type filter simply excludes them.
+    if (yf !== null && (i.kind !== "text" || classifyClip(i.text).kind !== yf)) return false;
     if (!q) return true;
     return (i.text ?? "").toLowerCase().includes(q) ||
       (i.deviceName ?? "").toLowerCase().includes(q) ||

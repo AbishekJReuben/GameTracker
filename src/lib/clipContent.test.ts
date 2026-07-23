@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyClip, firstHttpUrl, tokenizeCode } from "./clipContent";
+import { classifyClip, firstHttpUrl, linkSegments, tokenizeCode } from "./clipContent";
 
 describe("firstHttpUrl", () => {
   it("finds a plain http(s) url", () => {
@@ -151,6 +151,69 @@ describe("classifyClip", () => {
     expect(classifyClip("").kind).toBe("text");
     expect(classifyClip("   \n  ").kind).toBe("text");
     expect(classifyClip(null).kind).toBe("text");
+  });
+});
+
+describe("linkSegments", () => {
+  it("returns one plain segment when there is no link", () => {
+    expect(linkSegments("just some prose")).toEqual([{ text: "just some prose" }]);
+  });
+
+  it("splits a link out of a sentence and keeps the punctuation outside it", () => {
+    const segs = linkSegments("check https://github.com/x/y. thanks");
+    expect(segs.map((s) => s.text).join("")).toBe("check https://github.com/x/y. thanks");
+    expect(segs.filter((s) => s.url)).toHaveLength(1);
+    expect(segs.find((s) => s.url)?.text).toBe("https://github.com/x/y");
+  });
+
+  it("handles several links, bare and schemed", () => {
+    const segs = linkSegments("see amazon.in/dp/B077TQRPZS and https://offbrand.gg/devs/ too");
+    const links = segs.filter((s) => s.url);
+    expect(links).toHaveLength(2);
+    expect(links[0].url).toBe("https://amazon.in/dp/B077TQRPZS");
+    expect(links[1].url).toBe("https://offbrand.gg/devs/");
+  });
+
+  it("never loses or duplicates text", () => {
+    for (const s of ["a github.com/x b amazon.in c", "https://a.com https://b.com", "no links here", ""]) {
+      expect(linkSegments(s).map((x) => x.text).join(""), s).toBe(s);
+    }
+  });
+
+  it("does not linkify a version number mid-sentence", () => {
+    expect(linkSegments("bumped to 3.9.81 today").filter((s) => s.url)).toHaveLength(0);
+  });
+});
+
+describe("C# detection", () => {
+  it("recognizes a class with auto-properties", () => {
+    const code = [
+      "using System;",
+      "using System.Collections.Generic;",
+      "",
+      "namespace GameTracker.Sensors",
+      "{",
+      "    public sealed class SensorReading",
+      "    {",
+      "        public string Name { get; init; }",
+      "        public double Value { get; set; }",
+      "    }",
+      "}",
+    ].join("\n");
+    expect(classifyClip(code)).toMatchObject({ kind: "code", label: "C#" });
+  });
+
+  it("recognizes an async method body", () => {
+    const code = [
+      "public async Task<List<string>> LoadAsync(string[] args)",
+      "{",
+      "    var items = new List<string>();",
+      "    foreach (var a in args) { items.Add(a); }",
+      "    Console.WriteLine(nameof(LoadAsync));",
+      "    return items;",
+      "}",
+    ].join("\n");
+    expect(classifyClip(code)).toMatchObject({ kind: "code", label: "C#" });
   });
 });
 

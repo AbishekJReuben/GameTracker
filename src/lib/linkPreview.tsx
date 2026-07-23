@@ -34,9 +34,11 @@ export async function openExternalUrl(url: string) {
 export function LinkPreview({ url }: { url: string }) {
   const [preview, setPreview] = useState<LinkPreviewData | null>(null);
   const [artFailed, setArtFailed] = useState(false);
+  const [iconFailed, setIconFailed] = useState(false);
   useEffect(() => {
     let live = true;
     setArtFailed(false);
+    setIconFailed(false);
     void invoke<LinkPreviewData>("link_preview", { url }).then((data) => live && setPreview(data)).catch(() => live && setPreview(fallbackPreview(url)));
     return () => { live = false; };
   }, [url]);
@@ -53,15 +55,21 @@ export function LinkPreview({ url }: { url: string }) {
         onError={() => setArtFailed(true)}
         className="aspect-video w-full object-cover"
       />
-    ) : data.faviconUrl ? (
-      <span className="grid h-16 w-16 shrink-0 place-items-center bg-cyan-300/[0.08]"><img src={data.faviconUrl} alt="" className="h-7 w-7 rounded" /></span>
+    ) : data.faviconUrl && !iconFailed ? (
+      <span className="grid h-16 w-16 shrink-0 place-items-center bg-cyan-300/[0.08]">
+        {/* Plenty of hosts 404 their /favicon.ico. Swap in the globe rather than
+            leaving the WebView's broken-image glyph sitting in the card. */}
+        <img src={data.faviconUrl} alt="" onError={() => setIconFailed(true)} className="h-7 w-7 rounded" />
+      </span>
     ) : (
       <span className="grid h-16 w-16 shrink-0 place-items-center bg-cyan-300/[0.08] text-cyan-200"><Globe2 className="h-5 w-5" /></span>
     )}
     <span className="flex min-w-0 flex-1 items-start gap-1 px-2.5 py-2">
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1 text-[10px] font-700 text-cyan-200/90">
-          {hero && data.faviconUrl && <img src={data.faviconUrl} alt="" className="h-3 w-3 shrink-0 rounded-[3px]" />}
+          {hero && data.faviconUrl && !iconFailed && (
+            <img src={data.faviconUrl} alt="" onError={() => setIconFailed(true)} className="h-3 w-3 shrink-0 rounded-[3px]" />
+          )}
           <span className="truncate">{data.host}</span>
         </span>
         <span className="mt-0.5 line-clamp-2 block text-[11.5px] font-700 leading-snug text-ink">{data.title}</span>

@@ -1982,9 +1982,14 @@ public class ClipboardService extends Service {
     synchronized (this) {
       folders = foldersLocked();
     }
+    // A dock left filtered to "Untagged" before that chip was removed would have
+    // no way back to All — drop the selection instead of stranding it.
+    if ("".equals(dockFolderFilter)) dockFolderFilter = null;
     if (folders.isEmpty() && dockFolderFilter == null) return; // nothing to filter
     addFolderChip(strip, "All", null);
-    addFolderChip(strip, "Untagged", "");
+    // No "Untagged" chip: filtering *to* the unfiled pile is not something anyone
+    // reaches for, and it pushed the real tags off the edge of a narrow dock.
+    // Notes are still moved out of a folder from the row's own folder picker.
     for (String f : folders) addFolderChip(strip, f, f);
   }
 
