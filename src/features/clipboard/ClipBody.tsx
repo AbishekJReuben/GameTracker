@@ -4,7 +4,7 @@
 // instead of the word-wrapped mush a <p> makes of an 80-column stack trace.
 import { forwardRef } from "react";
 import { cn } from "@/lib/cn";
-import { tokenizeCode, logSeverity, linkSegments, type ClipContent } from "@/lib/clipContent";
+import { tokenizeCode, logSeverity, proseSegments, type ClipContent } from "@/lib/clipContent";
 import { openExternalUrl } from "@/lib/linkPreview";
 
 const TOKEN_CLASS: Record<string, string> = {
@@ -51,9 +51,18 @@ function CodeLines({ text }: { text: string }) {
  * Opening goes through the same native handler the preview card uses, so it
  * works from the overlay WebView too.
  */
+const MARK_CLASS = {
+  bold: "font-700 text-ink",
+  italic: "italic text-ink/90",
+  strike: "line-through text-ink-dim",
+  code: "rounded bg-white/[0.08] px-1 py-px font-mono text-[0.92em] text-cyan-100",
+  bullet: "font-700 text-accent-2",
+  quote: "border-l-2 border-white/15 pl-2 text-ink-dim",
+} as const;
+
 function ProseText({ text }: { text: string }) {
-  const segments = linkSegments(text);
-  if (segments.length === 1 && !segments[0].url) return <>{text}</>;
+  const segments = proseSegments(text);
+  if (segments.length === 1 && !segments[0].url && !segments[0].mark) return <>{text}</>;
   return (
     <>
       {segments.map((seg, i) =>
@@ -73,7 +82,9 @@ function ProseText({ text }: { text: string }) {
             {seg.text}
           </a>
         ) : (
-          <span key={i}>{seg.text}</span>
+          <span key={i} className={seg.mark ? MARK_CLASS[seg.mark] : undefined}>
+            {seg.text}
+          </span>
         ),
       )}
     </>
@@ -109,6 +120,10 @@ export const ClipBody = forwardRef<HTMLElement, ClipBodyProps>(function ClipBody
   ref,
 ) {
   if (!content.mono) {
+    // A third of all notes are a single short line — a name, a code, a reminder.
+    // Setting those as a runt paragraph wastes them; at title weight they read
+    // as the label they are, and the list gets a rhythm instead of a grey wall.
+    const isTitle = !text.includes("\n") && text.trim().length <= 60;
     return (
       <p
         ref={ref as React.Ref<HTMLParagraphElement>}
@@ -119,6 +134,8 @@ export const ClipBody = forwardRef<HTMLElement, ClipBodyProps>(function ClipBody
           "m-0 whitespace-pre-wrap break-words text-[13.5px] leading-[1.65] tracking-[0.006em] text-ink/95",
           "[hyphens:auto] [overflow-wrap:anywhere]",
           expanded ? "max-h-[52vh] overflow-y-auto pr-1" : "overflow-hidden",
+          // Last, so these win the merge against the prose defaults above.
+          isTitle && "text-[15px] font-600 leading-snug tracking-normal text-ink",
         )}
         style={
           expanded

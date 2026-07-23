@@ -17,7 +17,10 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
 import android.graphics.drawable.BitmapDrawable;
 import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
@@ -30,8 +33,16 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.IBinder;
 import android.os.SystemClock;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
 import android.text.method.LinkMovementMethod;
-import android.text.util.Linkify;
+import android.text.style.BackgroundColorSpan;
+import android.text.style.ClickableSpan;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.StrikethroughSpan;
+import android.text.style.StyleSpan;
+import android.text.style.TypefaceSpan;
+import android.text.style.UnderlineSpan;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -55,6 +66,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -292,6 +304,7 @@ public class ClipboardService extends Service {
     String kind;          // "text" | "image" — fixed at build, survives pooling
     ClipEntry entry; // null while pooled
     TextView body;        // text rows only
+    Content content;      // what the body currently is (drives chrome + type chips)
     ImageView image;      // image rows only
     LinearLayout metaRow;
     TextView meta;        // tags + relative time (left of the action buttons)
@@ -302,7 +315,7 @@ public class ClipboardService extends Service {
     String linkUrl;       // url the current linkCard shows ("" = none)
     boolean linkPreviewOn;// dockShowLinkPreviews at last bind (card reconciles on change)
     String monoLabel;     // "Error"/"Code"/"Shell"/… when the body is monospaced, else null
-    String lastBody;      // body text last bound (skip re-setText/Linkify when unchanged)
+    String lastBody;      // body text last bound (skip re-setText/re-style when unchanged)
     boolean lastHadLink;  // whether lastBody had an http link (drives configureBody)
     String lastMeta;      // meta text last bound (skip re-setText when unchanged)
     boolean expanded;     // current Show more/less state
@@ -1653,6 +1666,11 @@ public class ClipboardService extends Service {
   // selected tag, and each existing item can hold multiple tags.
   private String dockFolderFilter = null;
   private LinearLayout dockFolderStrip; // rebuilt when folders change
+  // Content-type filter: null = Any, else a Content.kind ("link", "code", …).
+  // Parity with the desktop panel's type chips.
+  private String dockTypeFilter = null;
+  private LinearLayout dockTypeStrip;   // rebuilt when the item set changes
+  private View dockTypeScroll;          // hidden outright when there's nothing to pick
   // Note editing: non-null while the composer is editing this entry in place.
   private String dockEditingId = null;
   // Folder chooser: non-null while the list shows "move to folder" options for
@@ -1735,6 +1753,10 @@ public class ClipboardService extends Service {
     // Folder chips (All · Unfiled · one per folder) — the notes "lists" selector,
     // parity with the app screens. Hidden until a folder exists.
     root.addView(buildFolderStrip());
+
+    // Content-type chips (Any · Links · Code · Logs · …) — parity with the desktop
+    // panel's type filter. Hidden while every note is the same kind.
+    root.addView(buildTypeStrip());
 
     // Scrollable history.
     ScrollView scroll = new ScrollView(this);
@@ -1991,6 +2013,91 @@ public class ClipboardService extends Service {
     // reaches for, and it pushed the real tags off the edge of a narrow dock.
     // Notes are still moved out of a folder from the row's own folder picker.
     for (String f : folders) addFolderChip(strip, f, f);
+  }
+
+  // Type chips, in the desktop panel's order.
+  private static final String[] TYPE_KINDS = { "link", "code", "json", "log", "command", "path", "text" };
+  private static final String[] TYPE_LABELS = { "Links", "Code", "JSON", "Logs", "Commands", "Paths", "Notes" };
+
+  /** Horizontally-scrollable content-type chips (Any · Links · Code · …). */
+  private View buildTypeStrip() {
+    android.widget.HorizontalScrollView sv = new android.widget.HorizontalScrollView(this);
+    sv.setHorizontalScrollBarEnabled(false);
+    LinearLayout strip = new LinearLayout(this);
+    strip.setOrientation(LinearLayout.HORIZONTAL);
+    sv.addView(strip);
+    dockTypeStrip = strip;
+    dockTypeScroll = sv;
+    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    lp.topMargin = dp(5);
+    sv.setLayoutParams(lp);
+    populateTypeStrip();
+    return sv;
+  }
+
+  /** (Re)build the type chips from what's actually in the history. One kind
+   *  covering everything is the same as no filter at all, so the strip hides
+   *  itself until there are at least two to choose between. Must run on the main
+   *  thread. */
+  private void populateTypeStrip() {
+    LinearLayout strip = dockTypeStrip;
+    if (strip == null) return;
+    HashMap<String, Integer> counts = new HashMap<>();
+    synchronized (this) {
+      for (ClipEntry e : items) {
+        if (!"text".equals(e.kind)) continue;
+        String k = classify(e.text == null ? "" : e.text).kind;
+        Integer n = counts.get(k);
+        counts.put(k, n == null ? 1 : n + 1);
+      }
+    }
+    int present = 0;
+    for (String k : TYPE_KINDS) if (counts.containsKey(k)) present++;
+    // A filter left on a kind that no longer exists would strand the dock on an
+    // empty list with no obvious way back.
+    if (dockTypeFilter != null && !counts.containsKey(dockTypeFilter)) dockTypeFilter = null;
+    strip.removeAllViews();
+    if (present < 2) {
+      if (dockTypeScroll != null) dockTypeScroll.setVisibility(View.GONE);
+      return;
+    }
+    if (dockTypeScroll != null) dockTypeScroll.setVisibility(View.VISIBLE);
+    addTypeChip(strip, "Any", null);
+    for (int i = 0; i < TYPE_KINDS.length; i++) {
+      Integer n = counts.get(TYPE_KINDS[i]);
+      if (n == null) continue;
+      addTypeChip(strip, TYPE_LABELS[i] + "  " + n, TYPE_KINDS[i]);
+    }
+  }
+
+  private void addTypeChip(LinearLayout strip, String label, final String kind) {
+    Button chip = new Button(this);
+    chip.setText(label);
+    chip.setAllCaps(false);
+    chip.setStateListAnimator(null);
+    chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    chip.setPadding(dp(8), dp(2), dp(8), dp(2));
+    chip.setMinWidth(0);
+    chip.setMinimumWidth(0);
+    chip.setMinHeight(0);
+    chip.setMinimumHeight(0);
+    boolean active = kind == null ? dockTypeFilter == null : kind.equals(dockTypeFilter);
+    GradientDrawable bg = new GradientDrawable();
+    bg.setCornerRadius(dp(8));
+    bg.setColor(active ? 0x5938BDF8 : 0x10FFFFFF);
+    chip.setBackground(bg);
+    chip.setTextColor(active ? Color.WHITE : 0xFF94A3B8);
+    chip.setOnClickListener((v) -> {
+      dockTypeFilter = kind != null && kind.equals(dockTypeFilter) ? null : kind;
+      renderLimit = RENDER_PAGE;
+      populateTypeStrip();
+      refreshPanelIfOpen();
+    });
+    LinearLayout.LayoutParams lp =
+        new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(24));
+    if (strip.getChildCount() > 0) lp.leftMargin = dp(4);
+    strip.addView(chip, lp);
   }
 
   private void addFolderChip(LinearLayout strip, String label, String value) {
@@ -2405,6 +2512,8 @@ public class ClipboardService extends Service {
     dockAddBtn = null;
     dockScroll = null;
     dockFolderStrip = null;
+    dockTypeStrip = null;
+    dockTypeScroll = null;
     dockEditingId = null;
     folderPickForId = null;
     panelRefreshQueued = false;
@@ -2457,6 +2566,10 @@ public class ClipboardService extends Service {
     ArrayList<ClipEntry> out = new ArrayList<>();
     for (ClipEntry e : items) {
       if (!dockFilterKind.isEmpty() && !dockFilterKind.equals(e.kind)) continue;
+      if (dockTypeFilter != null) {
+        if (!"text".equals(e.kind)) continue;
+        if (!dockTypeFilter.equals(classify(e.text == null ? "" : e.text).kind)) continue;
+      }
       if (dockFolderFilter != null) {
         if (dockFolderFilter.isEmpty()) {
           if (!e.tags.isEmpty()) continue;
@@ -2483,9 +2596,10 @@ public class ClipboardService extends Service {
   }
 
   // --- content classification -------------------------------------------------
-  // A deliberately smaller sibling of the web client's classifier (src/lib/
-  // clipContent.ts). The dock only needs to answer "should this be monospaced,
-  // and what do I call it" — the web panel does the syntax colouring.
+  // The Java mirror of the web client's classifier (src/lib/clipContent.ts). Both
+  // must agree: a note filtered as "Code" in the app has to be a code block in the
+  // dock too, or the type chips lie. Kept in the same order as the TS so a change
+  // there is easy to port.
 
   private static final Pattern CMD_LINE = Pattern.compile(
       "^(?:sudo\\s+)?(?:npm|npx|pnpm|yarn|bun|git|cargo|rustup|python3?|pip3?|node|deno|go|docker|kubectl|adb|gradlew|\\./gradlew|mvn|curl|wget|ssh|scp|cd|ls|dir|cat|echo|mkdir|rm|cp|mv|touch|chmod|winget|choco|brew|apt|apt-get|dotnet|java|javac|tsc|vite|make|cmake|ffmpeg|tar|zip|unzip|powershell|pwsh|bash|sh)\\b");
@@ -2506,6 +2620,8 @@ public class ClipboardService extends Service {
       Pattern.compile("^\\s*\\[?\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}", Pattern.MULTILINE),
       Pattern.compile("^\\s*===.*===\\s*$", Pattern.MULTILINE),
       Pattern.compile("^\\s*(?:Failed to |Uncaught |Unhandled |Warning: |ERROR|FATAL)", Pattern.MULTILINE),
+      Pattern.compile("^\\s*\\d{1,3}\\s*\\|\\s", Pattern.MULTILINE), // rustc/vite code frame gutter
+      Pattern.compile("\\bException in thread\\b"),
       Pattern.compile("^[^\\n]{0,80}\\bdiagnostics\\b[^\\n]{0,40}$", Pattern.MULTILINE | Pattern.CASE_INSENSITIVE),
   };
   private static final Pattern FAILED_WORD =
@@ -2513,45 +2629,207 @@ public class ClipboardService extends Service {
   private static final Pattern CODE_WORD = Pattern.compile(
       "\\b(?:function|const|let|var|def|fn|class|struct|impl|public|private|import|export|return|if|else|for|while)\\b");
 
-  /** Badge for a note that should render monospaced, or null for ordinary text. */
-  private static String monoLabel(String text) {
-    if (text == null) return null;
+  /** What a note actually is: the kind drives the type chips and the block chrome,
+   *  the label is the badge, mono decides prose-vs-block rendering. */
+  static final class Content {
+    final String kind;  // link | command | code | json | log | path | text
+    final String label; // badge text; null for plain prose
+    final boolean mono;
+    Content(String kind, String label, boolean mono) {
+      this.kind = kind; this.label = label; this.mono = mono;
+    }
+  }
+  private static final Content PLAIN = new Content("text", null, false);
+
+  // Classification is pure and runs from render paths (every row, every refresh,
+  // plus the per-kind chip counts), so it is memoized by text. Bounded, because
+  // note bodies run to tens of kilobytes.
+  private static final LinkedHashMap<String, Content> CLASSIFY_CACHE = new LinkedHashMap<>();
+  private static final int CLASSIFY_CACHE_MAX = 400;
+
+  /** Decide how a note should be presented. Never throws. */
+  static synchronized Content classify(String text) {
+    String key = text == null ? "" : text;
+    Content hit = CLASSIFY_CACHE.get(key);
+    if (hit != null) return hit;
+    Content out;
+    try {
+      out = classifyUncached(key);
+    } catch (Exception ignored) {
+      out = PLAIN;
+    }
+    if (CLASSIFY_CACHE.size() >= CLASSIFY_CACHE_MAX) {
+      java.util.Iterator<String> it = CLASSIFY_CACHE.keySet().iterator();
+      if (it.hasNext()) { it.next(); it.remove(); }
+    }
+    CLASSIFY_CACHE.put(key, out);
+    return out;
+  }
+
+  private static Content classifyUncached(String text) {
     String raw = text.trim();
-    if (raw.isEmpty()) return null;
+    if (raw.isEmpty()) return PLAIN;
     String[] lines = raw.split("\n", -1);
     boolean single = lines.length == 1;
 
-    if (single && raw.equals(firstLinkOnly(raw))) return null; // a lone URL keeps its card
-    if (single && PATH_LINE.matcher(raw).matches()) return "Path";
-    if (single && raw.length() < 400 && CMD_LINE.matcher(raw).find()) return "Shell";
-    if (raw.startsWith("{") || raw.startsWith("[")) {
-      if (raw.endsWith("}") || raw.endsWith("]")) return "JSON";
+    // A note that is *only* a link is a link, whatever else it looks like.
+    String url = firstHttpLink(raw);
+    if (single && url != null) {
+      String bare = raw.replaceFirst("(?i)^https?://", "").replaceAll("/$", "");
+      String target = url.replaceFirst("(?i)^https?://", "").replaceAll("/$", "");
+      if (bare.equals(target)) return new Content("link", null, false);
     }
+
+    if (single && PATH_LINE.matcher(raw).matches()) return new Content("path", "Path", true);
+    if (single && raw.length() < 400 && CMD_LINE.matcher(raw).find()) {
+      return new Content("command", "Shell", true);
+    }
+    if (isJson(raw)) return new Content("json", "JSON", true);
 
     boolean failed = FAILED_WORD.matcher(raw).find();
     double prose = proseRatio(lines);
+
+    // Machine output is checked before code: a stack trace is full of code-ish
+    // punctuation and would otherwise be labelled with whatever language it names.
     for (Pattern p : LOG_MARKERS) {
       if (p.matcher(raw).find()) {
-        if (prose <= 0.6 || machineRatio(lines) > 0.2) return failed ? "Error" : "Log";
+        if (prose <= 0.6 || machineRatio(lines) > 0.2) {
+          return new Content("log", failed ? "Error" : "Log", true);
+        }
         break;
       }
     }
-    if (DIFF_LINE.matcher(raw).find()) return "Diff";
-    if (prose > 0.45) return null;
-    if (!single && codeScore(raw, lines) >= 3) return "Code";
-    if (!single && failed) return failed ? "Error" : "Log";
-    return null;
+    if (DIFF_LINE.matcher(raw).find()) return new Content("code", "Diff", true);
+    // A block of `key: value` lines is a diagnostics dump, not source.
+    if (!single && keyValueRatio(lines) > 0.5) {
+      return new Content("log", failed ? "Error" : "Log", true);
+    }
+    // Everything below can be confused with writing, so prose wins ties.
+    if (prose > 0.45) return PLAIN;
+    if (!single && codeScore(raw, lines) >= 3) return new Content("code", guessLanguage(raw), true);
+    if (!single && failed) return new Content("log", "Error", true);
+    // Single-line code is real, but the evidence bar is higher — most single-line
+    // notes are just text.
+    if (single && raw.length() > 24 && codeScore(raw, lines) >= 4) {
+      return new Content("code", guessLanguage(raw), true);
+    }
+    return PLAIN;
   }
 
-  /** The URL when the note is nothing but a link, else null. */
-  private static String firstLinkOnly(String raw) {
-    Matcher m = HTTP_LINK.matcher(raw);
-    if (m.find() && m.start() == 0 && m.end() == raw.length()) return raw;
-    Matcher b = BARE_LINK.matcher(raw);
-    if (b.find() && b.start() == 0 && b.end() == raw.length()) return raw;
-    return null;
+  /** Badge for a note that should render monospaced, or null for ordinary text. */
+  private static String monoLabel(String text) {
+    Content c = classify(text);
+    return c.mono ? c.label : null;
   }
 
+  private static boolean isJson(String raw) {
+    String s = raw.trim();
+    if (s.isEmpty() || (s.charAt(0) != '{' && s.charAt(0) != '[')) return false;
+    if (parsesAsJson(s)) return true;
+    // JSON-lines (one object per line) is what most structured logs actually are.
+    String[] ls = s.split("\n");
+    int total = 0, ok = 0;
+    for (String l : ls) {
+      if (l.trim().isEmpty()) continue;
+      total++;
+      if (parsesAsJson(l.trim())) ok++;
+    }
+    return total >= 2 && (double) ok / total > 0.8;
+  }
+
+  private static boolean parsesAsJson(String s) {
+    try {
+      if (s.startsWith("{")) { new JSONObject(s); return true; }
+      if (s.startsWith("[")) { new org.json.JSONArray(s); return true; }
+    } catch (Exception ignored) { }
+    return false;
+  }
+
+  private static final Pattern KV_LINE = Pattern.compile("^\\s*[\\w.$-]+\\s*[:=]\\s*\\S");
+  private static final Pattern KV_TERMINATED = Pattern.compile("[;{},]\\s*$");
+  private static final Pattern KV_CALLISH = Pattern.compile("=>|\\(\\)|\\[\\]|\\breturn\\b");
+  private static final Pattern KV_SENTENCE = Pattern.compile("[.!?]\\s*$");
+
+  /** Fraction of non-empty lines that read as `key: value` / `key=value`. The
+   *  exclusions matter more than the rule: a TypeScript interface body and a
+   *  YAML-ish diagnostics dump look identical until you notice that code lines
+   *  terminate (`;` `,` `{`) and carry call/arrow syntax. */
+  private static double keyValueRatio(String[] lines) {
+    int total = 0, kv = 0;
+    for (String l : lines) {
+      if (l.trim().isEmpty()) continue;
+      total++;
+      if (KV_LINE.matcher(l).find()
+          && !KV_TERMINATED.matcher(l).find()
+          && !KV_CALLISH.matcher(l).find()
+          && !KV_SENTENCE.matcher(l).find()) kv++;
+    }
+    return total == 0 ? 0 : (double) kv / total;
+  }
+
+  /** Language markers, scored highlight.js-style: most distinctive hits win.
+   *  Mirrors LANGUAGES in clipContent.ts. */
+  private static final class Lang {
+    final String label; final Pattern[] hints;
+    Lang(String label, String... regexes) {
+      this.label = label;
+      this.hints = new Pattern[regexes.length];
+      for (int i = 0; i < regexes.length; i++) {
+        this.hints[i] = Pattern.compile(regexes[i], Pattern.MULTILINE | Pattern.CASE_INSENSITIVE);
+      }
+    }
+  }
+  private static final Lang[] LANGUAGES = {
+      new Lang("TypeScript", "\\binterface\\s+\\w+\\s*\\{", ":\\s*(?:string|number|boolean|void|unknown|any)\\b",
+          "\\bexport\\s+(?:type|interface)\\b", "\\bas\\s+const\\b", "<[A-Z]\\w*(?:,\\s*\\w+)*>\\("),
+      new Lang("JavaScript", "\\b(?:const|let)\\s+\\w+\\s*=", "=>\\s*[{(]", "\\bfunction\\s*\\w*\\s*\\(",
+          "\\brequire\\(['\"]", "\\bconsole\\.\\w+\\(", "\\bexport\\s+default\\b"),
+      new Lang("Rust", "\\bfn\\s+\\w+\\s*[(<]", "\\blet\\s+mut\\b", "\\bimpl\\b[^\\n]*\\bfor\\b", "::\\w+",
+          "\\bpub\\s+(?:fn|struct|enum|mod)\\b", "\\bmatch\\s+\\w+\\s*\\{"),
+      new Lang("Java", "\\b(?:public|private|protected)\\s+(?:static\\s+)?(?:final\\s+)?[\\w<>\\[\\]]+\\s+\\w+\\s*\\(",
+          "\\bnew\\s+[A-Z]\\w*\\s*\\(", "\\bimport\\s+(?:java|android|androidx)\\.", "@Override\\b"),
+      new Lang("Kotlin", "\\bfun\\s+\\w+\\s*\\(", "\\bval\\s+\\w+\\s*[:=]", "\\bvar\\s+\\w+\\s*:\\s*\\w+",
+          "\\bcompanion\\s+object\\b"),
+      new Lang("Python", "^\\s*def\\s+\\w+\\s*\\(", "^\\s*from\\s+[\\w.]+\\s+import\\b", "^\\s*import\\s+\\w+$",
+          "\\bself\\.", "\\belif\\b", ":\\s*$"),
+      new Lang("C#", "\\busing\\s+System(?:\\.\\w+)*\\s*;", "\\bnamespace\\s+[\\w.]+", "\\bvar\\s+\\w+\\s*=\\s*new\\b",
+          "\\b(?:public|private|internal|protected)\\s+(?:static\\s+|sealed\\s+|partial\\s+|abstract\\s+)*(?:class|record|struct|interface)\\b",
+          "\\[(?:Serializable|Obsolete|TestMethod|HttpGet|HttpPost|Fact|Theory)\\]",
+          "\\bpublic\\s+[\\w<>\\[\\]?]+\\s+\\w+\\s*\\{\\s*get;\\s*(?:set;|init;)?",
+          "\\bstring\\[\\]\\s+args\\b", "\\basync\\s+Task(?:<[^>]+>)?\\s+\\w+\\s*\\(",
+          "\\bConsole\\.(?:WriteLine|Write|ReadLine)\\s*\\(",
+          "\\?\\?=|=>\\s*\\w+\\s*;|\\bnameof\\s*\\(|\\bIEnumerable<|\\bList<\\w+>\\s+\\w+\\s*="),
+      new Lang("Go", "\\bfunc\\s+\\w*\\s*\\(", "\\bpackage\\s+main\\b", ":=", "\\bimport\\s+\\("),
+      new Lang("SQL", "\\bselect\\b[\\s\\S]*\\bfrom\\b", "\\binsert\\s+into\\b", "\\bcreate\\s+table\\b",
+          "\\bwhere\\b.*\\band\\b"),
+      new Lang("HTML", "</(?:div|span|p|a|body|html|section|button)>", "<!DOCTYPE html>", "<[a-z]+\\s+[\\w-]+=[\"']"),
+      new Lang("CSS", "[.#]?[\\w-]+\\s*\\{[^}]*:[^}]*;[\\s\\S]*\\}", "@media\\b", "--[\\w-]+\\s*:"),
+      new Lang("Shell", "^\\s*#!", "\\$\\{?\\w+\\}?", "\\|\\s*(?:grep|awk|sed|head|tail)\\b",
+          "^\\s*(?:export|source)\\s+\\w+"),
+      new Lang("XML", "<\\?xml\\b", "<manifest\\b", "xmlns:"),
+  };
+
+  /** Highest-scoring language, but only when it wins outright — sibling languages
+   *  share most of their syntax, so a tie falls back to a plain "Code" badge
+   *  rather than naming the wrong language. */
+  private static String guessLanguage(String text) {
+    String bestLabel = null;
+    int best = 0, next = 0;
+    for (Lang lang : LANGUAGES) {
+      int score = 0;
+      for (Pattern p : lang.hints) if (p.matcher(text).find()) score++;
+      if (score > best) { next = best; best = score; bestLabel = lang.label; }
+      else if (score > next) { next = score; }
+    }
+    if (bestLabel == null || best < 2 || next == best) return "Code";
+    return bestLabel;
+  }
+
+  private static final Pattern PROSE_END = Pattern.compile("[.!?,;:]\\s*$");
+
+  /** How much this reads like someone writing to another person. Prose is the
+   *  default for a reason: the history is mostly notes-to-self and pasted chat,
+   *  and a stray "ERROR" or a semicolon must not turn a paragraph into code. */
   private static double proseRatio(String[] lines) {
     int total = 0, prosey = 0;
     for (String l : lines) {
@@ -2559,7 +2837,8 @@ public class ClipboardService extends Service {
       total++;
       int alpha = 0;
       for (String w : l.trim().split("\\s+")) if (w.matches("[A-Za-z][A-Za-z']*")) alpha++;
-      if ((alpha >= 4 && l.matches(".*[.!?,;:]\\s*")) || alpha >= 6) prosey++;
+      // Either a full sentence, or simply a long run of ordinary words.
+      if ((alpha >= 4 && PROSE_END.matcher(l).find()) || alpha >= 6) prosey++;
     }
     return total == 0 ? 0 : (double) prosey / total;
   }
@@ -2574,15 +2853,19 @@ public class ClipboardService extends Service {
     return total == 0 ? 0 : (double) hits / total;
   }
 
+  private static final Pattern DENSE_LINE = Pattern.compile("[{};()\\[\\]=<>]");
+  private static final Pattern INDENTED_LINE = Pattern.compile("^(?:\\s{2,}|\\t)");
+
+  /** Structural evidence that a block is code rather than prose. The denominator
+   *  is every line, blank ones included — same as codeScore in clipContent.ts, and
+   *  the two must agree or a note is a block in one client and prose in the other. */
   private static int codeScore(String raw, String[] lines) {
-    int total = 0, dense = 0, indented = 0;
+    int dense = 0, indented = 0;
     for (String l : lines) {
-      if (l.trim().isEmpty()) continue;
-      total++;
-      if (l.matches(".*[{};()\\[\\]=<>].*")) dense++;
-      if (l.startsWith("  ") || l.startsWith("\t")) indented++;
+      if (DENSE_LINE.matcher(l).find()) dense++;
+      if (INDENTED_LINE.matcher(l).find()) indented++;
     }
-    if (total == 0) return 0;
+    int total = Math.max(1, lines.length);
     double d = (double) dense / total, i = (double) indented / total;
     int score = 0;
     if (d > 0.45) score += 2;
@@ -2603,10 +2886,38 @@ public class ClipboardService extends Service {
   private static String firstHttpLink(String text) {
     if (text == null) return null;
     Matcher m = HTTP_LINK.matcher(text);
-    if (m.find()) return trimLinkTail(m.group());
+    if (m.find()) {
+      String url = trimLinkTail(m.group());
+      if (!looksLikePackageId(url)) return url;
+    }
     Matcher bare = BARE_LINK.matcher(text);
-    if (bare.find()) return "https://" + trimLinkTail(bare.group());
+    while (bare.find()) {
+      String url = "https://" + trimLinkTail(bare.group());
+      if (!looksLikePackageId(url)) return url;
+    }
     return null;
+  }
+
+  /** Reverse-DNS app ids (com.graceandtech.app) are shaped like hosts and end in
+   *  a real TLD. Nothing that starts with a TLD label and carries no path is a
+   *  site worth previewing. Mirrors looksLikePackageId in clipContent.ts. */
+  private static boolean looksLikePackageId(String url) {
+    // Split by hand rather than through Uri: this runs on strings that are only
+    // link-shaped, and it keeps the rule verifiable off-device.
+    String rest = url.replaceFirst("(?i)^https?://", "");
+    int cut = rest.length();
+    for (char c : new char[] {'/', '?', '#'}) {
+      int at = rest.indexOf(c);
+      if (at >= 0 && at < cut) cut = at;
+    }
+    String host = rest.substring(0, cut);
+    String path = rest.substring(cut);
+    if (!path.replaceAll("[/?#]+$", "").isEmpty()) return false;
+    int colon = host.indexOf(':');
+    if (colon >= 0) host = host.substring(0, colon);
+    String[] labels = host.toLowerCase(Locale.US).split("\\.");
+    if (labels.length < 3) return false;
+    return labels[0].matches("(?:" + TLDS + ")");
   }
 
   /** Sentence punctuation is almost never part of the link. */
@@ -2623,6 +2934,235 @@ public class ClipboardService extends Service {
     int n = 0;
     for (int i = 0; i < s.length(); i++) if (s.charAt(i) == c) n++;
     return n;
+  }
+
+  // --- rich text --------------------------------------------------------------
+  // The dock's answer to ClipBody.tsx: prose gets its inline marks and blue
+  // underlined links, code gets tokens coloured, logs get coloured by severity.
+  // Everything is spans on the one body TextView — no nested views, so pooling,
+  // clamping and "Show more" keep working exactly as before.
+
+  private static final int MARK_NONE = 0, MARK_BOLD = 1, MARK_ITALIC = 2, MARK_STRIKE = 3,
+      MARK_CODE = 4, MARK_BULLET = 5, MARK_QUOTE = 6, MARK_LINK = 7;
+
+  // Pasted copy — marketing blurbs, chat exports, meeting notes — carries the
+  // markup people actually type in messaging apps. Rendering `*this*` as literal
+  // asterisks is the difference between a note that reads and one that doesn't.
+  private static final Pattern P_INLINE_CODE = Pattern.compile("`([^`\n]+)`");
+  private static final Pattern P_BOLD = Pattern.compile("(?<![\\w*])\\*(?!\\s)([^*\n]+?)(?<!\\s)\\*(?![\\w*])");
+  private static final Pattern P_ITALIC = Pattern.compile("(?<![\\w_])_(?!\\s)([^_\n]+?)(?<!\\s)_(?![\\w_])");
+  private static final Pattern P_STRIKE = Pattern.compile("(?<![\\w~])~(?!\\s)([^~\n]+?)(?<!\\s)~(?![\\w~])");
+  private static final Pattern P_BULLET = Pattern.compile("^[ \t]*[-*•·][ \t]+", Pattern.MULTILINE);
+  private static final Pattern P_QUOTE = Pattern.compile("^[ \t]*>[ \t]?", Pattern.MULTILINE);
+
+  /** One resolved run of prose: the source span it replaces, plus how to paint it. */
+  private static final class Hit {
+    int start, end, mark;
+    String text, url;
+  }
+
+  /** Prose split into styled runs: links, bold, italic, strike, inline code,
+   *  bullet and quote markers. Deliberately a small fixed set — this is a notes
+   *  dock, not a Markdown renderer, and anything unrecognized stays plain. */
+  private CharSequence buildProse(String text) {
+    ArrayList<Hit> hits = new ArrayList<>();
+    // Code first: whatever is inside backticks is literal, markers included.
+    addMarkHits(hits, text, P_INLINE_CODE, MARK_CODE);
+    addLinkHits(hits, text, HTTP_LINK, false);
+    addLinkHits(hits, text, BARE_LINK, true);
+    addMarkHits(hits, text, P_BOLD, MARK_BOLD);
+    addMarkHits(hits, text, P_ITALIC, MARK_ITALIC);
+    addMarkHits(hits, text, P_STRIKE, MARK_STRIKE);
+    // Markers are normalized so a mixed list of "-", "*" and "•" looks like one
+    // list rather than three, while keeping the original indentation.
+    addMarkerHits(hits, text, P_BULLET, MARK_BULLET, "[-*•·][ \t]+$", "• ");
+    addMarkerHits(hits, text, P_QUOTE, MARK_QUOTE, ">[ \t]?$", "▎ ");
+    if (hits.isEmpty()) return text;
+    java.util.Collections.sort(hits, (a, b) -> a.start - b.start);
+
+    SpannableStringBuilder out = new SpannableStringBuilder();
+    int at = 0;
+    for (Hit h : hits) {
+      if (h.start > at) out.append(text, at, h.start);
+      int from = out.length();
+      out.append(h.text);
+      paintMark(out, from, out.length(), h.mark, h.url);
+      at = h.end;
+    }
+    if (at < text.length()) out.append(text, at, text.length());
+    return out;
+  }
+
+  private static void addMarkHits(ArrayList<Hit> hits, String text, Pattern p, int mark) {
+    Matcher m = p.matcher(text);
+    while (m.find()) {
+      if (m.end() == m.start()) continue;
+      if (overlaps(hits, m.start(), m.end())) continue;
+      Hit h = new Hit();
+      h.start = m.start(); h.end = m.end(); h.mark = mark; h.text = m.group(1);
+      hits.add(h);
+    }
+  }
+
+  /** Line-leading markers: the marker itself is replaced by a normalized glyph. */
+  private static void addMarkerHits(ArrayList<Hit> hits, String text, Pattern p, int mark,
+                                    String tail, String glyph) {
+    Matcher m = p.matcher(text);
+    while (m.find()) {
+      if (m.end() == m.start()) continue;
+      if (overlaps(hits, m.start(), m.end())) continue;
+      Hit h = new Hit();
+      h.start = m.start(); h.end = m.end(); h.mark = mark;
+      h.text = m.group().replaceAll(tail, glyph);
+      hits.add(h);
+    }
+  }
+
+  /** Links claim less than they matched: the sentence's full stop stays plain. */
+  private static void addLinkHits(ArrayList<Hit> hits, String text, Pattern p, boolean bare) {
+    Matcher m = p.matcher(text);
+    while (m.find()) {
+      String shown = trimLinkTail(m.group());
+      if (shown.isEmpty()) continue;
+      String url = bare ? "https://" + shown : shown;
+      if (looksLikePackageId(url)) continue;
+      int end = m.start() + shown.length();
+      if (overlaps(hits, m.start(), end)) continue;
+      Hit h = new Hit();
+      h.start = m.start(); h.end = end; h.mark = MARK_LINK; h.text = shown; h.url = url;
+      hits.add(h);
+    }
+  }
+
+  private static boolean overlaps(ArrayList<Hit> hits, int start, int end) {
+    for (Hit h : hits) if (start < h.end && end > h.start) return true;
+    return false;
+  }
+
+  private void paintMark(SpannableStringBuilder out, int from, int to, int mark, final String url) {
+    int flags = Spanned.SPAN_EXCLUSIVE_EXCLUSIVE;
+    switch (mark) {
+      case MARK_BOLD:
+        out.setSpan(new StyleSpan(Typeface.BOLD), from, to, flags);
+        out.setSpan(new ForegroundColorSpan(0xFFF8FAFC), from, to, flags);
+        break;
+      case MARK_ITALIC:
+        out.setSpan(new StyleSpan(Typeface.ITALIC), from, to, flags);
+        break;
+      case MARK_STRIKE:
+        out.setSpan(new StrikethroughSpan(), from, to, flags);
+        out.setSpan(new ForegroundColorSpan(0xFF94A3B8), from, to, flags);
+        break;
+      case MARK_CODE:
+        out.setSpan(new TypefaceSpan("monospace"), from, to, flags);
+        out.setSpan(new BackgroundColorSpan(0x1FFFFFFF), from, to, flags);
+        out.setSpan(new ForegroundColorSpan(0xFFA5F3FC), from, to, flags);
+        break;
+      case MARK_BULLET:
+        out.setSpan(new ForegroundColorSpan(0xFF7C5CFF), from, to, flags);
+        out.setSpan(new StyleSpan(Typeface.BOLD), from, to, flags);
+        break;
+      case MARK_QUOTE:
+        out.setSpan(new ForegroundColorSpan(0x66FFFFFF), from, to, flags);
+        break;
+      case MARK_LINK:
+        out.setSpan(new ForegroundColorSpan(0xFF38BDF8), from, to, flags);
+        out.setSpan(new UnderlineSpan(), from, to, flags);
+        out.setSpan(new ClickableSpan() {
+          @Override public void onClick(View widget) { openUrl(url); }
+          @Override public void updateDrawState(android.text.TextPaint ds) {
+            ds.setColor(0xFF38BDF8);
+            ds.setUnderlineText(true);
+          }
+        }, from, to, flags);
+        break;
+      default:
+        break;
+    }
+  }
+
+  private void openUrl(String url) {
+    try {
+      startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+    } catch (Exception ignored) { }
+  }
+
+  // Minimal multi-language tokenizer, mirroring tokenizeCode in clipContent.ts. A
+  // real highlighter is far too much weight for a dock; comments / strings /
+  // numbers / keywords cover every language that actually turns up here, and
+  // unknown syntax simply falls through as plain text.
+  private static final Pattern TOKENIZER = Pattern.compile(
+      "(?<comment>//[^\n]*|#[^\n]*|/\\*[\\s\\S]*?\\*/|<!--[\\s\\S]*?-->)"
+      + "|(?<string>\"(?:[^\"\\\\\n]|\\\\.)*\"|'(?:[^'\\\\\n]|\\\\.)*'|`(?:[^`\\\\]|\\\\.)*`)"
+      + "|(?<number>\\b0[xX][0-9a-fA-F]+\\b|\\b\\d+(?:\\.\\d+)?(?:[eE][-+]?\\d+)?\\b)"
+      + "|(?<meta>@[A-Za-z_]\\w*|#\\[[^\\]]*\\])"
+      + "|(?<word>[A-Za-z_$][\\w$]*)"
+      + "|(?<punct>[{}()\\[\\];:,.<>=+\\-*/%!&|^~?]+)");
+  private static final Pattern KEYWORDS = Pattern.compile(
+      "^(?:abstract|any|as|async|await|base|bool|boolean|break|case|catch|char|class|const|constructor|continue|crate"
+      + "|decimal|def|default|delete|do|double|elif|else|enum|event|except|export|extends|extern|false|final|finally"
+      + "|float|fn|for|foreach|from|func|function|get|goto|if|impl|implements|import|in|init|instanceof|int|interface"
+      + "|internal|is|let|lambda|lock|long|match|mod|module|mut|namespace|new|None|not|null|nullptr|number|object"
+      + "|operator|or|out|override|package|params|partial|pass|private|protected|pub|public|raise|readonly|record|ref"
+      + "|return|sealed|self|set|short|static|str|string|struct|super|switch|this|throw|throws|trait|true|try|type"
+      + "|typeof|union|unsafe|use|using|val|var|virtual|void|when|where|while|with|yield)$");
+
+  private static final int TOK_COMMENT = 0x736EE7B7, TOK_STRING = 0xD9FDE68A, TOK_NUMBER = 0xD9FDBA74,
+      TOK_KEYWORD = 0xFFC4B5FD, TOK_PUNCT = 0xFF94A3B8, TOK_META = 0xCC67E8F9;
+
+  /** Source with its tokens coloured. */
+  private static CharSequence buildCode(String text) {
+    SpannableStringBuilder out = new SpannableStringBuilder(text);
+    Matcher m = TOKENIZER.matcher(text);
+    while (m.find()) {
+      int colour;
+      if (m.group("comment") != null) colour = TOK_COMMENT;
+      else if (m.group("string") != null) colour = TOK_STRING;
+      else if (m.group("number") != null) colour = TOK_NUMBER;
+      else if (m.group("meta") != null) colour = TOK_META;
+      else if (m.group("word") != null) {
+        if (!KEYWORDS.matcher(m.group()).matches()) continue;
+        colour = TOK_KEYWORD;
+      } else colour = TOK_PUNCT;
+      out.setSpan(new ForegroundColorSpan(colour), m.start(), m.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+    }
+    return out;
+  }
+
+  private static final Pattern SEV_ERROR =
+      Pattern.compile("\\b\\w*(?:error|exception)\\b|\\b(?:failed|failure|fatal|panicked)\\b|^E/", Pattern.CASE_INSENSITIVE);
+  private static final Pattern SEV_WARN =
+      Pattern.compile("\\b(?:warn|warning|deprecated|W/)\\b", Pattern.CASE_INSENSITIVE);
+  private static final Pattern SEV_INFO = Pattern.compile("^\\s*(?:at\\s|File\\s\"|Caused by:|\\d+\\s*\\|)");
+
+  /** Log lines carry severity rather than syntax; colour by what went wrong. */
+  private static CharSequence buildLog(String text) {
+    SpannableStringBuilder out = new SpannableStringBuilder(text);
+    int at = 0;
+    while (at <= text.length()) {
+      int nl = text.indexOf('\n', at);
+      int end = nl < 0 ? text.length() : nl;
+      String line = text.substring(at, end);
+      int colour = 0;
+      if (SEV_ERROR.matcher(line).find()) colour = 0xFFFDA4AF;
+      else if (SEV_WARN.matcher(line).find()) colour = 0xE6FCD34D;
+      else if (SEV_INFO.matcher(line).find()) colour = 0xFF94A3B8;
+      if (colour != 0 && end > at) {
+        out.setSpan(new ForegroundColorSpan(colour), at, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+      }
+      if (nl < 0) break;
+      at = nl + 1;
+    }
+    return out;
+  }
+
+  /** A shell command is one line by definition — give it the prompt treatment
+   *  rather than a block, so it reads as something you run. */
+  private static CharSequence buildCommand(String text) {
+    SpannableStringBuilder out = new SpannableStringBuilder("$  ");
+    out.setSpan(new ForegroundColorSpan(0xB334D399), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+    out.append(text);
+    return out;
   }
 
   /** Native overlay counterpart to the web link card. OG image wins, then a
@@ -2947,6 +3487,9 @@ public class ClipboardService extends Service {
       }
       folderPickForId = null;
     }
+    // The kinds present move as notes arrive and leave, so the chips are recounted
+    // with the list rather than only when the panel opens.
+    populateTypeStrip();
     ArrayList<ClipEntry> snapshot;
     synchronized (this) {
       snapshot = filteredLocked();
@@ -3081,6 +3624,7 @@ public class ClipboardService extends Service {
     h.linkUrl = null;
     h.linkPreviewOn = false;
     h.monoLabel = null;
+    h.content = null;
     h.expanded = false;
   }
 
@@ -3118,7 +3662,9 @@ public class ClipboardService extends Service {
       return row;
     }
 
-    // Text row.
+    // Text row. Block chrome (the coloured stripe) is the body's own background,
+    // so the row keeps exactly one child before the meta line — which is what
+    // syncLinkCard's insert position depends on.
     final TextView body = new TextView(this);
     body.setTextColor(0xFFF1F5F9);
     body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
@@ -3258,45 +3804,84 @@ public class ClipboardService extends Service {
     });
   }
 
-  /** Set the body text and choose its link behaviour for the current preview mode.
-   *  - Preview ON, or no link: selectable (handles + Android's selection toolbar),
-   *    and the preview card (when on) is the click target.
-   *  - Preview OFF and the note HAS a link: the URL itself becomes tappable
-   *    (Linkify + LinkMovementMethod) so a single tap opens the browser. Selection
-   *    is mutually exclusive with link-clicking, so it's disabled on these rows —
-   *    the explicit Copy button still copies. */
+  /** Accent stripe colour per block kind — the fastest "what is this" signal. */
+  private static int accentFor(String kind) {
+    if ("json".equals(kind)) return 0xFF38BDF8;
+    if ("log".equals(kind)) return 0xFFFB7185;
+    if ("command".equals(kind)) return 0xFF34D399;
+    if ("path".equals(kind)) return 0xFF22D3EE;
+    return 0xFF7C5CFF; // code / diff
+  }
+
+  /** A recessed panel with a coloured stripe down its leading edge. */
+  private Drawable blockBackground(int accent) {
+    GradientDrawable stripe = new GradientDrawable();
+    stripe.setColor(accent & 0x66FFFFFF);
+    stripe.setCornerRadius(dp(9));
+    GradientDrawable fill = new GradientDrawable();
+    fill.setColor(0x3D000000);
+    fill.setCornerRadius(dp(9));
+    LayerDrawable layers = new LayerDrawable(new Drawable[] { stripe, fill });
+    layers.setLayerInset(1, dp(2), 0, 0, 0);
+    return layers;
+  }
+
+  /** Set the body text, styled as whatever the note actually is, and choose its
+   *  link behaviour.
+   *  - Prose keeps its inline formatting and gets blue underlined links.
+   *  - Code / JSON / logs / commands / paths become a monospaced block with a
+   *    coloured stripe, syntax or severity colouring. Lines still wrap — the dock
+   *    is too narrow for horizontal scrolling to be anything but a trap.
+   *  A note that contains a link is tappable rather than selectable (the two are
+   *  mutually exclusive in a TextView); the explicit Copy action still copies. */
   private void configureBody(RowHolder h, String fullText) {
     TextView body = h.body;
     h.linkPreviewOn = dockShowLinkPreviews;
-    boolean tapLink = !dockShowLinkPreviews && h.lastHadLink;
-    body.setText(fullText);
+    Content c = classify(fullText);
+    h.content = c;
+    h.monoLabel = c.mono ? c.label : null;
 
-    // Code, logs, commands and paths read as themselves: monospaced, a size down,
-    // on a slightly recessed panel. Lines still wrap — the dock is too narrow for
-    // horizontal scrolling to be anything but a trap.
-    h.monoLabel = monoLabel(fullText);
-    if (h.monoLabel != null) {
-      body.setTypeface(android.graphics.Typeface.MONOSPACE);
+    if (c.mono) {
+      body.setTypeface(Typeface.MONOSPACE);
       body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
-      body.setTextColor("Error".equals(h.monoLabel) ? 0xFFFECDD3 : 0xFFE2E8F0);
-      GradientDrawable panel = new GradientDrawable();
-      panel.setColor(0x33000000);
-      panel.setCornerRadius(dp(8));
-      body.setBackground(panel);
-      body.setPadding(dp(8), dp(6), dp(8), dp(6));
+      body.setLineSpacing(dp(1), 1f);
+      if ("command".equals(c.kind)) {
+        body.setTextColor(0xFFD1FAE5);
+        body.setText(buildCommand(fullText));
+      } else if ("path".equals(c.kind)) {
+        body.setTextColor(0xFFCFFAFE);
+        body.setText(fullText);
+      } else if ("log".equals(c.kind)) {
+        body.setTextColor(0xFFE2E8F0);
+        body.setText(buildLog(fullText));
+      } else {
+        body.setTextColor(0xFFE2E8F0);
+        body.setText(buildCode(fullText));
+      }
+      // No badge on the block: the meta line directly beneath already reads
+      // "TypeScript · 2h", and a corner badge would either cover the first line of
+      // code or cost every line the width it reserved. The stripe carries the kind.
+      body.setBackground(blockBackground(accentFor(c.kind)));
+      body.setPadding(dp(9), dp(7), dp(9), dp(7));
     } else {
-      body.setTypeface(android.graphics.Typeface.DEFAULT);
-      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-      body.setTextColor(0xFFF1F5F9);
+      // A third of all notes are a single short line — a name, a code, a reminder.
+      // Setting those as a runt paragraph wastes them; at title weight they read as
+      // the label they are, and the list gets a rhythm instead of a grey wall.
+      boolean title = !fullText.contains("\n") && fullText.trim().length() <= 60;
+      body.setTypeface(title ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
+      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, title ? 15f : 13.5f);
+      body.setTextColor(title ? 0xFFF8FAFC : 0xFFE2E8F0);
+      body.setLineSpacing(dp(title ? 1 : 3), 1f);
       body.setBackground(null);
       body.setPadding(0, 0, 0, 0);
+      body.setText(buildProse(fullText));
     }
 
-    if (tapLink) {
-      // setText clears prior Linkify spans; re-apply, then make them clickable.
-      Linkify.addLinks(body, Linkify.WEB_URLS);
+    if (h.lastHadLink && !c.mono) {
+      // The prose builder already made every URL blue, underlined and clickable;
+      // it just needs a movement method to receive the taps. Code blocks keep
+      // selection instead — a URL inside a stack trace is not the point of the row.
       body.setMovementMethod(LinkMovementMethod.getInstance());
-      body.setLinkTextColor(0xFF67E8F9);
       body.setTextIsSelectable(false);
     } else {
       body.setMovementMethod(null);

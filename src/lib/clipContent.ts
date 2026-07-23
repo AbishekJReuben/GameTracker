@@ -43,6 +43,20 @@ const BARE_URL = new RegExp(
   "i",
 );
 
+/**
+ * Reverse-DNS identifiers (`com.graceandtech.app`,
+ * `com.chilloutgames.gametracker.companion`) are shaped exactly like hosts and
+ * end in something that is technically a TLD. Real hosts essentially never
+ * *begin* with a TLD label, so that plus "no path to speak of" separates an app
+ * id from a site. A genuine `in.linkedin.com/in/x` keeps its path and survives.
+ */
+function looksLikePackageId(hostname: string, path: string): boolean {
+  if (path.replace(/\/+$/, "") !== "") return false;
+  const labels = hostname.toLowerCase().split(".");
+  if (labels.length < 3) return false;
+  return new RegExp(`^(?:${TLDS})$`).test(labels[0]);
+}
+
 /** Trailing sentence punctuation is almost never part of the link. */
 function trimUrlTail(raw: string): string {
   let out = raw;
@@ -55,42 +69,99 @@ function trimUrlTail(raw: string): string {
   return out;
 }
 
-/** A run of text, flagged as either a link or ordinary prose. */
-export type TextSegment = { text: string; url?: string };
+/** A run of prose with its inline formatting resolved. */
+export type ProseSegment = {
+  text: string;
+  url?: string;
+  mark?: "bold" | "italic" | "strike" | "code" | "bullet" | "quote";
+};
 
-const SCHEME_URL_G = new RegExp(SCHEME_URL.source, "gi");
-const BARE_URL_G = new RegExp(BARE_URL.source, "gi");
-
-/**
- * Split prose into plain runs and link runs, so a paragraph can render its URLs
- * as real links without the caller resorting to `dangerouslySetInnerHTML`.
- */
-export function linkSegments(text: string): TextSegment[] {
-  const hits: { start: number; end: number; url: string }[] = [];
-  for (const re of [SCHEME_URL_G, BARE_URL_G]) {
+/** Non-overlapping matches, earlier patterns winning ties. */
+function collectMatches(
+  text: string,
+  patterns: {
+    re: RegExp;
+    /** `consumed` shortens the claimed span — a link drops the sentence's full
+     *  stop, which must still be emitted as plain text after it. */
+    take: (m: RegExpExecArray) => { text: string; seg: Omit<ProseSegment, "text">; consumed?: number } | null;
+  }[],
+): { start: number; end: number; seg: ProseSegment }[] {
+  const hits: { start: number; end: number; seg: ProseSegment }[] = [];
+  for (const { re, take } of patterns) {
     re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text))) {
-      const start = m.index;
-      const end = start + m[0].length;
-      // The scheme pass runs first and wins; skip anything it already claimed.
-      if (hits.some((h) => start < h.end && end > h.start)) continue;
-      const url = firstHttpUrl(m[0]);
-      if (url) hits.push({ start, end: start + trimUrlTail(m[0]).length, url });
+      if (m[0].length === 0) {
+        re.lastIndex++;
+        continue;
+      }
+      // Bound outside the closure below — TypeScript can't keep `m` narrowed
+      // through a callback.
+      const match = m;
+      const start = match.index;
+      if (hits.some((h) => start < h.end && start + match[0].length > h.start)) continue;
+      const got = take(match);
+      if (got) hits.push({ start, end: start + (got.consumed ?? match[0].length), seg: { ...got.seg, text: got.text } });
     }
   }
+  return hits.sort((a, b) => a.start - b.start);
+}
+
+function assemble(text: string, hits: { start: number; end: number; seg: ProseSegment }[]): ProseSegment[] {
   if (!hits.length) return [{ text }];
-  hits.sort((a, b) => a.start - b.start);
-  const out: TextSegment[] = [];
+  const out: ProseSegment[] = [];
   let at = 0;
   for (const h of hits) {
     if (h.start > at) out.push({ text: text.slice(at, h.start) });
-    out.push({ text: text.slice(h.start, h.end), url: h.url });
+    out.push(h.seg);
     at = h.end;
   }
   if (at < text.length) out.push({ text: text.slice(at) });
   return out;
 }
+
+// Pasted copy — marketing blurbs, chat exports, meeting notes — carries the
+// markup people actually type in messaging apps. Rendering `*this*` as literal
+// asterisks is the difference between a note that reads and one that doesn't.
+const BOLD = /(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])/g;
+const ITALIC = /(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])/g;
+const STRIKE = /(?<![\w~])~(?!\s)([^~\n]+?)(?<!\s)~(?![\w~])/g;
+const INLINE_CODE = /`([^`\n]+)`/g;
+const BULLET = /^[ \t]*[-*•·][ \t]+/gm;
+const QUOTE = /^[ \t]*>[ \t]?/gm;
+
+/**
+ * Prose split into styled runs: links, `*bold*`, `_italic_`, `~strike~`,
+ * `` `code` ``, bullet markers and quote markers. Deliberately a small, fixed
+ * set — this is a notes list, not a Markdown renderer, and anything it fails to
+ * recognize simply stays plain text.
+ */
+export function proseSegments(text: string): ProseSegment[] {
+  const hits = collectMatches(text, [
+    // Code first: whatever is inside backticks is literal, markers included.
+    { re: INLINE_CODE, take: (m) => ({ text: m[1], seg: { mark: "code" } }) },
+    { re: SCHEME_URL_G, take: (m) => urlHit(m[0]) },
+    { re: BARE_URL_G, take: (m) => urlHit(m[0]) },
+    { re: BOLD, take: (m) => ({ text: m[1], seg: { mark: "bold" } }) },
+    { re: ITALIC, take: (m) => ({ text: m[1], seg: { mark: "italic" } }) },
+    { re: STRIKE, take: (m) => ({ text: m[1], seg: { mark: "strike" } }) },
+    // Markers are normalized so a mixed list of "-", "*" and "•" looks like one
+    // list rather than three, while keeping the original indentation.
+    { re: BULLET, take: (m) => ({ text: m[0].replace(/[-*•·][ \t]+$/, "• "), seg: { mark: "bullet" } }) },
+    { re: QUOTE, take: (m) => ({ text: m[0].replace(/>[ \t]?$/, ""), seg: { mark: "quote" } }) },
+  ]);
+  return assemble(text, hits);
+}
+
+function urlHit(raw: string) {
+  const url = firstHttpUrl(raw);
+  if (!url) return null;
+  const text = trimUrlTail(raw);
+  return { text, seg: { url }, consumed: text.length };
+}
+
+const SCHEME_URL_G = new RegExp(SCHEME_URL.source, "gi");
+const BARE_URL_G = new RegExp(BARE_URL.source, "gi");
 
 /**
  * First link in the text as an absolute URL, accepting bare hosts. Returns null
@@ -98,19 +169,28 @@ export function linkSegments(text: string): TextSegment[] {
  */
 export function firstHttpUrl(text?: string | null): string | null {
   if (!text) return null;
-  const withScheme = text.match(SCHEME_URL)?.[0];
-  const raw = withScheme ?? text.match(BARE_URL)?.[0];
-  if (!raw) return null;
-  const cleaned = trimUrlTail(raw);
-  const candidate = withScheme ? cleaned : `https://${cleaned}`;
-  try {
-    const url = new URL(candidate);
-    // A host with no dot ("https://localhost") is not a real destination here.
-    if (!url.hostname.includes(".")) return null;
-    return url.toString();
-  } catch {
-    return null;
+  // Every candidate is considered, not just the first: a note can name an app id
+  // before it names a real site, and rejecting the id must not hide the link.
+  for (const [re, needsScheme] of [
+    [SCHEME_URL_G, false],
+    [BARE_URL_G, true],
+  ] as const) {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text))) {
+      const cleaned = trimUrlTail(m[0]);
+      try {
+        const url = new URL(needsScheme ? `https://${cleaned}` : cleaned);
+        // A host with no dot ("https://localhost") is not a real destination here.
+        if (!url.hostname.includes(".")) continue;
+        if (looksLikePackageId(url.hostname, url.pathname)) continue;
+        return url.toString();
+      } catch {
+        continue;
+      }
+    }
   }
+  return null;
 }
 
 /* ------------------------------------------------------------- code sniff -- */

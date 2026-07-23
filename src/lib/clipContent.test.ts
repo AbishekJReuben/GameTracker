@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyClip, firstHttpUrl, linkSegments, tokenizeCode } from "./clipContent";
+import { classifyClip, firstHttpUrl, proseSegments, tokenizeCode } from "./clipContent";
 
 describe("firstHttpUrl", () => {
   it("finds a plain http(s) url", () => {
@@ -36,6 +36,62 @@ describe("firstHttpUrl", () => {
 
   it("returns null for ordinary prose", () => {
     expect(firstHttpUrl("Sales filter should also have broadcast filters.")).toBeNull();
+  });
+
+  it("ignores reverse-DNS app identifiers", () => {
+    for (const s of [
+      "com.graceandtech.app",
+      "https://com.graceandtech.app/",
+      "com.chilloutgames.gametracker.companion",
+      "io.sentry.android.core",
+    ]) {
+      expect(firstHttpUrl(s), s).toBeNull();
+    }
+  });
+
+  it("still accepts a real host that happens to start with a TLD label", () => {
+    expect(firstHttpUrl("in.linkedin.com/in/someone")).toBe("https://in.linkedin.com/in/someone");
+  });
+});
+
+describe("proseSegments", () => {
+  it("renders messaging-style markup as marks", () => {
+    const segs = proseSegments("*MGP Sensate* is _really_ nice, ~not~ `npm run dev`");
+    const marks = segs.filter((s) => s.mark).map((s) => [s.mark, s.text]);
+    expect(marks).toEqual([
+      ["bold", "MGP Sensate"],
+      ["italic", "really"],
+      ["strike", "not"],
+      ["code", "npm run dev"],
+    ]);
+  });
+
+  it("normalizes bullet markers", () => {
+    const segs = proseSegments("- one\n* two\n• three");
+    expect(segs.filter((s) => s.mark === "bullet")).toHaveLength(3);
+    expect(segs.filter((s) => s.mark === "bullet").every((s) => s.text.endsWith("• "))).toBe(true);
+  });
+
+  it("leaves markup alone inside inline code", () => {
+    const segs = proseSegments("run `git commit -m *wip*` now");
+    expect(segs.find((s) => s.mark === "code")?.text).toBe("git commit -m *wip*");
+    expect(segs.some((s) => s.mark === "bold")).toBe(false);
+  });
+
+  it("does not treat arithmetic or separators as markup", () => {
+    for (const s of ["2 * 3 * 4", "a_b_c", "x ~ y", "5*6"]) {
+      expect(proseSegments(s).some((seg) => seg.mark && seg.mark !== "bullet"), s).toBe(false);
+    }
+  });
+
+  it("still linkifies inside formatted prose", () => {
+    const segs = proseSegments("*see* https://offbrand.gg/devs/ now");
+    expect(segs.find((s) => s.url)?.url).toBe("https://offbrand.gg/devs/");
+  });
+
+  it("keeps plain text intact", () => {
+    const s = "nothing special here at all";
+    expect(proseSegments(s)).toEqual([{ text: s }]);
   });
 });
 
@@ -154,20 +210,20 @@ describe("classifyClip", () => {
   });
 });
 
-describe("linkSegments", () => {
+describe("link splitting", () => {
   it("returns one plain segment when there is no link", () => {
-    expect(linkSegments("just some prose")).toEqual([{ text: "just some prose" }]);
+    expect(proseSegments("just some prose")).toEqual([{ text: "just some prose" }]);
   });
 
   it("splits a link out of a sentence and keeps the punctuation outside it", () => {
-    const segs = linkSegments("check https://github.com/x/y. thanks");
+    const segs = proseSegments("check https://github.com/x/y. thanks");
     expect(segs.map((s) => s.text).join("")).toBe("check https://github.com/x/y. thanks");
     expect(segs.filter((s) => s.url)).toHaveLength(1);
     expect(segs.find((s) => s.url)?.text).toBe("https://github.com/x/y");
   });
 
   it("handles several links, bare and schemed", () => {
-    const segs = linkSegments("see amazon.in/dp/B077TQRPZS and https://offbrand.gg/devs/ too");
+    const segs = proseSegments("see amazon.in/dp/B077TQRPZS and https://offbrand.gg/devs/ too");
     const links = segs.filter((s) => s.url);
     expect(links).toHaveLength(2);
     expect(links[0].url).toBe("https://amazon.in/dp/B077TQRPZS");
@@ -176,12 +232,12 @@ describe("linkSegments", () => {
 
   it("never loses or duplicates text", () => {
     for (const s of ["a github.com/x b amazon.in c", "https://a.com https://b.com", "no links here", ""]) {
-      expect(linkSegments(s).map((x) => x.text).join(""), s).toBe(s);
+      expect(proseSegments(s).map((x) => x.text).join(""), s).toBe(s);
     }
   });
 
   it("does not linkify a version number mid-sentence", () => {
-    expect(linkSegments("bumped to 3.9.81 today").filter((s) => s.url)).toHaveLength(0);
+    expect(proseSegments("bumped to 3.9.81 today").filter((s) => s.url)).toHaveLength(0);
   });
 });
 
