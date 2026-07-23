@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { motion } from "motion/react";
 import { Search, NotebookPen, Tag } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useClipboard, visibleClips, type ClipFilter } from "@/store/clipboard";
@@ -57,6 +58,15 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Narrowing to a tag (or a search term) has to reach past the pages already in
+  // memory, otherwise a tag whose notes are older than the first page looks empty.
+  // Debounced so typing a query doesn't fire a paging run per keystroke.
+  useEffect(() => {
+    const t = window.setTimeout(() => void s.ensureMatches(), s.search ? 250 : 0);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.tagFilter, s.filter, s.search]);
+
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
       <Composer
@@ -85,6 +95,9 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
         {pinned.length === 0 && rest.length === 0 && !s.loading ? (
           <EmptyState icon={<NotebookPen className="h-6 w-6" />} title="Nothing here yet" message="Copy anything or jot a note above. Add as many tags as you need and it syncs everywhere." />
         ) : (
+          // Keyed on the active filter so switching tags crossfades the list
+          // instead of hard-cutting between two unrelated sets of rows.
+          <motion.div key={`${s.tagFilter ?? "all"}·${s.filter}`} initial={{ opacity: 0.35 }} animate={{ opacity: 1 }} transition={{ duration: 0.18, ease: "easeOut" }}>
           <ClipboardList
             pinned={pinned} rest={rest} loading={s.loading} hasMore={s.hasMore}
             onCopy={s.copy} onDelete={s.remove} onTogglePin={s.togglePin}
@@ -92,6 +105,7 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
             onSetTags={(id, tags) => void s.setTags(id, tags)} knownTags={s.tags}
             onLoadMore={s.loadMore} compact={compact} showHistory={!compact}
           />
+          </motion.div>
         )}
       </div>
     </div>

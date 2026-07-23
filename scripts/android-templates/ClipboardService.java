@@ -192,6 +192,8 @@ public class ClipboardService extends Service {
   // requests so refreshes cannot create endless loading requests.
   private final HashMap<String, LinkPreviewInfo> linkPreviewCache = new HashMap<>();
   private final HashSet<String> linkPreviewLoading = new HashSet<>();
+  /** Decoded card artwork by image URL, so re-binding a row never re-downloads. */
+  private final HashMap<String, Bitmap> linkArtCache = new HashMap<>();
   // Native voice capture (dock mic).
   private MediaRecorder recorder;
   private File audioFile;
@@ -266,8 +268,12 @@ public class ClipboardService extends Service {
     final String description;
     final String image;
     final String host;
-    LinkPreviewInfo(String title, String description, String image, String host) {
-      this.title = title; this.description = description; this.image = image; this.host = host;
+    /** True when {@link #image} came from og:image/twitter:image (or a known
+     *  provider thumbnail) and therefore deserves the full-width hero slot. A
+     *  favicon is not artwork — it goes in the small slot beside the title. */
+    final boolean hero;
+    LinkPreviewInfo(String title, String description, String image, String host, boolean hero) {
+      this.title = title; this.description = description; this.image = image; this.host = host; this.hero = hero;
     }
   }
 
@@ -1860,6 +1866,10 @@ public class ClipboardService extends Service {
       dockShowLinkPreviews = !dockShowLinkPreviews;
       getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE).edit()
           .putBoolean("dockShowLinkPreviews", dockShowLinkPreviews).apply();
+      // The header is built once per panel open, so the label has to follow the
+      // state here — otherwise it keeps saying "Preview on" with previews off.
+      previews.setText(dockShowLinkPreviews ? "Preview on" : "Preview off");
+      previews.setTextColor(dockShowLinkPreviews ? 0xFF67E8F9 : 0xFF64748B);
       refreshPanelIfOpen();
     });
     header.addView(previews, new LinearLayout.LayoutParams(dp(72), dp(30)));
@@ -2471,45 +2481,178 @@ public class ClipboardService extends Service {
    *  Reuses the link cache + loading guard, so re-adding a card for the same url
    *  (row rebound) is instant and never re-fetches. */
   private View buildLinkCard(final String url) {
-    final TextView card = new TextView(this);
-    card.setText("Loading link preview…");
-    card.setTextColor(0xFFBAE6FD);
-    card.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-    card.setMaxLines(3);
-    card.setPadding(dp(9), dp(7), dp(9), dp(7));
-    GradientDrawable bg = new GradientDrawable(); bg.setColor(0x1638BDF8); bg.setCornerRadius(dp(9)); card.setBackground(bg);
+    final LinearLayout card = new LinearLayout(this);
+    card.setOrientation(LinearLayout.VERTICAL);
+    GradientDrawable bg = new GradientDrawable(); bg.setColor(0x1638BDF8); bg.setCornerRadius(dp(11)); card.setBackground(bg);
+    card.setClipToOutline(true); // so the hero image's top corners follow the card
     card.setOnClickListener((v) -> { try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); } catch (Exception ignored) {} });
+
+    // Full-bleed artwork. Hidden until a real og:image lands — a card that
+    // reserves space for artwork it never gets just looks broken.
+    final ImageView hero = new ImageView(this);
+    hero.setScaleType(ImageView.ScaleType.CENTER_CROP);
+    hero.setVisibility(View.GONE);
+    card.addView(hero, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(150)));
+
+    final LinearLayout text = new LinearLayout(this);
+    text.setOrientation(LinearLayout.VERTICAL);
+    text.setPadding(dp(10), dp(8), dp(10), dp(9));
+    card.addView(text, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+    final TextView site = new TextView(this);
+    site.setTextColor(0xFF67E8F9);
+    site.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+    site.setTypeface(site.getTypeface(), android.graphics.Typeface.BOLD);
+    site.setMaxLines(1);
+    site.setEllipsize(android.text.TextUtils.TruncateAt.END);
+    site.setCompoundDrawablePadding(dp(5));
+    text.addView(site);
+
+    final TextView title = new TextView(this);
+    title.setTextColor(0xFFF1F5F9);
+    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+    title.setMaxLines(2);
+    title.setEllipsize(android.text.TextUtils.TruncateAt.END);
+    title.setPadding(0, dp(1), 0, 0);
+    text.addView(title);
+
+    final TextView desc = new TextView(this);
+    desc.setTextColor(0xFF94A3B8);
+    desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+    desc.setMaxLines(2);
+    desc.setEllipsize(android.text.TextUtils.TruncateAt.END);
+    desc.setVisibility(View.GONE);
+    text.addView(desc);
+
     LinkPreviewInfo cached;
     synchronized (this) { cached = linkPreviewCache.get(url); }
-    if (cached != null) {
-      card.setText(cached.title + (cached.description.isEmpty() ? "" : "\n" + cached.description) + "\n" + cached.host);
-      fetchLinkArt(cached.image == null ? "https://www.google.com/s2/favicons?domain=" + Uri.encode(cached.host) + "&sz=128" : cached.image, card);
-      return card;
-    }
+    if (cached != null) { applyLinkCard(cached, hero, site, title, desc); return card; }
+
+    site.setText(hostForLink(url));
+    title.setText("Loading preview…");
     synchronized (this) {
-      // A row can be rebound while the same preview is loading. Show a stable
-      // domain card instead of starting another request (or showing a stuck spinner).
-      if (!linkPreviewLoading.add(url)) { card.setText(hostForLink(url)); return card; }
+      // A row can be rebound while the same preview is loading. Leave the stable
+      // domain card in place instead of starting a second identical request.
+      if (!linkPreviewLoading.add(url)) return card;
     }
     new Thread(() -> {
-      String title = null, description = null, image = null;
-      try (Response response = previewHttp().newCall(new Request.Builder().url(url)
-          .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Safari/537.36")
-          .header("Accept", "text/html,application/xhtml+xml").build()).execute()) {
-        String page = readPreviewHtml(response);
-        title = htmlMeta(page, "og:title"); description = htmlMeta(page, "og:description"); image = htmlMeta(page, "og:image");
-        if (image == null) image = htmlMeta(page, "twitter:image");
-        if (title == null) title = htmlMeta(page, "twitter:title");
-        if (description == null) description = htmlMeta(page, "twitter:description");
-      } catch (Exception ignored) {}
-      final String host; try { host = Uri.parse(url).getHost(); } catch (Exception e) { main.post(() -> { synchronized (this) { linkPreviewLoading.remove(url); } card.setText(url); }); return; }
-      final String t = title == null || title.trim().isEmpty() ? (host == null ? hostForLink(url) : host) : title.trim();
-      final String d = description == null ? "" : description.trim();
-      final String art = image == null ? null : absoluteLink(url, image);
-      final LinkPreviewInfo info = new LinkPreviewInfo(t, d, art, host == null ? hostForLink(url) : host);
-      main.post(() -> { synchronized (this) { linkPreviewLoading.remove(url); linkPreviewCache.put(url, info); } card.setText(info.title + (info.description.isEmpty() ? "" : "\n" + info.description) + "\n" + info.host); fetchLinkArt(info.image == null ? "https://www.google.com/s2/favicons?domain=" + Uri.encode(info.host) + "&sz=128" : info.image, card); });
+      LinkPreviewInfo resolved = resolvePreview(url);
+      main.post(() -> {
+        synchronized (this) { linkPreviewLoading.remove(url); linkPreviewCache.put(url, resolved); }
+        applyLinkCard(resolved, hero, site, title, desc);
+      });
     }, "gt-link-preview").start();
     return card;
+  }
+
+  /** Paint resolved metadata into a card's children (main thread). */
+  private void applyLinkCard(LinkPreviewInfo info, ImageView hero, TextView site, TextView title, TextView desc) {
+    site.setText(info.host);
+    title.setText(info.title);
+    if (info.description.isEmpty()) {
+      desc.setVisibility(View.GONE);
+    } else {
+      desc.setText(info.description);
+      desc.setVisibility(View.VISIBLE);
+    }
+    if (info.image != null && info.hero) {
+      fetchLinkArt(info.image, hero);
+    } else {
+      // No artwork: keep the hero hidden and mark the site line with the favicon.
+      hero.setVisibility(View.GONE);
+      fetchFavicon("https://www.google.com/s2/favicons?domain=" + Uri.encode(info.host) + "&sz=64", site);
+    }
+  }
+
+  /** Resolve a URL's card metadata off the main thread. YouTube is special-cased
+   *  through oEmbed: the watch page serves a consent stub to non-browser clients,
+   *  and the thumbnail is derivable from the video id with no request at all. */
+  private LinkPreviewInfo resolvePreview(String url) {
+    String host = hostForLink(url);
+    String videoId = youTubeId(url);
+    if (videoId != null) {
+      LinkPreviewInfo yt = youTubePreview(url, videoId);
+      if (yt != null) return yt;
+    }
+    String title = null, description = null, image = null;
+    try (Response response = previewHttp().newCall(new Request.Builder().url(url)
+        .header("User-Agent", PREVIEW_UA)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept", "text/html,application/xhtml+xml").build()).execute()) {
+      String page = readPreviewHtml(response);
+      title = htmlMeta(page, "og:title"); description = htmlMeta(page, "og:description"); image = htmlMeta(page, "og:image");
+      if (image == null) image = htmlMeta(page, "og:image:url");
+      if (image == null) image = htmlMeta(page, "twitter:image");
+      if (title == null) title = htmlMeta(page, "twitter:title");
+      if (title == null) title = htmlTitleTag(page);
+      if (description == null) description = htmlMeta(page, "twitter:description");
+      if (description == null) description = htmlMeta(page, "description");
+    } catch (Exception ignored) {}
+    try { String h = Uri.parse(url).getHost(); if (h != null && !h.isEmpty()) host = h.startsWith("www.") ? h.substring(4) : h; } catch (Exception ignored) {}
+    String t = title == null || title.trim().isEmpty() ? host : title.trim();
+    String d = description == null ? "" : description.trim();
+    String art = image == null ? null : absoluteLink(url, image);
+    return new LinkPreviewInfo(clampPreviewText(t, 120), clampPreviewText(d, 200), art, host, art != null);
+  }
+
+  private static final String PREVIEW_UA =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+  private static String clampPreviewText(String value, int max) {
+    if (value == null) return "";
+    String flat = value.replace('\n', ' ').replace('\r', ' ').trim();
+    return flat.length() <= max ? flat : flat.substring(0, max - 1).trim() + "…";
+  }
+
+  /** Video id for a watch/shorts/embed/youtu.be URL, else null. */
+  private static String youTubeId(String url) {
+    try {
+      Uri uri = Uri.parse(url);
+      String host = uri.getHost();
+      if (host == null) return null;
+      host = host.toLowerCase(Locale.US);
+      if (host.equals("youtu.be")) {
+        String path = uri.getPath();
+        String id = path == null ? "" : path.replace("/", "");
+        return id.isEmpty() ? null : id;
+      }
+      if (!host.endsWith("youtube.com") && !host.endsWith("youtube-nocookie.com")) return null;
+      String v = uri.getQueryParameter("v");
+      if (v != null && !v.isEmpty()) return v;
+      String path = uri.getPath();
+      if (path == null) return null;
+      Matcher m = Pattern.compile("/(?:shorts|embed|live|v)/([A-Za-z0-9_-]{6,})").matcher(path);
+      return m.find() ? m.group(1) : null;
+    } catch (Exception ignored) { return null; }
+  }
+
+  /** Title + channel from oEmbed (no API key, no quota); artwork from the id. */
+  private LinkPreviewInfo youTubePreview(String url, String videoId) {
+    String art = "https://i.ytimg.com/vi/" + videoId + "/maxresdefault.jpg";
+    try (Response response = previewHttp().newCall(new Request.Builder()
+        .url("https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch?v=" + Uri.encode(videoId))
+        .header("User-Agent", PREVIEW_UA).build()).execute()) {
+      if (response.isSuccessful() && response.body() != null) {
+        String json = response.body().string();
+        String title = jsonString(json, "title");
+        String author = jsonString(json, "author_name");
+        if (title != null && !title.isEmpty()) {
+          return new LinkPreviewInfo(clampPreviewText(title, 120), author == null ? "" : author, art, "YouTube", true);
+        }
+      }
+    } catch (Exception ignored) {}
+    // oEmbed unreachable (offline, or the video is private): the thumbnail URL is
+    // still derivable, so show artwork rather than falling all the way back.
+    return new LinkPreviewInfo(hostForLink(url), "", art, "YouTube", true);
+  }
+
+  /** Minimal string-field reader for the flat oEmbed payload. */
+  private static String jsonString(String json, String key) {
+    if (json == null) return null;
+    Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(json);
+    if (!m.find()) return null;
+    return m.group(1).replace("\\\"", "\"").replace("\\/", "/").replace("\\n", " ").replace("\\\\", "\\");
   }
 
   private OkHttpClient previewHttp() { return http.newBuilder().callTimeout(8, TimeUnit.SECONDS).connectTimeout(5, TimeUnit.SECONDS).readTimeout(6, TimeUnit.SECONDS).followRedirects(true).followSslRedirects(true).build(); }
@@ -2536,21 +2679,97 @@ public class ClipboardService extends Service {
     return m.find() ? m.group(2) : null;
   }
 
-  private void fetchLinkArt(String url, TextView card) {
+  /** Load a card's hero artwork. YouTube's maxresdefault 404s on older uploads,
+   *  so a miss silently retries hqdefault, which every video has. Decoded bitmaps
+   *  are cached by URL — a dock rebuild must not re-download the same thumbnail. */
+  private void fetchLinkArt(final String url, final ImageView hero) {
     if (url == null || url.isEmpty()) return;
+    Bitmap cached;
+    synchronized (this) { cached = linkArtCache.get(url); }
+    if (cached != null) { hero.setImageBitmap(cached); hero.setVisibility(View.VISIBLE); return; }
     new Thread(() -> {
-      Bitmap bmp = null;
-      try (Response response = previewHttp().newCall(new Request.Builder().url(url).build()).execute()) {
-        if (response.isSuccessful() && response.body() != null) bmp = decodeThumb(response.body().bytes());
-      } catch (Exception ignored) {}
+      Bitmap bmp = loadPreviewBitmap(url);
+      if (bmp == null && url.endsWith("/maxresdefault.jpg")) {
+        bmp = loadPreviewBitmap(url.replace("/maxresdefault.jpg", "/hqdefault.jpg"));
+      }
       final Bitmap art = bmp;
-      if (art != null) main.post(() -> {
-        BitmapDrawable d = new BitmapDrawable(getResources(), art);
-        d.setBounds(0, 0, dp(52), dp(52));
-        card.setCompoundDrawables(d, null, null, null);
-        card.setCompoundDrawablePadding(dp(8));
+      if (art == null) return;
+      main.post(() -> {
+        cacheLinkArt(url, art);
+        hero.setImageBitmap(art);
+        hero.setVisibility(View.VISIBLE);
       });
     }, "gt-link-art").start();
+  }
+
+  /** Small site mark drawn inline with the host label when there is no artwork. */
+  private void fetchFavicon(final String url, final TextView site) {
+    if (url == null || url.isEmpty()) return;
+    Bitmap cached;
+    synchronized (this) { cached = linkArtCache.get(url); }
+    if (cached != null) { applyFavicon(cached, site); return; }
+    new Thread(() -> {
+      final Bitmap icon = loadPreviewBitmap(url);
+      if (icon == null) return;
+      main.post(() -> {
+        cacheLinkArt(url, icon);
+        applyFavicon(icon, site);
+      });
+    }, "gt-link-icon").start();
+  }
+
+  private void applyFavicon(Bitmap icon, TextView site) {
+    BitmapDrawable d = new BitmapDrawable(getResources(), icon);
+    d.setBounds(0, 0, dp(13), dp(13));
+    site.setCompoundDrawables(d, null, null, null);
+  }
+
+  /** Card artwork spans the row's full width, so it needs more resolution than a
+   *  list thumbnail — decoding it at THUMB_MAX_PX would visibly blur the hero. */
+  private static final int CARD_ART_MAX_PX = 640;
+  private static final int LINK_ART_CACHE_MAX = 12;
+
+  private static Bitmap decodeCardArt(byte[] raw) {
+    try {
+      BitmapFactory.Options bounds = new BitmapFactory.Options();
+      bounds.inJustDecodeBounds = true;
+      BitmapFactory.decodeByteArray(raw, 0, raw.length, bounds);
+      int sample = 1;
+      int longest = Math.max(bounds.outWidth, bounds.outHeight);
+      while (longest / sample > CARD_ART_MAX_PX) sample *= 2;
+      BitmapFactory.Options opts = new BitmapFactory.Options();
+      opts.inSampleSize = sample;
+      return BitmapFactory.decodeByteArray(raw, 0, raw.length, opts);
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  /** Bounded insert — full-size artwork is far heavier than a row thumbnail, so
+   *  the cache drops its oldest entry rather than growing with history length. */
+  private synchronized void cacheLinkArt(String url, Bitmap art) {
+    if (linkArtCache.size() >= LINK_ART_CACHE_MAX && !linkArtCache.containsKey(url)) {
+      java.util.Iterator<String> it = linkArtCache.keySet().iterator();
+      if (it.hasNext()) { it.next(); it.remove(); }
+    }
+    linkArtCache.put(url, art);
+  }
+
+  private Bitmap loadPreviewBitmap(String url) {
+    try (Response response = previewHttp().newCall(new Request.Builder().url(url)
+        .header("User-Agent", PREVIEW_UA).build()).execute()) {
+      if (response.isSuccessful() && response.body() != null) return decodeCardArt(response.body().bytes());
+    } catch (Exception ignored) {}
+    return null;
+  }
+
+  /** Last-resort title when a page publishes no card metadata at all. */
+  private static String htmlTitleTag(String html) {
+    if (html == null) return null;
+    Matcher m = Pattern.compile("<title[^>]*>(.*?)</title>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(html);
+    if (!m.find()) return null;
+    String value = m.group(1).replace("&amp;", "&").replace("&#39;", "'").replace("&quot;", "\"").trim();
+    return value.isEmpty() ? null : value;
   }
 
   /** Populate the list with the matching items (search + kind filter), rendering
@@ -2812,6 +3031,9 @@ public class ClipboardService extends Service {
   private void bindRow(View row, final ClipEntry e, long now) {
     final RowHolder h = (RowHolder) row.getTag();
     h.entry = e;
+    // Every row buildRow() produces is a vertical LinearLayout; the parameter is
+    // typed View only because the pools and liveRows map hold plain Views.
+    final LinearLayout box = (LinearLayout) row;
 
     // --- background (pinned stroke / pending-delete tint) ---------------------
     GradientDrawable bg = (GradientDrawable) row.getBackground();
@@ -2844,7 +3066,7 @@ public class ClipboardService extends Service {
     }
 
     // --- link preview card (only when previews are ON) ------------------------
-    syncLinkCard(h, row, fullText);
+    syncLinkCard(h, box, fullText);
 
     // --- meta + actions -------------------------------------------------------
     bindMetaActionsRow(h.metaRow, h, relativeTime(e.createdAtMs, now));
@@ -2852,16 +3074,16 @@ public class ClipboardService extends Service {
     // --- show more / less -----------------------------------------------------
     final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
     if (longText) {
-      if (h.expand.getParent() != row) {
-        row.addView(h.expand, new LinearLayout.LayoutParams(
+      if (h.expand.getParent() != box) {
+        box.addView(h.expand, new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, dp(30)));
       }
       // Reflect the entry's current expanded state.
       h.body.setMaxLines(h.expanded ? Integer.MAX_VALUE : COLLAPSED_LINES);
       h.body.setEllipsize(h.expanded ? null : android.text.TextUtils.TruncateAt.END);
       h.expand.setText(h.expanded ? "Show less  ↑" : "Show more  ↓");
-    } else if (h.expand.getParent() == row) {
-      row.removeView(h.expand);
+    } else if (h.expand.getParent() == box) {
+      box.removeView(h.expand);
       h.expanded = false;
     }
   }

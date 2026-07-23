@@ -212,6 +212,9 @@ export function ClipRow({
   const [confirming, setConfirming] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
+  // Images only earn a "View" affordance when expanding would actually reveal
+  // more pixels — a 90px-tall screenshot already shows everything it has.
+  const [imageCanGrow, setImageCanGrow] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
   const [tagsOpen, setTagsOpen] = useState(false);
   const [datesOpen, setDatesOpen] = useState(false);
@@ -246,7 +249,23 @@ export function ClipRow({
     if (el) setClamped(el.scrollHeight - el.clientHeight > 2);
   }, [item.text, isImage, expanded, compact]);
 
-  const canExpand = isImage || clamped || expanded;
+  // Collapsed image cap, matching the max-h-32 below (Tailwind 8rem).
+  const COLLAPSED_IMAGE_PX = 128;
+
+  /** True when the image, laid out at the row's width, would be taller collapsed
+   *  than the cap allows — i.e. there is genuinely something to expand into. */
+  const measureImage = (el: HTMLImageElement) => {
+    if (!el.naturalWidth || !el.naturalHeight) return;
+    const boxWidth = el.parentElement?.clientWidth || el.clientWidth;
+    const width = Math.min(el.naturalWidth, boxWidth);
+    const height = (width * el.naturalHeight) / el.naturalWidth;
+    // Expanding must also have somewhere to go: in a short panel the expanded cap
+    // (52vh) can be no bigger than the collapsed one, and "View" would do nothing.
+    const room = window.innerHeight * 0.52 > COLLAPSED_IMAGE_PX + 8;
+    setImageCanGrow(height > COLLAPSED_IMAGE_PX + 4 && room);
+  };
+
+  const canExpand = (isImage ? imageCanGrow : clamped) || expanded;
 
   return (
     <motion.div
@@ -267,6 +286,7 @@ export function ClipRow({
           <img
             src={(expanded ? full : thumb) ?? undefined}
             loading="lazy"
+            onLoad={(e) => measureImage(e.currentTarget)}
             className={cn(
               "w-auto max-w-full rounded-lg border border-white/10 object-contain transition-all",
               expanded ? "max-h-[52vh]" : "max-h-32",

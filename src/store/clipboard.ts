@@ -27,6 +27,8 @@ interface ClipStore {
   load: () => Promise<void>;
   loadMore: () => Promise<void>;
   refresh: () => Promise<void>;
+  /** Page deeper until the active filters have something to show. */
+  ensureMatches: () => Promise<void>;
 
   addText: (text: string) => Promise<void>;
   addImage: (imageBase64: string, mime?: string) => Promise<void>;
@@ -79,6 +81,27 @@ export const useClipboard = create<ClipStore>((set, get) => ({
       set({ items: merged, hasMore: more.length >= PAGE, loading: false });
     } catch {
       set({ loading: false });
+    }
+  },
+
+  // Filters run over the pages already in memory, so picking a tag whose notes
+  // live deeper in history would show an empty list until the user had scrolled
+  // all the way there under "All". The scroll sentinel can't rescue it either:
+  // it fires on an intersection *change*, so a short filtered list loads exactly
+  // one extra page and then stalls. Page forward here until the filter has a
+  // screenful (or history runs out) — `loading` stays true throughout, so the
+  // panel shows its skeletons instead of a false "nothing here".
+  ensureMatches: async () => {
+    const TARGET = 12;
+    const MAX_PAGES = 25; // ~1000 notes; a bound so an unmatched tag can't spin
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const s = get();
+      if (!s.hasMore || s.loading) return;
+      const { pinned, rest } = visibleClips(s);
+      if (pinned.length + rest.length >= TARGET) return;
+      const before = s.items.length;
+      await get().loadMore();
+      if (get().items.length === before) return; // no progress — stop
     }
   },
 

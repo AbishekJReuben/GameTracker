@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "motion/react";
 import { NotebookPen, X } from "lucide-react";
+import { cn } from "@/lib/cn";
 import { clip } from "@/lib/clip";
 import { useClipboard } from "@/store/clipboard";
 import { ClipboardPanel } from "./ClipboardPanel";
@@ -13,6 +14,12 @@ const BUBBLE = 76;
 const PANEL_W = 380;
 const PANEL_H = 560;
 const SIZE_KEY = "gt.clip.overlaySize";
+const MIN_W = 300;
+const MAX_W = 900;
+const MIN_H = 360;
+const MAX_H = 1200;
+const clampW = (w: number) => Math.max(MIN_W, Math.min(Math.round(w), MAX_W));
+const clampH = (h: number) => Math.max(MIN_H, Math.min(Math.round(h), MAX_H));
 
 /** Last user-chosen expanded size (logical px), clamped to something sane. */
 function savedPanelSize(): { w: number; h: number } {
@@ -20,9 +27,7 @@ function savedPanelSize(): { w: number; h: number } {
     const raw = localStorage.getItem(SIZE_KEY);
     if (raw) {
       const [w, h] = raw.split(",").map((n) => Math.round(Number(n)));
-      if (Number.isFinite(w) && Number.isFinite(h)) {
-        return { w: Math.max(300, Math.min(w, 900)), h: Math.max(360, Math.min(h, 1200)) };
-      }
+      if (Number.isFinite(w) && Number.isFinite(h)) return { w: clampW(w), h: clampH(h) };
     }
   } catch {
     /* ignore */
@@ -78,6 +83,66 @@ function useWindowDrag(onTap?: () => void) {
   );
 
   return { onPointerDown, onPointerMove, onPointerUp };
+}
+
+/** In-window resize grips.
+ *
+ *  The overlay is `decorations: false`, so Windows gives it no non-client area —
+ *  there is no OS border to drag and `setResizable(true)` alone is invisible to
+ *  the user. These handles do the resize in the WebView instead: the top-left
+ *  corner stays put (matching the expand morph's origin), so only the size
+ *  changes and the window never needs repositioning. */
+function ResizeGrips({ onCommit }: { onCommit: (w: number, h: number) => void }) {
+  const st = useRef<{ sx: number; sy: number; w: number; h: number; edge: string } | null>(null);
+
+  const begin = (edge: string) => async (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    const win = getCurrentWindow();
+    const [size, sf] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+    st.current = { sx: e.screenX, sy: e.screenY, w: size.width / sf, h: size.height / sf, edge };
+  };
+
+  const move = (e: React.PointerEvent) => {
+    const s = st.current;
+    if (!s) return;
+    // screenX/Y are CSS pixels, the same unit as LogicalSize — no scaling needed.
+    const w = s.edge.includes("e") ? clampW(s.w + (e.screenX - s.sx)) : clampW(s.w);
+    const h = s.edge.includes("s") ? clampH(s.h + (e.screenY - s.sy)) : clampH(s.h);
+    void getCurrentWindow().setSize(new LogicalSize(w, h));
+  };
+
+  const end = async (e: React.PointerEvent) => {
+    if (!st.current) return;
+    st.current = null;
+    (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+    const win = getCurrentWindow();
+    const [size, sf] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+    onCommit(Math.round(size.width / sf), Math.round(size.height / sf));
+  };
+
+  const grip = (edge: string, className: string, cursor: string) => (
+    <div
+      key={edge}
+      onPointerDown={begin(edge)}
+      onPointerMove={move}
+      onPointerUp={end}
+      onPointerCancel={end}
+      className={cn("absolute z-20", className)}
+      style={{ cursor, touchAction: "none" }}
+    />
+  );
+
+  return (
+    <>
+      {grip("e", "right-0 top-3 bottom-6 w-1.5", "ew-resize")}
+      {grip("s", "bottom-0 left-3 right-6 h-1.5", "ns-resize")}
+      {grip("se", "bottom-0 right-0 h-4 w-4", "nwse-resize")}
+      {/* Corner tick — the only visible hint that the panel can be dragged bigger. */}
+      <div className="pointer-events-none absolute bottom-1 right-1 z-10 h-2.5 w-2.5 rounded-br-[5px] border-b-2 border-r-2 border-white/25" />
+    </>
+  );
 }
 
 export default function ClipboardOverlay() {
@@ -289,6 +354,15 @@ export default function ClipboardOverlay() {
             <div className="min-h-0 flex-1 p-2.5">
               <ClipboardPanel compact sttEnabled={sttEnabled} draftKey="gt.clip.draft.overlay" />
             </div>
+            <ResizeGrips
+              onCommit={(w, h) => {
+                try {
+                  localStorage.setItem(SIZE_KEY, `${w},${h}`);
+                } catch {
+                  /* ignore */
+                }
+              }}
+            />
           </motion.div>
         ) : (
           <motion.button
