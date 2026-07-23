@@ -346,15 +346,43 @@ function measure(el: HTMLElement | null, natW: number, natH: number): Layout | n
 }
 
 /**
- * Clamp pan so the scaled image stays inside the viewport.
- * At zoom ≤ 1 (image fits / letterboxes) pan is forced to 0 — otherwise a stale
- * pan from a taller pre-keyboard layout can shove the stream off the top.
+ * Pixels of an element's bottom edge that the soft keyboard is sitting on top of.
+ *
+ * Two Android layouts exist and both must work: when the IME *resizes* the page
+ * (adjustResize / `interactive-widget=resizes-content`) the element already ends
+ * at the keyboard, so this is 0. When the IME merely *covers* the page (pan mode,
+ * Quest browser, OEM WebViews that ignore the resize request) the element's rect
+ * still runs underneath the keyboard — every edge/pan calculation must then treat
+ * the top of the keyboard as the bottom edge instead of the element's own bottom.
  */
-function clampPan(l: Layout, zoom: number, panX: number, panY: number) {
-  if (zoom <= 1.001) return { x: 0, y: 0 };
+function imeOverlap(el: HTMLElement | null): number {
+  const vv = window.visualViewport;
+  if (!el || !vv) return 0;
+  // Only a real keyboard counts — sub-100px deltas are address bar / rounding noise.
+  if (window.innerHeight - vv.height <= 100) return 0;
+  const r = el.getBoundingClientRect();
+  if (r.height < 2) return 0;
+  return clamp(r.bottom - (vv.offsetTop + vv.height), 0, r.height);
+}
+
+/**
+ * Clamp pan so the scaled image stays inside the *visible* part of the viewport.
+ * `kb` is the keyboard overlap (see `imeOverlap`): the usable band is the top
+ * `l.ch - kb` px, so the neutral offset shifts up by kb/2 to recentre the stream
+ * above the keyboard instead of leaving half of it hidden underneath.
+ * With no keyboard and zoom ≤ 1 (image fits / letterboxes) pan is forced to 0 —
+ * otherwise a stale pan from a taller pre-keyboard layout shoves the stream off the top.
+ */
+function clampPan(l: Layout, zoom: number, panX: number, panY: number, kb = 0) {
+  if (zoom <= 1.001 && kb <= 0) return { x: 0, y: 0 };
+  const vh = Math.max(1, l.ch - kb);
   const maxX = Math.max(0, (l.dispW * zoom - l.cw) / 2);
-  const maxY = Math.max(0, (l.dispH * zoom - l.ch) / 2);
-  return { x: clamp(panX, -maxX, maxX), y: clamp(panY, -maxY, maxY) };
+  const spanY = Math.max(0, (l.dispH * zoom - vh) / 2);
+  const centreY = -kb / 2; // move the image up into the visible band
+  return {
+    x: clamp(panX, -maxX, maxX),
+    y: clamp(panY, centreY - spanY, centreY + spanY),
+  };
 }
 
 /**
@@ -1916,8 +1944,13 @@ export function ControlScreen({
       const l = measure(viewportRef.current, natRef.current.w, natRef.current.h);
       if (l) {
         layoutRef.current = l;
-        const next = clampPan(l, zoomRef.current, panRef.current.x, panRef.current.y);
-        if (next.x !== panRef.current.x || next.y !== panRef.current.y) {
+        // Re-run the follow first: as the keyboard opens this slides the view up
+        // so the cursor stays above it, and as it closes the shrinking overlap
+        // lets the clamp below settle the stream back to its resting offset.
+        const prev = { ...panRef.current };
+        followCursor(l);
+        const next = clampPan(l, zoomRef.current, panRef.current.x, panRef.current.y, imeOverlap(viewportRef.current));
+        if (next.x !== prev.x || next.y !== prev.y) {
           panRef.current = next;
           setPan({ ...next });
         }
@@ -2101,23 +2134,34 @@ export function ControlScreen({
     return v ?? c;
   };
 
+  /** Keyboard overlap of the screen viewport, in px (0 when the IME resizes the page). */
+  const viewportIme = () => imeOverlap(viewportRef.current);
+
+  /**
+   * Pan-follow: keep the remote cursor comfortably inside the *visible* band.
+   * The bottom bound is the top of the soft keyboard when one is up, so the
+   * cursor is never left underneath it; with no keyboard this is the old
+   * zoomed-in edge follow, unchanged.
+   */
+  const followCursor = (l: Layout | null) => {
+    const media = mediaEl();
+    const kb = viewportIme();
+    if (!l || !media || (zoomRef.current <= 1.01 && kb <= 0)) return;
+    const s = normToViewport(viewportRef.current, media, cursorRef.current.x, cursorRef.current.y);
+    if (!s) return;
+    const bottom = Math.max(FOLLOW_MARGIN, l.ch - kb);
+    let px = panRef.current.x;
+    let py = panRef.current.y;
+    if (s.x < FOLLOW_MARGIN) px += FOLLOW_MARGIN - s.x;
+    else if (s.x > l.cw - FOLLOW_MARGIN) px -= s.x - (l.cw - FOLLOW_MARGIN);
+    if (s.y < FOLLOW_MARGIN) py += FOLLOW_MARGIN - s.y;
+    else if (s.y > bottom - FOLLOW_MARGIN) py -= s.y - (bottom - FOLLOW_MARGIN);
+    panRef.current = clampPan(l, zoomRef.current, px, py, kb);
+  };
+
   const setCursorPos = (nx: number, ny: number) => {
     cursorRef.current = { x: clamp(nx, 0, 1), y: clamp(ny, 0, 1) };
-    // Edge pan-follow (zoomed in): keep the cursor comfortably inside the viewport.
-    const l = liveLayout();
-    const media = mediaEl();
-    if (l && media && zoomRef.current > 1.01) {
-      const s = normToViewport(viewportRef.current, media, cursorRef.current.x, cursorRef.current.y);
-      if (s) {
-        let px = panRef.current.x;
-        let py = panRef.current.y;
-        if (s.x < FOLLOW_MARGIN) px += FOLLOW_MARGIN - s.x;
-        else if (s.x > l.cw - FOLLOW_MARGIN) px -= s.x - (l.cw - FOLLOW_MARGIN);
-        if (s.y < FOLLOW_MARGIN) py += FOLLOW_MARGIN - s.y;
-        else if (s.y > l.ch - FOLLOW_MARGIN) py -= s.y - (l.ch - FOLLOW_MARGIN);
-        panRef.current = clampPan(l, zoomRef.current, px, py);
-      }
-    }
+    followCursor(liveLayout());
     commitView();
     queueMove(cursorRef.current.x, cursorRef.current.y);
   };
@@ -2127,20 +2171,7 @@ export function ControlScreen({
   const followHostCursor = (nx: number, ny: number) => {
     if (pts.current.size > 0) return; // local touch owns the cursor mid-gesture
     cursorRef.current = { x: clamp(nx, 0, 1), y: clamp(ny, 0, 1) };
-    const l = liveLayout();
-    const media = mediaEl();
-    if (l && media && zoomRef.current > 1.01) {
-      const s = normToViewport(viewportRef.current, media, cursorRef.current.x, cursorRef.current.y);
-      if (s) {
-        let px = panRef.current.x;
-        let py = panRef.current.y;
-        if (s.x < FOLLOW_MARGIN) px += FOLLOW_MARGIN - s.x;
-        else if (s.x > l.cw - FOLLOW_MARGIN) px -= s.x - (l.cw - FOLLOW_MARGIN);
-        if (s.y < FOLLOW_MARGIN) py += FOLLOW_MARGIN - s.y;
-        else if (s.y > l.ch - FOLLOW_MARGIN) py -= s.y - (l.ch - FOLLOW_MARGIN);
-        panRef.current = clampPan(l, zoomRef.current, px, py);
-      }
-    }
+    followCursor(liveLayout());
     commitView();
   };
 
@@ -2155,13 +2186,16 @@ export function ControlScreen({
     const px = focalX - l.cw / 2 - (fpx - l.cw / 2) * z1;
     const py = focalY - l.ch / 2 - (fpy - l.ch / 2) * z1;
     zoomRef.current = z1;
-    panRef.current = clampPan(l, z1, px, py);
+    panRef.current = clampPan(l, z1, px, py, viewportIme());
     commitView();
   };
 
   const resetView = () => {
     zoomRef.current = 1;
-    panRef.current = { x: 0, y: 0 };
+    // Not a bare {0,0}: with the keyboard up the neutral pan is shifted up so the
+    // stream sits in the visible band rather than half-buried under the IME.
+    const l = liveLayout();
+    panRef.current = l ? clampPan(l, 1, 0, 0, viewportIme()) : { x: 0, y: 0 };
     commitView();
   };
 
@@ -2204,6 +2238,10 @@ export function ControlScreen({
     // stationary tap or long-press that merely happens to land near an edge.
     const panning = gesture.current === "dragging" || maxMove.current > TAP_SLOP;
     if (panning) {
+      // With the soft keyboard up the finger can never reach the element's own
+      // bottom — the keyboard is in the way — so the edge zone must sit at the
+      // top of the keyboard instead, or the bottom edge simply stops working.
+      const h = Math.max(EDGE_MARGIN * 2, r.height - imeOverlap(viewportRef.current));
       const fx = fingerPos.current.x - r.left;
       const fy = fingerPos.current.y - r.top;
       let vx = 0;
@@ -2211,7 +2249,7 @@ export function ControlScreen({
       if (fx < EDGE_MARGIN) vx = -(EDGE_MARGIN - fx) / EDGE_MARGIN;
       else if (fx > r.width - EDGE_MARGIN) vx = (fx - (r.width - EDGE_MARGIN)) / EDGE_MARGIN;
       if (fy < EDGE_MARGIN) vy = -(EDGE_MARGIN - fy) / EDGE_MARGIN;
-      else if (fy > r.height - EDGE_MARGIN) vy = (fy - (r.height - EDGE_MARGIN)) / EDGE_MARGIN;
+      else if (fy > h - EDGE_MARGIN) vy = Math.min(1, (fy - (h - EDGE_MARGIN)) / EDGE_MARGIN);
       if (vx !== 0 || vy !== 0) {
         // Ease-in on depth so the edge feels gentle near the boundary, fast at the rim.
         setCursorPos(cursorRef.current.x + vx * Math.abs(vx) * EDGE_SPEED, cursorRef.current.y + vy * Math.abs(vy) * EDGE_SPEED);
