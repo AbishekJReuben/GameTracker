@@ -304,6 +304,7 @@ public class ClipboardService extends Service {
     String kind;          // "text" | "image" — fixed at build, survives pooling
     ClipEntry entry; // null while pooled
     TextView body;        // text rows only
+    android.widget.HorizontalScrollView bodyScroll; // code stays unwrapped and pans horizontally
     Content content;      // what the body currently is (drives chrome + type chips)
     ImageView image;      // image rows only
     LinearLayout metaRow;
@@ -3662,9 +3663,16 @@ public class ClipboardService extends Service {
       return row;
     }
 
-    // Text row. Block chrome (the coloured stripe) is the body's own background,
-    // so the row keeps exactly one child before the meta line — which is what
-    // syncLinkCard's insert position depends on.
+    // Text row. The body always lives in one HorizontalScrollView: prose fills
+    // the viewport and wraps normally, while code switches its child to
+    // WRAP_CONTENT and disables wrapping so long source lines pan horizontally.
+    // The scroller remains the row's one child before meta, preserving the link
+    // card's fixed insertion position.
+    final android.widget.HorizontalScrollView bodyScroll =
+        new android.widget.HorizontalScrollView(this);
+    bodyScroll.setFillViewport(true);
+    bodyScroll.setHorizontalScrollBarEnabled(false);
+    bodyScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
     final TextView body = new TextView(this);
     body.setTextColor(0xFFF1F5F9);
     body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
@@ -3673,7 +3681,12 @@ public class ClipboardService extends Service {
     body.setLineSpacing(dp(1), 1f);
     body.setTextIsSelectable(true); // default for non-link notes; configureBody flips it off for link notes
     h.body = body;
-    row.addView(body);
+    h.bodyScroll = bodyScroll;
+    bodyScroll.addView(body, new android.widget.HorizontalScrollView.LayoutParams(
+        android.widget.HorizontalScrollView.LayoutParams.MATCH_PARENT,
+        android.widget.HorizontalScrollView.LayoutParams.WRAP_CONTENT));
+    row.addView(bodyScroll, new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
     h.metaRow = buildMetaActionsRowForHolder(h, "text");
     row.addView(h.metaRow);
     final TextView expand = new TextView(this);
@@ -3829,9 +3842,9 @@ public class ClipboardService extends Service {
   /** Set the body text, styled as whatever the note actually is, and choose its
    *  link behaviour.
    *  - Prose keeps its inline formatting and gets blue underlined links.
-   *  - Code / JSON / logs / commands / paths become a monospaced block with a
-   *    coloured stripe, syntax or severity colouring. Lines still wrap — the dock
-   *    is too narrow for horizontal scrolling to be anything but a trap.
+   *  - Code / JSON / logs / commands / paths become a monospaced, non-wrapping
+   *    block with a coloured stripe, syntax/severity colouring and horizontal
+   *    scrolling — the same behavior as the desktop Notes view.
    *  A note that contains a link is tappable rather than selectable (the two are
    *  mutually exclusive in a TextView); the explicit Copy action still copies. */
   private void configureBody(RowHolder h, String fullText) {
@@ -3842,6 +3855,15 @@ public class ClipboardService extends Service {
     h.monoLabel = c.mono ? c.label : null;
 
     if (c.mono) {
+      body.setHorizontallyScrolling(true);
+      if (h.bodyScroll != null) {
+        h.bodyScroll.setFillViewport(true);
+        h.bodyScroll.setHorizontalScrollBarEnabled(true);
+        h.bodyScroll.scrollTo(0, 0);
+      }
+      body.setLayoutParams(new android.widget.HorizontalScrollView.LayoutParams(
+          android.widget.HorizontalScrollView.LayoutParams.WRAP_CONTENT,
+          android.widget.HorizontalScrollView.LayoutParams.WRAP_CONTENT));
       body.setTypeface(Typeface.MONOSPACE);
       body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
       body.setLineSpacing(dp(1), 1f);
@@ -3864,6 +3886,14 @@ public class ClipboardService extends Service {
       body.setBackground(blockBackground(accentFor(c.kind)));
       body.setPadding(dp(9), dp(7), dp(9), dp(7));
     } else {
+      body.setHorizontallyScrolling(false);
+      if (h.bodyScroll != null) {
+        h.bodyScroll.setHorizontalScrollBarEnabled(false);
+        h.bodyScroll.scrollTo(0, 0);
+      }
+      body.setLayoutParams(new android.widget.HorizontalScrollView.LayoutParams(
+          android.widget.HorizontalScrollView.LayoutParams.MATCH_PARENT,
+          android.widget.HorizontalScrollView.LayoutParams.WRAP_CONTENT));
       // A third of all notes are a single short line — a name, a code, a reminder.
       // Setting those as a runt paragraph wastes them; at title weight they read as
       // the label they are, and the list gets a rhythm instead of a grey wall.

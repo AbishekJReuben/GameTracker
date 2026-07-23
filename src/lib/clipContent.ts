@@ -171,11 +171,16 @@ export function firstHttpUrl(text?: string | null): string | null {
   if (!text) return null;
   // Every candidate is considered, not just the first: a note can name an app id
   // before it names a real site, and rejecting the id must not hide the link.
+  //
+  // These MUST be fresh regexes. `proseSegments` calls this helper while it is
+  // already iterating SCHEME_URL_G / BARE_URL_G; reusing those same global
+  // RegExp instances here mutates the outer loop's `lastIndex`. A rejected
+  // package id resets it to zero and makes the outer loop visit that same text
+  // forever, locking the Notes route and the overlay WebView.
   for (const [re, needsScheme] of [
-    [SCHEME_URL_G, false],
-    [BARE_URL_G, true],
+    [new RegExp(SCHEME_URL.source, "gi"), false],
+    [new RegExp(BARE_URL.source, "gi"), true],
   ] as const) {
-    re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text))) {
       const cleaned = trimUrlTail(m[0]);

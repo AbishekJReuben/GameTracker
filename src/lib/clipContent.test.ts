@@ -55,6 +55,24 @@ describe("firstHttpUrl", () => {
 });
 
 describe("proseSegments", () => {
+  it("does not loop or linkify reverse-DNS identifiers", () => {
+    for (const s of [
+      "com.graceandtech.app",
+      "package com.chilloutgames.gametracker.companion",
+      "https://com.graceandtech.app/",
+    ]) {
+      expect(proseSegments(s), s).toEqual([{ text: s }]);
+    }
+  });
+
+  it("continues to a real link after a reverse-DNS identifier", () => {
+    const segs = proseSegments("package com.graceandtech.app docs at https://example.com/help");
+    expect(segs.map((seg) => seg.text).join("")).toBe(
+      "package com.graceandtech.app docs at https://example.com/help",
+    );
+    expect(segs.filter((seg) => seg.url).map((seg) => seg.url)).toEqual(["https://example.com/help"]);
+  });
+
   it("renders messaging-style markup as marks", () => {
     const segs = proseSegments("*MGP Sensate* is _really_ nice, ~not~ `npm run dev`");
     const marks = segs.filter((s) => s.mark).map((s) => [s.mark, s.text]);

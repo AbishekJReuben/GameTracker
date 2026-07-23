@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -20,6 +20,7 @@ const MIN_H = 360;
 const MAX_H = 1200;
 const clampW = (w: number) => Math.max(MIN_W, Math.min(Math.round(w), MAX_W));
 const clampH = (h: number) => Math.max(MIN_H, Math.min(Math.round(h), MAX_H));
+const SCREEN_GUTTER = 8;
 
 /** Last user-chosen expanded size (logical px), clamped to something sane. */
 function savedPanelSize(): { w: number; h: number } {
@@ -230,30 +231,90 @@ export default function ClipboardOverlay() {
   // the REAL current size first — the expanded panel is user-resizable now, so
   // the starting size can't be assumed.
   const animRef = useRef<number | null>(null);
+  const animRunRef = useRef(0);
+  const animResolveRef = useRef<(() => void) | null>(null);
   const tweenSize = useCallback(async (toW: number, toH: number, ms: number) => {
+    const run = ++animRunRef.current;
     if (animRef.current != null) cancelAnimationFrame(animRef.current);
+    animResolveRef.current?.();
     const win = getCurrentWindow();
     const [cur, sf] = await Promise.all([win.innerSize(), win.scaleFactor()]);
     const fromW = cur.width / sf;
     const fromH = cur.height / sf;
     return new Promise<void>((resolve) => {
+      animResolveRef.current = resolve;
       const start = performance.now();
       const ease = (t: number) => 1 - Math.pow(1 - t, 3); // easeOutCubic
-      const step = (now: number) => {
+      const finish = () => {
+        if (run !== animRunRef.current) return;
+        animRef.current = null;
+        animResolveRef.current = null;
+        resolve();
+      };
+      const step = async (now: number) => {
+        if (run !== animRunRef.current) {
+          resolve();
+          return;
+        }
         const t = Math.min(1, (now - start) / ms);
         const k = ease(t);
         const w = Math.round(fromW + (toW - fromW) * k);
         const h = Math.round(fromH + (toH - fromH) * k);
-        void win.setSize(new LogicalSize(w, h));
+        // Keep one resize command in flight at a time. Flooding WebView2 with
+        // un-awaited setSize calls lets late intermediate sizes win, leaving the
+        // panel visibly half-open on Windows.
+        await win.setSize(new LogicalSize(w, h)).catch(() => {});
+        if (run !== animRunRef.current) {
+          resolve();
+          return;
+        }
         if (t < 1) {
           animRef.current = requestAnimationFrame(step);
         } else {
-          animRef.current = null;
-          resolve();
+          // Land on the exact target even when the final animation frame was
+          // delayed or rounded.
+          await win.setSize(new LogicalSize(toW, toH)).catch(() => {});
+          finish();
         }
       };
       animRef.current = requestAnimationFrame(step);
     });
+  }, []);
+
+  /** Keep the expanded panel wholly inside the current monitor's work area.
+   *  The bubble is allowed against an edge; a 380x560 panel anchored to that
+   *  same point is not, or its right/bottom half opens off-screen. */
+  const fitExpandedPanel = useCallback(async (wantedW: number, wantedH: number) => {
+    const win = getCurrentWindow();
+    const [monitor, pos, windowScale] = await Promise.all([
+      currentMonitor(),
+      win.outerPosition(),
+      win.scaleFactor(),
+    ]);
+    if (!monitor) return { w: wantedW, h: wantedH };
+
+    const scale = monitor.scaleFactor || windowScale;
+    const area = monitor.workArea;
+    const gutter = Math.round(SCREEN_GUTTER * scale);
+    const maxW = Math.max(1, area.size.width - gutter * 2);
+    const maxH = Math.max(1, area.size.height - gutter * 2);
+    const w = Math.min(wantedW, Math.floor(maxW / scale));
+    const h = Math.min(wantedH, Math.floor(maxH / scale));
+    const widthPx = Math.round(w * scale);
+    const heightPx = Math.round(h * scale);
+    const x = Math.max(
+      area.position.x + gutter,
+      Math.min(pos.x, area.position.x + area.size.width - widthPx - gutter),
+    );
+    const y = Math.max(
+      area.position.y + gutter,
+      Math.min(pos.y, area.position.y + area.size.height - heightPx - gutter),
+    );
+    if (x !== pos.x || y !== pos.y) {
+      await win.setPosition(new PhysicalPosition(x, y)).catch(() => {});
+      void clip.overlaySetPos(x / scale, y / scale).catch(() => {});
+    }
+    return { w, h };
   }, []);
 
   // The bubble must never grow OS resize grips; only the expanded panel is
@@ -267,11 +328,16 @@ export default function ClipboardOverlay() {
     // fallback for items that arrived while collapsed (the always-on listener
     // above also refreshes, but this guarantees a fresh view on open).
     void useClipboard.getState().refresh();
+    const saved = savedPanelSize();
+    const { w, h } = await fitExpandedPanel(saved.w, saved.h).catch(() => saved);
     setExpanded(true);
-    const { w, h } = savedPanelSize();
-    await tweenSize(w, h, 260);
-    await getCurrentWindow().setResizable(true).catch(() => {});
-  }, [tweenSize]);
+    const win = getCurrentWindow();
+    await tweenSize(w, h, 260).catch(() => {});
+    // Monitor queries or an animation frame can fail during display/DPI changes;
+    // the interaction still has one non-negotiable outcome: a fully open panel.
+    await win.setSize(new LogicalSize(w, h)).catch(() => {});
+    await win.setResizable(true).catch(() => {});
+  }, [fitExpandedPanel, tweenSize]);
 
   const collapse = useCallback(async () => {
     // Remember the size the user left the panel at (they can drag OS edges).
@@ -290,7 +356,10 @@ export default function ClipboardOverlay() {
   }, [tweenSize]);
 
   useEffect(() => () => {
+    animRunRef.current++;
     if (animRef.current != null) cancelAnimationFrame(animRef.current);
+    animResolveRef.current?.();
+    animResolveRef.current = null;
   }, []);
 
   const bubbleDrag = useWindowDrag(expand);
