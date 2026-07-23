@@ -1258,3 +1258,31 @@ per-row copy/edit/folder/pin/share/delete.
   (pad on the inner side) — a big, easy hit/swipe target that still looks slim.
   All pin geometry now goes through those constants (drag clamp, flip, position).
 
+### Notes dock: tappable links when preview is off + view recycling (do not regress)
+
+- **Links are clickable even when "Preview off"** (`ClipboardService.configureBody`).
+  The preview toggle used to gate the ONLY clickable target (`buildLinkCard`, added
+  under the body when previews are on). When off there was nothing — and the body's
+  `setTextIsSelectable(true)` also swallowed taps, so links in the text never opened.
+  Now: a note whose body contains an `http(s)://` link is rendered with
+  `Linkify.addLinks(body, WEB_URLS)` + `LinkMovementMethod` + `setLinkTextColor` when
+  previews are OFF — a single tap on the URL opens the browser. Selection mode
+  (`setTextIsSelectable`) is mutually exclusive with link-clicking, so it's disabled
+  on those link rows (the explicit **Copy** button still copies); non-link notes keep
+  selection exactly as before. Preview ON is unchanged (selectable body + clickable card).
+  Don't re-enable `setTextIsSelectable` on a link body — it re-breaks link taps.
+- **History rows are recycled, not re-inflated** (`renderList`/`buildRow`/`bindRow`).
+  Every refresh used to `removeAllViews()` + rebuild ~10 Views × 30 rows (~300
+  allocations, immediately GC'd) — the lag during relay catch-up / thumb decode /
+  pin-delete. Now a `RowHolder` (stored as the row's tag) caches the child views; a
+  `HashMap<String,View> liveRows` (id → row) keeps built rows across refreshes and
+  two per-kind pools (`poolText`/`poolImage`, capped `ROW_POOL_MAX`) absorb detached
+  ones. **Listeners are wired ONCE in `buildRow` and read `holder.entry` at click
+  time** — never rebind lambdas, never capture a stale entry. `bindRow` only touches
+  what moved (body text gated by `lastBody`, link card reconciled by `linkUrl` +
+  `linkPreviewOn`, meta label gated by `lastMeta`). `rowKindOf` reads the holder's
+  fixed `kind` field (NOT `entry`, which is nulled during recycling — that mis-pooled
+  image rows into the text pool). `recycleAllRows` runs on `hidePanel` so the next
+  open reuses rows. Density is cached once (`dp()`) instead of per call. Don't revert
+  to `removeAllViews`+rebuild or to entry-capturing per-bind listeners.
+

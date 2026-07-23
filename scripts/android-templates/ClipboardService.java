@@ -30,6 +30,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.IBinder;
 import android.os.SystemClock;
+import android.text.method.LinkMovementMethod;
+import android.text.util.Linkify;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -125,6 +127,20 @@ public class ClipboardService extends Service {
   private View panel;
   private LinearLayout panelList; // the row container inside the panel's ScrollView
   private ScrollView dockScroll;
+  // ---- view recycling for the history list -----------------------------------
+  // The dock used to removeAllViews() + re-inflate every visible row on every
+  // refresh (relay notices, thumbnail decode, pin/delete toggles…) — ~10 Views
+  // per row × ~30 rendered rows per refresh, immediately GC'd. That churn was
+  // the lag. Rows are now built once and REBOUND: liveRows keeps the row View
+  // (and its RowHolder tag) for every id currently on screen; on a refresh we
+  // detach survivors, drop the rest into per-kind pools, then re-add survivors
+  // in order and pull fresh rows from the pools only for genuinely new ids.
+  // listeners are wired once in buildRow and read holder.entry at click time, so
+  // a rebind never allocates a lambda.
+  private final HashMap<String, View> liveRows = new HashMap<>();
+  private final ArrayList<View> poolText = new ArrayList<>();
+  private final ArrayList<View> poolImage = new ArrayList<>();
+  private static final int ROW_POOL_MAX = 24;
   private TextView panelStatusText; // status label in floating panel header
   private boolean socketConnected;
   private WindowManager.LayoutParams panelLp;
@@ -140,9 +156,10 @@ public class ClipboardService extends Service {
   private final Runnable renderPanel = () -> {
     panelRefreshQueued = false;
     if (panel != null && panelList != null) {
-      // A full row rebuild is intentionally deferred until a fling settles. It
-      // keeps the compositor's scroll path free even while a relay catch-up or
-      // image thumbnail completion is arriving in the background.
+      // A render is deferred until a fling settles so the compositor's scroll
+      // path stays free even while a relay catch-up or image thumbnail lands in
+      // the background. (renderList now recycles rows rather than rebuilding
+      // them all, but re-adding/detaching during a fling still costs layout.)
       long sinceScroll = SystemClock.uptimeMillis() - lastDockScrollAt;
       if (sinceScroll < 180) {
         panelRefreshQueued = false;
@@ -252,6 +269,29 @@ public class ClipboardService extends Service {
     LinkPreviewInfo(String title, String description, String image, String host) {
       this.title = title; this.description = description; this.image = image; this.host = host;
     }
+  }
+
+  /** Cached handles to a row's child views + the entry it currently shows, plus
+   *  the bits bindRow needs to decide whether to touch a child (so a refresh that
+   *  didn't change the body text, say, skips setText entirely). Stored as the
+   *  row's tag so a pooled row keeps its holder for its whole life. */
+  static final class RowHolder {
+    String kind;          // "text" | "image" — fixed at build, survives pooling
+    ClipEntry entry; // null while pooled
+    TextView body;        // text rows only
+    ImageView image;      // image rows only
+    LinearLayout metaRow;
+    TextView meta;        // tags + relative time (left of the action buttons)
+    TextView expand;      // text rows only (null when never long)
+    View linkCard;        // the preview card, when one is attached
+    Button pinBtn;        // rebind updates glyph + colour
+    Button folderBtn;     // rebind updates colour
+    String linkUrl;       // url the current linkCard shows ("" = none)
+    boolean linkPreviewOn;// dockShowLinkPreviews at last bind (card reconciles on change)
+    String lastBody;      // body text last bound (skip re-setText/Linkify when unchanged)
+    boolean lastHadLink;  // whether lastBody had an http link (drives configureBody)
+    String lastMeta;      // meta text last bound (skip re-setText when unchanged)
+    boolean expanded;     // current Show more/less state
   }
   private final ArrayList<ClipEntry> items = new ArrayList<>();
 
@@ -1365,9 +1405,13 @@ public class ClipboardService extends Service {
         .build();
   }
 
+  // Density captured once at first use; getResources().getDisplayMetrics() is a
+  // lookup the dock called ~100x per render. Density never changes for a live
+  // service (we don't support config changes on the overlay), so cache it.
+  private float density = -1f;
   private int dp(float v) {
-    DisplayMetrics m = getResources().getDisplayMetrics();
-    return Math.round(v * m.density);
+    if (density < 0f) density = getResources().getDisplayMetrics().density;
+    return Math.round(v * density);
   }
 
   // ---- edge pin -------------------------------------------------------------
@@ -2342,6 +2386,9 @@ public class ClipboardService extends Service {
     folderPickForId = null;
     panelRefreshQueued = false;
     main.removeCallbacks(renderPanel);
+    // Return built rows to their pools (capped) so the next open reuses them
+    // instead of rebuilding — the panel View tree is about to leave the WindowManager.
+    recycleAllRows();
     final boolean right = pinOnRight;
     // Fall back to the laid-out width if getWidth() is 0 (rapid open→close before
     // a layout pass) — a 0 slide would just alpha-blink instead of sliding out.
@@ -2419,8 +2466,11 @@ public class ClipboardService extends Service {
   }
 
   /** Native overlay counterpart to the web link card. OG image wins, then a
-   * Twitter-card image, then the site's favicon. The card itself opens the URL. */
-  private void addLinkPreview(LinearLayout parent, final String url) {
+   *  Twitter-card image, then the site's favicon. Returns the card View (the
+   *  caller inserts it into the row); the card itself opens the URL on tap.
+   *  Reuses the link cache + loading guard, so re-adding a card for the same url
+   *  (row rebound) is instant and never re-fetches. */
+  private View buildLinkCard(final String url) {
     final TextView card = new TextView(this);
     card.setText("Loading link preview…");
     card.setTextColor(0xFFBAE6FD);
@@ -2429,18 +2479,17 @@ public class ClipboardService extends Service {
     card.setPadding(dp(9), dp(7), dp(9), dp(7));
     GradientDrawable bg = new GradientDrawable(); bg.setColor(0x1638BDF8); bg.setCornerRadius(dp(9)); card.setBackground(bg);
     card.setOnClickListener((v) -> { try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); } catch (Exception ignored) {} });
-    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT); lp.topMargin = dp(6); parent.addView(card, lp);
     LinkPreviewInfo cached;
     synchronized (this) { cached = linkPreviewCache.get(url); }
     if (cached != null) {
       card.setText(cached.title + (cached.description.isEmpty() ? "" : "\n" + cached.description) + "\n" + cached.host);
       fetchLinkArt(cached.image == null ? "https://www.google.com/s2/favicons?domain=" + Uri.encode(cached.host) + "&sz=128" : cached.image, card);
-      return;
+      return card;
     }
     synchronized (this) {
-      // A row can be rebuilt while the same preview is loading. Show a stable
+      // A row can be rebound while the same preview is loading. Show a stable
       // domain card instead of starting another request (or showing a stuck spinner).
-      if (!linkPreviewLoading.add(url)) { card.setText(hostForLink(url)); return; }
+      if (!linkPreviewLoading.add(url)) { card.setText(hostForLink(url)); return card; }
     }
     new Thread(() -> {
       String title = null, description = null, image = null;
@@ -2460,6 +2509,7 @@ public class ClipboardService extends Service {
       final LinkPreviewInfo info = new LinkPreviewInfo(t, d, art, host == null ? hostForLink(url) : host);
       main.post(() -> { synchronized (this) { linkPreviewLoading.remove(url); linkPreviewCache.put(url, info); } card.setText(info.title + (info.description.isEmpty() ? "" : "\n" + info.description) + "\n" + info.host); fetchLinkArt(info.image == null ? "https://www.google.com/s2/favicons?domain=" + Uri.encode(info.host) + "&sz=128" : info.image, card); });
     }, "gt-link-preview").start();
+    return card;
   }
 
   private OkHttpClient previewHttp() { return http.newBuilder().callTimeout(8, TimeUnit.SECONDS).connectTimeout(5, TimeUnit.SECONDS).readTimeout(6, TimeUnit.SECONDS).followRedirects(true).followSslRedirects(true).build(); }
@@ -2510,7 +2560,9 @@ public class ClipboardService extends Service {
    *  Each row carries a Pin and a Share action (parity with the desktop panel). */
   private void renderList(LinearLayout list) {
     // Folder-chooser mode: a row's 📁 was tapped — show the move targets instead
-    // of the history until a pick or cancel.
+    // of the history until a pick or cancel. Rendered directly (small + rare); the
+    // shared removeAllViews() below already detached recycled rows, and the
+    // liveRows cache is reused when history returns.
     if (folderPickForId != null) {
       ClipEntry target = null;
       synchronized (this) {
@@ -2519,6 +2571,8 @@ public class ClipboardService extends Service {
         }
       }
       if (target != null) {
+        list.removeAllViews();
+        recycleAllRows();
         renderFolderChooser(list, target);
         return;
       }
@@ -2528,6 +2582,36 @@ public class ClipboardService extends Service {
     synchronized (this) {
       snapshot = filteredLocked();
     }
+    final int limit = Math.min(renderLimit, snapshot.size());
+
+    // Build a set of ids we want on screen so survivors stay and the rest recycle.
+    final java.util.HashSet<String> keep = new java.util.HashSet<>(limit);
+    for (int i = 0; i < limit; i++) keep.add(snapshot.get(i).id);
+
+    // Detach rows that dropped out of the window / filter, returning them to pools.
+    // Iterate liveRows' keys (not panelList children) so the order rows were added
+    // last frame doesn't matter.
+    java.util.Iterator<java.util.Map.Entry<String, View>> it = liveRows.entrySet().iterator();
+    while (it.hasNext()) {
+      java.util.Map.Entry<String, View> me = it.next();
+      if (!keep.contains(me.getKey())) {
+        View v = me.getValue();
+        if (v.getParent() == list) list.removeView(v);
+        RowHolder h = (RowHolder) v.getTag();
+        String kind = rowKindOf(v); // capture kind BEFORE nulling entry (rowKindOf reads it)
+        if (h != null) h.entry = null;
+        poolForKind(kind).add(v);
+        it.remove();
+      }
+    }
+    // Cap pools so a one-time huge history can't wedge memory forever.
+    trimPool(poolText);
+    trimPool(poolImage);
+
+    // removeAllViews drops section labels/dividers AND detaches surviving rows
+    // (they're kept alive in liveRows); we re-add them in order below.
+    list.removeAllViews();
+
     if (snapshot.isEmpty()) {
       TextView empty = new TextView(this);
       boolean any;
@@ -2542,9 +2626,8 @@ public class ClipboardService extends Service {
       list.addView(empty);
       return;
     }
+
     long now = System.currentTimeMillis();
-    final int collapsedLines = 6;
-    final int limit = Math.min(renderLimit, snapshot.size());
     boolean pinnedHeaderShown = false;
     boolean dividerShown = false;
     for (int idx = 0; idx < limit; idx++) {
@@ -2558,98 +2641,17 @@ public class ClipboardService extends Service {
         list.addView(makeSectionDivider());
         dividerShown = true;
       }
-      LinearLayout row = new LinearLayout(this);
-      row.setOrientation(LinearLayout.VERTICAL);
-      GradientDrawable rowBg = new GradientDrawable();
-      rowBg.setColor(e.pendingDelete ? 0x33EF4444 : 0x14FFFFFF);
-      rowBg.setCornerRadius(dp(12));
-      if (e.pinned) {
-        // Subtle accent stroke so pinned rows are visibly "kept" (matches the
-        // desktop panel's accent border on pinned items).
-        rowBg.setStroke(dp(1), 0x557C5CFF);
+      // Reuse the row we already built for this id, else pull one from the right
+      // pool (or build fresh). bindRow then refreshes only the visuals that moved.
+      View row = liveRows.get(e.id);
+      if (row == null) {
+        row = obtainRow(e.kind);
+        liveRows.put(e.id, row);
       }
-      if (e.pendingDelete) {
-        // Red stroke on an armed delete so the two-tap confirm is visible.
-        rowBg.setStroke(dp(1), 0xFFEF4444);
-      }
-      row.setBackground(rowBg);
-      row.setPadding(dp(11), dp(9), dp(11), dp(9));
+      bindRow(row, e, now);
       LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
           LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
       rowLp.bottomMargin = dp(6);
-
-      if ("image".equals(e.kind)) {
-        Bitmap bmp;
-        synchronized (this) { bmp = thumbs.get(e.id); }
-        ImageView iv = new ImageView(this);
-        iv.setAdjustViewBounds(true);
-        iv.setMaxHeight(dp(160));
-        iv.setScaleType(ImageView.ScaleType.FIT_START);
-        if (bmp != null) {
-          iv.setImageBitmap(bmp);
-        } else {
-          // Row exists before its bitmap: kick the lazy fetch and show a soft
-          // placeholder until refreshPanelIfOpen repaints with the thumb.
-          GradientDrawable ph = new GradientDrawable();
-          ph.setColor(0x22FFFFFF);
-          ph.setCornerRadius(dp(8));
-          iv.setBackground(ph);
-          iv.setMinimumHeight(dp(72));
-          iv.setMinimumWidth(dp(120));
-          fetchImageThumb(e.id);
-        }
-        row.addView(iv, new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-        row.addView(buildMetaActionsRow(e, "Image · " + relativeTime(e.createdAtMs, now)));
-        row.setOnClickListener((v) -> shareEntry(e));
-        row.setOnLongClickListener((v) -> { hidePanel(); openApp(); return true; });
-        list.addView(row, rowLp);
-        continue;
-      }
-
-      final TextView body = new TextView(this);
-      final String fullText = e.text == null ? "" : e.text;
-      body.setText(fullText);
-      body.setTextColor(0xFFF1F5F9);
-      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-      body.setMaxLines(collapsedLines);
-      body.setEllipsize(android.text.TextUtils.TruncateAt.END);
-      body.setLineSpacing(dp(1), 1f);
-      // Explicit for overlay windows: enables handles + Android's selection toolbar.
-      body.setTextIsSelectable(true);
-      row.addView(body);
-
-      String link = firstHttpLink(fullText);
-      if (link != null && dockShowLinkPreviews) addLinkPreview(row, link);
-
-      final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
-      row.addView(buildMetaActionsRow(e, relativeTime(e.createdAtMs, now)));
-
-      final boolean[] expanded = {false};
-      final TextView expand = new TextView(this);
-      if (longText) {
-        expand.setText("Show more  ↓");
-        expand.setTextColor(0xFFA78BFA);
-        expand.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        expand.setTypeface(expand.getTypeface(), android.graphics.Typeface.BOLD);
-        expand.setGravity(Gravity.CENTER_VERTICAL);
-        expand.setPadding(0, dp(7), 0, dp(2));
-        row.addView(expand, new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, dp(30)));
-      }
-      final Runnable toggleExpanded = () -> {
-        if (!longText) return;
-        expanded[0] = !expanded[0];
-        body.setMaxLines(expanded[0] ? Integer.MAX_VALUE : collapsedLines);
-        body.setEllipsize(expanded[0] ? null : android.text.TextUtils.TruncateAt.END);
-        expand.setText(expanded[0] ? "Show less  ↑" : "Show more  ↓");
-      };
-      expand.setOnClickListener((v) -> toggleExpanded.run());
-      // Selecting or pressing the row never copies. Use the explicit Copy action.
-      row.setOnLongClickListener((v) -> {
-        toggleExpanded.run();
-        return true;
-      });
       list.addView(row, rowLp);
     }
     // Trailing "load more" hint when the window is shorter than the match set.
@@ -2661,6 +2663,277 @@ public class ClipboardService extends Service {
       more.setPadding(dp(8), dp(8), dp(8), dp(8));
       list.addView(more);
     }
+  }
+
+  /** Which pool a row belongs to. Read from the holder's fixed kind (NOT the
+   *  entry, which may already be nulled during recycling). */
+  private static String rowKindOf(View row) {
+    RowHolder h = (RowHolder) row.getTag();
+    return h != null && h.kind != null ? h.kind : "text";
+  }
+  private ArrayList<View> poolForKind(String kind) {
+    return "image".equals(kind) ? poolImage : poolText;
+  }
+  private void trimPool(ArrayList<View> pool) {
+    while (pool.size() > ROW_POOL_MAX) pool.remove(pool.size() - 1);
+  }
+
+  /** Pop a row of this kind from its pool if one is free, else build a fresh one.
+   *  A pooled row keeps its built views + wired listeners, but its diff-cache
+   *  (lastBody/lastMeta/…) is cleared so the next bindRow fully repopulates it
+   *  for the new entry rather than trusting a stale match. */
+  private View obtainRow(String kind) {
+    ArrayList<View> pool = poolForKind(kind);
+    View row;
+    if (!pool.isEmpty()) {
+      row = pool.remove(pool.size() - 1);
+      RowHolder h = (RowHolder) row.getTag();
+      resetHolderCache(h);
+      // A row pooled via the inline renderList path may still carry its old link
+      // card as a child (recycleAllRows detaches it, that path doesn't). Drop it so
+      // the first bindRow starts clean — syncLinkCard adds the right card if any.
+      if (h != null && h.linkCard != null && h.linkCard.getParent() == row) {
+        ((LinearLayout) row).removeView(h.linkCard);
+      }
+      if (h != null) { h.linkCard = null; }
+    } else {
+      row = buildRow(kind);
+    }
+    return row;
+  }
+
+  /** Clear a holder's "what did I last show" fields so bindRow treats the next
+   *  entry as brand new (forces setText/re-style instead of skipping). */
+  private void resetHolderCache(RowHolder h) {
+    if (h == null) return;
+    h.lastBody = null;
+    h.lastHadLink = false;
+    h.lastMeta = null;
+    h.linkUrl = null;
+    h.linkPreviewOn = false;
+    h.expanded = false;
+  }
+
+  /** Construct a row's View tree ONCE and wire its listeners to a fresh
+   *  RowHolder (stored as the row's tag). Listeners read holder.entry at click
+   *  time, so they never need rebinding and never capture a stale entry. The
+   *  entry is left null here; bindRow sets it. */
+  private View buildRow(String kind) {
+    LinearLayout row = new LinearLayout(this);
+    row.setOrientation(LinearLayout.VERTICAL);
+    row.setPadding(dp(11), dp(9), dp(11), dp(9));
+    final RowHolder h = new RowHolder();
+    h.kind = kind; // fixed for the row's life; survives pooling (entry is nulled)
+    row.setTag(h);
+
+    if ("image".equals(kind)) {
+      ImageView iv = new ImageView(this);
+      iv.setAdjustViewBounds(true);
+      iv.setMaxHeight(dp(160));
+      iv.setScaleType(ImageView.ScaleType.FIT_START);
+      GradientDrawable ph = new GradientDrawable();
+      ph.setColor(0x22FFFFFF);
+      ph.setCornerRadius(dp(8));
+      iv.setBackground(ph);
+      iv.setMinimumHeight(dp(72));
+      iv.setMinimumWidth(dp(120));
+      h.image = iv;
+      row.addView(iv, new LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+      h.metaRow = buildMetaActionsRowForHolder(h, "image");
+      row.addView(h.metaRow);
+      // Tap an image row to share; long-press opens the app (parity with before).
+      row.setOnClickListener((v) -> { if (h.entry != null) shareEntry(h.entry); });
+      row.setOnLongClickListener((v) -> { hidePanel(); openApp(); return true; });
+      return row;
+    }
+
+    // Text row.
+    final TextView body = new TextView(this);
+    body.setTextColor(0xFFF1F5F9);
+    body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+    body.setMaxLines(COLLAPSED_LINES);
+    body.setEllipsize(android.text.TextUtils.TruncateAt.END);
+    body.setLineSpacing(dp(1), 1f);
+    body.setTextIsSelectable(true); // default for non-link notes; configureBody flips it off for link notes
+    h.body = body;
+    row.addView(body);
+    h.metaRow = buildMetaActionsRowForHolder(h, "text");
+    row.addView(h.metaRow);
+    final TextView expand = new TextView(this);
+    expand.setTextColor(0xFFA78BFA);
+    expand.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+    expand.setTypeface(expand.getTypeface(), android.graphics.Typeface.BOLD);
+    expand.setGravity(Gravity.CENTER_VERTICAL);
+    expand.setPadding(0, dp(7), 0, dp(2));
+    expand.setOnClickListener((v) -> toggleExpand(h));
+    h.expand = expand;
+    // Selecting or pressing the row never copies. Use the explicit Copy action.
+    row.setOnLongClickListener((v) -> { toggleExpand(h); return true; });
+    return row;
+  }
+
+  private static final int COLLAPSED_LINES = 6;
+  private void toggleExpand(RowHolder h) {
+    if (h.body == null) return;
+    boolean hasExpand = h.expand != null && h.expand.getParent() != null;
+    if (!hasExpand) return;
+    h.expanded = !h.expanded;
+    h.body.setMaxLines(h.expanded ? Integer.MAX_VALUE : COLLAPSED_LINES);
+    h.body.setEllipsize(h.expanded ? null : android.text.TextUtils.TruncateAt.END);
+    h.expand.setText(h.expanded ? "Show less  ↑" : "Show more  ↓");
+  }
+
+  /** Bind an image row: show the cached thumbnail if present, else keep the soft
+   *  placeholder and kick the lazy fetch (refreshPanelIfOpen repaints when the
+   *  thumb lands). Updates the meta label with "Image · <relative time>". */
+  private void bindImageRow(RowHolder h, final ClipEntry e, long now) {
+    Bitmap bmp;
+    synchronized (this) { bmp = thumbs.get(e.id); }
+    if (bmp != null) {
+      h.image.setImageBitmap(bmp);
+      h.image.setBackground(null);
+    } else {
+      // Placeholder until refreshPanelIfOpen repaints with the decoded thumb.
+      h.image.setImageDrawable(null);
+      GradientDrawable ph = new GradientDrawable();
+      ph.setColor(0x22FFFFFF);
+      ph.setCornerRadius(dp(8));
+      h.image.setBackground(ph);
+      fetchImageThumb(e.id);
+    }
+    bindMetaActionsRow(h.metaRow, h, "Image · " + relativeTime(e.createdAtMs, now));
+  }
+
+  /** Refresh a row's visuals to match a (possibly different) entry. Allocates
+   *  nothing on the steady-state path: background is mutated in place, body text
+   *  is only re-set when it changed, the link card is added/removed only when the
+   *  url or the preview toggle actually moved. */
+  private void bindRow(View row, final ClipEntry e, long now) {
+    final RowHolder h = (RowHolder) row.getTag();
+    h.entry = e;
+
+    // --- background (pinned stroke / pending-delete tint) ---------------------
+    GradientDrawable bg = (GradientDrawable) row.getBackground();
+    if (bg == null) { bg = new GradientDrawable(); row.setBackground(bg); }
+    bg.setColor(e.pendingDelete ? 0x33EF4444 : 0x14FFFFFF);
+    bg.setCornerRadius(dp(12));
+    if (e.pendingDelete) {
+      bg.setStroke(dp(1), 0xFFEF4444);
+    } else if (e.pinned) {
+      bg.setStroke(dp(1), 0x557C5CFF);
+    } else {
+      bg.setStroke(0, 0); // clear any prior stroke (reused row, was pinned/deleted)
+    }
+
+    if ("image".equals(e.kind)) {
+      bindImageRow(h, e, now);
+      return;
+    }
+
+    // --- body text ------------------------------------------------------------
+    final String fullText = e.text == null ? "" : e.text;
+    if (!fullText.equals(h.lastBody)) {
+      h.lastBody = fullText;
+      h.lastHadLink = firstHttpLink(fullText) != null;
+      configureBody(h, fullText);
+    } else if (h.linkPreviewOn != dockShowLinkPreviews) {
+      // Preview toggle flipped but text is identical: still reconfigure the body's
+      // link handling (selectable ↔ tappable) and reconcile the card below.
+      configureBody(h, fullText);
+    }
+
+    // --- link preview card (only when previews are ON) ------------------------
+    syncLinkCard(h, row, fullText);
+
+    // --- meta + actions -------------------------------------------------------
+    bindMetaActionsRow(h.metaRow, h, relativeTime(e.createdAtMs, now));
+
+    // --- show more / less -----------------------------------------------------
+    final boolean longText = fullText.length() > 90 || fullText.indexOf('\n') >= 0;
+    if (longText) {
+      if (h.expand.getParent() != row) {
+        row.addView(h.expand, new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(30)));
+      }
+      // Reflect the entry's current expanded state.
+      h.body.setMaxLines(h.expanded ? Integer.MAX_VALUE : COLLAPSED_LINES);
+      h.body.setEllipsize(h.expanded ? null : android.text.TextUtils.TruncateAt.END);
+      h.expand.setText(h.expanded ? "Show less  ↑" : "Show more  ↓");
+    } else if (h.expand.getParent() == row) {
+      row.removeView(h.expand);
+      h.expanded = false;
+    }
+  }
+
+  /** Set the body text and choose its link behaviour for the current preview mode.
+   *  - Preview ON, or no link: selectable (handles + Android's selection toolbar),
+   *    and the preview card (when on) is the click target.
+   *  - Preview OFF and the note HAS a link: the URL itself becomes tappable
+   *    (Linkify + LinkMovementMethod) so a single tap opens the browser. Selection
+   *    is mutually exclusive with link-clicking, so it's disabled on these rows —
+   *    the explicit Copy button still copies. */
+  private void configureBody(RowHolder h, String fullText) {
+    TextView body = h.body;
+    h.linkPreviewOn = dockShowLinkPreviews;
+    boolean tapLink = !dockShowLinkPreviews && h.lastHadLink;
+    body.setText(fullText);
+    if (tapLink) {
+      // setText clears prior Linkify spans; re-apply, then make them clickable.
+      Linkify.addLinks(body, Linkify.WEB_URLS);
+      body.setMovementMethod(LinkMovementMethod.getInstance());
+      body.setLinkTextColor(0xFF67E8F9);
+      body.setTextIsSelectable(false);
+    } else {
+      body.setMovementMethod(null);
+      body.setTextIsSelectable(true);
+    }
+  }
+
+  /** Attach/detach the link preview card so it sits between body and meta. Only
+   *  adds a card when previews are ON and the note has a link, and only rebuilds
+   *  the card when the url or the preview mode actually changed (the link cache
+   *  makes a re-add for the same url instant — no re-fetch). */
+  private void syncLinkCard(RowHolder h, LinearLayout row, String fullText) {
+    String wantUrl = (dockShowLinkPreviews && h.lastHadLink) ? firstHttpLink(fullText) : "";
+    String haveUrl = h.linkUrl == null ? "" : h.linkUrl;
+    if (wantUrl.equals(haveUrl)) return; // nothing to do
+    // Remove the old card if any.
+    if (h.linkCard != null && h.linkCard.getParent() == row) {
+      row.removeView(h.linkCard);
+    }
+    h.linkCard = null;
+    h.linkUrl = wantUrl;
+    if (wantUrl.isEmpty()) return;
+    // Insert the new card right after the body (index 1: body=0, then card, then meta).
+    View card = buildLinkCard(wantUrl);
+    h.linkCard = card;
+    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    lp.topMargin = dp(6);
+    // body is always child 0 on a text row; meta may or may not follow yet.
+    row.addView(card, Math.min(1, row.getChildCount()), lp);
+  }
+
+  /** Return the dock to a clean slate on close: drop every live row into its pool
+   *  (capped) so the next open reuses them instead of rebuilding. */
+  private void recycleAllRows() {
+    for (View v : liveRows.values()) {
+      RowHolder h = (RowHolder) v.getTag();
+      String kind = rowKindOf(v); // capture kind BEFORE nulling entry (rowKindOf reads it)
+      if (h != null) {
+        h.entry = null;
+        if (h.linkCard != null && h.linkCard.getParent() != null) {
+          ((android.view.ViewGroup) h.linkCard.getParent()).removeView(h.linkCard);
+        }
+        h.linkCard = null;
+        h.linkUrl = null;
+      }
+      poolForKind(kind).add(v);
+    }
+    liveRows.clear();
+    trimPool(poolText);
+    trimPool(poolImage);
   }
 
   /** One borderless glyph action button for a row's meta strip. */
@@ -2685,23 +2958,16 @@ public class ClipboardService extends Service {
     return b;
   }
 
-  /** The thin meta + actions row under each clip: folder + relative time on the
-   *  left; edit (text) / folder / pin / share / delete on the right (parity with
-   *  the app screens' per-row actions). Returns a horizontal LinearLayout. */
-  private LinearLayout buildMetaActionsRow(final ClipEntry e, String metaText) {
+  /** Build the meta + actions row ONCE, wiring every listener to the holder (so
+   *  the same row can be rebound to many entries without re-allocating lambdas).
+   *  kind is "text" or "image" and decides whether Copy/Edit appear. Stores the
+   *  refs bindMetaActionsRow needs to touch (meta label, pin, folder) on the holder. */
+  private LinearLayout buildMetaActionsRowForHolder(final RowHolder h, String kind) {
     LinearLayout row = new LinearLayout(this);
     row.setOrientation(LinearLayout.HORIZONTAL);
     row.setGravity(Gravity.CENTER_VERTICAL);
 
     TextView meta = new TextView(this);
-    StringBuilder tagText = new StringBuilder();
-    for (int i = 0; i < Math.min(2, e.tags.size()); i++) {
-      if (i > 0) tagText.append("  ");
-      tagText.append("#").append(e.tags.get(i));
-    }
-    if (e.tags.size() > 2) tagText.append(" +").append(e.tags.size() - 2);
-    if (tagText.length() > 0) tagText.append("  ·  ");
-    meta.setText(tagText.toString() + metaText);
     meta.setTextColor(0xFF64748B);
     meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
     meta.setSingleLine(true);
@@ -2710,31 +2976,60 @@ public class ClipboardService extends Service {
         0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
     metaLp.topMargin = dp(4);
     row.addView(meta, metaLp);
+    h.meta = meta;
 
     LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(dp(34), dp(30));
     btnLp.leftMargin = dp(2);
 
-    if ("text".equals(e.kind)) {
+    if ("text".equals(kind)) {
       row.addView(rowActionBtn("Copy", 0xFF67E8F9, (v) -> {
-        setOsClipboard(e.text == null ? "" : e.text);
+        if (h.entry == null) return;
+        setOsClipboard(h.entry.text == null ? "" : h.entry.text);
         toast("Copied");
       }), new LinearLayout.LayoutParams(dp(48), dp(30)));
-      row.addView(rowActionBtn("✎", 0xFF94A3B8, (v) -> startEditEntry(e)),
+      row.addView(rowActionBtn("✎", 0xFF94A3B8, (v) -> { if (h.entry != null) startEditEntry(h.entry); }),
           new LinearLayout.LayoutParams(dp(34), dp(30)));
     }
-    Button folderBtn = rowActionBtn("#", e.tags.isEmpty() ? 0xFF94A3B8 : 0xFFA78BFA, (v) -> {
-      folderPickForId = e.id;
+    // Folder button: colour reflects whether the entry has tags. Re-coloured on bind.
+    Button folderBtn = rowActionBtn("#", 0xFF94A3B8, (v) -> {
+      if (h.entry == null) return;
+      folderPickForId = h.entry.id;
       refreshPanelIfOpen();
     });
     row.addView(folderBtn, new LinearLayout.LayoutParams(btnLp));
-    Button pin = rowActionBtn(e.pinned ? "📌" : "📍",
-        e.pinned ? 0xFF7C5CFF : 0xFF94A3B8, (v) -> togglePin(e));
+    h.folderBtn = folderBtn;
+    // Pin button: glyph + colour flip on bind (📌 accent when pinned, 📍 muted when not).
+    Button pin = rowActionBtn("📍", 0xFF94A3B8, (v) -> { if (h.entry != null) togglePin(h.entry); });
     row.addView(pin, new LinearLayout.LayoutParams(btnLp));
-    Button share = rowActionBtn("↗", 0xFF94A3B8, (v) -> shareEntry(e));
-    row.addView(share, new LinearLayout.LayoutParams(btnLp));
-    Button del = rowActionBtn("✕", 0xFFF87171, (v) -> confirmDelete(e));
-    row.addView(del, new LinearLayout.LayoutParams(btnLp));
+    h.pinBtn = pin;
+    row.addView(rowActionBtn("↗", 0xFF94A3B8, (v) -> { if (h.entry != null) shareEntry(h.entry); }),
+        new LinearLayout.LayoutParams(btnLp));
+    row.addView(rowActionBtn("✕", 0xFFF87171, (v) -> { if (h.entry != null) confirmDelete(h.entry); }),
+        new LinearLayout.LayoutParams(btnLp));
     return row;
+  }
+
+  /** Update only the meta-row visuals that depend on the current entry: the tags
+   *  + relative-time label (skipped when unchanged), plus the pin glyph/colour and
+   *  the folder button colour (cheap, always applied so a recycled row can't keep
+   *  a stale style from a prior entry). */
+  private void bindMetaActionsRow(LinearLayout row, final RowHolder h, String metaText) {
+    final ClipEntry e = h.entry;
+    StringBuilder tagText = new StringBuilder();
+    for (int i = 0; i < Math.min(2, e.tags.size()); i++) {
+      if (i > 0) tagText.append("  ");
+      tagText.append("#").append(e.tags.get(i));
+    }
+    if (e.tags.size() > 2) tagText.append(" +").append(e.tags.size() - 2);
+    if (tagText.length() > 0) tagText.append("  ·  ");
+    String meta = tagText.toString() + metaText;
+    if (!meta.equals(h.lastMeta)) {
+      h.lastMeta = meta;
+      h.meta.setText(meta);
+    }
+    h.pinBtn.setText(e.pinned ? "📌" : "📍");
+    h.pinBtn.setTextColor(e.pinned ? 0xFF7C5CFF : 0xFF94A3B8);
+    h.folderBtn.setTextColor(e.tags.isEmpty() ? 0xFF94A3B8 : 0xFFA78BFA);
   }
 
   /** Replace the history with the "move to folder" targets for one entry:
