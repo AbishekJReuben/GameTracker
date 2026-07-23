@@ -73,7 +73,17 @@ fn youtube_preview(url: &Url, id: &str, agent: &ureq::Agent) -> LinkPreview {
     let image = format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg");
     let oembed = format!("https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch%3Fv%3D{id}");
     let (mut title, mut author) = (None, None);
-    if let Ok(body) = agent.get(&oembed).set("User-Agent", UA).call().and_then(|r| Ok(r.into_json::<serde_json::Value>()?)) {
+    // Parsed from the response text rather than `into_json`: this module is shared
+    // verbatim with the companion crate, whose ureq is built without the `json`
+    // feature. serde_json is a direct dependency of both.
+    if let Ok(body) = agent
+        .get(&oembed)
+        .set("User-Agent", UA)
+        .call()
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.into_string().map_err(|e| e.to_string()))
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string()))
+    {
         title = body.get("title").and_then(|v| v.as_str()).map(str::to_string);
         author = body.get("author_name").and_then(|v| v.as_str()).map(str::to_string);
     }
