@@ -5272,12 +5272,12 @@ function StatCell({ k, v, hi }: { k: string; v: string; hi?: boolean }) {
   const meta = STAT_INFO[k];
   if (verbose && meta) {
     return (
-      <div className="col-span-2 border-b border-white/[0.04] pb-1 last:border-0">
+      <div className="col-span-2 min-w-0 max-w-full border-b border-white/[0.04] pb-1 last:border-0">
         <div className="flex items-baseline justify-between gap-2">
           <span className="min-w-0 font-700 text-ink-dim">{meta.long}</span>
           <span className={`shrink-0 font-800 tabular-nums ${hi ? "text-amber" : "text-white"}`}>{v}</span>
         </div>
-        <p className="mt-px text-[8px] leading-snug text-ink-faint">{meta.info}</p>
+        <p className="mt-px min-w-0 whitespace-normal break-words text-[8px] leading-snug text-ink-faint">{meta.info}</p>
       </div>
     );
   }

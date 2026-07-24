@@ -542,6 +542,14 @@ export function startHost(opts: HostOptions): () => void {
   let adaptFps = quality.fps;
   let adaptCleanSince = 0;
   let lastAdaptPush = 0;
+  // A healthy DIRECT channel can hover around the soft-fill threshold because
+  // SCTP releases bytes in bursts.  That is not proof that the link needs a
+  // lower target.  Remember that state separately from a real hard drop so we
+  // can re-arm the target without asking the phone user to nudge a slider.
+  let softBackpressureSince = 0;
+  let lastSoftRearmAt = 0;
+  const SOFT_ADAPT_REARM_MS = 12_000;
+  const SOFT_ADAPT_REARM_COOLDOWN_MS = 15_000;
 
   /** Target ceiling from the Tune panel (or auto curve). */
   const targetKbps = () =>
@@ -575,6 +583,23 @@ export function startHost(opts: HostOptions): () => void {
     }
     // Keep the canvas/WebCodecs encoder (fallback path) on the same budget.
     applyBitrate();
+  };
+
+  /**
+   * Restore the Tune target after a real setting edit or a proven false
+   * soft-congestion cycle.  This deliberately uses the same live reconfigure
+   * path as the FPS/resolution/bitrate controls, which is why a tiny slider
+   * nudge used to recover the stream immediately.
+   */
+  const resetAdaptiveTarget = (reason: string, reapply = true) => {
+    adaptKbps = targetKbps();
+    adaptFps = quality.fps;
+    probeCeilKbps = 0;
+    adaptCleanSince = 0;
+    lastSkipAt = 0;
+    softBackpressureSince = 0;
+    slog("adapt", `reset to target ${adaptKbps}k (${reason})`);
+    if (reapply) pushAdaptBitrate(true);
   };
 
   /**
@@ -634,6 +659,32 @@ export function startHost(opts: HostOptions): () => void {
     const fill = maxBuffered > 0 ? buffered / maxBuffered : 0;
     const now = Date.now();
     const realBacklog = buffered >= congestionBytes();
+    // Soft fills are allowed to protect latency, but a long-lived, sub-pause
+    // soft-only state with no hard drop is usually SCTP batching, not exhausted
+    // bandwidth. Previously it kept trimming/restoring forever
+    // until a user changed any target slider, which reset this controller.
+    if (hardDrop) {
+      softBackpressureSince = 0;
+    } else if (fill > 0.35 && realBacklog) {
+      if (softBackpressureSince === 0) softBackpressureSince = now;
+    } else if (fill < 0.12 && buffered < congestionBytes()) {
+      softBackpressureSince = 0;
+    }
+
+    const needsRearm = adaptKbps < tgt * 0.9 || adaptFps < quality.fps;
+    if (
+      !hardDrop &&
+      fill < 0.75 &&
+      softBackpressureSince > 0 &&
+      needsRearm &&
+      now - softBackpressureSince >= SOFT_ADAPT_REARM_MS &&
+      now - lastSkipAt >= SOFT_ADAPT_REARM_MS &&
+      now - lastSoftRearmAt >= SOFT_ADAPT_REARM_COOLDOWN_MS
+    ) {
+      lastSoftRearmAt = now;
+      resetAdaptiveTarget("soft-only rearm");
+      return;
+    }
     // Forget the ceiling gradually. A drained channel after a few seconds with
     // no HARD drop means the ceiling was a radio blip, not capacity — clear it
     // so we don't crawl 1%/tick out of a false 1.5 Mbps prison.
@@ -2688,18 +2739,12 @@ export function startHost(opts: HostOptions): () => void {
           // target (or res/fps). Re-asserts on connect / every slider tick used
           // to slam adaptKbps back to 16 Mbps mid-shed, then the next fat frame
           // shed it again — that sawtooth is what pinned Enc cap at 1500k.
-          const tgtNow = targetKbps();
           const targetChanged =
             quality.bitrate !== prevBitrate ||
             quality.maxW !== prevMaxW ||
             quality.fps !== prevFps;
           if (targetChanged || adaptKbps <= 0) {
-            adaptKbps = tgtNow;
-            adaptFps = quality.fps;
-            probeCeilKbps = 0;
-            adaptCleanSince = 0;
-            lastSkipAt = 0;
-            slog("adapt", `reset to target ${adaptKbps}k (tune ${targetChanged ? "target changed" : "init"})`);
+            resetAdaptiveTarget(`tune ${targetChanged ? "target changed" : "init"}`, false);
           }
           // Native encode on/off takes effect live — the whole point is to A/B it (or
           // escape a bad picture) without reconnecting. Only meaningful while DIRECT

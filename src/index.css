@@ -536,6 +536,14 @@
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
+  /* Prose must consume the available mobile width instead of stretching a
+     horizontally scrollable parent. Keep pre/code out of this rule: diagnostic
+     output remains intentionally scrollable when a line is genuinely long. */
+  p {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: break-word;
+  }
   ::selection {
     background: color-mix(in srgb, var(--accent-1) 38%, transparent);
   }
