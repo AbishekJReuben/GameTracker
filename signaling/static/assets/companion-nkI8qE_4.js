@@ -1,0 +1,1 @@
+import{R as e,j as t,a as o}from"./AreaChart-Dk_wX8AJ.js";import{C as r}from"./CompanionApp-BEpUZXXg.js";window.__GT_COMPANION__=!0;e.createRoot(document.getElementById("root")).render(t.jsx(o.StrictMode,{children:t.jsx(r,{})}));
