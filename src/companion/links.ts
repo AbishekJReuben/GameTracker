@@ -77,6 +77,9 @@ export type QualitySettings = {
   wcQueueMax?: number;
   /** Host: allow native NVENC encode (false = force the JPEG→WebCodecs path). */
   hostNvenc?: boolean;
+  /** Host/DIRECT: drive the encode bitrate from the guest's link reports
+   *  (measured receive rate + delay gradient) instead of send-queue depth. */
+  abrV2?: boolean;
   /** Host/RTC audio: the PC's playout buffer target (ms) feeding the Opus
    *  encoder. Prime/max are derived from it. No effect on DIRECT audio, which
    *  bypasses the host worklet entirely. */

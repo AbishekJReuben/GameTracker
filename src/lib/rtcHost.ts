@@ -15,7 +15,7 @@ import { Channel } from "@tauri-apps/api/core";
 import { api, type RemoteCaptureStats } from "./api";
 import { Signaling, defaultIceServers, gatheredLocalSdp, pipeIce, type IceServer } from "./rtc";
 import { auxMonitorRoom } from "./remoteConfig";
-import { AUDIO_HDR_BYTES, StreamingAudioResampler, audioPacket } from "./audioWire";
+import { AUDIO_HDR_BYTES, StreamingAudioResampler, audioPacket, audioRedPacket } from "./audioWire";
 // Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
 import audioFeederWorkletUrl from "./audioFeeder.worklet.js?url";
 
@@ -173,6 +173,36 @@ const AUDIO_OPUS_WIRE_RATE = 48000;
  *  SCTP has no "drop the stale stuff" knob, so refusing to enqueue is the only
  *  backpressure available — and stale audio is worthless by definition. */
 const AUDIO_MAX_BUF_MS = 250;
+
+// ---- STUDIO audio ("amode: pcm" + red) --------------------------------------
+// Both existing sound paths trade the same two things against each other and
+// neither wins outright:
+//   RTC   — a real Opus track through NetEQ. Robust, but NetEQ targets ~150ms+
+//           and no receiver hint moves it, so it is always audibly behind.
+//   DIRECT— 20ms Opus on an ORDERED, `maxPacketLifeTime:60` channel. Low
+//           latency, but every packet that misses its window is simply gone,
+//           and while video saturates the shared SCTP association those losses
+//           arrive in clusters. Clustered concealment is what "robotic" is.
+//
+// STUDIO removes the trade instead of picking a side. Three changes:
+//   1. 10ms frames in Opus' RESTRICTED_LOWDELAY mode — 6.5ms of algorithmic
+//      delay instead of 26.5ms, because there is no forward-adaptive LPC
+//      lookahead to fill.
+//   2. Every packet carries the PREVIOUS packet's payload as well (explicit
+//      redundancy — RFC 2198's idea, which is also how WebRTC's own `red/48000/2`
+//      protects Opus). Losing any single packet then costs nothing: the next
+//      arrival still contains it. Opus' own in-band FEC cannot be used here —
+//      recovering it needs libopus `decode_fec=1`, which WebCodecs does not
+//      expose.
+//   3. Because loss is covered, the channel can be UNORDERED with zero
+//      retransmits: audio is never held behind a video burst and never waits
+//      for a retransmit it would be too late to use.
+// Cost is ~2× a 10ms Opus stream (~260kbps) — a rounding error against a
+// multi-megabit screen share, and the phone stops having to invent audio.
+/** STUDIO frame size (µs). Redundancy covers the losses that 20ms bought off. */
+const AUDIO_STUDIO_FRAME_US = 10_000;
+/** How many previous payloads ride along with each STUDIO packet. */
+const AUDIO_STUDIO_REDUNDANCY = 1;
 
 const CONTENT_NUM: Record<string, number> = { auto: 0, text: 1, video: 2 };
 /** Video-track content hint + bitrate-degradation preference per content mode. */
@@ -473,6 +503,31 @@ export function startHost(opts: HostOptions): () => void {
   let lastGuestJoinNonce = "";
   /** Guest trickle candidates may beat its answer; queue until SDP is installed. */
   let pendingGuestCandidates: { candidate: RTCIceCandidateInit; sid?: string }[] = [];
+  /**
+   * Cleanups owned by peer sessions (timers, pollers, watchdogs). `startPeer` is
+   * async and re-entrant — two concurrent starts (signaling glare, a guest
+   * reconnect landing mid-build) both write the single-slot session hooks, so
+   * the loser's timers used to survive forever with no way to reach them.
+   *
+   * That is not cosmetic: an orphaned session left `nativeAwaitKey` latched, and
+   * its 350ms watchdog kept calling the process-wide `remote_request_keyframe()`.
+   * Rust has ONE force-IDR flag, so the LIVE stream was forced to emit an IDR
+   * ~3×/s forever — ~9% of all frames were keyframes, which is where the
+   * bitrate went and why the picture looked blocky and noisy. Every session
+   * registers its cleanups here and `teardownPeer` drains the whole set, so no
+   * session can outlive its teardown regardless of how the race resolves.
+   */
+  const sessionCleanups = new Set<() => void>();
+  const runSessionCleanups = () => {
+    for (const fn of [...sessionCleanups]) {
+      sessionCleanups.delete(fn);
+      try {
+        fn();
+      } catch {
+        /* a failing cleanup must not strand the rest */
+      }
+    }
+  };
   /** Pop-out monitor hosts spawned from the primary (monitor index → stop). */
   const auxStops = new Map<number, () => void>();
 
@@ -515,6 +570,9 @@ export function startHost(opts: HostOptions): () => void {
     // Let Rust encode natively (NVENC). The phone can turn this off to fall back to
     // the long-standing JPEG→canvas→WebCodecs path.
     hostNvenc: true,
+    // Drive the DIRECT bitrate from the guest's own link reports (see ABR v2
+    // below) instead of from our send-queue depth alone.
+    abrV2: true,
     // RTC audio: this worklet's playout target (ms) before the Opus encoder.
     // DIRECT audio diverts upstream of the worklet, so this only shapes the
     // classic track. Prime/max are derived (see audioEnvelope).
@@ -550,6 +608,65 @@ export function startHost(opts: HostOptions): () => void {
   let lastSoftRearmAt = 0;
   const SOFT_ADAPT_REARM_MS = 12_000;
   const SOFT_ADAPT_REARM_COOLDOWN_MS = 15_000;
+
+  // ---- ABR v2: receiver-driven congestion control ---------------------------
+  //
+  // The controller above infers the link from ONE local signal: how many bytes
+  // are sitting in our own data-channel send queue. That signal is wrong in a
+  // specific, self-reinforcing way. `bufferedAmount` includes bytes in flight,
+  // so a perfectly healthy link always carries ~one bandwidth-delay product of
+  // occupancy; and the budget it is measured against is derived from the
+  // bitrate, so every cut shrinks the budget, which raises `fill`, which
+  // triggers the next cut. Captured in the field: a 32Mbps target walked down
+  // to 2.6Mbps in 35 seconds, one 3–6% shed at a time, while the phone reported
+  // 36ms end-to-end, 32ms RTT and an empty decode queue. Nothing was congested.
+  // The only escape was a settings change (which calls resetAdaptiveTarget) —
+  // exactly the "I have to nudge a slider to get my quality back" symptom.
+  //
+  // v2 asks the receiver instead. The guest reports, 4×/s, what it actually
+  // receives (kbps) and its one-way delay together with the rolling MINIMUM of
+  // that delay. The excess over the minimum is the standing queue we put on the
+  // link — the same delay-gradient signal GCC and Copa use, and the only one
+  // that distinguishes "the pipe is full" from "the pipe is fast". On overuse
+  // the new rate is set from the MEASURED receive rate (GCC's `0.85 × R_hat`)
+  // rather than from a blind fraction of our own guess, so recovery is
+  // deterministic; when the delay signal is clean the rate climbs
+  // multiplicatively and any remembered ceiling is dropped after a few clean
+  // seconds, so a good network gets used to the full Tune target.
+  /** Guest-reported link telemetry (ABR v2 input). */
+  type VideoLinkReport = {
+    /** Bytes/s the phone actually received, as kbps. */
+    recvKbps: number;
+    /** Smoothed one-way delay: host capture → guest arrival (clock-synced). */
+    owdMs: number;
+    /** Rolling minimum of the same measure — the queue-free floor. */
+    owdMinMs: number;
+    /** Frames the phone assembled in the window (0 ⇒ nothing is arriving). */
+    fps: number;
+    /** Frames waiting in the decoder (a persistent backlog is decoder-bound). */
+    queue: number;
+  };
+  /** True while fresh guest reports are arriving (an old guest sends none). */
+  let vsAt = 0;
+  let vsRecvKbps = 0;
+  let vsQueueMs = 0;
+  /** The queue EWMA holds a real value (0 is a legitimate reading). */
+  let vsSeeded = false;
+  let vsFps = 0;
+  let vsDecoderQueue = 0;
+  /** Rate last proven to overuse the link; cleared by a clean stretch. */
+  let abrCeilKbps = 0;
+  let abrCleanSince = 0;
+  let abrLastMoveAt = 0;
+  let abrLastFpsMoveAt = 0;
+  /** Standing queue (ms) above which we treat the link as overused. */
+  const ABR_QUEUE_HIGH_MS = 110;
+  /** ...and below which it is provably clean and we may probe upward. */
+  const ABR_QUEUE_LOW_MS = 45;
+  /** A clean stretch this long retires the remembered ceiling entirely. */
+  const ABR_CEIL_FORGET_MS = 6000;
+  /** v2 owns the rate only while the guest is actually reporting. */
+  const abrV2Live = () => quality.abrV2 && vsAt > 0 && Date.now() - vsAt < 3000;
 
   /** Target ceiling from the Tune panel (or auto curve). */
   const targetKbps = () =>
@@ -598,6 +715,11 @@ export function startHost(opts: HostOptions): () => void {
     adaptCleanSince = 0;
     lastSkipAt = 0;
     softBackpressureSince = 0;
+    abrCeilKbps = 0;
+    abrCleanSince = 0;
+    abrLastMoveAt = 0;
+    vsSeeded = false;
+    vsQueueMs = 0;
     slog("adapt", `reset to target ${adaptKbps}k (${reason})`);
     if (reapply) pushAdaptBitrate(true);
   };
@@ -645,6 +767,18 @@ export function startHost(opts: HostOptions): () => void {
     const pace = clamp(quality.pace, 0, 100) / 100;
     const capBytes = quality.wcBufKB * 1024 * (1 + pace);
     const kbps = adaptKbps > 0 ? adaptKbps : targetKbps();
+    if (abrV2Live()) {
+      // v2 protects standing latency with the delay signal, so this budget is a
+      // pure safety valve: it must sit ABOVE the link's bandwidth-delay product
+      // or a healthy link's normal in-flight bytes look like a backlog. Size it
+      // off whichever of "what we send" and "what actually arrives" is larger,
+      // and never below four real frames — the old 2.5-frame/32KB floor is what
+      // the BDP kept exceeding.
+      const linkKbps = Math.max(kbps, vsRecvKbps);
+      const timeBytes = (linkKbps * WC_BUF_MS * 2 * (1 + pace)) / 8;
+      const floorBytes = Math.max(64 * 1024, Math.round(ewmaFrameBytes * 4));
+      return Math.min(capBytes * 2, Math.max(floorBytes, timeBytes));
+    }
     const timeBytes = (kbps * WC_BUF_MS * (1 + pace)) / 8; // kbit/s × ms / 8 = bytes
     const floorBytes = Math.max(32 * 1024, Math.round(ewmaFrameBytes * 2.5));
     return Math.min(capBytes, Math.max(floorBytes, timeBytes));
@@ -653,9 +787,140 @@ export function startHost(opts: HostOptions): () => void {
   /** Absolute backlog that counts as "real" congestion (not one fat frame). */
   const congestionBytes = () => Math.max(24 * 1024, Math.round(ewmaFrameBytes * 2));
 
+  /**
+   * One guest link report → one control decision. Delay-gradient AIMD:
+   * shrink toward what the receiver measured when we are queueing, climb while
+   * the link is provably clean, and forget the ceiling after a clean stretch so
+   * the full Tune target is always re-reached on a network that can carry it.
+   */
+  const adaptFromReport = (r: VideoLinkReport) => {
+    const now = Date.now();
+    vsAt = now;
+    vsFps = r.fps;
+    vsDecoderQueue = r.queue;
+    vsRecvKbps = vsRecvKbps <= 0 ? r.recvKbps : vsRecvKbps * 0.7 + r.recvKbps * 0.3;
+    const queueMs = Math.max(0, r.owdMs - r.owdMinMs);
+    // Plain EWMA once seeded. Re-seeding whenever the smoothed value happened to
+    // reach exactly 0 would let a single spike jump straight to a cut — the
+    // smoothing exists precisely so one sample cannot decide anything.
+    vsQueueMs = vsSeeded ? vsQueueMs * 0.6 + queueMs * 0.4 : queueMs;
+    vsSeeded = true;
+    if (!quality.abrV2) return;
+    const tgt = targetKbps();
+    if (adaptKbps <= 0) adaptKbps = tgt;
+    const floor = Math.min(Math.max(500, quality.minBitrateKbps), tgt);
+    // Frames stopped arriving entirely — that is a stall, not a rate problem,
+    // and the stall watchdogs own it. Cutting here would only make recovery
+    // slower once the link returns.
+    if (r.fps <= 0) return;
+    // One move per ~400ms: reports arrive at 4Hz and each change costs the
+    // encoder a reconfigure.
+    if (now - abrLastMoveAt < 400) return;
+
+    if (vsQueueMs > ABR_QUEUE_HIGH_MS) {
+      abrLastMoveAt = now;
+      abrCleanSince = 0;
+      // GCC's decrease: the new rate comes from what the receiver MEASURED, not
+      // from a fraction of our own (possibly fantasy) target. Reaching this
+      // branch means a queue is building, which means we ARE filling the link,
+      // which is what makes the receive rate a capacity estimate rather than
+      // just "how busy the screen is".
+      //
+      // Bounded to half per step anyway: one bad sample (a radio blip on an
+      // otherwise idle screen can show a low receive rate AND a delay spike)
+      // must not be able to collapse the rate in a single move. Recovery from
+      // an over-cut is ~1s per halving on the clean ramp; recovery from a
+      // collapse used to be a reconnect.
+      const measured = vsRecvKbps > 0 ? vsRecvKbps * 0.85 : adaptKbps * 0.85;
+      const next = Math.max(floor, Math.round(Math.max(measured, adaptKbps * 0.5)));
+      if (next < adaptKbps) {
+        abrCeilKbps = adaptKbps;
+        slog(
+          "abr",
+          `overuse: queue ${Math.round(vsQueueMs)}ms → ${adaptKbps}k to ${next}k (recv ${Math.round(vsRecvKbps)}k, ceil ${adaptKbps}k)`,
+        );
+        adaptKbps = next;
+        pushAdaptBitrate(true);
+      }
+      return;
+    }
+
+    if (vsQueueMs > ABR_QUEUE_LOW_MS) {
+      // In between: neither proof of congestion nor proof of headroom. Hold —
+      // the single most valuable thing a delay controller does is NOT move here.
+      abrCleanSince = 0;
+      return;
+    }
+
+    // Provably clean. Give frame rate back first (it is the most visible loss),
+    // then climb the bitrate.
+    if (abrCleanSince === 0) abrCleanSince = now;
+    if (
+      quality.adaptiveFps &&
+      adaptFps < quality.fps &&
+      now - abrCleanSince >= 700 &&
+      now - abrLastFpsMoveAt >= 700
+    ) {
+      abrLastFpsMoveAt = now;
+      abrLastMoveAt = now;
+      adaptFps = Math.min(quality.fps, adaptFps + 3);
+      slog("abr", `clean: fps restore → ${adaptFps}`);
+      pushAdaptBitrate(true);
+      return;
+    }
+    // A sustained clean stretch retires the ceiling outright. Without this the
+    // rate converges just under whatever a single radio blip once proved, and
+    // stays there for the rest of the session.
+    if (abrCeilKbps > 0 && now - abrCleanSince >= ABR_CEIL_FORGET_MS) {
+      slog("abr", `clean ${Math.round((now - abrCleanSince) / 1000)}s — ceiling ${abrCeilKbps}k retired`);
+      abrCeilKbps = 0;
+    }
+    if (adaptKbps >= tgt) return;
+    abrLastMoveAt = now;
+    // Multiplicative while there is real room, additive on final approach to a
+    // known ceiling — the classic "ramp fast, converge gently" shape.
+    const nearCeil = abrCeilKbps > 0 && adaptKbps >= abrCeilKbps * 0.85;
+    const next = Math.min(
+      tgt,
+      nearCeil ? adaptKbps + Math.max(150, Math.round(adaptKbps * 0.03)) : Math.round(adaptKbps * 1.12 + 150),
+    );
+    if (next !== adaptKbps) {
+      slog(
+        "abr",
+        `clean: queue ${Math.round(vsQueueMs)}ms → raise ${adaptKbps}k to ${next}k (target ${tgt}k${abrCeilKbps ? `, ceil ${abrCeilKbps}k` : ""})`,
+      );
+      adaptKbps = next;
+      pushAdaptBitrate(true);
+    }
+  };
+
   const adaptFromBuffer = (buffered: number, maxBuffered: number, hardDrop: boolean) => {
     const tgt = targetKbps();
     if (adaptKbps <= 0) adaptKbps = tgt;
+    if (abrV2Live()) {
+      // The receiver report owns the rate. Queue depth stays useful as a FAST
+      // signal — it reacts in milliseconds where a delay measurement needs a
+      // couple of reports — but only a genuine hard drop (4× budget: the wire
+      // truly is not taking frames) is allowed to move the bitrate here, and it
+      // moves it once, not on every frame of the burst. Soft fill is ignored
+      // outright: reading normal in-flight bytes as congestion is the bug v2
+      // exists to remove.
+      if (!hardDrop) return;
+      const now = Date.now();
+      lastSkipAt = now;
+      if (now - lastShedAt < 700) return;
+      lastShedAt = now;
+      const floor = Math.min(Math.max(500, quality.minBitrateKbps), tgt);
+      const next = Math.max(floor, Math.round(adaptKbps * 0.8));
+      if (next < adaptKbps) {
+        abrCeilKbps = adaptKbps;
+        abrCleanSince = 0;
+        slog("abr", `hard drop at ${Math.round(buffered / 1024)}KB → ${adaptKbps}k to ${next}k`);
+        adaptKbps = next;
+        pushAdaptBitrate(true);
+      }
+      return;
+    }
     const fill = maxBuffered > 0 ? buffered / maxBuffered : 0;
     const now = Date.now();
     const realBacklog = buffered >= congestionBytes();
@@ -941,6 +1206,9 @@ export function startHost(opts: HostOptions): () => void {
     }
     wcStop?.();
     wcStop = null;
+    // Kill every session-owned timer, including ones belonging to a start that
+    // lost a race and is no longer reachable through the single-slot hooks.
+    runSessionCleanups();
     stopCapture();
     stopAudio();
     videoWriter?.close().catch(() => {});
@@ -1184,9 +1452,14 @@ export function startHost(opts: HostOptions): () => void {
     track: MediaStreamTrack;
     start: () => Promise<void>;
     setDirectSink: (ch: RTCDataChannel | null) => void;
-    /** Negotiate the wire codec against the guest's advertised decode support. */
-    setDirectCodec: (codecs: string[]) => Promise<"opus" | "f32">;
-    stats: () => { codec: "opus" | "f32"; dropped: number };
+    /** The peer's unordered zero-retransmit channel — where STUDIO packets go.
+     *  Registered once when the channels exist, before any opt-in. */
+    setRedundantSink: (ch: RTCDataChannel | null) => void;
+    /** Negotiate the wire codec against the guest's advertised decode support.
+     *  `studio` asks for the redundant 10ms low-delay wire; the returned `wire`
+     *  says what the host could actually build (never assume it was granted). */
+    setDirectCodec: (codecs: string[], studio?: boolean) => Promise<{ codec: "opus" | "f32"; studio: boolean }>;
+    stats: () => { codec: "opus" | "f32"; dropped: number; studio: boolean };
     format: () => { sampleRate: number; channels: number } | null;
   } | null> => {
     try {
@@ -1247,6 +1520,15 @@ export function startHost(opts: HostOptions): () => void {
     let audioDropped = 0;
     /** What the guest told us it can decode; replayed when the format changes. */
     let guestAudioCodecs: string[] = [];
+    // ---- STUDIO wire (10ms low-delay Opus + explicit redundancy) ------------
+    /** Guest asked for it (Tune). Independent of whether we could build it. */
+    let studioWanted = false;
+    /** ...and we actually did: 10ms frames encoding, redundant channel open. */
+    let studioLive = false;
+    /** Redundancy ring: the previous packets' payloads, newest first. */
+    let studioPrev: Uint8Array[] = [];
+    /** Unordered, zero-retransmit sink for STUDIO packets (set by startPeer). */
+    let studioSink: RTCDataChannel | null = null;
 
     /** Bytes/sec the live DIRECT format costs on the wire. */
     const audioBytesPerSec = () => {
@@ -1291,6 +1573,10 @@ export function startHost(opts: HostOptions): () => void {
      *  the stream self-describing, so a guest can never feed Opus bytes to its
      *  PCM worklet (or vice versa) across a format switch. */
     const sendOpusChunk = (chunk: EncodedAudioChunk) => {
+      if (studioLive) {
+        sendStudioChunk(chunk);
+        return;
+      }
       const sink = directSink;
       if (!sink || sink.readyState !== "open") return;
       if (audioChBacked()) {
@@ -1304,6 +1590,41 @@ export function startHost(opts: HostOptions): () => void {
       } catch {
         /* channel torn down */
       }
+    };
+
+    /**
+     * Ship one STUDIO packet: this payload plus the previous one(s), over the
+     * unordered zero-retransmit channel.
+     *
+     * There is deliberately NO `audioChBacked()` gate here. On an unreliable
+     * channel a backlog cannot build the way it does on a reliable one — SCTP
+     * abandons what it cannot deliver — and dropping fresh packets host-side is
+     * precisely the clustered-loss behaviour STUDIO exists to eliminate. The
+     * only guard is a hard sanity ceiling for a channel that has stopped
+     * draining entirely (a dead link), where sending is pointless anyway.
+     */
+    const sendStudioChunk = (chunk: EncodedAudioChunk) => {
+      const sink = studioSink;
+      if (!sink || sink.readyState !== "open") return;
+      const payload = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(payload);
+      const seq = audioSeq++;
+      if (sink.bufferedAmount > 128 * 1024) {
+        audioDropped++;
+        // Still remember it: when the channel drains, the next packet's
+        // redundant copy is what repairs this hole.
+        studioPrev.unshift(payload);
+        studioPrev.length = Math.min(studioPrev.length, AUDIO_STUDIO_REDUNDANCY);
+        return;
+      }
+      const units = [payload, ...studioPrev.slice(0, AUDIO_STUDIO_REDUNDANCY)];
+      try {
+        sink.send(audioRedPacket(seq, units));
+      } catch {
+        /* channel torn down */
+      }
+      studioPrev.unshift(payload);
+      studioPrev.length = Math.min(studioPrev.length, AUDIO_STUDIO_REDUNDANCY);
     };
 
     const closeAudioEncoder = () => {
@@ -1333,44 +1654,64 @@ export function startHost(opts: HostOptions): () => void {
     /** Build the Opus encoder. Always at an Opus-native rate — non-native capture
      *  (44.1k) is resampled in encodeDirectAudio so we never fall back to the
      *  ~3.1 Mbps raw path that caused robotic DIRECT. */
-    const buildOpusEncoder = async (wireRate: number, channels: number): Promise<AudioEncoder | null> => {
+    const buildOpusEncoder = async (
+      wireRate: number,
+      channels: number,
+      studio: boolean,
+    ): Promise<{ enc: AudioEncoder; studio: boolean } | null> => {
       if (typeof AudioEncoder === "undefined" || typeof AudioData === "undefined") return null;
       if (!AUDIO_OPUS_RATES.includes(wireRate)) return null;
-      const cfg = {
-        codec: "opus",
-        sampleRate: wireRate,
-        numberOfChannels: channels,
-        bitrate: AUDIO_OPUS_BPS,
-        opus: {
-          frameDuration: AUDIO_OPUS_FRAME_US,
-          // NO in-band FEC: reconstructing a lost packet from the next one's
-          // embedded copy requires decoding that packet with the loss flagged
-          // (libopus decode_fec=1) — WebCodecs' AudioDecoder has no such hook,
-          // so the guest can never use the redundancy. The ~10% bitrate it
-          // cost was pure dead weight; losses are concealed guest-side instead
-          // (seq-gap → worklet filler). Revisit if playout moves to wasm-libopus.
-          useinbandfec: false,
-          packetlossperc: 0,
-          complexity: 5,
-        },
-      } as unknown as AudioEncoderConfig;
-      try {
-        const sup = await AudioEncoder.isConfigSupported(cfg);
-        if (!sup?.supported) return null;
-      } catch {
-        return null;
+      const makeCfg = (lowDelay: boolean) =>
+        ({
+          codec: "opus",
+          sampleRate: wireRate,
+          numberOfChannels: channels,
+          bitrate: AUDIO_OPUS_BPS,
+          opus: {
+            // STUDIO halves the frame and drops Opus into RESTRICTED_LOWDELAY:
+            // no forward-adaptive lookahead, so algorithmic delay falls from
+            // 26.5ms to 6.5ms. It can afford the smaller packets because the
+            // redundant copy makes an isolated loss free.
+            frameDuration: lowDelay ? AUDIO_STUDIO_FRAME_US : AUDIO_OPUS_FRAME_US,
+            ...(lowDelay ? { application: "lowdelay" } : {}),
+            // NO in-band FEC: reconstructing a lost packet from the next one's
+            // embedded copy requires decoding that packet with the loss flagged
+            // (libopus decode_fec=1) — WebCodecs' AudioDecoder has no such hook,
+            // so the guest can never use the redundancy. The ~10% bitrate it
+            // cost was pure dead weight; STUDIO carries an EXPLICIT copy instead
+            // (audioWire's RED packets), which any decoder can use.
+            useinbandfec: false,
+            packetlossperc: 0,
+            complexity: 5,
+          },
+        }) as unknown as AudioEncoderConfig;
+      // Try the asked-for shape, then plain 20ms. `application` and a 10ms
+      // frameDuration are both optional in the WebCodecs Opus registry, so a
+      // browser that rejects either must still get sound.
+      const attempts = studio ? [true, false] : [false];
+      for (const lowDelay of attempts) {
+        const cfg = makeCfg(lowDelay);
+        try {
+          const sup = await AudioEncoder.isConfigSupported(cfg);
+          if (!sup?.supported) continue;
+        } catch {
+          continue;
+        }
+        try {
+          const enc = new AudioEncoder({
+            output: (chunk) => sendOpusChunk(chunk),
+            error: (e) => revertAudioToRaw("Opus encoder error", e),
+          });
+          enc.configure(cfg);
+          return { enc, studio: lowDelay };
+        } catch (e) {
+          console.warn(
+            `[remote] DIRECT audio: Opus configure failed (${lowDelay ? "10ms low-delay" : "20ms"}):`,
+            e,
+          );
+        }
       }
-      try {
-        const enc = new AudioEncoder({
-          output: (chunk) => sendOpusChunk(chunk),
-          error: (e) => revertAudioToRaw("Opus encoder error", e),
-        });
-        enc.configure(cfg);
-        return enc;
-      } catch (e) {
-        console.warn("[remote] DIRECT audio: Opus configure failed — raw PCM:", e);
-        return null;
-      }
+      return null;
     };
 
     /** Encode one PCM chunk. False ⇒ caller degrades this session to raw PCM. */
@@ -1412,37 +1753,50 @@ export function startHost(opts: HostOptions): () => void {
     /**
      * Negotiate the DIRECT audio codec against what the guest can decode, and
      * (re)build the encoder. Old guests advertise nothing → raw f32, which is
-     * byte-for-byte what they already expect. Returns the codec now in use.
+     * byte-for-byte what they already expect. Returns the wire now in use —
+     * the caller must relay THAT, never what it asked for.
      */
-    const setDirectCodec = async (codecs: string[]): Promise<"opus" | "f32"> => {
+    const setDirectCodec = async (
+      codecs: string[],
+      studio = false,
+    ): Promise<{ codec: "opus" | "f32"; studio: boolean }> => {
       guestAudioCodecs = codecs;
+      // STUDIO needs BOTH ends: a guest that asked for it and a redundant
+      // channel to put it on. An older host has no such channel and an older
+      // guest never asks — either way we quietly stay on the classic wire.
+      studioWanted = studio && !!studioSink;
       const fmt = liveFmt;
       if (!codecs.includes("opus") || !fmt) {
         closeAudioEncoder();
         audioCodec = "f32";
-        return audioCodec;
+        studioLive = false;
+        return { codec: audioCodec, studio: false };
       }
       // Wire at capture rate when Opus-native; otherwise resample to 48k.
       const wireRate = AUDIO_OPUS_RATES.includes(fmt.sampleRate)
         ? fmt.sampleRate
         : AUDIO_OPUS_WIRE_RATE;
-      // Already encoding this exact capture→wire mapping — nothing to do.
+      // Already encoding this exact capture→wire mapping in the asked-for mode.
       if (
         audioEnc &&
         audioCodec === "opus" &&
+        studioLive === studioWanted &&
         audioSrcRate === fmt.sampleRate &&
         audioEncRate === wireRate &&
         audioEncCh === fmt.channels
       ) {
-        return audioCodec;
+        return { codec: audioCodec, studio: studioLive };
       }
-      const enc = await buildOpusEncoder(wireRate, fmt.channels);
+      const built = await buildOpusEncoder(wireRate, fmt.channels, studioWanted);
       closeAudioEncoder();
-      if (!enc) {
+      if (!built) {
         audioCodec = "f32";
-        return audioCodec;
+        studioLive = false;
+        return { codec: audioCodec, studio: false };
       }
-      audioEnc = enc;
+      audioEnc = built.enc;
+      studioLive = built.studio;
+      studioPrev = [];
       audioSrcRate = fmt.sampleRate;
       audioEncRate = wireRate;
       audioEncCh = fmt.channels;
@@ -1457,9 +1811,10 @@ export function startHost(opts: HostOptions): () => void {
         wireRate !== fmt.sampleRate ? ` (resample ${fmt.sampleRate}→${wireRate}Hz)` : "";
       console.info(
         `[remote] DIRECT audio via Opus @ ${Math.round(AUDIO_OPUS_BPS / 1000)}kbps ` +
-          `(${wireRate}Hz ×${fmt.channels})${resampleNote} — was ${Math.round((fmt.sampleRate * fmt.channels * 4 * 8) / 1000)}kbps raw`,
+          `(${wireRate}Hz ×${fmt.channels}${studioLive ? `, STUDIO 10ms +${AUDIO_STUDIO_REDUNDANCY} redundant` : ""})${resampleNote} ` +
+          `— was ${Math.round((fmt.sampleRate * fmt.channels * 4 * 8) / 1000)}kbps raw`,
       );
-      return audioCodec;
+      return { codec: audioCodec, studio: studioLive };
     };
 
     // The audio channel has a bounded packet lifetime, so an old one-shot format
@@ -1485,9 +1840,18 @@ export function startHost(opts: HostOptions): () => void {
         // Announce the WIRE rate the guest must decode/play — after Opus resample
         // that may be 48k even when WASAPI captured at 44.1k.
         const rate = audioCodec === "opus" && audioEncRate > 0 ? audioEncRate : liveFmt.sampleRate;
+        // `studio` says which CHANNEL the samples are on and therefore which
+        // framing to expect; it must ride the same announce as the rate so the
+        // guest can never mis-route a wire switch.
         directSink.send(
           JSON.stringify({
-            cfg: { sampleRate: rate, channels: liveFmt.channels, codec: audioCodec },
+            cfg: {
+              sampleRate: rate,
+              channels: liveFmt.channels,
+              codec: audioCodec,
+              studio: studioLive,
+              frameMs: studioLive ? AUDIO_STUDIO_FRAME_US / 1000 : AUDIO_OPUS_FRAME_US / 1000,
+            },
           }),
         );
       } catch {
@@ -1544,13 +1908,16 @@ export function startHost(opts: HostOptions): () => void {
       // a guest that opted into DIRECT before capture started got raw PCM, so
       // re-negotiate against its advertised codecs and announce the result.
       if (directSink) {
-        await setDirectCodec(guestAudioCodecs);
+        await setDirectCodec(guestAudioCodecs, studioWanted);
         startCfgBurst();
       }
     };
     return {
       track,
       start,
+      setRedundantSink: (sink) => {
+        studioSink = sink;
+      },
       setDirectSink: (sink) => {
         directSink = sink;
         if (sink) {
@@ -1561,13 +1928,16 @@ export function startHost(opts: HostOptions): () => void {
           // from a clean timestamp/sequence base.
           closeAudioEncoder();
           audioCodec = "f32";
+          studioWanted = false;
+          studioLive = false;
+          studioPrev = [];
           audioSeq = 0;
           audioTsUs = 0;
           audioSrcRate = 0;
         }
       },
       setDirectCodec,
-      stats: () => ({ codec: audioCodec, dropped: audioDropped }),
+      stats: () => ({ codec: audioCodec, dropped: audioDropped, studio: studioLive }),
       format: () => liveFmt,
     };
   };
@@ -1590,8 +1960,11 @@ export function startHost(opts: HostOptions): () => void {
     let startVideoCapture: (() => Promise<void>) | null = null;
     let startAudioCapture: (() => Promise<void>) | null = null;
     let setAudioDirectSink: ((ch: RTCDataChannel | null) => void) | null = null;
-    let setAudioDirectCodec: ((codecs: string[]) => Promise<"opus" | "f32">) | null = null;
-    let audioStats: (() => { codec: "opus" | "f32"; dropped: number }) | null = null;
+    let setAudioRedundantSink: ((ch: RTCDataChannel | null) => void) | null = null;
+    let setAudioDirectCodec:
+      | ((codecs: string[], studio?: boolean) => Promise<{ codec: "opus" | "f32"; studio: boolean }>)
+      | null = null;
+    let audioStats: (() => { codec: "opus" | "f32"; dropped: number; studio: boolean }) | null = null;
     /** Live capture format — re-posting the worklet envelope must not change it
      *  (a framing change makes the worklet drop its buffer and re-prime). */
     let audioFormat: (() => { sampleRate: number; channels: number } | null) | null = null;
@@ -1731,6 +2104,15 @@ export function startHost(opts: HostOptions): () => void {
     // an in-place ICE restart (re-route the same live session) from a fresh session.
     const sessionId = Math.random().toString(36).slice(2);
     activeSessionId = sessionId;
+    // Liveness for THIS session's timers. `pc !== myPc` covers most async
+    // handlers, but a session that lost a concurrent-start race never becomes
+    // `pc` at all — it needs a flag its own callbacks can read. Anything that
+    // touches the process-wide Rust capture (keyframe requests, encoder pause)
+    // must check it first: those globals are shared with the live session.
+    let sessionAlive = true;
+    sessionCleanups.add(() => {
+      sessionAlive = false;
+    });
     let iceRestartTimer: number | null = null;
     let deadTimer: number | null = null;
     let restartAttempts = 0;
@@ -1840,6 +2222,17 @@ export function startHost(opts: HostOptions): () => void {
       priority: "high",
     } as RTCDataChannelInit);
     audioCh.binaryType = "arraybuffer";
+    // STUDIO audio: UNORDERED + zero retransmits. Every packet carries the
+    // previous one's payload, so a single loss needs no repair at all and there
+    // is nothing worth waiting for — which is exactly when ordering and
+    // retransmission stop being protection and become latency. Created up front
+    // (no renegotiation); silent until a guest opts in with `red:true`.
+    const audioRedCh = pc.createDataChannel("audio2", {
+      ordered: false,
+      maxRetransmits: 0,
+      priority: "high",
+    } as RTCDataChannelInit);
+    audioRedCh.binaryType = "arraybuffer";
 
     // ---- WebCodecs direct-video encoder (bypasses the receiver jitter buffer).
     // The phone's dominant latency term was Chromium's video jitter buffer:
@@ -1951,6 +2344,9 @@ export function startHost(opts: HostOptions): () => void {
     const SKIP_RECOVER_AT = 4;
     const SOFT_RECOVER_MIN_MS = 4000;
     const requestNativeKeyframe = (reason = "unspecified") => {
+      // Rust has ONE force-IDR flag for the whole process. A torn-down session
+      // firing this steals keyframes from whoever is actually streaming.
+      if (!sessionAlive) return;
       const now = performance.now();
       // Coalesce capture-rate calls while Rust's atomic request is still pending.
       if (now - nativeKeyRequestAt < 250) return;
@@ -1975,20 +2371,45 @@ export function startHost(opts: HostOptions): () => void {
     let pauseEvents = 0;
     let pausePoll: number | null = null;
     let pausedAtMs = 0;
+    sessionCleanups.add(() => {
+      if (pausePoll !== null) {
+        window.clearInterval(pausePoll);
+        pausePoll = null;
+      }
+      if (awaitKeyPoll !== null) {
+        window.clearInterval(awaitKeyPoll);
+        awaitKeyPoll = null;
+      }
+      // The encoder pause is a process-wide Rust flag. Whoever set it has to
+      // clear it: an orphaned session leaving it latched is a frozen stream for
+      // whatever session comes next.
+      if (encodePaused) {
+        encodePaused = false;
+        try {
+          void api.remoteSetEncodePaused(false);
+        } catch {
+          /* not on desktop */
+        }
+      }
+    });
     /** While hard-gated on an IDR, keep asking even if no frames are flowing —
      *  otherwise a paused encoder + dropped recovery key leaves the guest frozen
      *  until its stall watchdog tears the session down (multi-second blackouts). */
     let awaitKeyPoll: number | null = null;
+    /** Consecutive watchdog ticks with no IDR on the wire — bounds the ask. */
+    let awaitKeyTicks = 0;
     const clearAwaitKeyWatchdog = () => {
       if (awaitKeyPoll !== null) {
         window.clearInterval(awaitKeyPoll);
         awaitKeyPoll = null;
       }
+      awaitKeyTicks = 0;
     };
     const armAwaitKeyWatchdog = () => {
       if (awaitKeyPoll !== null) return;
+      awaitKeyTicks = 0;
       awaitKeyPoll = window.setInterval(() => {
-        if (!nativeAwaitKey) {
+        if (!nativeAwaitKey || !sessionAlive) {
           clearAwaitKeyWatchdog();
           return;
         }
@@ -1997,10 +2418,24 @@ export function startHost(opts: HostOptions): () => void {
         if (encodePaused && videoCh.readyState === "open" && videoCh.bufferedAmount < wcBufBudget()) {
           setEncoderPaused(false, videoCh.bufferedAmount, wcBufBudget());
         }
-        requestNativeKeyframe("await-key watchdog");
+        // Back off instead of hammering. An IDR that hasn't landed after a few
+        // asks isn't going to land because we asked a seventh time, and each ask
+        // costs the live stream a full keyframe: at 350ms flat that is ~3 IDR/s,
+        // which on its own eats most of the bitrate on a modest link. Ask hard
+        // for the first ~1s (a genuinely fresh decoder needs it fast), then once
+        // a second — the guest's own vkf timer and the periodic safety net still
+        // cover the rest.
+        awaitKeyTicks++;
+        if (awaitKeyTicks <= 3 || awaitKeyTicks % 3 === 0) {
+          requestNativeKeyframe("await-key watchdog");
+        }
       }, 350);
     };
-    const setNativeAwaitKey = (on: boolean) => {
+    const setNativeAwaitKey = (on: boolean, reason = "") => {
+      // The gate drops every P-frame until an IDR lands, so a stuck one is a
+      // frozen picture *and* an IDR storm. Journal both edges with their cause —
+      // without this, "why is 9% of the stream keyframes?" is unanswerable.
+      if (on !== nativeAwaitKey) slog("gate", `${on ? "hard-gate ON" : "hard-gate OFF"}${reason ? ` (${reason})` : ""}`);
       nativeAwaitKey = on;
       if (on) armAwaitKeyWatchdog();
       else clearAwaitKeyWatchdog();
@@ -2103,7 +2538,7 @@ export function startHost(opts: HostOptions): () => void {
         }
         // A decoder configuration/resize genuinely cannot decode a P-frame sent under
         // the old SPS — HARD-gate until the IDR arrives.
-        if (!key) setNativeAwaitKey(true);
+        if (!key) setNativeAwaitKey(true, `config/announce ${w}x${h}`);
         slog("config", `announce ${w}x${h}`);
         requestNativeKeyframe("config/announce");
       }
@@ -2144,7 +2579,7 @@ export function startHost(opts: HostOptions): () => void {
           `P-frame dropped — channel dead (buffered=${Math.round(buffered / 1024)}KB, 4× budget); hard-gating until IDR`,
         );
         setEncoderPaused(true, buffered, maxBuffered);
-        setNativeAwaitKey(true);
+        setNativeAwaitKey(true, "P-frame dropped at 4x budget");
         armNativeRecovery(true, true);
         adaptFromBuffer(buffered, maxBuffered, true);
         return;
@@ -2190,7 +2625,7 @@ export function startHost(opts: HostOptions): () => void {
         // Channel threw mid-frame — the guest received a partial access unit, which
         // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
         slog("fault", `channel send threw mid-${key ? "keyframe" : "P-frame"} (partial AU) — hard gate`);
-        setNativeAwaitKey(true);
+        setNativeAwaitKey(true, "partial access unit on the wire");
         armNativeRecovery(false, true);
         return;
       }
@@ -2206,7 +2641,7 @@ export function startHost(opts: HostOptions): () => void {
           slog("recover", `closed by IDR on wire (recovered=${nativeRecoveredEvents})`);
         }
         nativeRecoveryPending = false;
-        setNativeAwaitKey(false);
+        setNativeAwaitKey(false, "IDR confirmed on the wire");
         skipsSinceKey = 0;
       } else {
         // Channel accepted a P-frame — if a skip burst just ended, one recovery IDR.
@@ -2483,9 +2918,14 @@ export function startHost(opts: HostOptions): () => void {
         pc.addTrack(audioTrack, new MediaStream([audioTrack]));
         startAudioCapture = a.start;
         setAudioDirectSink = a.setDirectSink;
+        setAudioRedundantSink = a.setRedundantSink;
         setAudioDirectCodec = a.setDirectCodec;
         audioStats = a.stats;
         audioFormat = a.format;
+        // Register the unordered channel once, up front: `setDirectCodec` reads
+        // it to decide whether STUDIO is even possible, and that decision has to
+        // be made BEFORE the first packet leaves.
+        setAudioRedundantSink(audioRedCh);
       }
     }
 
@@ -2601,7 +3041,7 @@ export function startHost(opts: HostOptions): () => void {
           const now = Date.now();
           if (authorized && now - lastVresetAt > 4000) {
             lastVresetAt = now;
-            setNativeAwaitKey(true);
+            setNativeAwaitKey(true, "guest vreset");
             slog("idr", "requested (guest vreset — decoder wedged)");
             // On the native path the canvas/generator track isn't in the picture at
             // all — the equivalent un-wedge is a fresh IDR + SPS from Rust.
@@ -2611,6 +3051,23 @@ export function startHost(opts: HostOptions): () => void {
               /* not on desktop / no native encoder */
             }
             void rebuildVideoPipeline();
+          }
+          return;
+        }
+        // Guest link report (ABR v2): what the phone actually received and how
+        // much standing delay the link is carrying. Not an input event, and it
+        // arrives ~4×/s, so it is handled before the auth gate falls through to
+        // injection — but it still only feeds the controller once authorized
+        // (an unauthorized peer has no stream to rate-control anyway).
+        if (msg && msg.type === "vstat") {
+          if (authorized && opts.fixedMonitor == null) {
+            adaptFromReport({
+              recvKbps: Math.max(0, Number(msg.recvKbps) || 0),
+              owdMs: Math.max(0, Number(msg.owdMs) || 0),
+              owdMinMs: Math.max(0, Number(msg.owdMinMs) || 0),
+              fps: Math.max(0, Number(msg.fps) || 0),
+              queue: Math.max(0, Number(msg.queue) || 0),
+            });
           }
           return;
         }
@@ -2641,14 +3098,20 @@ export function startHost(opts: HostOptions): () => void {
             const codecs = Array.isArray(msg.codecs)
               ? (msg.codecs as unknown[]).map((c) => String(c))
               : [];
+            // `red` = the guest wants the STUDIO wire. Only ever GRANTED if the
+            // encoder actually built at 10ms low-delay, and the ack carries what
+            // we ended up with — the guest must route on that, not on its ask.
+            const wantRed = msg.red === true;
             void (async () => {
-              const codec = (await setAudioDirectCodec?.(codecs)) ?? "f32";
+              const wire = (await setAudioDirectCodec?.(codecs, wantRed)) ?? { codec: "f32" as const, studio: false };
               if (pc !== myPc) return; // session replaced while negotiating
               setAudioDirectSink?.(audioCh);
               if (audioTrack) audioTrack.enabled = false;
               if (dataCh?.readyState === "open") {
                 try {
-                  dataCh.send(JSON.stringify({ event: "amode", mode: "pcm", codec }));
+                  dataCh.send(
+                    JSON.stringify({ event: "amode", mode: "pcm", codec: wire.codec, red: wire.studio }),
+                  );
                 } catch {
                   /* ignore */
                 }
@@ -2673,7 +3136,7 @@ export function startHost(opts: HostOptions): () => void {
         // the whole keyframe interval staring at nothing.
         if (msg && msg.type === "vkf") {
           wcForceKey = true;
-          setNativeAwaitKey(true);
+          setNativeAwaitKey(true, "guest vkf");
           slog("idr", "requested (guest vkf — decoder lost sync)");
           try {
             void api.remoteRequestKeyframe();
@@ -2712,6 +3175,13 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.wcKeyMs === "number") quality.wcKeyMs = clamp(msg.wcKeyMs, 1000, 30000);
           if (typeof msg.wcBufKB === "number") quality.wcBufKB = clamp(msg.wcBufKB, 64, 1024);
           if (typeof msg.wcQueueMax === "number") quality.wcQueueMax = clamp(msg.wcQueueMax, 1, 6);
+          if (typeof msg.abrV2 === "boolean" && msg.abrV2 !== quality.abrV2) {
+            quality.abrV2 = msg.abrV2;
+            // Switching controllers mid-stream must not inherit the other one's
+            // shed state — that is how an A/B test reads as "the new one is
+            // stuck at 2Mbps" when it merely started there.
+            resetAdaptiveTarget(`abr ${msg.abrV2 ? "v2" : "v1"}`, false);
+          }
           // RTC audio buffer: re-post the envelope so the slider is audible on
           // the live worklet without a reconnect. The worklet only resets its
           // adaptive target when the BASE actually changes, so re-sending an
@@ -2958,7 +3428,13 @@ export function startHost(opts: HostOptions): () => void {
       // If authorization somehow completed before this channel opened, make sure
       // the guest still learns it's allowed (otherwise it stays "pending").
       if (authorized && data.readyState === "open") data.send(JSON.stringify({ event: "auth", state: "ok" }));
-      focusTimer = window.setInterval(async () => {
+      // Session-scoped, not just module-scoped. This loop drives `adaptFromBuffer`
+      // → `remoteSetCaptureQuality`, which is PROCESS-wide: an orphan from a
+      // start that lost a race would sit there re-setting the live session's
+      // bitrate every 500ms. `focusTimer` is a single slot, so it cannot reach
+      // an orphan — the cleanup registry can.
+      const myFocusTimer = window.setInterval(async () => {
+        if (!sessionAlive) return;
         try {
           const active = await api.remoteTextfieldActive();
           if (active !== lastTextField) {
@@ -3066,6 +3542,15 @@ export function startHost(opts: HostOptions): () => void {
                           kbpsMax: Math.round((adaptKbps > 0 ? adaptKbps : wcTargetBps() / 1000)),
                           adaptKbps: Math.round(adaptKbps),
                           targetKbps: targetKbps(),
+                          // ABR v2 state, so "why is my bitrate here?" is answerable
+                          // from the HUD: which controller is live, the standing
+                          // queue it measured, and any ceiling it is respecting.
+                          abr: abrV2Live() ? "v2" : quality.abrV2 ? "v2-idle" : "v1",
+                          abrQueueMs: Math.round(vsQueueMs),
+                          abrRecvKbps: Math.round(vsRecvKbps),
+                          abrCeilKbps: Math.round(abrCeilKbps),
+                          abrGuestFps: Math.round(vsFps),
+                          abrDecQueue: vsDecoderQueue,
                           // Artifact / recovery telemetry for the HUD. The host is the
                           // single source of truth: it knows every backpressure skip,
                           // every soft-recovery arming, and every clean IDR that closed
@@ -3087,9 +3572,12 @@ export function startHost(opts: HostOptions): () => void {
                   // a climbing count means the link can't even carry the audio.
                   audio: {
                     mode: audioDirect ? "pcm" : "rtc",
-                    chBufKB: Math.round((audioCh.bufferedAmount || 0) / 1024),
+                    chBufKB: Math.round(
+                      ((audioStats?.().studio ? audioRedCh.bufferedAmount : audioCh.bufferedAmount) || 0) / 1024,
+                    ),
                     codec: audioStats?.().codec ?? "f32",
                     dropped: audioStats?.().dropped ?? 0,
+                    studio: audioStats?.().studio ?? false,
                   },
                   at: Date.now(),
                 }),
@@ -3179,6 +3667,11 @@ export function startHost(opts: HostOptions): () => void {
           }
         }
       }, 250);
+      focusTimer = myFocusTimer;
+      sessionCleanups.add(() => {
+        window.clearInterval(myFocusTimer);
+        if (focusTimer === myFocusTimer) focusTimer = null;
+      });
     };
 
     const offer = await pc.createOffer();

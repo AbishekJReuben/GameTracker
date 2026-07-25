@@ -38,6 +38,30 @@ describe("normalizeStreamTune", () => {
     expect(normalizeStreamTune({ preferDirectAudio: false }).preferDirectAudio).toBe(false);
   });
 
+  describe("streaming pass 3 knobs", () => {
+    it("defaults abrV2 and audioStudio ON for a tune saved before they existed", () => {
+      // Same `!== false` shape as every other opt-out: a phone upgrading from
+      // 3.9.x has a persisted tune with neither key, and absent must mean
+      // "default" or the upgrade silently strands it on the old paths.
+      const t = normalizeStreamTune({ maxW: 1920, fps: 60 });
+      expect(t.abrV2).toBe(true);
+      expect(t.audioStudio).toBe(true);
+    });
+
+    it("honours an explicit false and round-trips true", () => {
+      expect(normalizeStreamTune({ abrV2: false }).abrV2).toBe(false);
+      expect(normalizeStreamTune({ abrV2: true }).abrV2).toBe(true);
+      expect(normalizeStreamTune({ audioStudio: false }).audioStudio).toBe(false);
+      expect(normalizeStreamTune({ audioStudio: true }).audioStudio).toBe(true);
+    });
+
+    it("counts as custom when either is turned off", () => {
+      expect(streamTuneIsCustom(normalizeStreamTune({ abrV2: false }))).toBe(true);
+      expect(streamTuneIsCustom(normalizeStreamTune({ audioStudio: false }))).toBe(true);
+      expect(streamTuneIsCustom(normalizeStreamTune({}))).toBe(false);
+    });
+  });
+
   describe("RTC audio knobs", () => {
     it("migrates a tune saved before the current audio and fps defaults", () => {
       const t = normalizeStreamTune({ maxW: 1920, fps: 40 });

@@ -4,9 +4,12 @@ import {
   AUDIO_HDR_BYTES,
   StreamingAudioResampler,
   audioPacket,
+  audioRedPacket,
   audioSeqGap,
   audioSeqOf,
   isOpusPacket,
+  isOpusRedPacket,
+  parseOpusRed,
 } from "./audioWire";
 
 /** A framed Opus packet with `payload` bytes after the header. */
@@ -77,6 +80,52 @@ describe("audioWire", () => {
     it("ignores an encoder restart (seq back to 0) instead of blaming the link", () => {
       expect(audioSeqGap(50_000, 0)).toBe(0);
       expect(audioSeqGap(50_000, 1)).toBe(0);
+    });
+  });
+
+  describe("STUDIO redundancy packets", () => {
+    const u = (...b: number[]) => Uint8Array.from(b);
+
+    it("round-trips units newest-first with descending sequences", () => {
+      const ab = audioRedPacket(10, [u(1, 2, 3), u(4, 4), u(5)]);
+      expect(isOpusRedPacket(ab)).toBe(true);
+      const units = parseOpusRed(ab);
+      expect(units.map((x) => x.seq)).toEqual([10, 9, 8]);
+      expect([...units[0].payload]).toEqual([1, 2, 3]);
+      expect([...units[1].payload]).toEqual([4, 4]);
+      expect([...units[2].payload]).toEqual([5]);
+    });
+
+    it("is never confused with a classic Opus packet in either direction", () => {
+      // Both formats can share a session (the host switches when the guest
+      // re-negotiates), so routing must be decided by the fmt byte alone.
+      const red = audioRedPacket(3, [u(9, 9)]);
+      const plain = audioPacket(3, 2);
+      expect(isOpusPacket(red)).toBe(false);
+      expect(isOpusRedPacket(plain)).toBe(false);
+      expect(parseOpusRed(plain)).toEqual([]);
+    });
+
+    it("survives a u32 sequence wrap in the redundant units", () => {
+      const units = parseOpusRed(audioRedPacket(1, [u(1), u(2), u(3)]));
+      expect(units.map((x) => x.seq)).toEqual([1, 0, 0xffffffff]);
+    });
+
+    it("caps at AUDIO_RED_MAX_UNITS instead of overflowing the count byte", () => {
+      const many = [u(1), u(2), u(3), u(4), u(5), u(6)];
+      expect(parseOpusRed(audioRedPacket(20, many))).toHaveLength(4);
+    });
+
+    it("rejects a truncated packet rather than decoding a partial payload", () => {
+      const ab = audioRedPacket(5, [u(1, 2, 3, 4), u(7, 7)]);
+      expect(parseOpusRed(ab.slice(0, ab.byteLength - 2))).toEqual([]);
+    });
+
+    it("skips zero-length units (a padded packet has nothing to decode)", () => {
+      const ab = audioRedPacket(4, [u(1, 1), new Uint8Array(0)]);
+      const units = parseOpusRed(ab);
+      expect(units).toHaveLength(1);
+      expect(units[0].seq).toBe(4);
     });
   });
 

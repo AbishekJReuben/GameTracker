@@ -887,6 +887,10 @@ where
     let my_gen = CAP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     CAP_RUNNING.store(true, Ordering::SeqCst);
     ST_PRODUCED.store(0, Ordering::Relaxed);
+    // Per-session, like `produced`. Left cumulative these read as tens of
+    // thousands of skips against a few thousand frames on a healthy stream,
+    // which is exactly the wrong conclusion to hand someone reading the HUD.
+    ST_PAUSE_SKIPS.store(0, Ordering::Relaxed);
     // Every session starts on JPEG and is upgraded only once THIS guest opts into
     // DIRECT. Leaving the previous session's flag set would hand native H.264 to a
     // brand-new RTC guest, which paints its canvas from pixels and would show black.

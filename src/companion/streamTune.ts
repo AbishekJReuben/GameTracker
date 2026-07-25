@@ -93,6 +93,26 @@ export type StreamTune = {
    * thread; the prime/max envelope is derived from it.
    */
   audioHostMs: number;
+  /**
+   * Host/DIRECT: drive the encode bitrate from what the PHONE actually receives
+   * and how much standing delay the link is carrying, instead of from the local
+   * send-queue depth alone. The queue-depth controller reads a normal
+   * bandwidth-delay product as congestion, and because its own budget shrinks
+   * with the bitrate it can ratchet all the way down and never climb back
+   * (only a settings change reset it). ON also re-probes for headroom whenever
+   * the link is provably clean, so a good network is actually used. OFF is the
+   * long-standing controller, byte for byte.
+   */
+  abrV2: boolean;
+  /**
+   * DIRECT audio only: the STUDIO wire — 10ms Opus frames carrying one
+   * redundant copy of the previous frame, over an UNORDERED, zero-retransmit
+   * channel, with pitch-aware gap repair on the phone. A single lost packet
+   * costs nothing (the next one still contains it), and nothing can ever be
+   * held up waiting for a retransmit. OFF keeps the 20ms ordered/time-bounded
+   * wire. No effect while PC sound is on the RTC track.
+   */
+  audioStudio: boolean;
 };
 
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
@@ -121,6 +141,8 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   preferDirectAudio: true,
   audioJbMs: 100,
   audioHostMs: 90,
+  abrV2: true,
+  audioStudio: true,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -183,6 +205,8 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     hostNvenc: r.hostNvenc !== false,
     preferNativeDecode: r.preferNativeDecode !== false,
     preferDirectAudio: r.preferDirectAudio !== false,
+    abrV2: r.abrV2 !== false,
+    audioStudio: r.audioStudio !== false,
     // 0 means "auto" (don't touch NetEQ). Finite test — like `pace`.
     audioJbMs: clamp(Number.isFinite(Number(r.audioJbMs)) ? Number(r.audioJbMs) : d.audioJbMs, 0, 400),
     audioHostMs,
@@ -275,6 +299,8 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.preferNativeDecode !== d.preferNativeDecode ||
     t.preferDirectAudio !== d.preferDirectAudio ||
     t.audioJbMs !== d.audioJbMs ||
-    t.audioHostMs !== d.audioHostMs
+    t.audioHostMs !== d.audioHostMs ||
+    t.abrV2 !== d.abrV2 ||
+    t.audioStudio !== d.audioStudio
   );
 }

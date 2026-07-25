@@ -1286,3 +1286,120 @@ per-row copy/edit/folder/pin/share/delete.
   open reuses rows. Density is cached once (`dp()`) instead of per call. Don't revert
   to `removeAllViews`+rebuild or to entry-capturing per-bind listeners.
 
+
+### v3.9.x streaming pass 3 â€” receiver-driven bitrate, STUDIO audio, dock polish (do not regress)
+
+Four independent problems, one session. The evidence for the first two came from a
+live phone diagnostic dump (Copy diag + host stream log); read that before changing
+any of this â€” the numbers are the argument.
+
+**1. The bitrate ratchet (`rtcHost.ts`).** DIRECT bitrate walked down from a 34Mbps
+target to 2.6Mbps over ~35s, one 3â€“6% shed at a time, and never came back. Meanwhile
+the phone reported **36ms end-to-end, 32ms RTT, decode queue 0** â€” the link was fine.
+Two compounding causes, both now fixed:
+
+- **`bufferedAmount` is not a congestion signal.** It counts bytes in flight, so a
+  healthy link permanently holds ~one bandwidth-delay product (~25KB at 2.6Mbps Ã—
+  32ms). The old controller compared that against a budget *derived from the
+  bitrate*, so every cut shrank the budget, which raised `fill`, which triggered the
+  next cut â€” a latch whose only exit was `resetAdaptiveTarget`, i.e. the user nudging
+  a slider. That is exactly what "I have to change a setting to get my quality back"
+  was.
+- **fps restore was gated on `adaptKbps >= target*0.7`**, so a stuck bitrate also
+  permanently stuck the frame rate (60 â†’ 27fps in the capture).
+
+**ABR v2** (`tune.abrV2`, default ON, toggle "Smart bitrate") replaces the signal
+rather than retuning the constants. The guest sends `{type:"vstat"}` 4Ã—/s with the
+bytes it actually received plus its one-way delay AND the rolling 10s **minimum** of
+that delay; `owd âˆ’ min(owd)` is the standing queue this stream is adding, and the
+clock offset cancels in the subtraction. Then: overuse (>110ms queue) sets the rate
+from the **measured receive rate** (`0.85 Ã— R_hat`, GCC's decrease) instead of a
+fraction of our own guess; a clean signal (<45ms) climbs Ã—1.12 and, after 6 clean
+seconds, **retires the remembered ceiling entirely** so the full target is re-reached;
+in between it holds. fps restores off the delay signal alone. Soft `fill` no longer
+moves the rate at all in v2 â€” only a true 4Ã—-budget hard drop does. `wcBufBudget` in
+v2 is sized off `max(send, receive)` rate with a 4-frame floor so a normal BDP can
+never look like a backlog. **v1 is untouched and still selected by the toggle; v2 only
+engages while fresh `vstat` reports are arriving (`abrV2Live()`), so an older guest
+silently gets v1.** HUD: `ABR` / `Queue` / `Recv` / `Ceil` cells.
+
+**2. Zombie peer sessions were forcing ~3 IDR/s.** The same dump showed **519
+keyframes in 5885 frames (~9%)** with `[idr] requested (await-key watchdog)` every
+350ms for the whole session â€” while `wc.frames` matched Rust's `producedFrames`
+exactly, i.e. the LIVE session was not gating anything. Cause: `startPeer` is async
+and re-entrant, and its teardown hooks (`wcStop`, `nativeSink`) are single-slot module
+state. Two concurrent starts and the loser's timers survive forever â€” including its
+await-key watchdog, whose `remote_request_keyframe()` hits Rust's ONE process-wide
+force-IDR flag. Nine percent keyframes is where the bitrate went, and the blockiness
+with it.
+
+- Every session now registers its cleanups in **`sessionCleanups`**, which
+  `teardownPeer` drains in full â€” no session can outlive its teardown regardless of
+  how the race resolves. Each session also carries `sessionAlive`, checked by
+  `requestNativeKeyframe` and the watchdog **before touching any process-wide Rust
+  state**. Add new session timers to that set; do not rely on the single-slot hooks.
+- The watchdog **backs off** (hard for ~1s, then ~1/s) instead of asking at a flat
+  350ms, and `setNativeAwaitKey(on, reason)` journals both edges â€” a stuck gate is now
+  diagnosable from the stream log instead of inferable.
+- `ST_PAUSE_SKIPS` resets in `start_capture` (it was lifetime-cumulative and read as
+  13577 skips against 5888 frames on a healthy stream).
+
+**3. STUDIO audio (`tune.audioStudio`, default ON, toggle "Studio sound").** A third
+sound path beside RTC and DIRECT; both of those stay exactly as they are. DIRECT's
+20ms Opus rides an ORDERED, `maxPacketLifeTime:60` channel, so a packet that misses
+its window is gone â€” and while video saturates the shared SCTP association those
+losses arrive in **clusters**, which is what "robotic" is. STUDIO removes the trade
+instead of picking a side:
+
+- **10ms frames in Opus `application:"lowdelay"`** (RESTRICTED_LOWDELAY): 6.5ms of
+  algorithmic delay instead of 26.5ms. Configure is a ladder â€” 10ms low-delay, then
+  plain 20ms â€” because both fields are optional in the WebCodecs Opus registry.
+- **Explicit redundancy** (`audioWire.ts` `audioRedPacket`/`parseOpusRed`, fmt byte
+  3): every packet also carries the previous one's payload, so an isolated loss costs
+  nothing. Opus' own in-band FEC is unusable here â€” recovering it needs libopus
+  `decode_fec=1`, which WebCodecs' `AudioDecoder` does not expose. Cost is ~260kbps, a
+  rounding error against the picture.
+- Because loss is covered, it ships on a **new `audio2` channel: unordered, zero
+  retransmits, high priority** â€” never head-of-line blocked behind a video burst,
+  never waiting for a retransmit it would be too late to use. The guest reorders by
+  sequence and declares a real gap only once `redDepth + 1` later packets have
+  arrived. There is deliberately **no host-side backpressure drop** on this channel:
+  dropping fresh packets is the clustered loss STUDIO exists to remove.
+- **The worklet gained real PLC** (`conceal:"plc"`): normalised-autocorrelation pitch
+  search, then a crossfaded loop of that period with a per-repetition decay, capped at
+  80ms. `"hold"` remains the default and is byte-for-byte the shipped behaviour for
+  RTC and classic DIRECT. Tested in `audioFeeder.worklet.test.ts` (the test evaluates
+  the worklet source via `?raw`, so it exercises the shipping file).
+- Negotiation is `{type:"amode",mode:"pcm",codecs,red:true}` â†’ host acks
+  `{event:"amode",mode:"pcm",codec,red}`. **Route on what was GRANTED, never on what
+  was asked** â€” a host with no low-delay encoder legitimately answers `red:false`, and
+  the cfg announce repeats `studio`+`frameMs` for the same reason. Badge:
+  `AUDÂ·STUDIO`; `A-fixed` counts losses redundancy repaired.
+
+**4. Android Notes dock (`ClipboardService.java`).**
+
+- **The pin is available over our OWN app.** The fullscreen probe hides the pin when
+  the foreground app hides the status bar â€” which the companion's own Control screen
+  does, so the pin vanished exactly when it was most wanted. `trackOwnForeground()`
+  registers `ActivityLifecycleCallbacks` (event-driven, no polling, no
+  `getRunningTasks`) and `applyPinVisibility()` hides only when fullscreen AND none of
+  our activities are resumed.
+- **A tap that isn't quick no longer does nothing.** The old release path opened the
+  panel only inside 420ms; past that the hold-drag had armed and the release called
+  `settlePin()` instead â€” a press that felt normal simply did nothing. Now any press
+  that never MOVED the pin (`draggedAny`) opens it, however long it was held, and
+  `ACTION_CANCEL` is handled separately from `ACTION_UP`.
+- **The dock's chrome is built once and reused** (`buildPanelTree` / `panelRoot*` /
+  `discardPanelTree`), and `prewarmPanel()` builds it on ACTION_DOWN â€” while the
+  finger is still on the pin â€” so the release only attaches a window. Two things this
+  REQUIRES: `showPanel` must detach the root synchronously if a reopen races the 160ms
+  exit animation ("already added to the window manager"), and `hidePanel`'s end action
+  must no-op when `panel == p` (the view can be back on screen by then). The cache is
+  discarded on `flipSide` (corner radii/gravity are baked in) and on a width change.
+- **Prose wraps.** `MATCH_PARENT` is not enough inside a `HorizontalScrollView`:
+  `measureChild` always uses an UNSPECIFIED width spec, so the TextView reported the
+  whole paragraph on one line and `setFillViewport` (which only stretches a child that
+  measured NARROWER) never fired. An explicit `setMaxWidth(proseMaxWidthPx())` is the
+  one constraint that measure pass respects. Mono kinds (code/log/command/path) keep
+  `setMaxWidth(Integer.MAX_VALUE)` and pan horizontally as before.
+

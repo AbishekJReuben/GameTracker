@@ -156,6 +156,17 @@ type HostWcStats = {
   /** Reference-safe backpressure: encoder pause events instead of frame drops. */
   paused?: number;
   pausedNow?: boolean;
+  /** Which bitrate controller is live: "v2" (receiver-driven, reports arriving),
+   *  "v2-idle" (selected but no reports yet), or "v1" (send-queue depth). */
+  abr?: string;
+  /** Standing delay this stream is adding to the link (ms) — the v2 signal. */
+  abrQueueMs?: number;
+  /** What the phone reported actually receiving (kbps). */
+  abrRecvKbps?: number;
+  /** Rate last proven to overuse the link; 0 once a clean stretch retires it. */
+  abrCeilKbps?: number;
+  abrGuestFps?: number;
+  abrDecQueue?: number;
 };
 type HostAudioStats = {
   mode: "pcm" | "rtc";
@@ -164,6 +175,8 @@ type HostAudioStats = {
   codec?: "opus" | "f32";
   /** Chunks the host's backpressure guard refused because the channel was full. */
   dropped?: number;
+  /** STUDIO wire live (10ms low-delay Opus + a redundant copy per packet). */
+  studio?: boolean;
 };
 type HostStats = RemoteCaptureStats & {
   producedFps?: number;
@@ -1237,6 +1250,7 @@ export function ControlScreen({
       wcQueueMax: tune.wcQueueMax,
       hostNvenc: tune.hostNvenc,
       audioHostMs: tune.audioHostMs,
+      abrV2: tune.abrV2,
     }),
     [tune],
   );
@@ -3512,7 +3526,7 @@ export function ControlScreen({
                     audioStats.mode === "pcm" ? "bg-green/20 text-green" : "bg-white/[0.08] text-ink-soft"
                   }`}
                 >
-                  {audioStats.mode === "pcm" ? "AUD·DIRECT" : "AUD·RTC"}
+                  {audioStats.mode === "pcm" ? (audioStats.studio ? "AUD·STUDIO" : "AUD·DIRECT") : "AUD·RTC"}
                 </span>
               ) : null}
               {/* Live recovery indicator — pulses while the host has an outstanding
@@ -3823,6 +3837,25 @@ export function ControlScreen({
                         hi={(hostStats.wc.adaptKbps ?? 0) < (hostStats.wc.targetKbps ?? 0) * 0.7}
                       />
                     )}
+                    {/* Which controller is setting the bitrate, and the two
+                        numbers it is deciding from. `Queue` is the delay the
+                        stream is ADDING to the link (one-way delay minus its own
+                        rolling minimum) — that, not the send-queue depth, is
+                        what "the pipe is full" actually looks like. */}
+                    {hostStats.wc.abr && <StatCell k="ABR" v={hostStats.wc.abr} />}
+                    {hostStats.wc.abr === "v2" && (
+                      <>
+                        <StatCell
+                          k="Queue"
+                          v={`${hostStats.wc.abrQueueMs ?? 0} ms`}
+                          hi={(hostStats.wc.abrQueueMs ?? 0) > 110}
+                        />
+                        <StatCell k="Recv" v={`${hostStats.wc.abrRecvKbps ?? 0}k`} />
+                        {(hostStats.wc.abrCeilKbps ?? 0) > 0 && (
+                          <StatCell k="Ceil" v={`${hostStats.wc.abrCeilKbps}k`} />
+                        )}
+                      </>
+                    )}
                     {/* Per-session artifact/recovery counters. Pulses red while a
                         recovery is in flight so a healthy stream stays green. */}
                     <StatCell
@@ -3881,6 +3914,11 @@ export function ControlScreen({
                       v={`${hostStats?.audio?.dropped ?? 0}`}
                       hi={(hostStats?.audio?.dropped ?? 0) > 0}
                     />
+                    {audioStats.studio && (
+                      // Losses that never became a gap. A healthy count here with
+                      // A-loss near zero is exactly what the extra bytes bought.
+                      <StatCell k="A-fixed" v={`${audioStats.repaired ?? 0}`} />
+                    )}
                   </>
                 )}
               </div>
@@ -4195,6 +4233,29 @@ export function ControlScreen({
                 )}
                 <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
                   <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    Smart bitrate <ScopeTag scope="direct" />
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => patchTune({ abrV2: !tune.abrV2 })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
+                      tune.abrV2 ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tune.abrV2 ? "ON" : "OFF"}
+                  </button>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    <b className="text-ink-dim">ON</b>: this phone tells the PC what it is actually receiving and how much
+                    delay the link is carrying, and the PC sets the bitrate from that — so it climbs back to your full
+                    setting the moment the network can take it. <b className="text-ink-dim">OFF</b>: the older controller,
+                    which guesses from its own send queue and can ratchet down over a long session until you nudge a
+                    slider. The <b className="text-ink-dim">ABR</b> row in the host stats shows which one is live.
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
                     Direct (WebCodecs) <ScopeTag scope="direct" />
                   </span>
                   <button
@@ -4280,6 +4341,29 @@ export function ControlScreen({
                     <b className="text-ink-dim">OFF</b>: classic WebRTC Opus track (NetEQ). Flip OFF only if DIRECT
                     still crackles on a flaky link. Header shows{" "}
                     <b className="text-ink-dim">AUD·DIRECT</b> / <b className="text-ink-dim">AUD·RTC</b>.
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    Studio sound <ScopeTag scope="direct" />
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => patchTune({ audioStudio: !tune.audioStudio })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
+                      tune.audioStudio ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tune.audioStudio ? "ON" : "OFF"}
+                  </button>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    <b className="text-ink-dim">Needs PC sound (DIRECT) on.</b> Halves the packet size, drops Opus into
+                    its low-delay mode, and sends every packet twice — once fresh, once riding along with the next one —
+                    on a channel that never waits or retransmits. A lost packet is repaired instead of concealed, which
+                    is what the metallic edge actually was. Costs about 260kbps, nothing next to the picture. Header
+                    shows <b className="text-ink-dim">AUD·STUDIO</b>; the audio stats show how many losses it repaired.
                   </p>
                 )}
                 <button

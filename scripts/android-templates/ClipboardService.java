@@ -352,6 +352,7 @@ public class ClipboardService extends Service {
     }
     INSTANCE = this;
     startForegroundNotif();
+    trackOwnForeground();
     deriveCryptoKey();
     showBubble();
     // A gallery upload coming in from ClipboardPickActivity — handle it before the
@@ -1538,14 +1539,66 @@ public class ClipboardService extends Service {
     }
   }
 
+  /** Our own Activity is on screen right now (see {@link #trackOwnForeground}). */
+  private int ownActivitiesResumed;
+  /** Last visibility actually applied to the pin — the two inputs (fullscreen
+   *  probe, own-app foreground) change independently, so the decision has to be
+   *  recomputed rather than toggled. */
+  private boolean pinHidden;
+  private boolean fullscreenNow;
+
+  /**
+   * Watch our OWN activities so the pin can stay up over our own app.
+   *
+   * The fullscreen probe alone cannot express this: the companion's Control
+   * screen hides the system bars, so the probe correctly reports "immersive" and
+   * the pin vanished exactly when the user was most likely to want to paste
+   * something into it. Activity lifecycle callbacks are exact and event-driven —
+   * no polling, no `getRunningTasks` (removed on modern Android anyway).
+   */
+  private boolean ownForegroundHooked;
+
+  private void trackOwnForeground() {
+    if (ownForegroundHooked) return;
+    ownForegroundHooked = true;
+    try {
+      getApplication().registerActivityLifecycleCallbacks(
+          new android.app.Application.ActivityLifecycleCallbacks() {
+            @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}
+            @Override public void onActivityStarted(android.app.Activity a) {}
+            @Override public void onActivityResumed(android.app.Activity a) {
+              ownActivitiesResumed++;
+              applyPinVisibility();
+            }
+            @Override public void onActivityPaused(android.app.Activity a) {
+              if (ownActivitiesResumed > 0) ownActivitiesResumed--;
+              applyPinVisibility();
+            }
+            @Override public void onActivityStopped(android.app.Activity a) {}
+            @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}
+            @Override public void onActivityDestroyed(android.app.Activity a) {}
+          });
+    } catch (Exception ignored) {
+      // Without the hook we simply fall back to the old fullscreen-only rule.
+    }
+  }
+
   private void setHiddenForFullscreen(boolean fullscreen) {
-    if (hiddenForFullscreen == fullscreen) return;
-    hiddenForFullscreen = fullscreen;
+    fullscreenNow = fullscreen;
+    applyPinVisibility();
+  }
+
+  /** Hide the pin only over SOMEONE ELSE'S fullscreen content. */
+  private void applyPinVisibility() {
+    final boolean hide = fullscreenNow && ownActivitiesResumed <= 0;
+    if (hide == pinHidden) return;
+    pinHidden = hide;
+    hiddenForFullscreen = hide;
     main.post(() -> {
       if (bubble == null) return;
-      if (fullscreen) {
+      if (hide) {
         bubble.animate().alpha(0f).setDuration(180)
-            .withEndAction(() -> { if (hiddenForFullscreen && bubble != null) bubble.setVisibility(View.GONE); })
+            .withEndAction(() -> { if (pinHidden && bubble != null) bubble.setVisibility(View.GONE); })
             .start();
       } else {
         bubble.setVisibility(View.VISIBLE);
@@ -1587,9 +1640,16 @@ public class ClipboardService extends Service {
     private boolean movedBeforeHold;
     private boolean holding;
     private boolean touchActive;
+    /** True once a hold-drag has actually MOVED the pin. A hold that never moves
+     *  is still a tap on release — the old code only opened the panel for taps
+     *  released inside 420ms, so a deliberate press (or any tap on a busy phone
+     *  where the frame took a moment) armed the drag and then did nothing at
+     *  all on release. That is the "I have to tap the pin several times". */
+    private boolean draggedAny;
     private final Runnable armDrag = () -> {
       if (!touchActive || movedBeforeHold || bubble == null) return;
       holding = true;
+      draggedAny = false;
       bubble.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
     };
 
@@ -1605,7 +1665,13 @@ public class ClipboardService extends Service {
           downTime = System.currentTimeMillis();
           movedBeforeHold = false;
           holding = false;
+          draggedAny = false;
           touchActive = true;
+          // Warm the panel while the finger is still down. Building it takes a
+          // few ms of view inflation; doing that during the touch instead of
+          // after the release is the difference between "opens" and "opens in a
+          // moment". Idempotent and thrown away if the gesture turns into a drag.
+          prewarmPanel();
           main.postDelayed(armDrag, 420);
           return true;
         case MotionEvent.ACTION_MOVE: {
@@ -1620,6 +1686,7 @@ public class ClipboardService extends Service {
           }
           // After the haptic-confirmed hold, drag vertically while staying pinned
           // to the edge. There is intentionally no swipe-to-open gesture here.
+          if (Math.abs(dy) > dp(4)) draggedAny = true;
           bubbleLp.y = Math.max(0, Math.min(m.heightPixels - dp(PIN_HEIGHT), startY + dy));
           try {
             wm.updateViewLayout(bubble, bubbleLp);
@@ -1628,14 +1695,22 @@ public class ClipboardService extends Service {
           return true;
         }
         case MotionEvent.ACTION_UP:
+          touchActive = false;
+          main.removeCallbacks(armDrag);
+          if (holding && draggedAny) {
+            settlePin();
+          } else if (!movedBeforeHold) {
+            // Any press that didn't move the pin opens the panel, however long
+            // it was held. A hold that armed but never dragged still settles its
+            // (unchanged) position so the two paths stay symmetric.
+            if (holding) settlePin();
+            showPanel();
+          }
+          return true;
         case MotionEvent.ACTION_CANCEL:
           touchActive = false;
           main.removeCallbacks(armDrag);
-          if (holding) {
-            settlePin();
-          } else if (!movedBeforeHold && System.currentTimeMillis() - downTime < 420) {
-            showPanel();
-          }
+          if (holding && draggedAny) settlePin();
           return true;
         default:
           return false;
@@ -1690,17 +1765,112 @@ public class ClipboardService extends Service {
       hidePanel();
       return;
     }
-    if (wm == null) wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
-    if (wm == null) return;
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(this)) {
-      return;
-    }
-    dockShowLinkPreviews = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
-        .getBoolean("dockShowLinkPreviews", true);
+    if (!buildPanelTree()) return;
+    final LinearLayout root = panelRoot;
+    final int widthPx = panelRootWidth;
+    final int heightPx = getResources().getDisplayMetrics().heightPixels;
 
+    int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+        ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        : WindowManager.LayoutParams.TYPE_PHONE;
+    panelLp = new WindowManager.LayoutParams(
+        widthPx,
+        heightPx,
+        type,
+        // Drop NOT_FOCUSABLE so the composer/search EditTexts receive keystrokes;
+        // WATCH_OUTSIDE_TOUCH dismisses on an outside tap.
+        WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+        PixelFormat.TRANSLUCENT);
+    panelLp.gravity = Gravity.TOP | (pinOnRight ? Gravity.END : Gravity.START);
+    panelLp.x = 0;
+    panelLp.y = 0;
+
+    panel = root;
+    // Populate the history BEFORE the window is shown so there's no empty→filled
+    // pop-in during the slide.
+    renderList(panelList);
+    // Set the slide-in offset + transparent state BEFORE attaching: View transform
+    // properties persist while detached, so the very first frame the compositor
+    // draws is already off-screen and faded. Setting them AFTER addView (the old
+    // order) drew one frame at the final position, then jumped to the offset to
+    // animate — that one-frame jump was the open flicker.
+    root.animate().cancel();
+    // Reopening during the 160ms exit animation would otherwise hit
+    // "already added to the window manager": the tree is now REUSED, so the
+    // close is not guaranteed to have detached it yet. Detach synchronously.
+    if (root.getParent() != null) {
+      try {
+        wm.removeView(root);
+      } catch (Exception ignored) {
+      }
+    }
+    root.setTranslationX(pinOnRight ? widthPx : -widthPx);
+    root.setAlpha(0f);
+    try {
+      wm.addView(root, panelLp);
+      root.animate()
+          .translationX(0f).alpha(1f)
+          .setDuration(220)
+          .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f))
+          .start();
+    } catch (Exception ignored) {
+      panel = null;
+    }
+  }
+
+  /**
+   * Build the dock's chrome once and keep it.
+   *
+   * Inflating ~60 views by hand is a few milliseconds of work, and it used to
+   * happen between the finger lifting off the pin and the first frame of the
+   * slide — which is precisely where a delay is felt. The tree is detached (not
+   * destroyed) on close, so a reopen costs an `addView`, and {@link
+   * #prewarmPanel} moves even the first build to ACTION_DOWN, while the finger
+   * is still on the pin.
+   *
+   * Rebuilt only when something baked into it changes: the side it hugs (corner
+   * radii, flip arrow, gravity) or the screen width (rotation, fold).
+   *
+   * @return false when the dock cannot be shown at all (no overlay permission).
+   */
+  private boolean buildPanelTree() {
+    if (wm == null) wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+    if (wm == null) return false;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(this)) {
+      return false;
+    }
     DisplayMetrics m = getResources().getDisplayMetrics();
     final int widthPx = Math.min(dp(372), m.widthPixels - dp(24));
-    final int heightPx = m.heightPixels;
+    if (panelRoot != null && panelRootRight == pinOnRight && panelRootWidth == widthPx) {
+      // Reusable — just re-adopt the live handles hidePanel() cleared.
+      panelList = panelRootList;
+      dockScroll = panelRootScroll;
+      dockComposer = panelRootComposer;
+      dockMic = panelRootMic;
+      dockAddBtn = panelRootAddBtn;
+      panelStatusText = panelRootStatus;
+      dockFolderStrip = panelRootFolderStrip;
+      dockTypeStrip = panelRootTypeStrip;
+      dockTypeScroll = panelRootTypeScroll;
+      if (panelStatusText != null) {
+        panelStatusText.setText(getSyncStatusText());
+        panelStatusText.setTextColor(getSyncStatusColor());
+      }
+      // `dockEditingId` is cleared on close, so a reused composer must not come
+      // back still labelled "Save" — it would save into a note nothing is
+      // editing any more. (Draft TEXT deliberately survives, same as before:
+      // it was already persisted to prefs and restored on open.)
+      if (dockAddBtn != null && dockEditingId == null) dockAddBtn.setText("Add");
+      populateFolderStrip();
+      populateTypeStrip();
+      return true;
+    }
+    discardPanelTree();
+    dockShowLinkPreviews = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+        .getBoolean("dockShowLinkPreviews", true);
+    panelRootRight = pinOnRight;
+    panelRootWidth = widthPx;
 
     LinearLayout root = new LinearLayout(this);
     root.setOrientation(LinearLayout.VERTICAL);
@@ -1796,22 +1966,6 @@ public class ClipboardService extends Service {
 
     root.addView(buildDockFooter());
 
-    int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-        ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        : WindowManager.LayoutParams.TYPE_PHONE;
-    panelLp = new WindowManager.LayoutParams(
-        widthPx,
-        heightPx,
-        type,
-        // Drop NOT_FOCUSABLE so the composer/search EditTexts receive keystrokes;
-        // WATCH_OUTSIDE_TOUCH dismisses on an outside tap.
-        WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
-            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-        PixelFormat.TRANSLUCENT);
-    panelLp.gravity = Gravity.TOP | (pinOnRight ? Gravity.END : Gravity.START);
-    panelLp.x = 0;
-    panelLp.y = 0;
-
     root.setOnTouchListener((v, ev) -> {
       if (ev.getAction() == MotionEvent.ACTION_OUTSIDE) {
         hidePanel();
@@ -1820,26 +1974,69 @@ public class ClipboardService extends Service {
       return false;
     });
 
-    panel = root;
-    // Populate the history BEFORE the window is shown so there's no empty→filled
-    // pop-in during the slide.
-    renderList(list);
-    // Set the slide-in offset + transparent state BEFORE attaching: View transform
-    // properties persist while detached, so the very first frame the compositor
-    // draws is already off-screen and faded. Setting them AFTER addView (the old
-    // order) drew one frame at the final position, then jumped to the offset to
-    // animate — that one-frame jump was the open flicker.
-    root.setTranslationX(pinOnRight ? widthPx : -widthPx);
-    root.setAlpha(0f);
+    panelRoot = root;
+    panelRootList = list;
+    panelRootScroll = scroll;
+    panelRootComposer = dockComposer;
+    panelRootMic = dockMic;
+    panelRootAddBtn = dockAddBtn;
+    panelRootStatus = panelStatusText;
+    panelRootFolderStrip = dockFolderStrip;
+    panelRootTypeStrip = dockTypeStrip;
+    panelRootTypeScroll = dockTypeScroll;
+    return true;
+  }
+
+  /** Cached dock chrome (see buildPanelTree) and the handles into it. */
+  private LinearLayout panelRoot;
+  private boolean panelRootRight;
+  private int panelRootWidth = -1;
+  private LinearLayout panelRootList;
+  private ScrollView panelRootScroll;
+  private EditText panelRootComposer;
+  private View panelRootMic;
+  private Button panelRootAddBtn;
+  private TextView panelRootStatus;
+  private LinearLayout panelRootFolderStrip;
+  private LinearLayout panelRootTypeStrip;
+  private View panelRootTypeScroll;
+
+  /** Drop the cached tree (side/width changed, or the service is going away). */
+  private void discardPanelTree() {
+    panelRoot = null;
+    panelRootList = null;
+    panelRootScroll = null;
+    panelRootComposer = null;
+    panelRootMic = null;
+    panelRootAddBtn = null;
+    panelRootStatus = null;
+    panelRootFolderStrip = null;
+    panelRootTypeStrip = null;
+    panelRootTypeScroll = null;
+    panelRootWidth = -1;
+    // The pooled rows are CHILDREN of the tree being thrown away. Keeping them
+    // would hand the next tree a View that still has a parent, and `addView`
+    // throws on that ("already has a parent") — the flip-side path reached
+    // exactly that. Rows are cheap to rebuild; the tree is what was worth
+    // keeping.
+    liveRows.clear();
+    poolText.clear();
+    poolImage.clear();
+  }
+
+  /**
+   * Build the dock's views while the finger is still on the pin, so the release
+   * only has to attach a window. Cheap and idempotent once the tree is cached;
+   * skipped entirely when the panel is already up.
+   */
+  private void prewarmPanel() {
+    if (panel != null) return;
+    if (panelRoot != null && panelRootRight == pinOnRight) return;
     try {
-      wm.addView(root, panelLp);
-      root.animate()
-          .translationX(0f).alpha(1f)
-          .setDuration(220)
-          .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f))
-          .start();
+      buildPanelTree();
     } catch (Exception ignored) {
-      panel = null;
+      // A failed prewarm must never block the tap — showPanel rebuilds.
+      discardPanelTree();
     }
   }
 
@@ -2490,6 +2687,9 @@ public class ClipboardService extends Service {
   /** Move the dock (and pin) to the opposite edge, remembering the choice. */
   private void flipSide() {
     pinOnRight = !pinOnRight;
+    // Corner radii, the flip arrow and the window gravity are all baked into
+    // the cached tree — it has to be rebuilt for the other edge.
+    discardPanelTree();
     settlePin();
     if (bubble != null && bubbleLp != null) {
       DisplayMetrics m = getResources().getDisplayMetrics();
@@ -2522,6 +2722,9 @@ public class ClipboardService extends Service {
     // Return built rows to their pools (capped) so the next open reuses them
     // instead of rebuilding — the panel View tree is about to leave the WindowManager.
     recycleAllRows();
+    // The chrome itself is kept (detached) for the next open; only the live
+    // handles are cleared above, and buildPanelTree re-adopts them.
+    if (p != panelRoot) discardPanelTree();
     final boolean right = pinOnRight;
     // Fall back to the laid-out width if getWidth() is 0 (rapid open→close before
     // a layout pass) — a 0 slide would just alpha-blink instead of sliding out.
@@ -2536,8 +2739,11 @@ public class ClipboardService extends Service {
         .setDuration(160)
         .setInterpolator(new android.view.animation.AccelerateInterpolator())
         .withEndAction(() -> {
+          // The same view can be back on screen by now (reopened mid-exit) —
+          // removing it then would blank the panel the user just asked for.
+          if (panel == p) return;
           try {
-            if (wm != null) wm.removeView(p);
+            if (wm != null && p.getParent() != null) wm.removeView(p);
           } catch (Exception ignored) {
           }
         })
@@ -3597,6 +3803,15 @@ public class ClipboardService extends Service {
    *  for the new entry rather than trusting a stale match. */
   private View obtainRow(String kind) {
     ArrayList<View> pool = poolForKind(kind);
+    // Belt and braces: a pooled row must never still be attached. renderList's
+    // removeAllViews() normally guarantees it, but the panel tree is reused
+    // across opens now, so make the invariant local instead of inherited.
+    for (int i = pool.size() - 1; i >= 0; i--) {
+      View v = pool.get(i);
+      if (v.getParent() instanceof android.view.ViewGroup) {
+        ((android.view.ViewGroup) v.getParent()).removeView(v);
+      }
+    }
     View row;
     if (!pool.isEmpty()) {
       row = pool.remove(pool.size() - 1);
@@ -3847,6 +4062,22 @@ public class ClipboardService extends Service {
    *    scrolling — the same behavior as the desktop Notes view.
    *  A note that contains a link is tappable rather than selectable (the two are
    *  mutually exclusive in a TextView); the explicit Copy action still copies. */
+  /**
+   * Width prose is allowed to occupy, in pixels: the dock's window minus the
+   * root's horizontal padding minus a row's own. Derived rather than measured so
+   * it is correct on the very first layout pass (a measured width is 0 then, and
+   * a 0 maxWidth would collapse every line to one character).
+   */
+  private int proseMaxWidthPx() {
+    int panelW = panelRootWidth;
+    if (panelW <= 0) {
+      DisplayMetrics m = getResources().getDisplayMetrics();
+      panelW = Math.min(dp(372), m.widthPixels - dp(24));
+    }
+    // root padding dp(14)*2 (see buildPanelTree) + row padding dp(11)*2.
+    return Math.max(dp(80), panelW - dp(14) * 2 - dp(11) * 2);
+  }
+
   private void configureBody(RowHolder h, String fullText) {
     TextView body = h.body;
     h.linkPreviewOn = dockShowLinkPreviews;
@@ -3856,6 +4087,7 @@ public class ClipboardService extends Service {
 
     if (c.mono) {
       body.setHorizontallyScrolling(true);
+      body.setMaxWidth(Integer.MAX_VALUE);
       if (h.bodyScroll != null) {
         h.bodyScroll.setFillViewport(true);
         h.bodyScroll.setHorizontalScrollBarEnabled(true);
@@ -3887,6 +4119,15 @@ public class ClipboardService extends Service {
       body.setPadding(dp(9), dp(7), dp(9), dp(7));
     } else {
       body.setHorizontallyScrolling(false);
+      // MATCH_PARENT is NOT enough to make prose wrap in here.
+      // HorizontalScrollView.measureChild always measures its child with an
+      // UNSPECIFIED width spec (that is how horizontal panning works), so the
+      // TextView reports the width of the WHOLE paragraph laid out on one line.
+      // setFillViewport only stretches a child that measured NARROWER than the
+      // viewport, so a long note sailed past it and became a horizontal
+      // scroller. An explicit maxWidth is the one constraint the measure pass
+      // does respect, and it makes the layout wrap at the panel's width again.
+      body.setMaxWidth(proseMaxWidthPx());
       if (h.bodyScroll != null) {
         h.bodyScroll.setHorizontalScrollBarEnabled(false);
         h.bodyScroll.scrollTo(0, 0);
@@ -4387,6 +4628,7 @@ public class ClipboardService extends Service {
       }
       panel = null;
     }
+    discardPanelTree();
     if (bubble != null && wm != null) {
       try {
         wm.removeView(bubble);

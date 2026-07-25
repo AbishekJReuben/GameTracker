@@ -20,7 +20,13 @@ import {
   pipeIce,
   type IceServer,
 } from "@/lib/rtc";
-import { AUDIO_HDR_BYTES, audioSeqGap, audioSeqOf, isOpusPacket } from "@/lib/audioWire";
+import {
+  AUDIO_HDR_BYTES,
+  audioSeqGap,
+  audioSeqOf,
+  isOpusPacket,
+  parseOpusRed,
+} from "@/lib/audioWire";
 import audioFeederWorkletUrl from "@/lib/audioFeeder.worklet.js?url";
 import {
   dumpNativeDecoderDiag,
@@ -205,6 +211,10 @@ export type AudioStats = {
   codec?: "opus" | "f32";
   /** Opus sequence gaps after the channel's bounded retransmit window expires. */
   lost?: number;
+  /** STUDIO wire live: 10ms low-delay Opus with a redundant copy per packet. */
+  studio?: boolean;
+  /** Losses the redundant copy repaired — packets that never became a gap. */
+  repaired?: number;
 };
 
 /** Live telemetry for the WebCodecs direct-video path (data-channel H.264). */
@@ -470,9 +480,38 @@ export class CloudConn {
   private wcPlayTimer: number | null = null;
   /** NTP-style clock samples from the data-channel heartbeat (host perf clock). */
   private clockSamples: { rtt: number; off: number }[] = [];
+  // ---- link reports for the host's ABR v2 controller ------------------------
+  // The host cannot see its own link: its only local signal is how full its
+  // send queue is, which on a healthy connection always holds about one
+  // bandwidth-delay product and so reads as permanent mild congestion. What it
+  // needs is what WE measure — bytes actually delivered, and the ONE-WAY delay
+  // together with the rolling minimum of that delay. Delay minus its own
+  // minimum is the standing queue the stream is putting on the link, which is
+  // the only signal that tells "the pipe is full" apart from "the pipe is fast".
+  /** Raw per-frame one-way delay samples (host capture → our arrival), 10s. */
+  private owdWin: { at: number; ms: number }[] = [];
+  private owdMin = 0;
+  private vstatTimer: number | null = null;
 
   // ---- DIRECT audio (PCM over data channel) ---------------------------------
   private chAudio?: RTCDataChannel;
+  /** STUDIO wire: unordered/zero-retransmit channel carrying redundant Opus. */
+  private chAudioRed?: RTCDataChannel;
+  /** Tune preference; granted only when the host acks `red:true`. */
+  private preferStudioAudio = true;
+  /** The host is actually sending the redundant wire right now. */
+  private audioStudio = false;
+  /** Reorder/repair window keyed by wire sequence (STUDIO only). */
+  private redPending = new Map<number, Uint8Array>();
+  /** Next sequence we owe the decoder. -1 until the first packet lands. */
+  private redNextSeq = -1;
+  /** Units per packet the host is actually sending — how far back redundancy
+   *  reaches, and therefore how long a missing sequence is still recoverable. */
+  private redDepth = 1;
+  /** Frame duration the host announced (ms) — how much timeline a gap costs. */
+  private audioFrameMs = 20;
+  /** Losses redundancy repaired (HUD: proof the extra bytes are earning). */
+  private audioRepaired = 0;
   private audioDirect = false;
   private audioCtx: AudioContext | null = null;
   private audioNode: AudioWorkletNode | null = null;
@@ -620,6 +659,11 @@ export class CloudConn {
       this.audioJbMs = wantAudioJb;
       this.applyAudioJitter();
     }
+    // STUDIO rides on top of DIRECT, so flipping it re-negotiates the wire
+    // rather than switching paths — hence the explicit re-ask below.
+    const wantStudio = tune.audioStudio !== false;
+    const studioChanged = wantStudio !== this.preferStudioAudio;
+    this.preferStudioAudio = wantStudio;
     const wantAudio = tune.preferDirectAudio !== false;
     if (wantAudio !== this.preferDirectAudio) {
       this.preferDirectAudio = wantAudio;
@@ -629,6 +673,12 @@ export class CloudConn {
       }
     } else {
       this.preferDirectAudio = wantAudio;
+      if (studioChanged && wantAudio && this.authState === "ok") {
+        // Re-ask on the SAME path: the host rebuilds its encoder for the new
+        // wire and acks what it managed, so nothing has to be torn down.
+        this.audioDirect = false;
+        void this.maybeStartAudioDirect();
+      }
     }
     this.jitterTarget = Math.min(this.jbMax, Math.max(this.jbMin, this.jitterTarget || this.jbBase));
     this.jitterFloor = this.jbBase;
@@ -1003,11 +1053,17 @@ export class CloudConn {
     // Fresh session → fresh WebCodecs negotiation (re-probed after auth-ok).
     this.wcReset(true);
     this.audioDirect = false;
+    this.audioStudio = false;
     this.teardownAudioPlayer();
     this.audioBytes = 0;
     this.audioByteWin = [];
     this.audioLost = 0;
+    this.audioRepaired = 0;
+    this.redPending.clear();
+    this.redNextSeq = -1;
+    this.redDepth = 1;
     this.chAudio = undefined;
+    this.chAudioRed = undefined;
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
     this.pc = pc;
     pipeIce(pc, this.sig!, sid);
@@ -1096,6 +1152,12 @@ export class CloudConn {
         this.chAudio = ch;
         ch.binaryType = "arraybuffer";
         ch.onmessage = (ev) => this.onAudioMsg(ev.data);
+      } else if (ch.label === "audio2") {
+        // STUDIO audio: unordered, zero-retransmit, redundancy-carrying Opus.
+        // Its presence is also how we know the host is new enough to offer it.
+        this.chAudioRed = ch;
+        ch.binaryType = "arraybuffer";
+        ch.onmessage = (ev) => this.onAudioRedMsg(ev.data);
       } else if (ch.label === "data") {
         this.chData = ch;
         ch.onmessage = (ev) => this.onData(ev.data as string);
@@ -1243,6 +1305,7 @@ export class CloudConn {
   private wcReset(reprobe: boolean) {
     const wasActive = this.wcActive;
     this.wcActive = false;
+    this.stopLinkReports();
     this.wcRequestedAt = 0;
     this.wcAwaitKey = true;
     this.wcHead = null;
@@ -1322,20 +1385,43 @@ export class CloudConn {
     if (this.audioDirect) return;
     const codecs = await this.audioDecodeCodecs();
     if (this.closed || this.denied || !this.preferDirectAudio) return;
+    // STUDIO needs Opus (the redundancy carries Opus payloads) and a host new
+    // enough to have offered the unordered channel. Asking otherwise is
+    // harmless — an older host ignores the flag — but there is no point.
+    const red = this.preferStudioAudio && codecs.includes("opus") && !!this.chAudioRed;
     // Need the channel (or it will arrive shortly — still ask; host queues).
-    this.sendControl({ type: "amode", mode: "pcm", codecs });
+    this.sendControl({ type: "amode", mode: "pcm", codecs, red });
     await this.ensureAudioPlayer();
   }
 
   private audioFallback(reason: string) {
     console.warn("[remote] DIRECT audio off — using the WebRTC track:", reason);
     this.audioDirect = false;
+    this.audioStudio = false;
+    this.redPending.clear();
+    this.redNextSeq = -1;
     this.teardownAudioPlayer();
     this.sendControl({ type: "amode", mode: "rtc" });
     if (this.audioStream) {
       for (const t of this.audioStream.getAudioTracks()) t.enabled = true;
     }
     this.emitEvent({ event: "amode", mode: "rtc" });
+  }
+
+  /**
+   * Playout envelope for the worklet, per wire.
+   *
+   * The classic DIRECT wire has to hold enough audio to ride out a burst of
+   * unrecoverable losses, because it has no way to recover them — hence 65ms.
+   * STUDIO's losses are repaired by the next packet, so the buffer only has to
+   * cover jitter, not damage: it runs leaner AND asks for pitch-aware repair
+   * (`conceal: "plc"`) instead of the hold-and-decay filler, which is what gave
+   * concealed stretches their metallic edge.
+   */
+  private audioPlayoutProfile() {
+    return this.audioStudio
+      ? { primeMs: 25, targetMs: 35, maxMs: 180, conceal: "plc" as const }
+      : { primeMs: 40, targetMs: 65, maxMs: 240, conceal: "hold" as const };
   }
 
   /** Build (or resume) the lean phone-side PCM worklet. */
@@ -1377,7 +1463,7 @@ export class CloudConn {
         // without matching NetEQ's 150ms+. The worklet holds (not fades) on a
         // brief underrun and grows toward maxMs if the link is burstier.
         node.port.postMessage({
-          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, primeMs: 40, targetMs: 65, maxMs: 240 },
+          cfg: { channels: 2, captureRate: this.audioCtx.sampleRate, ...this.audioPlayoutProfile() },
         });
         this.audioNode = node;
         this.startAudioStatsPoll();
@@ -1401,6 +1487,7 @@ export class CloudConn {
     // decoder goes with it: the host re-negotiates on every DIRECT re-opt-in.
     this.audioCfgRate = 0;
     this.audioCfgCh = 0;
+    this.audioCfgStudio = false;
     this.audioWireCodec = "f32";
     this.audioDecRate = 0;
     this.audioDecCh = 0;
@@ -1432,6 +1519,8 @@ export class CloudConn {
    *  every time — deduplicate so repeats are true no-ops. */
   private audioCfgRate = 0;
   private audioCfgCh = 0;
+  /** ...and which playout profile it was told to use (STUDIO runs leaner). */
+  private audioCfgStudio = false;
 
   /** Wire format the host announced (`cfg.codec`). Opus packets carry a 'GA'
    *  header; raw f32 is headerless, exactly as older hosts sent it. */
@@ -1512,12 +1601,31 @@ export class CloudConn {
     if (typeof data === "string") {
       try {
         const msg = JSON.parse(data) as {
-          cfg?: { sampleRate?: number; channels?: number; codec?: string };
+          cfg?: {
+            sampleRate?: number;
+            channels?: number;
+            codec?: string;
+            studio?: boolean;
+            frameMs?: number;
+          };
         };
         if (msg.cfg) {
           const rate = msg.cfg.sampleRate ?? 48000;
           const ch = msg.cfg.channels ?? 2;
           const codec = msg.cfg.codec === "opus" ? "opus" : "f32";
+          // The host repeats this announce, and it is the authority on which
+          // wire is live: STUDIO framing changes how much timeline one lost
+          // packet costs, and which channel the samples are even arriving on.
+          const studio = msg.cfg.studio === true;
+          this.audioFrameMs = clampNum(Number(msg.cfg.frameMs) || (studio ? 10 : 20), 2.5, 60);
+          if (studio !== this.audioStudio) {
+            this.audioStudio = studio;
+            // A wire switch invalidates the reorder window (sequences restart
+            // with the encoder) — start it fresh rather than declaring a
+            // several-billion-packet gap.
+            this.redPending.clear();
+            this.redNextSeq = -1;
+          }
           // 1. Decoder lifecycle — independent of the worklet being up yet.
           if (codec !== this.audioWireCodec || rate !== this.audioDecRate || ch !== this.audioDecCh) {
             this.audioWireCodec = codec;
@@ -1537,13 +1645,17 @@ export class CloudConn {
           // been told: the cfg can arrive before the player exists, and marking
           // it applied then would leave the worklet on its default format for
           // the whole session (the host's cfg burst is finite).
-          if (this.audioNode && (rate !== this.audioCfgRate || ch !== this.audioCfgCh)) {
+          if (
+            this.audioNode &&
+            (rate !== this.audioCfgRate || ch !== this.audioCfgCh || studio !== this.audioCfgStudio)
+          ) {
             this.audioCfgRate = rate;
             this.audioCfgCh = ch;
+            this.audioCfgStudio = studio;
             // The worklet always consumes interleaved f32 at the capture rate —
             // Opus changes what crosses the wire, not what gets played.
             this.audioNode.port.postMessage({
-              cfg: { channels: ch, captureRate: rate, primeMs: 40, targetMs: 65, maxMs: 240 },
+              cfg: { channels: ch, captureRate: rate, ...this.audioPlayoutProfile() },
             });
           }
         }
@@ -1617,6 +1729,109 @@ export class CloudConn {
     this.pushAudioSamples(ab);
   }
 
+  /**
+   * One message on the STUDIO channel. Packets arrive UNORDERED and may be
+   * missing, so this is where the wire is put back into a playable sequence:
+   *
+   *  - each packet contributes its own payload AND the previous one(s), so a
+   *    single loss is repaired by its successor before anyone notices;
+   *  - arrivals are held in a tiny map keyed by sequence and drained strictly
+   *    in order, which is what makes an unordered channel safe to use;
+   *  - only when a sequence is still missing after its successors have piled up
+   *    (redundancy could not cover it) is a real gap declared, and then it is
+   *    declared exactly once, for exactly the timeline that vanished.
+   */
+  private onAudioRedMsg(data: unknown) {
+    if (!(data instanceof ArrayBuffer)) return;
+    const units = parseOpusRed(data);
+    if (units.length === 0) return;
+    if (!this.audioDirect) {
+      // Host started shipping before our ack — latch on and play.
+      this.audioDirect = true;
+      this.audioStudio = true;
+      void this.ensureAudioPlayer();
+      if (this.audioStream) {
+        for (const t of this.audioStream.getAudioTracks()) t.enabled = false;
+      }
+      this.emitEvent({ event: "amode", mode: "pcm" });
+    }
+    const now = Date.now();
+    let bytes = 0;
+    for (const u of units) bytes += u.payload.byteLength;
+    this.audioBytes += bytes;
+    this.audioByteWin.push({ at: now, bytes });
+    while (this.audioByteWin.length && now - this.audioByteWin[0].at > 2000) this.audioByteWin.shift();
+
+    const newest = units[0].seq;
+    this.redDepth = Math.max(1, units.length);
+    if (this.redNextSeq < 0) this.redNextSeq = newest;
+    for (const u of units) {
+      // Already played, or so far behind that the sequence restarted — either
+      // way feeding it now would go out of order.
+      const behind = (this.redNextSeq - u.seq) >>> 0;
+      if (behind > 0 && behind < 1000) continue;
+      if (this.redPending.has(u.seq)) continue;
+      // A non-primary unit we did not already hold means the packet that
+      // carried it as PRIMARY never arrived — this copy is the repair.
+      if (u.seq !== newest) this.audioRepaired++;
+      // `payload` is a view onto the received buffer; copy so the map can
+      // outlive it.
+      this.redPending.set(u.seq, u.payload.slice());
+    }
+    this.drainStudioAudio(newest);
+  }
+
+  /** Play everything now contiguous; skip past a hole redundancy couldn't fill. */
+  private drainStudioAudio(newest: number) {
+    for (let guard = 0; guard < 256; guard++) {
+      const next = this.redPending.get(this.redNextSeq);
+      if (next) {
+        this.redPending.delete(this.redNextSeq);
+        this.redNextSeq = (this.redNextSeq + 1) >>> 0;
+        this.feedStudioUnit(next);
+        continue;
+      }
+      // Nothing for the sequence we owe. Wait only as long as redundancy could
+      // still deliver it. With `redDepth` units per packet, sequence N is
+      // carried by packets N … N+redDepth-1, so it is unrecoverable once the
+      // newest we hold is that far along — plus one packet of slack, because
+      // the channel is unordered and a straggler is not yet a loss. Waiting
+      // longer than that would trade real latency for nothing.
+      const ahead = (newest - this.redNextSeq) >>> 0;
+      if (ahead < this.redDepth + 1 || ahead > 1000) return;
+      // Count the whole run of missing sequences as ONE gap so the worklet
+      // bridges it in a single splice rather than a stutter per packet.
+      let lost = 0;
+      while (lost < 64 && !this.redPending.has((this.redNextSeq + lost) >>> 0)) lost++;
+      this.audioLost += lost;
+      this.redNextSeq = (this.redNextSeq + lost) >>> 0;
+      try {
+        this.audioNode?.port.postMessage({ gap: lost * this.audioFrameMs });
+      } catch {
+        /* node torn down */
+      }
+    }
+  }
+
+  /** Submit one recovered/arrived Opus unit to the decoder. */
+  private feedStudioUnit(payload: Uint8Array) {
+    const dec = this.audioDec;
+    // No decoder yet ⇒ the cfg naming Opus hasn't landed (it repeats every 2s).
+    if (!dec || dec.state !== "configured") return;
+    try {
+      dec.decode(
+        new EncodedAudioChunk({
+          type: "key", // every Opus packet is independently decodable
+          timestamp: this.audioDecTsUs,
+          data: payload,
+        }),
+      );
+      this.audioDecTsUs += this.audioFrameMs * 1000;
+    } catch (e) {
+      console.warn("[remote] Opus decode submit failed:", e);
+    }
+  }
+
   /** Hand interleaved float32 to the playout worklet (both wire formats end here). */
   private pushAudioSamples(ab: ArrayBuffer) {
     if (!this.audioNode) return;
@@ -1681,6 +1896,8 @@ export class CloudConn {
       kbps: this.audioDirect ? Math.round((winBytes * 8) / 1000) : 0,
       codec: this.audioWireCodec,
       lost: this.audioLost,
+      studio: this.audioStudio,
+      repaired: this.audioRepaired,
     };
   }
 
@@ -1748,6 +1965,7 @@ export class CloudConn {
     if (!this.wcActive && !this.wcRequestedAt) return;
     const wasActive = this.wcActive;
     this.wcActive = false;
+    this.stopLinkReports();
     this.wcRequestedAt = 0;
     this.wcAwaitKey = true;
     this.wcFlushPaceQueue();
@@ -2120,6 +2338,7 @@ export class CloudConn {
     if (!this.wcActive) {
       this.wcActive = true;
       this.wcRequestedAt = 0;
+      this.startLinkReports();
       this.emitEvent({ event: "wc", active: true, native: this.wcNative });
     }
     this.wcLastFrameAt = now;
@@ -2160,6 +2379,7 @@ export class CloudConn {
         const capturedAtGuest = head.tsMs - clk.off;
         const net = now - capturedAtGuest;
         this.wcNetMs = this.smoothLatency(this.wcNetMs, net);
+        this.noteOwd(net);
         if (this.wcDecMs > 0) {
           const sample = this.wcNetMs + this.wcDecMs;
           hitchMaybeE2eJump(this.hitchLastE2e || this.wcE2eMs, sample);
@@ -2224,6 +2444,7 @@ export class CloudConn {
         const prevE2e = this.wcE2eMs;
         this.wcE2eMs = this.smoothLatency(this.wcE2eMs, e2e);
         this.wcNetMs = this.smoothLatency(this.wcNetMs, net);
+        this.noteOwd(net);
         hitchMaybeE2eJump(prevE2e || this.hitchLastE2e, e2e);
         this.hitchLastE2e = e2e;
       }
@@ -2327,6 +2548,57 @@ export class CloudConn {
     return () => {
       if (this.wcFrameCb === cb) this.wcFrameCb = null;
     };
+  }
+
+  /**
+   * Record one one-way-delay sample and keep the rolling minimum fresh.
+   *
+   * The MINIMUM is the whole point: host and guest clocks are only
+   * approximately aligned (heartbeat midpoint), so the absolute value carries
+   * an unknown constant offset — but that offset cancels in `owd - min(owd)`,
+   * which is exactly the queue the stream is building. A 10s window keeps the
+   * baseline honest when the route genuinely changes (Wi-Fi → cellular) while
+   * still being long enough that a busy stretch cannot re-baseline its own
+   * queue as "normal".
+   */
+  private noteOwd(ms: number) {
+    if (!Number.isFinite(ms)) return;
+    const now = Date.now();
+    this.owdWin.push({ at: now, ms });
+    while (this.owdWin.length && now - this.owdWin[0].at > 10_000) this.owdWin.shift();
+    let min = Infinity;
+    for (const s of this.owdWin) if (s.ms < min) min = s.ms;
+    this.owdMin = min === Infinity ? 0 : min;
+  }
+
+  /** Start/stop the 4Hz link report the host's ABR v2 controller consumes. */
+  private startLinkReports() {
+    if (this.vstatTimer !== null) return;
+    this.vstatTimer = window.setInterval(() => {
+      if (this.closed || !this.wcActive || this.authState !== "ok") return;
+      const now = Date.now();
+      let winBytes = 0;
+      for (const b of this.wcByteWin) if (now - b.at <= 1000) winBytes += b.bytes;
+      const perfNow = performance.now();
+      while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
+      this.sendControl({
+        type: "vstat",
+        recvKbps: Math.round((winBytes * 8) / 1000),
+        owdMs: Math.round(this.wcNetMs),
+        owdMinMs: Math.round(this.owdMin),
+        fps: this.wcTimes.length,
+        queue: this.wcNative ? 0 : (this.wcDecoder?.decodeQueueSize ?? 0),
+      });
+    }, 250);
+  }
+
+  private stopLinkReports() {
+    if (this.vstatTimer !== null) {
+      window.clearInterval(this.vstatTimer);
+      this.vstatTimer = null;
+    }
+    this.owdWin = [];
+    this.owdMin = 0;
   }
 
   /** Live wc-path telemetry for the HUD (null when the path isn't active). */
@@ -2761,6 +3033,16 @@ export class CloudConn {
         const mode = (msg as { mode?: string }).mode;
         if (mode === "pcm") {
           this.audioDirect = true;
+          // Only what the host GRANTED counts. Asking for STUDIO and being
+          // handed the classic wire is a normal outcome (no 10ms low-delay
+          // encoder on that machine), and mis-tracking it would leave the
+          // reorder window waiting on packets that will never come.
+          const granted = (msg as { red?: boolean }).red === true;
+          if (granted !== this.audioStudio) {
+            this.audioStudio = granted;
+            this.redPending.clear();
+            this.redNextSeq = -1;
+          }
           void this.ensureAudioPlayer();
           // Mute the RTC audio track so we don't double-play.
           if (this.audioStream) {
@@ -2768,6 +3050,9 @@ export class CloudConn {
           }
         } else if (mode === "rtc") {
           this.audioDirect = false;
+          this.audioStudio = false;
+          this.redPending.clear();
+          this.redNextSeq = -1;
           this.teardownAudioPlayer();
           if (this.audioStream) {
             for (const t of this.audioStream.getAudioTracks()) t.enabled = true;
