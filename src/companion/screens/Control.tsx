@@ -8,6 +8,8 @@ import {
   Pointer,
   ChevronUp,
   ChevronDown,
+  ChevronsUpDown,
+  ChevronsLeftRight,
   CornerDownLeft,
   Delete,
   ArrowLeft,
@@ -112,6 +114,9 @@ import {
   toolbarScaleOf,
   TOOLBAR_SCALE_MIN,
   TOOLBAR_SCALE_MAX,
+  SCROLL_SPEED_MIN,
+  SCROLL_SPEED_MAX,
+  type ScrollPadPrefs,
   type ControlChrome,
   type PinStyle,
   type ToolbarId,
@@ -219,6 +224,8 @@ const TWO_FINGER_TAP_MS = 260; // a right-click tap must be SHORT — a longer t
 const TWO_FINGER_TAP_SLOP = 20; // and either finger drifting past this is a scroll, not a tap
 const LONGPRESS_MS = 550; // stationary hold before left-button-down
 const SCROLL_STEP = 20; // finger px per wheel notch
+const WHEEL_UNIT = 40; // raw wheel delta per notch (one Chromium detent)
+const QUEST_WHEEL_UNIT = 150; // the Quest thumbstick streams wheel events — damp it hard
 const MIN_ZOOM = 0.25; // 25% — match toolbar / pin scale floor
 const MAX_ZOOM = 10; // 1000%
 const FOLLOW_MARGIN = 72; // keep the cursor this far from the viewport edge when zoomed
@@ -987,6 +994,19 @@ export function ControlScreen({
   const setPinLayoutPos = (id: string, x: number, y: number) => {
     updateChrome((prev) => ({ ...prev, layout: { ...prev.layout, [id]: { x, y } } }));
   };
+  const scrollPadLayerRef = useRef<HTMLDivElement | null>(null);
+  const scrollPad = chrome.scrollPad;
+  const scrollSpeed = chrome.scrollSpeed;
+  const patchScrollPad = (patch: Partial<ScrollPadPrefs>) => {
+    updateChrome((prev) => ({ ...prev, scrollPad: { ...prev.scrollPad, ...patch } }));
+  };
+  // Gestures read the speed from a ref: the wheel listener and the pointer
+  // handlers are installed once, and a stale closure here would silently pin the
+  // speed to whatever it was at mount.
+  const scrollSpeedRef = useRef(scrollSpeed);
+  scrollSpeedRef.current = scrollSpeed;
+  /** Finger px per wheel notch at the current speed (higher speed = shorter throw). */
+  const scrollStepPx = () => Math.max(4, SCROLL_STEP / scrollSpeedRef.current);
 
   // Natural hold: while a finger is down on a holdable key (has `wire`), we send
   // keydown and keep it in `heldKeys` for highlight; keyup on release. No manual
@@ -2442,15 +2462,16 @@ export function ControlScreen({
       } else if (twoMode.current === "scroll") {
         scrollAcc.current.y += midY - (prevMid.current?.y ?? midY);
         scrollAcc.current.x += midX - (prevMid.current?.x ?? midX);
-        while (Math.abs(scrollAcc.current.y) >= SCROLL_STEP) {
+        const step = scrollStepPx();
+        while (Math.abs(scrollAcc.current.y) >= step) {
           const dir = scrollAcc.current.y > 0 ? 1 : -1;
           send({ type: "scroll", dy: -dir }); // natural: content follows fingers
-          scrollAcc.current.y -= dir * SCROLL_STEP;
+          scrollAcc.current.y -= dir * step;
         }
-        while (Math.abs(scrollAcc.current.x) >= SCROLL_STEP) {
+        while (Math.abs(scrollAcc.current.x) >= step) {
           const dir = scrollAcc.current.x > 0 ? 1 : -1;
           send({ type: "scroll", dx: -dir, dy: 0 });
-          scrollAcc.current.x -= dir * SCROLL_STEP;
+          scrollAcc.current.x -= dir * step;
         }
       }
       prevMid.current = { x: midX, y: midY };
@@ -2473,12 +2494,23 @@ export function ControlScreen({
     setCursorPos(cursorRef.current.x + (e.clientX - prevX) * speed, cursorRef.current.y + (e.clientY - prevY) * speed);
   };
 
+  const wheelAcc = useRef({ x: 0, y: 0 });
   const onWheel = (e: WheelEvent) => {
     // Quest surface touchpad two-finger scroll + mouse wheel.
     e.preventDefault();
-    const dy = e.deltaY !== 0 ? (e.deltaY > 0 ? 1 : -1) : 0;
-    const dx = e.deltaX !== 0 ? (e.deltaX > 0 ? 1 : -1) : 0;
-    if (dx || dy) send({ type: "scroll", dx, dy });
+    // One notch per EVENT is far too fast on Quest, where holding the thumbstick
+    // emits a continuous wheel stream. Bank the raw delta and spend it in whole
+    // notches instead, so both the Quest damping and the speed slider bite.
+    const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+    const unit = (isQuestBrowser() ? QUEST_WHEEL_UNIT : WHEEL_UNIT) / scrollSpeedRef.current;
+    wheelAcc.current.y += e.deltaY * scale;
+    wheelAcc.current.x += e.deltaX * scale;
+    const dy = Math.trunc(wheelAcc.current.y / unit);
+    const dx = Math.trunc(wheelAcc.current.x / unit);
+    if (!dx && !dy) return;
+    wheelAcc.current.y -= dy * unit;
+    wheelAcc.current.x -= dx * unit;
+    send({ type: "scroll", dx, dy });
   };
 
   // Non-passive wheel — React's onWheel is passive and can't preventDefault, so
@@ -4436,6 +4468,30 @@ export function ControlScreen({
         </div>
       )}
 
+      {/* ---- free-place scroll strip (one-handed scrolling; drag/resize in Pin mode) ---- */}
+      {scrollPad.on && !pipView && (
+        <div
+          ref={scrollPadLayerRef}
+          // Pin mode has to show the close/resize handles, which sit outside the
+          // strip's own box — same overflow trade the pin layer makes.
+          className={`pointer-events-none absolute inset-0 z-30 ${pinMode ? "overflow-visible" : "overflow-hidden"}`}
+        >
+          <ScrollStrip
+            prefs={scrollPad}
+            pinMode={pinMode}
+            layerRef={scrollPadLayerRef}
+            stepPx={scrollStepPx}
+            onScroll={(dx, dy) => {
+              send({ type: "scroll", dx, dy });
+              flashCursor("scroll", dy || dx);
+            }}
+            onMove={(x, y) => patchScrollPad({ x, y })}
+            onResize={(w, h) => patchScrollPad({ w, h })}
+            onClose={() => patchScrollPad({ on: false })}
+          />
+        </div>
+      )}
+
       <AnimatePresence>
         {pinEdit && (
           <PinEditorSheet
@@ -4698,6 +4754,31 @@ export function ControlScreen({
               <IcoBtn label="Down" title="Scroll down" onClick={() => send({ type: "scroll", dy: 3 })}>
                 <ChevronDown className="h-4 w-4" />
               </IcoBtn>
+              <IcoBtn
+                label="Strip"
+                active={scrollPad.on}
+                title={
+                  scrollPad.on
+                    ? "Hide the floating scroll strip"
+                    : "Floating scroll strip — drag one finger in it to scroll (Pin mode moves/resizes it)"
+                }
+                onClick={() => patchScrollPad({ on: !scrollPad.on })}
+              >
+                <ChevronsUpDown className="h-4 w-4" />
+              </IcoBtn>
+              {scrollPad.on && (
+                <IcoBtn
+                  label={scrollPad.horizontal ? "Horz" : "Vert"}
+                  title={scrollPad.horizontal ? "Strip scrolls sideways" : "Strip scrolls up/down"}
+                  onClick={() => patchScrollPad({ horizontal: !scrollPad.horizontal })}
+                >
+                  {scrollPad.horizontal ? (
+                    <ChevronsLeftRight className="h-4 w-4" />
+                  ) : (
+                    <ChevronsUpDown className="h-4 w-4" />
+                  )}
+                </IcoBtn>
+              )}
               <Sep />
               <QSlider
                 icon={<Gauge className="h-3.5 w-3.5" />}
@@ -4708,6 +4789,16 @@ export function ControlScreen({
                 value={sensitivity}
                 fmt={(v) => `${v.toFixed(1)}×`}
                 onChange={setSensitivity}
+              />
+              <QSlider
+                icon={<ChevronsUpDown className="h-3.5 w-3.5" />}
+                label="Scroll"
+                min={SCROLL_SPEED_MIN}
+                max={SCROLL_SPEED_MAX}
+                step={0.1}
+                value={scrollSpeed}
+                fmt={(v) => `${v.toFixed(1)}×`}
+                onChange={(v) => updateChrome((prev) => ({ ...prev, scrollSpeed: v }))}
               />
               </div>
             </div>
@@ -6158,6 +6249,185 @@ function ReleaseHeldButton({ count, onClick }: { count: number; onClick: () => v
     </button>
   );
 }
+/**
+ * Free-placed scroll strip — a trackpad zone that turns one finger's travel into
+ * wheel notches, for people who can't hold a two-finger gesture. Notches go to
+ * whatever is under the PC cursor: the strip deliberately never sends a `move`,
+ * so aim once and then scroll as long as you like.
+ *
+ * In Pin mode it becomes furniture: drag the body to place it, drag the corner
+ * to resize, tap the X to put it away.
+ */
+function ScrollStrip({
+  prefs,
+  pinMode,
+  layerRef,
+  stepPx,
+  onScroll,
+  onMove,
+  onResize,
+  onClose,
+}: {
+  prefs: ScrollPadPrefs;
+  pinMode: boolean;
+  layerRef: React.RefObject<HTMLDivElement | null>;
+  stepPx: () => number;
+  onScroll: (dx: number, dy: number) => void;
+  onMove: (xPct: number, yPct: number) => void;
+  onResize: (wPct: number, hPct: number) => void;
+  onClose: () => void;
+}) {
+  const [active, setActive] = useState(false);
+  const gesture = useRef<{
+    pointerId: number;
+    kind: "scroll" | "move" | "resize";
+    lastX: number;
+    lastY: number;
+    startX: number;
+    startY: number;
+    origW: number;
+    origH: number;
+    acc: number;
+  } | null>(null);
+
+  const layerBox = () => {
+    const r = layerRef.current?.getBoundingClientRect();
+    return r && r.width >= 1 && r.height >= 1 ? r : null;
+  };
+
+  const begin = (e: React.PointerEvent, kind: "scroll" | "move" | "resize") => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    gesture.current = {
+      pointerId: e.pointerId,
+      kind,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      startX: e.clientX,
+      startY: e.clientY,
+      origW: prefs.w,
+      origH: prefs.h,
+      acc: 0,
+    };
+    if (kind === "scroll") setActive(true);
+  };
+
+  const onPointerMove = (e: React.PointerEvent) => {
+    const g = gesture.current;
+    if (!g || g.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (g.kind === "move") {
+      const r = layerBox();
+      if (r) {
+        onMove(
+          clamp(((e.clientX - r.left) / r.width) * 100, 4, 96),
+          clamp(((e.clientY - r.top) / r.height) * 100, 6, 94),
+        );
+      }
+    } else if (g.kind === "resize") {
+      const r = layerBox();
+      if (r) {
+        // The strip is centre-anchored, so the edge only travels half as far as
+        // the finger — the ×2 is what makes the corner track under the fingertip.
+        onResize(
+          clamp(g.origW + ((e.clientX - g.startX) / r.width) * 200, 6, 60),
+          clamp(g.origH + ((e.clientY - g.startY) / r.height) * 200, 8, 90),
+        );
+      }
+    } else {
+      const travel = prefs.horizontal ? e.clientX - g.lastX : e.clientY - g.lastY;
+      g.lastX = e.clientX;
+      g.lastY = e.clientY;
+      g.acc += travel;
+      const step = stepPx();
+      while (Math.abs(g.acc) >= step) {
+        const dir = g.acc > 0 ? 1 : -1;
+        // Natural, matching the two-finger gesture: content follows the finger.
+        if (prefs.horizontal) onScroll(-dir, 0);
+        else onScroll(0, -dir);
+        g.acc -= dir * step;
+        navigator.vibrate?.(3);
+      }
+    }
+  };
+
+  const end = (e: React.PointerEvent) => {
+    if (gesture.current?.pointerId !== e.pointerId) return;
+    gesture.current = null;
+    setActive(false);
+  };
+
+  const Arrow = prefs.horizontal ? ChevronsLeftRight : ChevronsUpDown;
+
+  return (
+    <div
+      className={`pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 select-none rounded-2xl border backdrop-blur-md transition-colors ${
+        active
+          ? "border-accent-3/80 bg-accent-3/25"
+          : pinMode
+            ? "border-accent-3/60 bg-black/50 ring-1 ring-accent-3/60"
+            : "border-white/15 bg-black/40"
+      }`}
+      style={{
+        left: `${prefs.x}%`,
+        top: `${prefs.y}%`,
+        width: `${prefs.w}%`,
+        height: `${prefs.h}%`,
+        opacity: active ? Math.min(1, prefs.opacity + 0.25) : prefs.opacity,
+        touchAction: "none",
+        zIndex: pinMode ? 40 : 30,
+      }}
+      title={pinMode ? "Drag to place · corner resizes · X hides" : "Drag here to scroll"}
+      onPointerDown={(e) => begin(e, pinMode ? "move" : "scroll")}
+      onPointerMove={onPointerMove}
+      onPointerUp={end}
+      onPointerCancel={end}
+    >
+      {/* Grip: a column of arrows so the affordance reads at a glance. */}
+      <div
+        className={`flex h-full w-full items-center justify-center gap-2 text-ink-dim ${
+          prefs.horizontal ? "flex-row" : "flex-col"
+        }`}
+      >
+        <Arrow className="h-4 w-4 opacity-70" />
+        <div
+          className={`rounded-full bg-white/20 ${prefs.horizontal ? "h-0.5 w-6" : "h-6 w-0.5"}`}
+        />
+        <Arrow className="h-4 w-4 opacity-70" />
+      </div>
+
+      {pinMode && (
+        <>
+          <button
+            type="button"
+            aria-label="Hide scroll strip"
+            className="absolute -right-2 -top-2 grid h-6 w-6 place-items-center rounded-full border border-white/25 bg-black/80 text-ink"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onClose();
+            }}
+          >
+            <X className="h-3 w-3" />
+          </button>
+          <div
+            role="presentation"
+            aria-label="Resize scroll strip"
+            className="absolute -bottom-2 -right-2 h-6 w-6 cursor-se-resize rounded-full border border-accent-3/70 bg-black/80"
+            style={{ touchAction: "none" }}
+            onPointerDown={(e) => begin(e, "resize")}
+            onPointerMove={onPointerMove}
+            onPointerUp={end}
+            onPointerCancel={end}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
 /**
  * Free-floating pinned quick button. In Pin mode: drag to place, tap to unpin,
  * gear / long-press opens the style editor. Outside Pin mode: tap/hold fires.

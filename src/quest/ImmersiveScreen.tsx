@@ -12,6 +12,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Volume2, VolumeX } from "lucide-react";
 import type { RemoteLink, ControlMsg } from "@/companion/links";
+import { loadControlChrome } from "@/companion/controlChrome";
 import { ImmersiveSession, type PointerAction } from "./xr/session";
 import { TextDiffSender } from "./textDiff";
 
@@ -46,6 +47,16 @@ export function ImmersiveScreen({
   const diff = useRef(new TextDiffSender((m) => link.send(m)));
   const lastMove = useRef(0);
   const scrollAcc = useRef({ x: 0, y: 0 });
+  // Read straight from storage: the session is created once in an effect that
+  // deliberately doesn't re-run, so there's no prop to thread this through.
+  const scrollSpeedRef = useRef(1);
+  useEffect(() => {
+    try {
+      scrollSpeedRef.current = loadControlChrome().scrollSpeed;
+    } catch {
+      /* private mode — 1× is the right fallback */
+    }
+  }, []);
 
   const send = (m: ControlMsg) => link.send(m);
 
@@ -129,8 +140,11 @@ export function ImmersiveScreen({
       onAction: handleAction,
       onScroll: (dx, dy) => {
         const acc = scrollAcc.current;
-        acc.x += dx;
-        acc.y += dy;
+        // Same "Scroll" slider the flat mouse panel exposes — read per gesture so
+        // a change made before entering VR is already in effect here.
+        const gain = scrollSpeedRef.current;
+        acc.x += dx * gain;
+        acc.y += dy * gain;
         const ny = Math.trunc(acc.y);
         const nx = Math.trunc(acc.x);
         if (ny !== 0 || nx !== 0) {
@@ -200,14 +214,12 @@ export function ImmersiveScreen({
         </p>
         <ul className="mx-auto mt-4 max-w-xs space-y-1.5 text-left text-sm text-ink-dim">
           <li>
-            <b>A</b> — open keyboard · <b>B</b> — Enter
+            <b>A</b> — open keyboard · <b>B</b> / <b>Y</b> — right-click
           </li>
           <li>
             <b>X</b> / left stick-press — recenter screen
           </li>
-          <li>
-            <b>Y</b> or hold both grips — exit VR
-          </li>
+          <li>hold both grips — exit VR</li>
           {mode === "gamepad" && <li className="text-accent-3">Gamepad mode: both controllers drive a virtual Xbox pad.</li>}
         </ul>
         {keyboardOpen && <p className="mt-4 text-sm text-accent-3">Keyboard open — type on the headset keyboard.</p>}

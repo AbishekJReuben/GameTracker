@@ -68,7 +68,11 @@ const EYE_HEIGHT = 1.5; // fallback when the head pose is unavailable
 const RAY_MISS_LEN = 8; // metres to draw the ray when it hits nothing
 const CURSOR_SIZE = 0.035; // metres
 const SCROLL_DEADZONE = 0.15;
-const SCROLL_GAIN = 0.6; // thumbstick deflection → wheel notches per frame
+// Thumbstick deflection → wheel notches per frame. This runs at the headset's
+// display rate (90Hz+), so even a small number is a lot of notches per second —
+// 0.6 sent pages flying past. `ImmersiveScreen` scales it again by the user's
+// mouse-panel scroll speed, so this is the 1× baseline.
+const SCROLL_GAIN = 0.16;
 const EXIT_HOLD_MS = 1100; // both grips held this long → leave VR
 
 const SCREEN_VS = `
@@ -635,8 +639,7 @@ export class ImmersiveSession {
         this.cb.onAction?.("middleclick");
       }
     }
-    // Face buttons: right A = keyboard, right B = Enter, left X = recenter,
-    // left Y = exit VR.
+    // Face buttons: right A = keyboard, left X = recenter.
     if (now.a && !prev.a) {
       if (isRight) {
         this.cb.onAction?.("keyboard");
@@ -645,10 +648,12 @@ export class ImmersiveSession {
         this.cb.onAction?.("recenter");
       }
     }
-    if (now.b && !prev.b) {
-      if (isRight) this.cb.onAction?.("enter");
-      else void this.end(); // left Y
-    }
+    // B and Y are both right-click. B is the headset's system "back" button, and
+    // reaching for a right-click with the thumb is the natural motion — so this
+    // is the binding people expect, and squeeze stays as the alternative. Exiting
+    // VR is the both-grips hold (Y used to end the session, which made a misfire
+    // cost the whole stream).
+    if (now.b && !prev.b) this.cb.onAction?.("rightclick");
 
     // Thumbstick scroll from the actively-pointing hand only.
     if (isActive) {

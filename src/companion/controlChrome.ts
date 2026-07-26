@@ -59,6 +59,37 @@ export function toolbarScaleOf(c: ControlChrome, id: ToolbarId): number {
   return clampToolbarScale(c.toolbars[id]?.scale ?? 1);
 }
 
+/**
+ * Free-placed scroll strip: a trackpad-style zone that emits wheel notches from a
+ * single dragging finger, so scrolling never needs a second finger. Geometry is
+ * in percent of the pin layer (x/y = centre) exactly like `PinPlacement`, so it
+ * survives rotation and different phones.
+ */
+export type ScrollPadPrefs = {
+  on: boolean;
+  x: number;
+  y: number;
+  /** Percent of layer width / height. */
+  w: number;
+  h: number;
+  opacity: number;
+  /** Emit horizontal notches instead of vertical. */
+  horizontal: boolean;
+};
+
+export const SCROLL_PAD_DEFAULTS: ScrollPadPrefs = {
+  on: false,
+  x: 90,
+  y: 50,
+  w: 12,
+  h: 38,
+  opacity: 0.55,
+  horizontal: false,
+};
+
+export const SCROLL_SPEED_MIN = 0.3;
+export const SCROLL_SPEED_MAX = 4;
+
 export type ControlChrome = {
   v: typeof CONTROL_CHROME_VERSION;
   pinned: PinId[];
@@ -68,6 +99,9 @@ export type ControlChrome = {
   toolbars: Partial<Record<ToolbarId, ToolbarPrefs>>;
   /** Extra single keys the user added (wire names) → registry as k:{wire}. */
   extraKeys: string[];
+  scrollPad: ScrollPadPrefs;
+  /** Wheel-notch multiplier for every scroll gesture (pad, two-finger, wheel). */
+  scrollSpeed: number;
 };
 
 export const PIN_STYLE_DEFAULTS: PinStyle = {
@@ -180,6 +214,24 @@ export function normalizeControlChrome(raw: unknown): ControlChrome {
     defaultStyle,
     toolbars,
     extraKeys,
+    scrollPad: normalizeScrollPad(r.scrollPad),
+    scrollSpeed: clamp(Number(r.scrollSpeed) || 1, SCROLL_SPEED_MIN, SCROLL_SPEED_MAX),
+  };
+}
+
+function normalizeScrollPad(raw: Partial<ScrollPadPrefs> | null | undefined): ScrollPadPrefs {
+  const r = raw ?? {};
+  const d = SCROLL_PAD_DEFAULTS;
+  // `|| d.x` is safe here only because 0 is outside every clamp range below —
+  // a pad centred at 0% or sized 0% is not a state the UI can produce.
+  return {
+    on: r.on === true,
+    x: clamp(Number(r.x) || d.x, 4, 96),
+    y: clamp(Number(r.y) || d.y, 6, 94),
+    w: clamp(Number(r.w) || d.w, 6, 60),
+    h: clamp(Number(r.h) || d.h, 8, 90),
+    opacity: clamp(Number(r.opacity) || d.opacity, 0.15, 1),
+    horizontal: r.horizontal === true,
   };
 }
 

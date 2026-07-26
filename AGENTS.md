@@ -1403,3 +1403,46 @@ instead of picking a side:
   one constraint that measure pass respects. Mono kinds (code/log/command/path) keep
   `setMaxWidth(Integer.MAX_VALUE)` and pan horizontally as before.
 
+
+### v3.9.x â€” one-handed scroll strip, scroll speed, Quest B/Y (do not regress)
+
+**Scroll strip (`controlChrome.ts` `scrollPad`, `Control.tsx` `ScrollStrip`).** A
+free-placed trackpad zone that turns ONE finger's travel into wheel notches, for
+users who can't hold a two-finger gesture. Two invariants:
+
+- **It never sends `move`.** Notches land wherever the PC cursor already is, so
+  the user aims once and then scrolls for as long as they like. Sending a move
+  from the strip would make it useless for its actual purpose.
+- **It is off by default and `on` is `=== true`.** Every chrome doc already on
+  disk lacks the key; anything looser would drop a floating panel over everyone's
+  stream on upgrade. Geometry is percent-of-layer (centre-anchored, like
+  `PinPlacement`) so rotation and a different phone both survive.
+
+Pin mode is the editor: drag body = place, corner = resize (the Ã—2 on the resize
+delta is because the strip is centre-anchored â€” the edge only travels half as far
+as the finger), X = hide. Toggles live in the mouse toolbar (`Strip`, and
+`Vert`/`Horz` for the axis).
+
+**Scroll speed (`chrome.scrollSpeed`, mouse toolbar `Scroll` slider, 0.3â€“4Ã—).**
+One multiplier for every scroll gesture: the strip, the two-finger trackpad
+gesture, the wheel listener, and the Quest thumbstick. Gesture handlers read it
+through `scrollSpeedRef`, not the state value â€” `onWheel` and the pointer
+handlers are installed once, and a captured closure would pin the speed to
+whatever it was at mount.
+
+`onWheel` no longer emits one notch per EVENT. It banks raw delta (normalizing
+`deltaMode` 1/2) and spends it in whole notches against `WHEEL_UNIT`, with
+`QUEST_WHEEL_UNIT` (150 vs 40) on Quest, where holding the thumbstick over the
+flat page streams wheel events continuously.
+
+**Quest immersive controller (`quest/xr/session.ts`).**
+
+- `SCROLL_GAIN` 0.6 â†’ **0.16**. This is per-FRAME at 90Hz+, so 0.6 was ~54
+  notches/second at full deflection. `ImmersiveScreen` scales it again by
+  `scrollSpeed`, so 0.16 is the 1Ã— baseline.
+- **B and Y are both right-click.** B is the headset's system "back" button and
+  the thumb reaches it naturally; squeeze stays as the alternative. Y previously
+  ENDED the session â€” one misfire cost the whole stream â€” so exiting VR is now
+  the both-grips hold only. B's old "Enter" binding is gone; the `"enter"`
+  `PointerAction` stays in the union for the flat path.
+
