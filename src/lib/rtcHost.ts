@@ -2371,6 +2371,36 @@ export function startHost(opts: HostOptions): () => void {
     let pauseEvents = 0;
     let pausePoll: number | null = null;
     let pausedAtMs = 0;
+    /** The guest is backgrounded and rendering nothing (see the `power` message).
+     *  Encoding for a phone that is throwing every frame away is pure battery. */
+    let guestIdle = false;
+    /** What Rust currently believes. Two owners share ONE process-wide pause flag
+     *  (backpressure and guest-idle), so every write funnels through here — a
+     *  drain poller clearing the flag out from under an idle guest would restart
+     *  a 30Mbps encode into a screen nobody is looking at. */
+    let encodePauseWire = false;
+    const applyEncodePause = () => {
+      const want = encodePaused || guestIdle;
+      if (want === encodePauseWire) return;
+      encodePauseWire = want;
+      try {
+        void api.remoteSetEncodePaused(want);
+      } catch {
+        /* not on desktop */
+      }
+    };
+    const setGuestIdle = (idle: boolean) => {
+      if (guestIdle === idle) return;
+      guestIdle = idle;
+      slog("power", `guest ${idle ? "backgrounded — encoder idle" : "foreground — encoder live"}`);
+      applyEncodePause();
+      // Coming back needs a fresh IDR: the guest dropped everything it received
+      // while hidden, so its decoder has no valid reference to build on.
+      if (!idle) {
+        setNativeAwaitKey(true, "guest resumed from background");
+        requestNativeKeyframe("guest resume");
+      }
+    };
     sessionCleanups.add(() => {
       if (pausePoll !== null) {
         window.clearInterval(pausePoll);
@@ -2383,13 +2413,10 @@ export function startHost(opts: HostOptions): () => void {
       // The encoder pause is a process-wide Rust flag. Whoever set it has to
       // clear it: an orphaned session leaving it latched is a frozen stream for
       // whatever session comes next.
-      if (encodePaused) {
+      if (encodePaused || guestIdle) {
         encodePaused = false;
-        try {
-          void api.remoteSetEncodePaused(false);
-        } catch {
-          /* not on desktop */
-        }
+        guestIdle = false;
+        applyEncodePause();
       }
     });
     /** While hard-gated on an IDR, keep asking even if no frames are flowing —
@@ -2451,11 +2478,7 @@ export function startHost(opts: HostOptions): () => void {
         "pause",
         `encoder ${paused ? "paused" : "resumed"} buffered=${Math.round(buffered / 1024)}KB budget=${Math.round(budget / 1024)}KB kbps=${Math.round(adaptKbps)}`,
       );
-      try {
-        void api.remoteSetEncodePaused(paused);
-      } catch {
-        /* not on desktop */
-      }
+      applyEncodePause();
       if (paused && pausePoll === null) {
         videoCh.bufferedAmountLowThreshold = Math.round(wcBufBudget() * 0.35);
         pausePoll = window.setInterval(() => {
@@ -3143,6 +3166,13 @@ export function startHost(opts: HostOptions): () => void {
           } catch {
             /* not on desktop / no native encoder */
           }
+          return;
+        }
+        // Guest went to the background (or came back). It throws away every
+        // frame it receives while hidden, so keeping the encoder + radio at full
+        // rate was burning its battery for nothing.
+        if (msg && msg.type === "power" && typeof msg.idle === "boolean") {
+          setGuestIdle(msg.idle);
           return;
         }
         // Multi-monitor pop-out: spin up (or keep) an aux host for that display.

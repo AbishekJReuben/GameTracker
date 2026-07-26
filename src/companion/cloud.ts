@@ -260,6 +260,10 @@ const HEARTBEAT_DEAD_MS = 13000; // no pong within this → treat link as dead
 const OFFER_TIMEOUT_MS = 8000; // joined the room but no offer arrived → rejoin
 const BACKOFF_MIN = 1500;
 const BACKOFF_MAX = 30000;
+/** Backgrounded, the retry loop is invisible — but every attempt still opens a
+ *  socket and gathers ICE, and eight hours at 30s is ~960 radio wakeups. Stretch
+ *  it out; `onVisibility` retries immediately the moment anyone is looking. */
+const BACKOFF_MAX_HIDDEN = 300_000;
 const WATCHDOG_MS = 3000; // health-check cadence
 const HARD_RESET_MS = 60000; // transport down this long → full teardown + rebuild
 // First-connection wedges (cold start) get a much shorter fuse: nothing is
@@ -492,6 +496,8 @@ export class CloudConn {
   private owdWin: { at: number; ms: number }[] = [];
   private owdMin = 0;
   private vstatTimer: number | null = null;
+  /** Host has been told to stop encoding because we're backgrounded. */
+  private powerIdle = false;
 
   // ---- DIRECT audio (PCM over data channel) ---------------------------------
   private chAudio?: RTCDataChannel;
@@ -602,6 +608,9 @@ export class CloudConn {
         this.wcRetryBackoff = this.wcRetryMin;
         if (this.authState === "ok") void this.maybeStartWc();
       }
+      // WebXR renders with the page marked hidden, so entering VR looks exactly
+      // like backgrounding from `document.hidden` alone.
+      this.syncPowerIdle();
     });
     // Apply persisted Tune-panel soft spot (JB + preferDirect) before first connect.
     this.applyStreamTune(loadStreamTune(), false);
@@ -715,10 +724,25 @@ export class CloudConn {
       this.wcAwaitKey = true;
       this.wcRequestKeyframe();
     }
+    // PiP arrives AFTER the page has already gone hidden, so this is what lifts
+    // the idle the visibilitychange just asked for.
+    this.syncPowerIdle();
   };
 
   private onVisibility = () => {
-    if (document.visibilityState !== "visible" || this.closed) return;
+    if (this.closed) return;
+    this.syncPowerIdle();
+    if (document.visibilityState !== "visible") return;
+    // A retry scheduled while hidden can be up to five minutes out. Nobody
+    // should watch a "Reconnecting… in 240s" countdown they can do nothing
+    // about — collapse it to the foreground cap and try now.
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.reconnectAt = 0;
+      this.backoff = Math.min(this.backoff, BACKOFF_MAX);
+      this.openSignaling(false).catch(() => this.scheduleReconnect());
+    }
     this.lastPong = Date.now();
     if (this.chData?.readyState === "open") {
       try {
@@ -728,6 +752,29 @@ export class CloudConn {
       }
     }
   };
+
+  /**
+   * Tell the host to stop encoding while we're backgrounded. Every frame that
+   * arrives hidden is thrown away anyway (see the `document.hidden` gates in the
+   * decode paths) — receiving and dropping 30Mbps was keeping the radio, the
+   * SCTP stack and the decoder busy for eight hours of nothing.
+   *
+   * PiP is NOT idle: the mini window is on screen and genuinely rendering.
+   * Immersive VR is not idle either — WebXR runs with the page hidden.
+   */
+  private syncPowerIdle() {
+    const w = window as Window & { __GT_PIP_ACTIVE__?: boolean };
+    const idle = document.hidden && !w.__GT_PIP_ACTIVE__ && !isImmersiveActive();
+    if (idle === this.powerIdle) return;
+    this.powerIdle = idle;
+    // Resuming: the decoder threw away everything that arrived while hidden, so
+    // ask for the IDR before the host's own resume keyframe races us.
+    if (!idle) {
+      this.wcAwaitKey = true;
+      this.wcRequestKeyframe();
+    }
+    this.sendControl({ type: "power", idle });
+  }
 
   /** True once the peer link has been established at least one time. */
   get established(): boolean {
@@ -977,8 +1024,9 @@ export class CloudConn {
 
   private scheduleReconnect() {
     if (this.closed || this.denied || this.reconnectTimer !== null || this.connecting) return;
-    const wait = this.backoff;
-    this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX);
+    const cap = document.hidden ? BACKOFF_MAX_HIDDEN : BACKOFF_MAX;
+    const wait = Math.min(this.backoff, cap);
+    this.backoff = Math.min(this.backoff * 2, cap);
     this.reconnectAttempt += 1;
     this.reconnectBackoffMs = wait;
     this.reconnectAt = Date.now() + wait;
@@ -2167,6 +2215,9 @@ export class CloudConn {
   private wcStartNativePoll() {
     if (this.wcNativePoll !== null) return;
     this.wcNativePoll = window.setInterval(() => {
+      // Backgrounded there is no decode to report on, and this is a JNI hop 4×
+      // a second. Skip rather than stop, so resuming needs no re-arm.
+      if (this.powerIdle) return;
       void this.wcPollNativeStats();
     }, 250);
   }
@@ -2576,6 +2627,9 @@ export class CloudConn {
     if (this.vstatTimer !== null) return;
     this.vstatTimer = window.setInterval(() => {
       if (this.closed || !this.wcActive || this.authState !== "ok") return;
+      // Backgrounded: the host has stopped encoding for us, so a report of "0
+      // kbps received" describes nothing and would only confuse its controller.
+      if (this.powerIdle) return;
       const now = Date.now();
       let winBytes = 0;
       for (const b of this.wcByteWin) if (now - b.at <= 1000) winBytes += b.bytes;
@@ -2990,6 +3044,10 @@ export class CloudConn {
           void this.maybeStartWc();
           // Same for DIRECT audio — closes the lag behind near-instant video.
           void this.maybeStartAudioDirect();
+          // A fresh host session assumes a foreground guest. If we reconnected
+          // while backgrounded (the reconnect loop keeps running there), say so
+          // now or it starts a full-rate encode into a hidden page.
+          if (this.powerIdle) this.sendControl({ type: "power", idle: true });
           // Shared-clipboard secret: the host attaches it to auth-ok ONLY when we
           // asked (wantSecret) and only after it approved us. Forward as an event
           // so the companion's clip store can derive its key and start syncing

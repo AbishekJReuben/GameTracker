@@ -1493,9 +1493,24 @@ export function ControlScreen({
   // when traffic looks idle; inbound video then arrives in bursts — the
   // periodic 100–700 ms frame gaps (with healthy RTT in between) the hitch log
   // kept recording on the moto g57. No-op outside the Tauri companion shell.
+  //
+  // Released again the moment nothing is on screen: this used to be held for as
+  // long as the Control screen stayed MOUNTED, which meant an eight-hour
+  // background sit kept the Wi-Fi radio out of power save for a session nobody
+  // was watching. PiP and immersive VR still count as on-screen.
   useEffect(() => {
-    void setStreamPowerActive(true);
+    const w = window as Window & { __GT_PIP_ACTIVE__?: boolean };
+    const apply = () => {
+      void setStreamPowerActive(!document.hidden || !!w.__GT_PIP_ACTIVE__ || isImmersiveActive());
+    };
+    apply();
+    document.addEventListener("visibilitychange", apply);
+    window.addEventListener("gt:pip", apply);
+    const unsub = onImmersiveActiveChange(apply);
     return () => {
+      document.removeEventListener("visibilitychange", apply);
+      window.removeEventListener("gt:pip", apply);
+      unsub?.();
       void setStreamPowerActive(false);
     };
   }, []);
@@ -1846,6 +1861,9 @@ export function ControlScreen({
     if (!connected) return;
     let alive = true;
     const id = window.setInterval(async () => {
+      // Backgrounded: nothing is on screen to read these, and `netStats()` is a
+      // full getStats() sweep every tick. Skipping it is most of the idle drain.
+      if (document.hidden) return;
       // Direct-video path telemetry (independent of the RTP stats below).
       setWcStats(link.wcStats?.() ?? null);
       const aStats = link.audioStats?.() ?? null;
@@ -1960,6 +1978,7 @@ export function ControlScreen({
   // so credit the decode-side wc fps (that IS the displayed picture).
   useEffect(() => {
     const id = window.setInterval(() => {
+      if (document.hidden) return; // no picture to count while backgrounded
       if (wcNativeRef.current) {
         const w = link.wcStats?.() ?? null;
         setFps(w?.fps ?? 0);

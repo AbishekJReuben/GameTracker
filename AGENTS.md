@@ -1446,3 +1446,50 @@ flat page streams wheel events continuously.
   the both-grips hold only. B's old "Enter" binding is gone; the `"enter"`
   `PointerAction` stays in the union for the flat path.
 
+
+### v3.9.x â€” background/idle battery (do not regress)
+
+Reported as 34% battery over 30min screen time + **8h08m background**. Three
+things were running at full tilt for a session nobody was looking at:
+
+**1. The Wi-Fi low-latency lock was held for the screen's whole MOUNT**
+(`Control.tsx` â†’ `setStreamPowerActive`). That lock exists to keep the radio out
+of power save (`WcDecoderBridge.setStreamActive`) â€” exactly the wrong thing for
+eight background hours. It now tracks *visibility*, not mount: released on
+hidden, re-acquired on visible. PiP (`__GT_PIP_ACTIVE__`) and immersive VR both
+still count as on-screen; WebXR runs with `document.hidden` true, so testing
+`document.hidden` alone would have killed the lock inside VR.
+
+**2. The host kept encoding and sending at full rate to a hidden guest.** The
+decode paths have always dropped every frame that arrives hidden â€” so this was
+30Mbps of radio, SCTP and decoder work producing nothing. New control message
+`{type:"power", idle:boolean}`, sent by `CloudConn.syncPowerIdle()` from
+visibilitychange / `gt:pip` / immersive change, and re-sent on `auth ok`
+(a reconnect while backgrounded otherwise gets a fresh host session that assumes
+a foreground guest).
+
+Host side: `guestIdle` pauses the encoder through Rust's `remoteSetEncodePaused`,
+which skips captures pre-encode â€” so the PC stops working too. **Two owners now
+share that one process-wide flag** (backpressure and guest-idle), so every write
+goes through `applyEncodePause()` â€” the backpressure drain poller clearing it out
+from under an idle guest would restart a full-rate encode into a hidden page.
+Resume re-arms the hard IDR gate and asks for a keyframe from both ends: the
+guest threw away everything that arrived while hidden, so its decoder has no
+reference left. `vstat` reports and the 4Hz native-decoder JNI poll are skipped
+while idle (a "0 kbps received" report describes nothing and would only confuse
+ABR v2).
+
+**Audio deliberately keeps flowing while backgrounded** â€” it's ~260kbps against
+the picture's tens of megabits, and PC sound continuing when you switch apps is
+a feature, not a leak.
+
+**3. The reconnect loop retried every 30s forever.** `BACKOFF_MAX_HIDDEN`
+(5 min) applies while hidden; `onVisibility` cancels a pending long retry,
+collapses the backoff to the foreground cap and reconnects immediately, so the
+user never watches a "retry in 240s" countdown.
+
+Idle-with-screen-on needs no equivalent: DXGI desktop duplication only delivers
+frames when the screen actually changes, so a static desktop already encodes
+almost nothing. The stats intervals in `Control.tsx` (the `netStats()` getStats
+sweep and the fps sampler) skip their work while hidden.
+
