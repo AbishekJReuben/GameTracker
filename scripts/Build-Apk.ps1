@@ -157,5 +157,5 @@ try {
 
 $apk = Get-Item $out
 $sw.Stop()
-Write-Host ("== APK done in {0:n0}s ==" -f $sw.Elapsed.TotalSeconds) -ForegroundColor Green
-Write-Host ("APK: {0}  ({1:n1} MB)" -f $apk.FullName, ($apk.Length / 1MB)) -ForegroundColor Green
+Write-Host ('== APK done in {0:n0}s ==' -f $sw.Elapsed.TotalSeconds) -ForegroundColor Green
+Write-Host ('APK: {0}  ({1:n1} MB)' -f $apk.FullName, ($apk.Length / 1MB)) -ForegroundColor Green

@@ -81,6 +81,9 @@ const save = (path, before, after, msg) => {
   for (const p of [
     "android.permission.WAKE_LOCK",
     "android.permission.ACCESS_WIFI_STATE",
+    // The widget uses the non-dangerous basic phone-state read to show the
+    // currently active radio type when Android exposes it to ordinary apps.
+    "android.permission.READ_BASIC_PHONE_STATE",
     // Shared clipboard: overlay bubble, indefinite foreground service (specialUse
     // has no 6h cap), notifications, boot restart, Doze exemption, connectivity.
     "android.permission.SYSTEM_ALERT_WINDOW",
@@ -201,6 +204,36 @@ const save = (path, before, after, msg) => {
       `          android:exported="false"${eol}` +
       `          android:theme="@android:style/Theme.Translucent.NoTitleBar" />${eol}`;
     m = m.replace(/([ \t]*<\/application>)/, `${act}$1`);
+  }
+
+  // Home-screen phone settings widget. The provider must be exported so the
+  // launcher can send APPWIDGET_UPDATE; its click actions target the private
+  // transparent activity below, which opens the system settings page and
+  // refreshes the widget when the user returns.
+  if (!m.includes(".PhoneSettingsWidgetProvider")) {
+    const widget =
+      `        <receiver${eol}` +
+      `          android:name=".PhoneSettingsWidgetProvider"${eol}` +
+      `          android:exported="true"${eol}` +
+      `          android:label="@string/phone_settings_widget_name">${eol}` +
+      `          <intent-filter>${eol}` +
+      `            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />${eol}` +
+      `          </intent-filter>${eol}` +
+      `          <meta-data${eol}` +
+      `            android:name="android.appwidget.provider"${eol}` +
+      `            android:resource="@xml/widget_phone_settings_info" />${eol}` +
+      `        </receiver>${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${widget}$1`);
+  }
+
+  if (!m.includes(".WidgetSettingsActivity")) {
+    const activity =
+      `        <activity${eol}` +
+      `          android:name=".WidgetSettingsActivity"${eol}` +
+      `          android:excludeFromRecents="true"${eol}` +
+      `          android:exported="false"${eol}` +
+      `          android:theme="@style/Theme.gametracker_companion.WidgetLauncher" />${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${activity}$1`);
   }
 
   // Boot receiver — restart the service after a reboot / app update.
@@ -649,6 +682,11 @@ const save = (path, before, after, msg) => {
       `-keep class ${pkg}.ClipboardBootReceiver { *; }\n` +
       `-keep class ${pkg}.ClipboardPickActivity { *; }\n` +
       `\n` +
+      `# Home-screen phone controls are reached by the launcher/provider and\n` +
+      `# the widget's explicit PendingIntents. Keep them stable in release R8.\n` +
+      `-keep class ${pkg}.PhoneSettingsWidgetProvider { *; }\n` +
+      `-keep class ${pkg}.WidgetSettingsActivity { *; }\n` +
+      `\n` +
       `# Belt-and-braces: never strip @JavascriptInterface methods anywhere.\n` +
       `-keepclassmembers class * {\n` +
       `    @android.webkit.JavascriptInterface <methods>;\n` +
@@ -660,6 +698,65 @@ const save = (path, before, after, msg) => {
       note("created proguard-gametracker.pro (JNI keep rules)");
     } else {
       save(rulesPath, before, content, "updated proguard-gametracker.pro (JNI keep rules)");
+    }
+  }
+}
+
+// --- 7: home-screen phone settings widget resources ------------------------
+// Resource files are copied from templates because gen/android is regenerated
+// by `tauri android init` and is intentionally not committed.
+{
+  const conf = JSON.parse(
+    readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"),
+  );
+  const pkg = String(conf.identifier || "");
+  if (pkg) {
+    for (const name of ["PhoneSettingsWidgetProvider.java", "WidgetSettingsActivity.java"]) {
+      const templatePath = join(root, "scripts", "android-templates", name);
+      if (!existsSync(templatePath)) {
+        console.warn(`[patch-android] ${templatePath} missing — skipping widget Java source.`);
+        continue;
+      }
+      const dest = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), name);
+      const content = readFileSync(templatePath, "utf8").replace(/__PACKAGE__/g, pkg);
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note(`created ${name} (phone settings widget)`);
+      } else {
+        save(dest, before, content, `updated ${name} (phone settings widget)`);
+      }
+    }
+  } else {
+    console.warn("[patch-android] no identifier — skipping widget Java sources.");
+  }
+
+  const widgetFiles = [
+    ["layout", "widget_phone_settings.xml"],
+    ["xml", "widget_phone_settings_info.xml"],
+    ["drawable", "widget_phone_settings_background.xml"],
+    ["drawable", "widget_phone_settings_row.xml"],
+    ["drawable", "widget_phone_settings_pill.xml"],
+    ["values", "widget_phone_settings_strings.xml"],
+  ];
+  for (const [resDir, name] of widgetFiles) {
+    const templatePath = join(root, "scripts", "android-templates", "widgets", name);
+    if (!existsSync(templatePath)) {
+      console.warn(`[patch-android] ${templatePath} missing — skipping widget resource.`);
+      continue;
+    }
+    const dest = join(androidDir, "app", "src", "main", "res", resDir, name);
+    const content = readFileSync(templatePath, "utf8");
+    const exists = existsSync(dest);
+    const before = exists ? readFileSync(dest, "utf8") : "";
+    if (!exists) {
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, content);
+      note(`created ${resDir}/${name} (phone settings widget)`);
+    } else {
+      save(dest, before, content, `updated ${resDir}/${name} (phone settings widget)`);
     }
   }
 }
