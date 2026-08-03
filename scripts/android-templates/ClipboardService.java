@@ -2850,32 +2850,46 @@ public class ClipboardService extends Service {
 
   // Classification is pure and runs from render paths (every row, every refresh,
   // plus the per-kind chip counts), so it is memoized by text. Bounded, because
-  // note bodies run to tens of kilobytes.
+  // note bodies can be very large pasted logs or webpages and classification must
+  // never be able to stall the floating panel's main thread.
   private static final LinkedHashMap<String, Content> CLASSIFY_CACHE = new LinkedHashMap<>();
   private static final int CLASSIFY_CACHE_MAX = 400;
+  private static final int CLASSIFY_MAX_CHARS = 32 * 1024;
 
   /** Decide how a note should be presented. Never throws. */
-  static synchronized Content classify(String text) {
+  static Content classify(String text) {
     String key = text == null ? "" : text;
-    Content hit = CLASSIFY_CACHE.get(key);
-    if (hit != null) return hit;
+    synchronized (CLASSIFY_CACHE) {
+      Content hit = CLASSIFY_CACHE.get(key);
+      if (hit != null) return hit;
+    }
     Content out;
     try {
       out = classifyUncached(key);
     } catch (Exception ignored) {
       out = PLAIN;
     }
-    if (CLASSIFY_CACHE.size() >= CLASSIFY_CACHE_MAX) {
-      java.util.Iterator<String> it = CLASSIFY_CACHE.keySet().iterator();
-      if (it.hasNext()) { it.next(); it.remove(); }
+    synchronized (CLASSIFY_CACHE) {
+      if (CLASSIFY_CACHE.size() >= CLASSIFY_CACHE_MAX) {
+        java.util.Iterator<String> it = CLASSIFY_CACHE.keySet().iterator();
+        if (it.hasNext()) { it.next(); it.remove(); }
+      }
+      CLASSIFY_CACHE.put(key, out);
     }
-    CLASSIFY_CACHE.put(key, out);
     return out;
   }
 
   private static Content classifyUncached(String text) {
     String raw = text.trim();
     if (raw.isEmpty()) return PLAIN;
+    if (raw.length() > CLASSIFY_MAX_CHARS) {
+      // Preserve complete lines when possible, but never scan an unbounded paste
+      // from the UI thread. The beginning contains the useful type/log markers.
+      int limit = CLASSIFY_MAX_CHARS;
+      int lineEnd = raw.lastIndexOf('\n', limit - 1);
+      if (lineEnd >= CLASSIFY_MAX_CHARS / 2) limit = lineEnd;
+      raw = raw.substring(0, limit);
+    }
     String[] lines = raw.split("\n", -1);
     boolean single = lines.length == 1;
 
@@ -3042,12 +3056,42 @@ public class ClipboardService extends Service {
     for (String l : lines) {
       if (l.trim().isEmpty()) continue;
       total++;
-      int alpha = 0;
-      for (String w : l.trim().split("\\s+")) if (w.matches("[A-Za-z][A-Za-z']*")) alpha++;
+      int alpha = asciiWordCount(l, 1);
       // Either a full sentence, or simply a long run of ordinary words.
       if ((alpha >= 4 && PROSE_END.matcher(l).find()) || alpha >= 6) prosey++;
     }
     return total == 0 ? 0 : (double) prosey / total;
+  }
+
+  /** Count whitespace-delimited ASCII words without regex allocation. This runs
+   *  during panel opening, so String.split + String.matches here can turn one
+   *  large pasted note into an Android input-dispatch ANR. */
+  private static int asciiWordCount(String text, int minimumLength) {
+    int count = 0;
+    int start = -1;
+    for (int i = 0; i <= text.length(); i++) {
+      boolean boundary = i == text.length() || Character.isWhitespace(text.charAt(i));
+      if (!boundary) {
+        if (start < 0) start = i;
+        continue;
+      }
+      if (start >= 0 && isAsciiWord(text, start, i, minimumLength)) count++;
+      start = -1;
+    }
+    return count;
+  }
+
+  private static boolean isAsciiWord(String text, int start, int end, int minimumLength) {
+    if (end - start < minimumLength || !isAsciiLetter(text.charAt(start))) return false;
+    for (int i = start + 1; i < end; i++) {
+      char c = text.charAt(i);
+      if (!isAsciiLetter(c) && c != '\'') return false;
+    }
+    return true;
+  }
+
+  private static boolean isAsciiLetter(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
   }
 
   private static double machineRatio(String[] lines) {
@@ -3082,7 +3126,11 @@ public class ClipboardService extends Service {
     if (Pattern.compile("^\\s*(?://|#|/\\*|\\*)", Pattern.MULTILINE).matcher(raw).find()) score += 1;
     if (CODE_WORD.matcher(raw).find()) score += 1;
     int words = 0, alpha = 0;
-    for (String w : raw.split("\\s+")) { if (w.isEmpty()) continue; words++; if (w.matches("[A-Za-z']{2,}")) alpha++; }
+    for (String w : raw.split("\\s+")) {
+      if (w.isEmpty()) continue;
+      words++;
+      if (w.length() >= 2 && isAsciiWord(w, 0, w.length(), 2)) alpha++;
+    }
     if (words > 0 && (double) alpha / words > 0.8) score -= 3;
     return score;
   }
