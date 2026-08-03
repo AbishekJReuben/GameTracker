@@ -267,6 +267,18 @@ const save = (path, before, after, msg) => {
     /[ \t]*<activity-alias\b[^>]*android:name="\.NetworkToggleShortcut"[^>]*>[\s\S]*?<\/activity-alias>[ \t]*\r?\n?/g,
     "",
   );
+  m = m.replace(
+    /[ \t]*<activity\b[^>]*android:name="\.VoLteToggleShortcutActivity"[^>]*>[\s\S]*?<\/activity>[ \t]*\r?\n?/g,
+    "",
+  );
+  m = m.replace(
+    /[ \t]*<activity\b[^>]*android:name="\.VoLteToggleShortcutActivity"[^>]*\/>[ \t]*\r?\n?/g,
+    "",
+  );
+  m = m.replace(
+    /[ \t]*<activity-alias\b[^>]*android:name="\.VoLteToggleShortcut"[^>]*>[\s\S]*?<\/activity-alias>[ \t]*\r?\n?/g,
+    "",
+  );
   const shortcut =
     `        <activity${eol}` +
     `          android:name=".NetworkSettingsShortcutActivity"${eol}` +
@@ -306,6 +318,26 @@ const save = (path, before, after, msg) => {
     `          </intent-filter>${eol}` +
     `        </activity-alias>${eol}`;
   m = m.replace(/([ \t]*<\/application>)/, `${toggleShortcut}$1`);
+
+  const volteShortcut =
+    `        <activity${eol}` +
+    `          android:name=".VoLteToggleShortcutActivity"${eol}` +
+    `          android:excludeFromRecents="true"${eol}` +
+    `          android:exported="false"${eol}` +
+    `          android:noHistory="true"${eol}` +
+    `          android:theme="@android:style/Theme.Translucent.NoTitleBar" />${eol}` +
+    `        <activity-alias${eol}` +
+    `          android:name=".VoLteToggleShortcut"${eol}` +
+    `          android:exported="true"${eol}` +
+    `          android:icon="@drawable/ic_volte_toggle"${eol}` +
+    `          android:label="@string/volte_toggle_shortcut_name"${eol}` +
+    `          android:targetActivity=".VoLteToggleShortcutActivity">${eol}` +
+    `          <intent-filter>${eol}` +
+    `            <action android:name="android.intent.action.MAIN" />${eol}` +
+    `            <category android:name="android.intent.category.LAUNCHER" />${eol}` +
+    `          </intent-filter>${eol}` +
+    `        </activity-alias>${eol}`;
+  m = m.replace(/([ \t]*<\/application>)/, `${volteShortcut}$1`);
 
   // Boot receiver — restart the service after a reboot / app update.
   if (!m.includes(".ClipboardBootReceiver")) {
@@ -772,6 +804,7 @@ const save = (path, before, after, msg) => {
       `# The optional Shizuku network toggle is reached through a launcher alias\n` +
       `# and a UserService class name, not ordinary Java references.\n` +
       `-keep class ${pkg}.NetworkToggleShortcutActivity { *; }\n` +
+      `-keep class ${pkg}.VoLteToggleShortcutActivity { *; }\n` +
       `-keep class ${pkg}.NetworkToggleUserService { *; }\n` +
       `\n` +
       `# Belt-and-braces: never strip @JavascriptInterface methods anywhere.\n` +
@@ -844,6 +877,24 @@ const save = (path, before, after, msg) => {
       }
     }
 
+    const name = "VoLteToggleShortcutActivity.java";
+    const templatePath = join(root, "scripts", "android-templates", name);
+    const dest = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), name);
+    if (!existsSync(templatePath)) {
+      console.warn(`[patch-android] ${templatePath} missing - skipping VoLTE shortcut Java source.`);
+    } else {
+      const content = readFileSync(templatePath, "utf8").replace(/__PACKAGE__/g, pkg);
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note(`created ${name} (Shizuku VoLTE toggle)`);
+      } else {
+        save(dest, before, content, `updated ${name} (Shizuku VoLTE toggle)`);
+      }
+    }
+
   }
 
   const stringsName = "network_settings_shortcut_strings.xml";
@@ -889,6 +940,27 @@ const save = (path, before, after, msg) => {
     }
   }
 
+  const volteStringsName = "volte_toggle_shortcut_strings.xml";
+  {
+    const resDir = "values";
+    const sourcePath = join(root, "scripts", "android-templates", volteStringsName);
+    const dest = join(androidDir, "app", "src", "main", "res", resDir, volteStringsName);
+    if (!existsSync(sourcePath)) {
+      console.warn(`[patch-android] ${sourcePath} missing - skipping VoLTE shortcut string.`);
+    } else {
+      const content = readFileSync(sourcePath, "utf8");
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note(`created ${resDir}/${volteStringsName} (Shizuku VoLTE toggle)`);
+      } else {
+        save(dest, before, content, `updated ${resDir}/${volteStringsName} (Shizuku VoLTE toggle)`);
+      }
+    }
+  }
+
   const iconName = "network_settings_shortcut_icon.png";
   {
     const sourcePath = join(root, "scripts", "android-templates", iconName);
@@ -930,6 +1002,26 @@ const save = (path, before, after, msg) => {
         note("created drawable/ic_network_toggle.xml (Shizuku network toggle icon)");
       } else {
         save(dest, before, content, "updated drawable/ic_network_toggle.xml (Shizuku network toggle icon)");
+      }
+    }
+  }
+
+  const volteIconName = "volte_toggle_icon.xml";
+  {
+    const sourcePath = join(root, "scripts", "android-templates", volteIconName);
+    const dest = join(androidDir, "app", "src", "main", "res", "drawable", "ic_volte_toggle.xml");
+    if (!existsSync(sourcePath)) {
+      console.warn(`[patch-android] ${sourcePath} missing - skipping VoLTE shortcut icon.`);
+    } else {
+      const content = readFileSync(sourcePath, "utf8");
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note("created drawable/ic_volte_toggle.xml (Shizuku VoLTE toggle icon)");
+      } else {
+        save(dest, before, content, "updated drawable/ic_volte_toggle.xml (Shizuku VoLTE toggle icon)");
       }
     }
   }

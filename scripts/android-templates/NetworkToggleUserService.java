@@ -9,6 +9,8 @@ import android.telephony.TelephonyManager;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
@@ -26,9 +28,15 @@ public final class NetworkToggleUserService extends Binder {
     static final String DESCRIPTOR = "__PACKAGE__.NetworkToggleUserService";
     static final int TRANSACTION_GET_ALLOWED = 2;
     static final int TRANSACTION_SET_ALLOWED = 3;
+    static final int TRANSACTION_GET_VOLTE = 4;
+    static final int TRANSACTION_SET_VOLTE = 5;
     private static final int TRANSACTION_DESTROY = 16777114;
     private static final long NR_MASK = TelephonyManager.NETWORK_TYPE_BITMASK_NR;
     private static final Map<String, Long> NETWORK_BITS = createNetworkBits();
+    private static final String SERVICE_MANAGER = "android.os.ServiceManager";
+    private static final String ITelephony_STUB =
+            "com.android.internal.telephony.ITelephony$Stub";
+    private static final String ITelephony = "com.android.internal.telephony.ITelephony";
 
     public NetworkToggleUserService() {
         attachInterface(null, DESCRIPTOR);
@@ -59,6 +67,22 @@ public final class NetworkToggleUserService extends Binder {
             int slot = data.readInt();
             long mask = data.readLong();
             setAllowedNetworkTypes(slot, mask);
+            if (reply != null) reply.writeNoException();
+            return true;
+        }
+        if (code == TRANSACTION_GET_VOLTE) {
+            int subId = data.readInt();
+            boolean enabled = getVoLteSetting(subId);
+            if (reply != null) {
+                reply.writeNoException();
+                reply.writeInt(enabled ? 1 : 0);
+            }
+            return true;
+        }
+        if (code == TRANSACTION_SET_VOLTE) {
+            int subId = data.readInt();
+            boolean enabled = data.readInt() != 0;
+            setVoLteSetting(subId, enabled);
             if (reply != null) reply.writeNoException();
             return true;
         }
@@ -103,6 +127,104 @@ public final class NetworkToggleUserService extends Binder {
         if (slot < 0 || slot > 3) {
             throw new IllegalArgumentException("Unsupported SIM slot: " + slot);
         }
+    }
+
+    private static void validateSubscription(int subId) {
+        if (subId < 0) {
+            throw new IllegalArgumentException("No active voice subscription was found");
+        }
+    }
+
+    /**
+     * Reads the same per-subscription Advanced Calling / Enhanced 4G LTE value
+     * used by the Settings app. A normal app would use ImsMmTelManager, but on
+     * Android 15/16 that manager's framework binder cache is not initialized in
+     * Shizuku's standalone UserService process. Resolve the same ITelephony
+     * binder directly instead. Shizuku UserServices run as the authorized
+     * shell/root identity and are specifically allowed to use non-SDK APIs.
+     */
+    private static boolean getVoLteSetting(int subId) {
+        validateSubscription(subId);
+        Object result = invokeTelephony(
+                "isAdvancedCallingSettingEnabled",
+                new Class<?>[]{int.class},
+                subId);
+        if (!(result instanceof Boolean)) {
+            throw new IllegalStateException("IMS returned an invalid VoLTE state");
+        }
+        return (Boolean) result;
+    }
+
+    private static void setVoLteSetting(int subId, boolean enabled) {
+        validateSubscription(subId);
+        try {
+            invokeTelephony(
+                    "setAdvancedCallingSettingEnabled",
+                    new Class<?>[]{int.class, boolean.class},
+                    subId,
+                    enabled);
+        } catch (IllegalStateException error) {
+            // Android 10-era ITelephony used this shorter name. Keep the
+            // fallback for devices whose IMS API predates the newer name.
+            if (!(error.getCause() instanceof NoSuchMethodException)) {
+                throw error;
+            }
+            invokeTelephony(
+                    "setAdvancedCallingSetting",
+                    new Class<?>[]{int.class, boolean.class},
+                    subId,
+                    enabled);
+        }
+    }
+
+    private static Object invokeTelephony(
+            String methodName, Class<?>[] parameterTypes, Object... args) {
+        try {
+            Object telephony = telephonyService();
+            Class<?> telephonyInterface = Class.forName(ITelephony);
+            Method method = telephonyInterface.getDeclaredMethod(methodName, parameterTypes);
+            method.setAccessible(true);
+            return method.invoke(telephony, args);
+        } catch (InvocationTargetException error) {
+            throw unwrap("VoLTE setting change", error);
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("VoLTE API is unavailable on this Android build", error);
+        }
+    }
+
+    private static Object telephonyService() {
+        try {
+            Class<?> serviceManagerClass = Class.forName(SERVICE_MANAGER);
+            Method getService = serviceManagerClass.getDeclaredMethod(
+                    "getService", String.class);
+            getService.setAccessible(true);
+            IBinder binder = (IBinder) getService.invoke(null, "phone");
+            if (binder == null) {
+                throw new IllegalStateException("Phone service is unavailable");
+            }
+            Class<?> stubClass = Class.forName(ITelephony_STUB);
+            Method asInterface = stubClass.getDeclaredMethod("asInterface", IBinder.class);
+            asInterface.setAccessible(true);
+            Object telephony = asInterface.invoke(null, binder);
+            if (telephony == null) {
+                throw new IllegalStateException("Phone service returned no telephony interface");
+            }
+            return telephony;
+        } catch (InvocationTargetException error) {
+            throw unwrap("connect to phone service", error);
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("VoLTE API is unavailable on this Android build", error);
+        }
+    }
+
+    private static RuntimeException unwrap(String action, InvocationTargetException error) {
+        Throwable cause = error.getCause();
+        if (cause instanceof RuntimeException) {
+            return (RuntimeException) cause;
+        }
+        String message = cause == null ? error.getMessage() : cause.getMessage();
+        return new IllegalStateException(action + " failed"
+                + (message == null || message.isEmpty() ? "" : ": " + message), cause);
     }
 
     private static String runCommand(String... command) {

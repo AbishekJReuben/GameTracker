@@ -17,6 +17,7 @@ import android.widget.Toast;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 import rikka.shizuku.Shizuku;
 
@@ -46,12 +47,19 @@ public final class NetworkToggleShortcutActivity extends Activity {
     private final ServiceConnection userServiceConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
-            worker.execute(() -> toggle(binder));
+            if (isFinishing() || worker.isShutdown()) return;
+            try {
+                worker.execute(() -> toggle(binder));
+            } catch (RejectedExecutionException ignored) {
+                // A delayed Shizuku callback can arrive after onDestroy().
+            }
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
-            showAndFinish("Shizuku stopped before the network could be changed");
+            if (!isFinishing()) {
+                showAndFinish("Shizuku stopped before the network could be changed");
+            }
         }
     };
     private final Shizuku.UserServiceArgs userServiceArgs =

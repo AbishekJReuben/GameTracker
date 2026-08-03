@@ -4,10 +4,16 @@
     android:height="48dp"
     android:viewportWidth="48"
     android:viewportHeight="48">
+    <!-- Filled backdrop keeps the glyph visible on launchers that wrap legacy vectors. -->
+    <path
+        android:fillColor="#FF0B3B60"
+        android:pathData="M0,0h48v48H0z" />
+    <!-- Cellular signal bars. -->
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M7,11h19v4H7zM7,22h12v4H7zM7,33h19v4H7z" />
+        android:pathData="M7,33h5v4H7zM15,25h5v12h-5zM23,17h5v20h-5z" />
+    <!-- Up/down refresh arrows: this is the 4G/5G mask toggle, not VoLTE. -->
     <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M33,8l8,8 -8,8v-5h-7v-6h7zM41,32l-8,8v-5h-7v-6h7v-5z" />
+        android:fillColor="#FFFFD166"
+        android:pathData="M35,7l7,7 -7,7v-4h-5v-6h5zM35,27l7,7 -7,7v-4h-5v-6h5z" />
 </vector>

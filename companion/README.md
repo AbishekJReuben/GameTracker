@@ -231,6 +231,14 @@ running through ADB/wireless debugging. If Shizuku is unavailable, the toggle ex
 and leaves the radio unchanged; **Mobile network settings** remains available as the no-setup
 fallback.
 
+### Quick VoLTE toggle
+
+The companion also exposes **Toggle VoLTE**, a separate launcher icon with a phone-and-radio icon.
+It changes only the default voice SIM's Android **Advanced calling / Enhanced 4G LTE** preference;
+it does not change the preferred 4G/5G network mask. It uses the same Shizuku authorization as the
+4G/5G toggle and verifies the setting after the change. The carrier may keep this preference fixed
+or ignore a change when VoLTE is not editable or provisioned.
+
 ## Notes / gotchas
 
 - **`companion/` needs its own `package.json`** (already committed). The generated Gradle build
