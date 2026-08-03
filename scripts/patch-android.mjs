@@ -224,24 +224,41 @@ const save = (path, before, after, msg) => {
   );
 
   // A normal launcher entry is more reliable than a RemoteViews widget for
-  // this device. The user can drag this separate "Mobile network settings"
-  // icon from the app drawer onto the home screen.
-  if (!m.includes(".NetworkSettingsShortcutActivity")) {
-    const shortcut =
-      `        <activity${eol}` +
-      `          android:name=".NetworkSettingsShortcutActivity"${eol}` +
-      `          android:excludeFromRecents="true"${eol}` +
-      `          android:exported="true"${eol}` +
-      `          android:icon="@mipmap/ic_launcher"${eol}` +
-      `          android:label="@string/network_settings_shortcut_name"${eol}` +
-      `          android:theme="@android:style/Theme.Translucent.NoTitleBar">${eol}` +
-      `          <intent-filter>${eol}` +
-      `            <action android:name="android.intent.action.MAIN" />${eol}` +
-      `            <category android:name="android.intent.category.LAUNCHER" />${eol}` +
-      `          </intent-filter>${eol}` +
-      `        </activity>${eol}`;
-    m = m.replace(/([ \t]*<\/application>)/, `${shortcut}$1`);
-  }
+  // this device. Keep the real activity private and expose the home-screen
+  // entry through an explicit alias. Without the alias, launchers can collapse
+  // two MAIN activities in one package onto the app's primary MainActivity,
+  // which makes the shortcut icon open GameTracker instead of Settings.
+  m = m.replace(
+    /[ \t]*<activity\b[^>]*android:name="\.NetworkSettingsShortcutActivity"[^>]*>[\s\S]*?<\/activity>[ \t]*\r?\n?/g,
+    "",
+  );
+  m = m.replace(
+    /[ \t]*<activity\b[^>]*android:name="\.NetworkSettingsShortcutActivity"[^>]*\/>[ \t]*\r?\n?/g,
+    "",
+  );
+  m = m.replace(
+    /[ \t]*<activity-alias\b[^>]*android:name="\.NetworkSettingsShortcut"[^>]*>[\s\S]*?<\/activity-alias>[ \t]*\r?\n?/g,
+    "",
+  );
+  const shortcut =
+    `        <activity${eol}` +
+    `          android:name=".NetworkSettingsShortcutActivity"${eol}` +
+    `          android:excludeFromRecents="true"${eol}` +
+    `          android:exported="false"${eol}` +
+    `          android:noHistory="true"${eol}` +
+    `          android:theme="@android:style/Theme.Translucent.NoTitleBar" />${eol}` +
+    `        <activity-alias${eol}` +
+    `          android:name=".NetworkSettingsShortcut"${eol}` +
+    `          android:exported="true"${eol}` +
+    `          android:icon="@drawable/ic_network_shortcut"${eol}` +
+    `          android:label="@string/network_settings_shortcut_name"${eol}` +
+    `          android:targetActivity=".NetworkSettingsShortcutActivity">${eol}` +
+    `          <intent-filter>${eol}` +
+    `            <action android:name="android.intent.action.MAIN" />${eol}` +
+    `            <category android:name="android.intent.category.LAUNCHER" />${eol}` +
+    `          </intent-filter>${eol}` +
+    `        </activity-alias>${eol}`;
+  m = m.replace(/([ \t]*<\/application>)/, `${shortcut}$1`);
 
   // Boot receiver — restart the service after a reboot / app update.
   if (!m.includes(".ClipboardBootReceiver")) {
@@ -744,9 +761,7 @@ const save = (path, before, after, msg) => {
   {
     const resDir = "values";
     const name = stringsName;
-    const templatePath = join(root, "scripts", "android-templates", "widgets", name);
-    const fallbackTemplatePath = join(root, "scripts", "android-templates", name);
-    const sourcePath = existsSync(fallbackTemplatePath) ? fallbackTemplatePath : templatePath;
+    const sourcePath = join(root, "scripts", "android-templates", name);
     if (!existsSync(sourcePath)) {
       console.warn(`[patch-android] ${sourcePath} missing — skipping shortcut string.`);
     } else {
@@ -760,6 +775,31 @@ const save = (path, before, after, msg) => {
         note(`created ${resDir}/${name} (mobile-network launcher shortcut)`);
       } else {
         save(dest, before, content, `updated ${resDir}/${name} (mobile-network launcher shortcut)`);
+      }
+    }
+  }
+
+  const iconName = "network_settings_shortcut_icon.png";
+  {
+    const sourcePath = join(root, "scripts", "android-templates", iconName);
+    if (!existsSync(sourcePath)) {
+      console.warn(`[patch-android] ${sourcePath} missing - skipping shortcut icon.`);
+    } else {
+      const dest = join(
+        androidDir,
+        "app",
+        "src",
+        "main",
+        "res",
+        "drawable-nodpi",
+        "ic_network_shortcut.png",
+      );
+      const content = readFileSync(sourcePath);
+      const before = existsSync(dest) ? readFileSync(dest) : null;
+      if (!before || !before.equals(content)) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note("updated drawable-nodpi/ic_network_shortcut.png (mobile-network launcher icon)");
       }
     }
   }

@@ -204,12 +204,14 @@ mouse/keyboard (see *Remote control features* above).
 
 ### Mobile network launcher shortcut
 
-The Android companion adds a separate launcher icon named **Mobile network settings**. It opens the
+The Android companion adds a separate launcher icon named **Mobile network settings**. It is an
+explicit launcher alias with its own icon, separate from the main GameTracker icon, and opens the
 phone’s Mobile network page directly; on the Moto G57 Power 5G running Android 16 this is the page
 that contains **Preferred network type** and **VoLTE**.
 
-After installing the update, find **Mobile network settings** in the app drawer and drag it onto the
-home screen. Android does not allow ordinary apps to silently place icons on the home screen.
+After installing the update, remove any older pinned **Mobile network settings** icon, then find the
+new **Mobile network settings** entry in the app drawer and drag it onto the home screen. Android
+does not allow ordinary apps to silently place icons on the home screen.
 The shortcut only opens Settings—the OS/carrier still controls which network and VoLTE changes are
 available.
 
