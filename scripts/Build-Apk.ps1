@@ -99,7 +99,7 @@ if (-not $SkipWebBuild) {
 # decoder probe died with NoSuchMethodError and DIRECT silently fell back to
 # WebCodecs.
 if (-not (Test-Path (Join-Path $root 'companion\src-tauri\gen\android'))) {
-    Write-Host "gen\android missing — running tauri android init..."
+    Write-Host "gen\android missing - running tauri android init..."
     Push-Location (Join-Path $root 'companion')
     try {
         npx tauri android init

@@ -202,21 +202,16 @@ Manage or revoke devices in the PC's Remote → **Devices** panel.
 **Stats** and **Music** mirror your PC live; **Control** streams the screen and drives the
 mouse/keyboard (see *Remote control features* above).
 
-### Home-screen phone controls widget
+### Mobile network launcher shortcut
 
-The Android companion also publishes a **GameTracker phone controls** widget. Add it from the
-launcher’s widget picker to get two home-screen shortcuts: **Preferred network type** and **VoLTE**.
-Each row opens the device’s Mobile network settings and refreshes the widget when you return.
+The Android companion adds a separate launcher icon named **Mobile network settings**. It opens the
+phone’s Mobile network page directly; on the Moto G57 Power 5G running Android 16 this is the page
+that contains **Preferred network type** and **VoLTE**.
 
-For Preferred network type, the widget also offers an explicitly labeled **Advanced 4636 menu**
-option. It only opens the dialer with `*#*#4636#*#*` prefilled; the user must activate it and the
-OEM may not support it. Android reserves direct secret-code broadcasts for the default dialer or
-carrier apps, so the companion never fires that broadcast or changes the radio mode automatically.
-
-Android reserves direct writes to preferred network mode and the carrier’s VoLTE setting for
-privileged/carrier apps. The widget therefore uses only the official readable phone-state APIs and
-shows the current network when available; it never writes hidden `Settings.Global` keys or claims a
-toggle succeeded when the OS does not permit it.
+After installing the update, find **Mobile network settings** in the app drawer and drag it onto the
+home screen. Android does not allow ordinary apps to silently place icons on the home screen.
+The shortcut only opens Settings—the OS/carrier still controls which network and VoLTE changes are
+available.
 
 ## Notes / gotchas
 
