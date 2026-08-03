@@ -122,6 +122,21 @@ const save = (path, before, after, msg) => {
     m = m.replace(/([ \t]*<\/application>)/, `${provider}$1`);
   }
 
+  // Shizuku provider. It is harmless when Shizuku is not installed and is
+  // required for the optional 4G/5G launcher toggle to receive Shizuku's
+  // binder. The provider permission prevents ordinary apps from using it.
+  if (!m.includes("rikka.shizuku.ShizukuProvider")) {
+    const provider =
+      `        <provider${eol}` +
+      `          android:name="rikka.shizuku.ShizukuProvider"${eol}` +
+      `          android:authorities="\${applicationId}.shizuku"${eol}` +
+      `          android:enabled="true"${eol}` +
+      `          android:exported="true"${eol}` +
+      `          android:multiprocess="false"${eol}` +
+      `          android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${provider}$1`);
+  }
+
   // ApkInstallReceiver — the PackageInstaller status callback target. Without this
   // registered receiver, committing an install session has nowhere to deliver
   // STATUS_PENDING_USER_ACTION, so the confirmation dialog never launches (this is
@@ -240,6 +255,18 @@ const save = (path, before, after, msg) => {
     /[ \t]*<activity-alias\b[^>]*android:name="\.NetworkSettingsShortcut"[^>]*>[\s\S]*?<\/activity-alias>[ \t]*\r?\n?/g,
     "",
   );
+  m = m.replace(
+    /[ \t]*<activity\b[^>]*android:name="\.NetworkToggleShortcutActivity"[^>]*>[\s\S]*?<\/activity>[ \t]*\r?\n?/g,
+    "",
+  );
+  m = m.replace(
+    /[ \t]*<activity\b[^>]*android:name="\.NetworkToggleShortcutActivity"[^>]*\/>[ \t]*\r?\n?/g,
+    "",
+  );
+  m = m.replace(
+    /[ \t]*<activity-alias\b[^>]*android:name="\.NetworkToggleShortcut"[^>]*>[\s\S]*?<\/activity-alias>[ \t]*\r?\n?/g,
+    "",
+  );
   const shortcut =
     `        <activity${eol}` +
     `          android:name=".NetworkSettingsShortcutActivity"${eol}` +
@@ -259,6 +286,26 @@ const save = (path, before, after, msg) => {
     `          </intent-filter>${eol}` +
     `        </activity-alias>${eol}`;
   m = m.replace(/([ \t]*<\/application>)/, `${shortcut}$1`);
+
+  const toggleShortcut =
+    `        <activity${eol}` +
+    `          android:name=".NetworkToggleShortcutActivity"${eol}` +
+    `          android:excludeFromRecents="true"${eol}` +
+    `          android:exported="false"${eol}` +
+    `          android:noHistory="true"${eol}` +
+    `          android:theme="@android:style/Theme.Translucent.NoTitleBar" />${eol}` +
+    `        <activity-alias${eol}` +
+    `          android:name=".NetworkToggleShortcut"${eol}` +
+    `          android:exported="true"${eol}` +
+    `          android:icon="@drawable/ic_network_toggle"${eol}` +
+    `          android:label="@string/network_toggle_shortcut_name"${eol}` +
+    `          android:targetActivity=".NetworkToggleShortcutActivity">${eol}` +
+    `          <intent-filter>${eol}` +
+    `            <action android:name="android.intent.action.MAIN" />${eol}` +
+    `            <category android:name="android.intent.category.LAUNCHER" />${eol}` +
+    `          </intent-filter>${eol}` +
+    `        </activity-alias>${eol}`;
+  m = m.replace(/([ \t]*<\/application>)/, `${toggleShortcut}$1`);
 
   // Boot receiver — restart the service after a reboot / app update.
   if (!m.includes(".ClipboardBootReceiver")) {
@@ -363,6 +410,19 @@ const save = (path, before, after, msg) => {
       `$&    implementation("com.squareup.okhttp3:okhttp:4.12.0")${eol}`,
     );
   }
+  // Optional privileged network toggle. Shizuku is not bundled as an app; the
+  // dependency only lets GameTracker talk to a separately installed Shizuku
+  // service when the user explicitly authorizes it.
+  if (!g.includes("dev.rikka.shizuku:api")) {
+    g = g.replace(
+      /dependencies\s*\{\r?\n/,
+      `$&    implementation("dev.rikka.shizuku:api:13.1.5")${eol}` +
+        `    implementation("dev.rikka.shizuku:provider:13.1.5")${eol}`,
+    );
+  }
+  // The toggle uses a hand-written Binder so Windows AIDL path comments cannot
+  // produce illegal Java unicode escapes in the generated source tree.
+  g = g.replace(/^[ \t]*aidl = true[ \t]*\r?\n/m, "");
   save(gradlePath, before, g, "set release networking and native clipboard WebSocket dependency");
 }
 
@@ -706,9 +766,13 @@ const save = (path, before, after, msg) => {
       `-keep class ${pkg}.ClipboardBootReceiver { *; }\n` +
       `-keep class ${pkg}.ClipboardPickActivity { *; }\n` +
       `\n` +
-       `# The mobile-network icon is reached only through the launcher manifest.\n` +
-       `# Keep the activity stable in release R8.\n` +
-       `-keep class ${pkg}.NetworkSettingsShortcutActivity { *; }\n` +
+      `# The mobile-network icon is reached only through the launcher manifest.\n` +
+      `# Keep the activity stable in release R8.\n` +
+      `-keep class ${pkg}.NetworkSettingsShortcutActivity { *; }\n` +
+      `# The optional Shizuku network toggle is reached through a launcher alias\n` +
+      `# and a UserService class name, not ordinary Java references.\n` +
+      `-keep class ${pkg}.NetworkToggleShortcutActivity { *; }\n` +
+      `-keep class ${pkg}.NetworkToggleUserService { *; }\n` +
       `\n` +
       `# Belt-and-braces: never strip @JavascriptInterface methods anywhere.\n` +
       `-keepclassmembers class * {\n` +
@@ -757,6 +821,31 @@ const save = (path, before, after, msg) => {
     console.warn("[patch-android] no identifier — skipping shortcut Java source.");
   }
 
+  // Optional Shizuku-backed toggle. These classes are loaded by class name in
+  // Shizuku's shell/root process, so copy the Java implementation into every
+  // generated Android tree.
+  if (pkg) {
+    for (const name of ["NetworkToggleShortcutActivity.java", "NetworkToggleUserService.java"]) {
+      const templatePath = join(root, "scripts", "android-templates", name);
+      const dest = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), name);
+      if (!existsSync(templatePath)) {
+        console.warn(`[patch-android] ${templatePath} missing - skipping ${name}.`);
+        continue;
+      }
+      const content = readFileSync(templatePath, "utf8").replace(/__PACKAGE__/g, pkg);
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note(`created ${name} (Shizuku network toggle)`);
+      } else {
+        save(dest, before, content, `updated ${name} (Shizuku network toggle)`);
+      }
+    }
+
+  }
+
   const stringsName = "network_settings_shortcut_strings.xml";
   {
     const resDir = "values";
@@ -775,6 +864,27 @@ const save = (path, before, after, msg) => {
         note(`created ${resDir}/${name} (mobile-network launcher shortcut)`);
       } else {
         save(dest, before, content, `updated ${resDir}/${name} (mobile-network launcher shortcut)`);
+      }
+    }
+  }
+
+  const toggleStringsName = "network_toggle_shortcut_strings.xml";
+  {
+    const resDir = "values";
+    const sourcePath = join(root, "scripts", "android-templates", toggleStringsName);
+    if (!existsSync(sourcePath)) {
+      console.warn(`[patch-android] ${sourcePath} missing - skipping toggle shortcut string.`);
+    } else {
+      const dest = join(androidDir, "app", "src", "main", "res", resDir, toggleStringsName);
+      const content = readFileSync(sourcePath, "utf8");
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note(`created ${resDir}/${toggleStringsName} (Shizuku network toggle)`);
+      } else {
+        save(dest, before, content, `updated ${resDir}/${toggleStringsName} (Shizuku network toggle)`);
       }
     }
   }
@@ -804,9 +914,42 @@ const save = (path, before, after, msg) => {
     }
   }
 
+  const toggleIconName = "network_toggle_icon.xml";
+  {
+    const sourcePath = join(root, "scripts", "android-templates", toggleIconName);
+    const dest = join(androidDir, "app", "src", "main", "res", "drawable", "ic_network_toggle.xml");
+    if (!existsSync(sourcePath)) {
+      console.warn(`[patch-android] ${sourcePath} missing - skipping toggle shortcut icon.`);
+    } else {
+      const content = readFileSync(sourcePath, "utf8");
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note("created drawable/ic_network_toggle.xml (Shizuku network toggle icon)");
+      } else {
+        save(dest, before, content, "updated drawable/ic_network_toggle.xml (Shizuku network toggle icon)");
+      }
+    }
+  }
+
   // Delete files left behind by the widget implementation in an existing
   // generated tree. These paths are all inside gen/android and are ignored by
   // Git; fresh Android scaffolds simply do not contain them.
+  const staleAidl = join(
+    androidDir,
+    "app",
+    "src",
+    "main",
+    "aidl",
+    ...pkg.split("."),
+    "INetworkToggleService.aidl",
+  );
+  if (existsSync(staleAidl)) {
+    unlinkSync(staleAidl);
+    note("removed aidl/INetworkToggleService.aidl (obsolete Windows AIDL bridge)");
+  }
   const staleJava = ["PhoneSettingsWidgetProvider.java", "WidgetSettingsActivity.java"];
   for (const name of staleJava) {
     const stale = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), name);

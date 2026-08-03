@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="network_toggle_shortcut_name">Toggle 4G / 5G</string>
+</resources>

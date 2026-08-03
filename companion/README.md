@@ -215,6 +215,22 @@ does not allow ordinary apps to silently place icons on the home screen.
 The shortcut only opens Settings—the OS/carrier still controls which network and VoLTE changes are
 available.
 
+### Quick 4G / 5G toggle
+
+The Android companion also exposes a separate **Toggle 4G / 5G** launcher icon. On supported
+devices it changes the allowed network mask for the phone's default-data SIM: tapping it once
+removes 5G and leaves LTE enabled; tapping it again restores the previous 5G-capable mask. It
+verifies the result after every change and does not touch the VoLTE setting.
+
+Android does not grant ordinary APKs the telephony privilege needed for this operation. The toggle
+therefore uses the optional [Shizuku](https://shizuku.rikka.app/) bridge, and only invokes the
+allow-listed `cmd phone` network command after the user authorizes GameTracker in Shizuku. Install
+Shizuku, start it through Android 11+ wireless debugging, authorize GameTracker, then place
+**Toggle 4G / 5G** on the home screen. Shizuku must be started again after a reboot when it is
+running through ADB/wireless debugging. If Shizuku is unavailable, the toggle explains the setup
+and leaves the radio unchanged; **Mobile network settings** remains available as the no-setup
+fallback.
+
 ## Notes / gotchas
 
 - **`companion/` needs its own `package.json`** (already committed). The generated Gradle build
