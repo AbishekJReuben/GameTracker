@@ -26,7 +26,6 @@ import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
-import android.net.NetworkRequest;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
@@ -161,7 +160,7 @@ public class ClipboardService extends Service {
   private final ArrayList<View> poolImage = new ArrayList<>();
   private static final int ROW_POOL_MAX = 24;
   private TextView panelStatusText; // status label in floating panel header
-  private boolean socketConnected;
+  private volatile boolean socketConnected;
   private WindowManager.LayoutParams panelLp;
   // Which screen edge the pin/dock lives on. The dock slides in from this side.
   private boolean pinOnRight = true;
@@ -195,9 +194,16 @@ public class ClipboardService extends Service {
     }
   };
   private OkHttpClient http;
-  private WebSocket socket;
+  private volatile WebSocket socket;
+  private final java.util.concurrent.ExecutorService syncWorker =
+      java.util.concurrent.Executors.newSingleThreadExecutor();
+  private final java.util.concurrent.ExecutorService contentWorker =
+      java.util.concurrent.Executors.newSingleThreadExecutor();
+  private long lastRevision; // memory cursor only: a fresh process still loads full history
+  private long replayRevision;
+  private boolean replaying;
   private long reconnectMs = 1000;
-  private boolean stopping;
+  private volatile boolean stopping;
   private String deviceId = "";
   private String socketUrl = "";
   private String clipSpace = ""; // clipId derived from the secret (for blob URLs)
@@ -205,6 +211,7 @@ public class ClipboardService extends Service {
   private String sarvamKey = ""; // voice-to-text key (from prefs; may be empty)
   private ConnectivityManager cm;
   private ConnectivityManager.NetworkCallback netCallback;
+  private final ClipboardNetworkState networkState = new ClipboardNetworkState();
   // Decoded image thumbnails, keyed by item id. Bounded by MAX_ITEMS eviction.
   private final HashMap<String, Bitmap> thumbs = new HashMap<>();
   // The dock rebuilds rows frequently; cache preview metadata and coalesce
@@ -262,6 +269,9 @@ public class ClipboardService extends Service {
     final String id;
     final String kind;
     String text;         // editable (notes) — updated in place by edits
+    volatile Content content = PLAIN;
+    volatile String classifiedText;
+    String classifyingText;
     // A save/edit is a meaningful touch, so it gets a fresh timestamp and moves
     // this entry to the top on every device.
     long createdAtMs;
@@ -346,22 +356,24 @@ public class ClipboardService extends Service {
   @Override
   public int onStartCommand(Intent intent, int flags, int startId) {
     String action = intent == null ? ACTION_START : intent.getAction();
-    if (ACTION_STOP.equals(action)) {
+    if (ACTION_STOP.equals(action) || !ClipboardBridge.backgroundEnabled(this)) {
+      stopping = true;
       stopSelf();
       return START_NOT_STICKY;
     }
     INSTANCE = this;
     startForegroundNotif();
     trackOwnForeground();
-    deriveCryptoKey();
     showBubble();
     // A gallery upload coming in from ClipboardPickActivity — handle it before the
     // usual connect cycle so the bytes are read + sent even if config is unchanged.
-    if (ACTION_UPLOAD_IMAGE.equals(action) && intent != null) {
-      final Uri uri = (Uri) intent.getParcelableExtra(Intent.EXTRA_STREAM);
-      if (uri != null) handleUploadImage(uri);
-    }
-    startSync();
+    final Uri upload = ACTION_UPLOAD_IMAGE.equals(action) && intent != null
+        ? (Uri) intent.getParcelableExtra(Intent.EXTRA_STREAM) : null;
+    runSync(() -> {
+      deriveCryptoKey();
+      startSync();
+      if (upload != null && !stopping) handleUploadImage(upload);
+    });
     return START_STICKY;
   }
 
@@ -554,6 +566,12 @@ public class ClipboardService extends Service {
 
   // ---- sync socket ----------------------------------------------------------
 
+  private void runSync(Runnable work) {
+    if (stopping) return;
+    try { syncWorker.execute(() -> { if (!stopping) work.run(); }); }
+    catch (java.util.concurrent.RejectedExecutionException ignored) { }
+  }
+
   /** Keep one idle push socket alive. History/decryption stays lazy in the UI.
    *  Called from every onStartCommand — the webview re-invokes startService
    *  whenever it learns the secret, so this must APPLY config changes: if the
@@ -561,6 +579,7 @@ public class ClipboardService extends Service {
    *  started unconfigured and the config just arrived), drop the old socket and
    *  reconnect with the new one instead of silently keeping the stale session. */
   private void startSync() {
+    if (stopping) return;
     android.content.SharedPreferences p =
         getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE);
     String secret = p.getString("secret", "");
@@ -585,8 +604,11 @@ public class ClipboardService extends Service {
     } catch (Exception ignored) {
       return;
     }
-    stopping = false;
     boolean urlChanged = !newUrl.equals(socketUrl);
+    if (urlChanged) {
+      lastRevision = 0;
+      synchronized (this) { items.clear(); thumbs.clear(); }
+    }
     socketUrl = newUrl;
     if (http == null) {
       // 90s pings: Cloudflare drops idle WS at ~100s, so this is the least-
@@ -601,7 +623,7 @@ public class ClipboardService extends Service {
     registerScreenOnReceiver();
     if (urlChanged && socket != null) {
       // Config changed under a live (or half-open) socket — replace it now.
-      forceReconnect();
+      reconnectNow();
     } else {
       connectSocket();
     }
@@ -615,20 +637,21 @@ public class ClipboardService extends Service {
     cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
     if (cm == null) return;
     netCallback = new ConnectivityManager.NetworkCallback() {
-      @Override public void onAvailable(Network network) {
-        forceReconnect();
-      }
       @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
-        if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
-          forceReconnect();
-        }
+        // Capabilities also change for bandwidth/signal strength. Only a newly
+        // validated DEFAULT network should replace a working socket.
+        final boolean validated = caps != null
+            && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+        runSync(() -> {
+          if (networkState.update(network, validated, socket == null)) reconnectNow();
+        });
+      }
+      @Override public void onLost(Network network) {
+        runSync(() -> networkState.lost(network));
       }
     };
     try {
-      NetworkRequest req = new NetworkRequest.Builder()
-          .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-          .build();
-      cm.registerNetworkCallback(req, netCallback);
+      cm.registerDefaultNetworkCallback(netCallback);
     } catch (Exception ignored) {
       netCallback = null;
     }
@@ -640,7 +663,9 @@ public class ClipboardService extends Service {
     if (screenOnReceiver != null) return;
     screenOnReceiver = new android.content.BroadcastReceiver() {
       @Override public void onReceive(Context ctx, Intent intent) {
-        if (socket == null) forceReconnect();
+        if (socket == null) {
+          forceReconnect();
+        }
       }
     };
     try {
@@ -654,54 +679,72 @@ public class ClipboardService extends Service {
   }
 
   /** Drop any stale socket and reconnect now, resetting the backoff. Safe to call
-   *  from the connectivity callback thread — the actual connect hops to `main`. */
+   *  from any callback thread — socket lifecycle is serialized on syncWorker. */
   private void forceReconnect() {
+    runSync(this::reconnectNow);
+  }
+
+  private void reconnectNow() {
     if (stopping) return;
     reconnectMs = 1000;
     reconnectFails = 0;
     main.removeCallbacks(reconnect);
-    main.post(() -> {
-      if (stopping) return;
-      WebSocket s = socket;
-      socket = null;
-      if (s != null) {
-        try { s.cancel(); } catch (Exception ignored) {}
-      }
-      connectSocket();
-    });
+    WebSocket s = socket;
+    socket = null;
+    socketConnected = false;
+    if (s != null) {
+      try { s.cancel(); } catch (Exception ignored) {}
+    }
+    connectSocket();
   }
 
   private void connectSocket() {
-    if (stopping || socketUrl.isEmpty() || socket != null) return;
+    if (stopping || http == null || socketUrl.isEmpty() || socket != null) return;
     socket = http.newWebSocket(new Request.Builder().url(socketUrl).build(), new WebSocketListener() {
       @Override public void onOpen(WebSocket ws, Response response) {
-        reconnectMs = 1000;
-        reconnectFails = 0;
-        socketConnected = true;
-        main.post(ClipboardService.this::refreshStatusIfOpen);
-        // Request the FULL history (since=0), not just items newer than the last
-        // seen rev — otherwise the dock can't show anything copied before this
-        // launch ("old history can't be viewed"). We dedupe by id and cap at
-        // MAX_ITEMS, so a large history stays memory-bounded.
-        ws.send("{\"t\":\"hello\",\"since\":0}");
+        runSync(() -> {
+          if (ws != socket) return;
+          reconnectMs = 1000;
+          reconnectFails = 0;
+          socketConnected = true;
+          main.post(ClipboardService.this::refreshStatusIfOpen);
+          replaying = true;
+          replayRevision = lastRevision;
+          ws.send("{\"t\":\"hello\",\"since\":" + lastRevision + "}");
+        });
       }
 
       @Override public void onMessage(WebSocket ws, String text) {
-        handleNotice(text);
+        runSync(() -> {
+          if (ws != socket) return;
+          handleNotice(text);
+          try {
+            JSONObject v = new JSONObject(text);
+            replayRevision = Math.max(replayRevision, v.optLong("rev", 0));
+            if ("synced".equals(v.optString("t"))) replaying = false;
+            if (!replaying) lastRevision = Math.max(lastRevision, replayRevision);
+          } catch (Exception ignored) { }
+        });
       }
 
       @Override public void onClosed(WebSocket ws, int code, String reason) {
-        socket = null;
-        socketConnected = false;
-        main.post(ClipboardService.this::refreshStatusIfOpen);
-        scheduleReconnect();
+        runSync(() -> {
+          if (ws != socket) return;
+          socket = null;
+          socketConnected = false;
+          main.post(ClipboardService.this::refreshStatusIfOpen);
+          scheduleReconnect();
+        });
       }
 
       @Override public void onFailure(WebSocket ws, Throwable error, Response response) {
-        socket = null;
-        socketConnected = false;
-        main.post(ClipboardService.this::refreshStatusIfOpen);
-        scheduleReconnect();
+        runSync(() -> {
+          if (ws != socket) return;
+          socket = null;
+          socketConnected = false;
+          main.post(ClipboardService.this::refreshStatusIfOpen);
+          scheduleReconnect();
+        });
       }
     });
   }
@@ -716,16 +759,11 @@ public class ClipboardService extends Service {
     main.postDelayed(reconnect, delay);
   }
 
-  private final Runnable reconnect = this::connectSocket;
+  private final Runnable reconnect = () -> runSync(this::connectSocket);
 
   private void handleNotice(String text) {
     try {
       JSONObject v = new JSONObject(text);
-      long rev = v.optLong("rev", 0);
-      if (rev > 0) {
-        getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
-            .edit().putLong("nativeRev", rev).apply();
-      }
       if (!"item".equals(v.optString("t"))) return;
       String id = v.optString("itemId", "");
       if (v.optBoolean("deleted", false)) {
@@ -806,7 +844,7 @@ public class ClipboardService extends Service {
           sortItemsLocked();
           trimItemsLocked();
         }
-        if (!own && !existed) main.post(this::showNewItemAttention);
+        if (!replaying && !own && !existed) main.post(this::showNewItemAttention);
         main.post(this::refreshPanelIfOpen);
         return;
       }
@@ -825,7 +863,7 @@ public class ClipboardService extends Service {
         sortItemsLocked();
         trimItemsLocked();
       }
-      if (!own && !existed) main.post(this::showNewItemAttention);
+      if (!replaying && !own && !existed) main.post(this::showNewItemAttention);
       main.post(this::refreshPanelIfOpen);
     } catch (Exception ignored) {
     }
@@ -863,7 +901,8 @@ public class ClipboardService extends Service {
    *  Called only when the dock actually renders the row, so background catch-ups
    *  never re-download blobs. Best-effort; refreshes the panel when done. */
   private void fetchImageThumb(String id) {
-    if (http == null || clipSpace.isEmpty() || httpBase.isEmpty()) return;
+    if (stopping || panel == null || http == null || clipSpace.isEmpty() || httpBase.isEmpty()) return;
+    final String space = clipSpace;
     synchronized (this) {
       if (thumbs.containsKey(id) || !thumbFetching.add(id)) return;
     }
@@ -884,9 +923,9 @@ public class ClipboardService extends Service {
           }
           synchronized (ClipboardService.this) {
             thumbFetching.remove(id);
-            if (bmp != null) thumbs.put(id, bmp);
+            if (bmp != null && !stopping && space.equals(clipSpace)) thumbs.put(id, bmp);
           }
-          if (bmp != null) main.post(ClipboardService.this::refreshPanelIfOpen);
+          if (bmp != null && !stopping) main.post(ClipboardService.this::refreshPanelIfOpen);
         }
       });
     } catch (Exception ignored) {
@@ -2245,7 +2284,7 @@ public class ClipboardService extends Service {
     synchronized (this) {
       for (ClipEntry e : items) {
         if (!"text".equals(e.kind)) continue;
-        String k = classify(e.text == null ? "" : e.text).kind;
+        String k = contentFor(e).kind;
         Integer n = counts.get(k);
         counts.put(k, n == null ? 1 : n + 1);
       }
@@ -2775,7 +2814,7 @@ public class ClipboardService extends Service {
       if (!dockFilterKind.isEmpty() && !dockFilterKind.equals(e.kind)) continue;
       if (dockTypeFilter != null) {
         if (!"text".equals(e.kind)) continue;
-        if (!dockTypeFilter.equals(classify(e.text == null ? "" : e.text).kind)) continue;
+        if (!dockTypeFilter.equals(contentFor(e).kind)) continue;
       }
       if (dockFolderFilter != null) {
         if (dockFolderFilter.isEmpty()) {
@@ -2848,6 +2887,31 @@ public class ClipboardService extends Service {
   }
   private static final Content PLAIN = new Content("text", null, false);
 
+  /** Rendering/type-chip counts must never classify a history batch on the UI
+   * thread or under the service lock. Use a cheap fallback until prepared. */
+  private Content contentFor(ClipEntry entry) {
+    if (entry == null || entry.text == null) return PLAIN;
+    String text = entry.text;
+    if (text.equals(entry.classifiedText)) return entry.content;
+    synchronized (entry) {
+      if (!text.equals(entry.classifyingText) && !stopping) {
+        entry.classifyingText = text;
+        try {
+          contentWorker.execute(() -> {
+            Content result = classify(text);
+            main.post(() -> {
+              if (stopping || !text.equals(entry.text)) return;
+              entry.content = result;
+              entry.classifiedText = text;
+              refreshPanelIfOpen();
+            });
+          });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) { }
+      }
+    }
+    return PLAIN;
+  }
+
   // Classification is pure and runs from render paths (every row, every refresh,
   // plus the per-kind chip counts), so it is memoized by text. Bounded, because
   // note bodies can be very large pasted logs or webpages and classification must
@@ -2858,7 +2922,8 @@ public class ClipboardService extends Service {
 
   /** Decide how a note should be presented. Never throws. */
   static Content classify(String text) {
-    String key = text == null ? "" : text;
+    // Bound the cache KEY too; otherwise it retains entire multi-MB pastes.
+    String key = text == null ? "" : text.substring(0, Math.min(text.length(), CLASSIFY_MAX_CHARS));
     synchronized (CLASSIFY_CACHE) {
       Content hit = CLASSIFY_CACHE.get(key);
       if (hit != null) return hit;
@@ -3140,6 +3205,7 @@ public class ClipboardService extends Service {
    *  absolute URL, or null when there is nothing link-shaped. */
   private static String firstHttpLink(String text) {
     if (text == null) return null;
+    if (text.length() > 8192) text = text.substring(0, 8192);
     Matcher m = HTTP_LINK.matcher(text);
     if (m.find()) {
       String url = trimLinkTail(m.group());
@@ -4032,7 +4098,7 @@ public class ClipboardService extends Service {
       h.lastBody = fullText;
       h.lastHadLink = firstHttpLink(fullText) != null;
       configureBody(h, fullText);
-    } else if (h.linkPreviewOn != dockShowLinkPreviews) {
+    } else if (h.linkPreviewOn != dockShowLinkPreviews || h.content != contentFor(e)) {
       // Preview toggle flipped but text is identical: still reconfigure the body's
       // link handling (selectable ↔ tappable) and reconcile the card below.
       configureBody(h, fullText);
@@ -4127,9 +4193,13 @@ public class ClipboardService extends Service {
   }
 
   private void configureBody(RowHolder h, String fullText) {
+    // Syntax highlighting and TextView layout must be bounded even when the
+    // source is a multi-MB log. Copy/edit/share still use the complete entry.
+    if (fullText.length() > 8192) fullText = fullText.substring(0, 8192)
+        + "\n[Preview shortened — Copy, Share or Edit for the full note]";
     TextView body = h.body;
     h.linkPreviewOn = dockShowLinkPreviews;
-    Content c = classify(fullText);
+    Content c = contentFor(h.entry);
     h.content = c;
     h.monoLabel = c.mono ? c.label : null;
 
@@ -4624,7 +4694,7 @@ public class ClipboardService extends Service {
   @Override
   public void onTaskRemoved(Intent rootIntent) {
     super.onTaskRemoved(rootIntent);
-    if (stopping) return;
+    if (stopping || !ClipboardBridge.backgroundEnabled(this)) return;
     try {
       Intent restart = new Intent(getApplicationContext(), ClipboardService.class);
       restart.setAction(ACTION_START);
@@ -4649,6 +4719,8 @@ public class ClipboardService extends Service {
     super.onDestroy();
     stopping = true;
     INSTANCE = null;
+    syncWorker.shutdownNow();
+    contentWorker.shutdownNow();
     main.removeCallbacks(reconnect);
     if (cm != null && netCallback != null) {
       try { cm.unregisterNetworkCallback(netCallback); } catch (Exception ignored) {}
@@ -4667,7 +4739,10 @@ public class ClipboardService extends Service {
     }
     if (socket != null) socket.cancel();
     socket = null;
-    if (http != null) http.dispatcher().executorService().shutdown();
+    if (http != null) {
+      http.dispatcher().cancelAll();
+      http.dispatcher().executorService().shutdown();
+    }
     http = null;
     if (panel != null && wm != null) {
       try {

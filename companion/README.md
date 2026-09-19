@@ -72,6 +72,59 @@ The **Control** tab is a full remote-desktop surface (see `src/companion/screens
   (`gt.remote.streamTune`). (Lower-sharpness presets use a fast nearest-neighbour downscale —
   the main fps lever on high-res/4K monitors, and only on the JPEG fallback.)
 
+## Notes background/data behavior (September 2026)
+
+Remote approval saves Notes credentials but does **not** enable Notes syncing.
+The webview Notes client connects only while the Notes page is visible, and
+disconnects on navigation/app hiding. Floating/background Notes has a separate
+on/off button in Notes, defaulting to off. Upgrades require a fresh opt-in because
+older versions implicitly enabled the service when remote access was approved.
+Disabling it stops the native service and cancels its restart alarm; boot, sticky
+restart and package-update paths also check the opt-in. Existing notes are not deleted.
+
+Fixed causes identified in source:
+
+- Every remote approval previously started both webview and native Notes clients.
+- Native network capability updates (including bandwidth/signal changes) forced
+  reconnects; callbacks from cancelled sockets could then discard the new socket.
+- Every reconnect requested full history, and the webview eagerly downloaded all
+  image blobs. Now a cold session still loads full history, but reconnects reuse an
+  in-memory revision cursor only after replay completion. Images and link previews
+  in the Notes page load on explicit request, with bounded image caching and aborts.
+- Native UI rendering classified full batches of notes on the main thread. That
+  classification is now asynchronous; previews are bounded without truncating
+  copy/edit/share content. The Notes page initially renders 24 rows, with Load more.
+
+Quest flat-browser remote control now has a **Right click** button on the screen.
+Select it, then tap the PC target. Select it again to cancel. The gesture consumes
+both trigger press/release, flushes its target position before sending the context
+click, and does not generate a left click or open the keyboard. Existing immersive
+controller mappings and normal touch/mouse controls are unchanged.
+
+Non-visual regression checks (no device installation or visual testing):
+
+```powershell
+npm test
+npm run build
+npm run discovery:build
+node scripts/patch-android.mjs
+# With the Android SDK/JDK configured:
+companion/src-tauri/gen/android/gradlew.bat -p companion/src-tauri/gen/android :app:compileUniversalReleaseJavaWithJavac
+# Pure JVM network-transition policy test (use a fresh temporary output directory):
+$notesTestOut = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ([guid]::NewGuid().ToString()))
+javac -d $notesTestOut.FullName scripts/android-templates/ClipboardNetworkState.java scripts/android-tests/ClipboardNetworkStateTest.java
+java -cp $notesTestOut.FullName __PACKAGE__.ClipboardNetworkStateTest
+```
+
+`clipboardCompanion.test.ts` covers opt-in, teardown, stale callbacks, interrupted
+replays, credential changes, bounded history, zero automatic image downloads and
+request cancellation. `useTargetRightClick.test.tsx` tests gesture events using
+jsdom, not screenshots. Physical-device data consumption/FPS remains unmeasured.
+The video/audio streaming pipeline itself is unchanged; active streaming still uses data.
+
+Android references: [network callback behavior](https://developer.android.com/develop/connectivity/network-ops/reading-network-state)
+and [keeping the UI responsive](https://developer.android.com/topic/performance/anrs/keep-your-app-responsive).
+
 ## Prerequisites (one-time, on your PC)
 
 1. **Rust** + the Android targets:

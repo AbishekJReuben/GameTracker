@@ -26,7 +26,7 @@ import {
   Mic,
   Check,
 } from "lucide-react";
-import { LS_SARVAM_KEY } from "../clipboardCompanion";
+import { LS_SARVAM_KEY, useCompanionClip } from "../clipboardCompanion";
 import { checkForUpdateVerbose, openReleasePage, type UpdateCheck } from "../update";
 import { UpdatePanel } from "../UpdatePanel";
 import { deviceName } from "../device";
@@ -181,25 +181,7 @@ function VoiceKeySection() {
     setTimeout(() => setSaved(false), 1500);
     // Push the key to the native background service now (it caches it in prefs for
     // the floating dock's mic) instead of waiting for the next reconnect.
-    if (isTauri()) {
-      const secret = localStorage.getItem("gt.remote.secret") || "";
-      const deviceId = localStorage.getItem("gt.clip.device") || "";
-      const signalUrl = localStorage.getItem("gt.remote.signal") || "";
-      if (secret) {
-        try {
-          const { invoke } = await import("@tauri-apps/api/core");
-          await invoke("clipboard_service_start", {
-            enabled: true,
-            secret,
-            deviceId,
-            signalUrl,
-            sarvamKey: trimmed,
-          });
-        } catch {
-          /* bridge missing / not android */
-        }
-      }
-    }
+    if (isTauri()) await useCompanionClip.getState().initializeBackground();
   };
 
   return (

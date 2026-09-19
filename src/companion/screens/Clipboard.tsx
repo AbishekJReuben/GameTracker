@@ -14,7 +14,6 @@ import {
 } from "lucide-react";
 import { isTauri } from "@/lib/tauri";
 import { cn } from "@/lib/cn";
-import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import { EmptyState } from "@/components/ui";
 import { Composer, type ComposerEdit } from "@/features/clipboard/Composer";
 import { ClipboardList as ClipList } from "@/features/clipboard/ClipboardList";
@@ -68,6 +67,9 @@ export default function ClipboardScreen() {
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [typeFilter, setTypeFilter] = useState<ClipContentKind | null>(null);
   const [editing, setEditing] = useState<ComposerEdit | null>(null);
+  const [backgroundError, setBackgroundError] = useState("");
+  const [visibleLimit, setVisibleLimit] = useState(24);
+  useEffect(() => setVisibleLimit(24), [search, filter, tagFilter, typeFilter]);
   const android = isTauri();
   // Sarvam mic is available whenever a key is saved on this device; the Composer
   // also offers the browser's built-in recognition when present.
@@ -88,26 +90,28 @@ export default function ClipboardScreen() {
   };
 
   useEffect(() => {
-    s.init();
+    const syncVisibility = () => {
+      if (document.visibilityState === "hidden") s.stop();
+      else void s.init();
+    };
+    syncVisibility();
     refreshPerms();
     const onFocus = () => refreshPerms();
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", syncVisibility);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", syncVisibility);
+      s.stop();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const startWidget = async () => {
-    if (!android) return;
-    const secret = localStorage.getItem("gt.remote.secret") || "";
-    const signalUrl = localStorage.getItem("gt.remote.signal") || DEFAULT_SIGNAL_URL;
-    await invoke("clipboard_service_start", {
-      enabled: true,
-      secret,
-      deviceId: s.deviceId,
-      signalUrl,
-      sarvamKey: (localStorage.getItem(LS_SARVAM_KEY) || "").trim(),
-    }).catch(() => {});
-    refreshPerms();
+  const toggleWidget = async () => {
+    setBackgroundError("");
+    try { await s.setBackgroundEnabled(!s.backgroundEnabled); }
+    catch (e) { setBackgroundError(String(e)); }
+    void refreshPerms();
   };
 
   const flashPasted = (kind: "text" | "image" | "none") => {
@@ -176,9 +180,10 @@ export default function ClipboardScreen() {
         </div>
       </div>
 
-      {needsSetup && (
+      {android && (
         <div className="space-y-2 rounded-2xl border border-white/[0.06] bg-white/[0.02] p-2.5">
-          <div className="px-1 text-[11px] font-700 text-ink-soft">Finish setup — keeps sync running in the background</div>
+          <div className="px-1 text-[11px] text-ink-soft">Background Notes is optional and uses data. When off, Notes syncs only while this page is visible.</div>
+          {needsSetup && <>
           <PermRow
             icon={<Layers className="h-4 w-4" />}
             title="Draw over apps"
@@ -200,9 +205,11 @@ export default function ClipboardScreen() {
             granted={perms.notif}
             onGrant={() => invoke("clipboard_request_notif")}
           />
-          <button onClick={startWidget} className="btn-primary flex w-full items-center justify-center gap-2 py-2 text-sm">
-            <Power className="h-4 w-4" /> Turn on floating widget
+          </>}
+          <button onClick={toggleWidget} aria-pressed={s.backgroundEnabled} className="btn-primary flex w-full items-center justify-center gap-2 py-2 text-sm">
+            <Power className="h-4 w-4" /> {s.backgroundEnabled ? "Turn off background Notes" : "Turn on floating widget & background Notes"}
           </button>
+          {backgroundError && <div role="alert" className="text-xs text-rose-400">{backgroundError}</div>}
         </div>
       )}
 
@@ -276,11 +283,12 @@ export default function ClipboardScreen() {
           />
         ) : (
           <ClipList
-            pinned={pinned}
-            rest={rest}
+            pinned={pinned.slice(0, visibleLimit)}
+            rest={rest.slice(0, Math.max(0, visibleLimit - pinned.length))}
             loading={false}
             hasMore={false}
             onCopy={s.copy}
+            onLoadImage={s.loadImage}
             onDelete={s.remove}
             onTogglePin={s.togglePin}
             onEdit={(item) => item.kind === "text" && setEditing({ id: item.id, text: item.text ?? "" })}
@@ -289,7 +297,13 @@ export default function ClipboardScreen() {
             onLoadMore={() => {}}
             compact
             showHistory
+            previewOnDemand
           />
+        )}
+        {pinned.length + rest.length > visibleLimit && (
+          <button className="btn-subtle mt-2 w-full py-2 text-sm" onClick={() => setVisibleLimit((count) => count + 24)}>
+            Load more notes
+          </button>
         )}
       </div>
 

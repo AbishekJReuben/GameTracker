@@ -1138,7 +1138,7 @@ const save = (path, before, after, msg) => {
   if (!pkg) {
     console.warn("[patch-android] no identifier — skipping clipboard components.");
   } else {
-    for (const name of ["ClipboardBridge", "ClipboardService", "ClipboardBootReceiver", "ClipboardPickActivity"]) {
+    for (const name of ["ClipboardBridge", "ClipboardService", "ClipboardBootReceiver", "ClipboardPickActivity", "ClipboardNetworkState"]) {
       const templatePath = join(root, "scripts", "android-templates", `${name}.java`);
       if (!existsSync(templatePath)) {
         console.warn(`[patch-android] ${templatePath} missing — skipping ${name}.`);

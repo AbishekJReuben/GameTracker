@@ -20,7 +20,7 @@ public class ClipboardBootReceiver extends BroadcastReceiver {
       return;
     }
     SharedPreferences p = ctx.getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE);
-    if (p.getBoolean("enabled", false)) {
+    if (ClipboardBridge.backgroundEnabled(ctx)) {
       ClipboardBridge.startService(
           ctx,
           true,

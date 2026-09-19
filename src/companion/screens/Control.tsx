@@ -90,6 +90,7 @@ import {
   hitchSnapshot,
 } from "../hitchLog";
 import { isQuestBrowser } from "../device";
+import { useTargetRightClick } from "../useTargetRightClick";
 import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
 import {
   loadStreamTune,
@@ -907,6 +908,13 @@ export function ControlScreen({
   const sendRightClick = () => {
     if (send({ type: "click", button: "right" })) navigator.vibrate?.(15);
   };
+  const targetRightClick = useTargetRightClick(
+    (x, y) => { moveAbsFromClient(x, y); flushMove(); }, sendRightClick,
+  );
+  useEffect(() => {
+    if (!connected) targetRightClick.cancel();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected]);
   // First frame received (video decoded or a canvas frame drawn) → hide the
   // app-icon "connecting" placeholder that fills the ~1s gap before pixels arrive.
   const [hasFrame, setHasFrame] = useState(false);
@@ -2339,6 +2347,7 @@ export function ControlScreen({
   const isMouseLike = (e: React.PointerEvent) => e.pointerType === "mouse" || e.pointerType === "pen";
 
   const onPointerDown = (e: React.PointerEvent) => {
+    if (targetRightClick.onPointerDown(e)) return;
     // Mouse-like right / middle click (Quest surface touchpad two-finger = right).
     if (isMouseLike(e)) {
       moveAbsFromClient(e.clientX, e.clientY);
@@ -2444,6 +2453,7 @@ export function ControlScreen({
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
+    if (targetRightClick.onPointerMove(e)) return;
     const p = pts.current.get(e.pointerId);
     // Hover: Quest surface touchpad / mouse / laser-without-trigger send
     // pointermove with buttons===0 and no prior pointerdown. Phone fingers
@@ -2543,6 +2553,8 @@ export function ControlScreen({
   }, [link]);
 
   const onPointerUp = (e: React.PointerEvent) => {
+    if (targetRightClick.onPointerUp(e)) return;
+    if (!pts.current.has(e.pointerId)) return;
     pts.current.delete(e.pointerId);
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
@@ -3331,6 +3343,19 @@ export function ControlScreen({
         </div>
       )}
       {/* ---- screen viewport ---- */}
+      {questBrowser && !pipView && (
+        <button
+          type="button"
+          aria-pressed={targetRightClick.armed}
+          disabled={!connected}
+          onClick={targetRightClick.toggle}
+          title="Select Right click, then tap a target on the PC screen. Select again to cancel."
+          className="absolute right-3 top-3 z-40 flex min-h-11 items-center gap-2 rounded-xl border border-white/20 bg-base px-3 text-sm font-700 text-ink disabled:opacity-50"
+        >
+          <MousePointerClick className="h-4 w-4" />
+          {targetRightClick.armed ? "Tap target · Cancel" : "Right click"}
+        </button>
+      )}
       <div
         ref={viewportRef}
         className="absolute inset-0 flex items-center justify-center overflow-hidden touch-none"

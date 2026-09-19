@@ -192,9 +192,11 @@ export function ClipRow({
   onMoveToFolder,
   folders,
   onSetTags,
+  onLoadImage,
   knownTags,
   compact,
   showHistory,
+  previewOnDemand,
 }: {
   item: ClipItem;
   onCopy: (id: string) => void;
@@ -204,13 +206,18 @@ export function ClipRow({
   onMoveToFolder?: (id: string, folder: string) => void;
   folders?: string[];
   onSetTags?: (id: string, tags: string[]) => void;
+  onLoadImage?: (id: string) => Promise<void>;
   knownTags?: string[];
   compact?: boolean;
   /** App screens (not the floating panels) show every date this exact item was
    *  copied. Off in the overlay/dock. */
   showHistory?: boolean;
+  previewOnDemand?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
+  const [imageLoading, setImageLoading] = useState(false);
+  const [imageError, setImageError] = useState("");
+  const [previewRequested, setPreviewRequested] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
@@ -246,7 +253,9 @@ export function ClipRow({
   const content = useMemo(() => classifyClip(item.text), [item.text]);
   // Only prose and bare links get a preview card. A URL buried in a stack trace
   // or a config file is a detail of the snippet, not the point of the note.
-  const link = !isImage && (content.kind === "link" || content.kind === "text") ? firstHttpUrl(item.text) : null;
+  const previewText = (item.text ?? "").slice(0, 8192);
+  const shortened = previewText.length < (item.text?.length ?? 0);
+  const link = !isImage && (content.kind === "link" || content.kind === "text") ? firstHttpUrl(previewText) : null;
 
   // Detect whether the collapsed body actually overflows, so the "More"
   // affordance only appears when there's genuinely more to reveal.
@@ -300,7 +309,20 @@ export function ClipRow({
     >
       {/* content — the primary element */}
       <div className="block min-w-0 text-left">
-        {isImage ? (
+        {isImage && !thumb && onLoadImage ? (
+          <div>
+            <button disabled={imageLoading} className="btn-subtle px-3 py-2 text-sm" onClick={async () => {
+              setImageLoading(true);
+              setImageError("");
+              try { await onLoadImage(item.id); }
+              catch (e) { setImageError(String(e)); }
+              finally { setImageLoading(false); }
+            }}>
+              {imageLoading ? "Loading image…" : "Load image"}
+            </button>
+            {imageError && <p role="alert" className="text-xs text-rose-400">{imageError}</p>}
+          </div>
+        ) : isImage ? (
           <img
             src={(expanded ? full : thumb) ?? undefined}
             loading="lazy"
@@ -314,12 +336,15 @@ export function ClipRow({
           <>
           <ClipBody
             ref={textRef}
-            text={item.text || "(empty)"}
+            text={previewText || "(empty)"}
             content={content}
             expanded={expanded}
             collapsedLines={collapsedLines}
           />
-          {link && <LinkPreview url={link} />}
+          {shortened && <p className="text-xs text-ink-dim">Preview shortened — Copy, Share or Edit for the full note.</p>}
+          {link && (previewOnDemand && !previewRequested
+            ? <button className="btn-subtle px-2 py-1 text-xs" onClick={() => setPreviewRequested(true)}>Load link preview</button>
+            : <LinkPreview url={link} />)}
           </>
         )}
       </div>
@@ -514,10 +539,12 @@ export function ClipboardList({
   onMoveToFolder,
   folders,
   onSetTags,
+  onLoadImage,
   knownTags,
   onLoadMore,
   compact,
   showHistory,
+  previewOnDemand,
 }: {
   pinned: ClipItem[];
   rest: ClipItem[];
@@ -530,10 +557,12 @@ export function ClipboardList({
   onMoveToFolder?: (id: string, folder: string) => void;
   folders?: string[];
   onSetTags?: (id: string, tags: string[]) => void;
+  onLoadImage?: (id: string) => Promise<void>;
   knownTags?: string[];
   onLoadMore: () => void;
   compact?: boolean;
   showHistory?: boolean;
+  previewOnDemand?: boolean;
 }) {
   const sentinel = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -566,9 +595,11 @@ export function ClipboardList({
                 onMoveToFolder={onMoveToFolder}
                 folders={folders}
                 onSetTags={onSetTags}
+                onLoadImage={onLoadImage}
                 knownTags={knownTags}
                 compact={compact}
                 showHistory={showHistory}
+                previewOnDemand={previewOnDemand}
               />
             ))}
           </AnimatePresence>
@@ -587,9 +618,11 @@ export function ClipboardList({
             onMoveToFolder={onMoveToFolder}
             folders={folders}
             onSetTags={onSetTags}
+            onLoadImage={onLoadImage}
             knownTags={knownTags}
             compact={compact}
             showHistory={showHistory}
+            previewOnDemand={previewOnDemand}
           />
         ))}
       </AnimatePresence>

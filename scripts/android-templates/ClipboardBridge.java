@@ -129,6 +129,7 @@ public class ClipboardBridge {
     SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     p.edit()
         .putBoolean("enabled", enabled)
+        .putBoolean("backgroundOptInV2", enabled)
         .putString("secret", secret)
         .putString("deviceId", deviceId)
         .putString("signalUrl", signalUrl)
@@ -137,11 +138,23 @@ public class ClipboardBridge {
 
     Intent i = new Intent(ctx, ClipboardService.class);
     if (!enabled) {
-      i.setAction(ClipboardService.ACTION_STOP);
+      // Stopping must work while the app is backgrounded, too. Starting a
+      // service just to stop it can be rejected by Android's background limits.
       try {
-        ctx.startService(i);
+        Intent restart = new Intent(ctx, ClipboardService.class).setAction(ClipboardService.ACTION_START);
+        int flags = android.app.PendingIntent.FLAG_NO_CREATE | android.app.PendingIntent.FLAG_ONE_SHOT
+            | android.app.PendingIntent.FLAG_IMMUTABLE;
+        android.app.PendingIntent pi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+            ? android.app.PendingIntent.getForegroundService(ctx, 42, restart, flags)
+            : android.app.PendingIntent.getService(ctx, 42, restart, flags);
+        if (pi != null) {
+          android.app.AlarmManager alarms = (android.app.AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
+          if (alarms != null) alarms.cancel(pi);
+          pi.cancel();
+        }
       } catch (Exception ignored) {
       }
+      ctx.stopService(i);
       return;
     }
     i.setAction(ClipboardService.ACTION_START);
@@ -154,5 +167,12 @@ public class ClipboardBridge {
 
   public static String snapshot(Context ctx) {
     return ClipboardService.snapshot();
+  }
+
+  static boolean backgroundEnabled(Context ctx) {
+    SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    // Old versions implicitly set enabled on every remote approval. An upgrade
+    // must not treat that as user consent to an always-on Notes service.
+    return p.getBoolean("enabled", false) && p.getBoolean("backgroundOptInV2", false);
   }
 }

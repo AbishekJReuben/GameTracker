@@ -81,6 +81,9 @@ const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
 ];
 
 export function CompanionApp() {
+  useEffect(() => {
+    void useCompanionClip.getState().initializeBackground();
+  }, []);
   const [phase, setPhase] = useState<Phase>("boot");
   const [conn, setConn] = useState<CloudConn | null>(null);
   const [tab, setTab] = useState<Tab>("control");
@@ -124,7 +127,7 @@ export function CompanionApp() {
     });
     // Shared clipboard: the host attaches the PC's remote_secret_code to auth-ok
     // (only after it approved us). Forward it to the clip store so it can derive
-    // its key and start syncing without the user typing the permanent key. The
+    // save credentials without enabling Notes or background sync. The
     // host only sends this when the user has already trusted this device.
     c.onEvent((e) => {
       if (e.event === "secret" && typeof e.secret === "string" && e.secret) {

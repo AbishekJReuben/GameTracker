@@ -4,8 +4,8 @@
 // talks straight to the relay's /clip namespace with the SAME E2E crypto, keeping
 // items in memory (the relay is the permanent store — a fresh open streams the
 // history back). The Android native service keeps the app present in the
-// background; this runs the actual sync while the companion is open (which is also
-// the only time Android lets us read the OS clipboard).
+// background only when explicitly enabled; this client runs only while the Notes
+// page is visible. Remote desktop approval alone never starts Notes.
 
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
@@ -19,11 +19,11 @@ import {
   decryptText,
   encryptBytes,
   decryptBytes,
-  bytesToB64,
   b64ToBytes,
 } from "@/lib/clipboardCrypto";
 
 const MAX_ITEMS = 300;
+const BACKGROUND_OPT_IN = "gt.clip.background.v2";
 
 /** LocalStorage key for the user's Sarvam STT key on the phone. Seeded from the PC
  *  over the trusted channel (see CompanionApp) or entered in companion Settings. */
@@ -62,10 +62,13 @@ interface CompanionClipState {
   connected: boolean;
   ready: boolean; // has a secret key configured
   deviceId: string;
+  backgroundEnabled: boolean;
+  initializeBackground: () => Promise<void>;
+  setBackgroundEnabled: (enabled: boolean) => Promise<void>;
+  loadImage: (id: string) => Promise<void>;
   init: () => Promise<void>;
   stop: () => void;
-  /** Inject a secret received from the host (post-approval) and (re)connect.
-   *  Idempotent — a no-op if this secret is already active. */
+  /** Save approved credentials. Remote approval does NOT enable Notes sync. */
   setSecret: (secret: string) => Promise<void>;
   addText: (text: string, tags?: string[]) => Promise<void>;
   addImage: (dataUrl: string, tags?: string[]) => Promise<void>;
@@ -94,6 +97,11 @@ let backoff = 1000;
 let retry: ReturnType<typeof setTimeout> | undefined;
 let ping: ReturnType<typeof setInterval> | undefined;
 let started = false;
+let generation = 0;
+let messageQueue = Promise.resolve();
+let publishTimer: ReturnType<typeof setTimeout> | undefined;
+const imageRequests = new Map<string, AbortController>();
+const imageUrls = new Map<string, string>();
 // The secret the current key was derived from. Lets setSecret no-op when the
 // host re-pushes the same secret on every reconnect.
 let activeSecret = "";
@@ -147,8 +155,77 @@ const items = new Map<string, ClipItem>();
 const folderEntities = new Map<string, string>();
 
 export const useCompanionClip = create<CompanionClipState>((set, get) => {
-  const publish = () =>
-    set({ items: sortItems(items), tags: tagNames(items) });
+  const publish = () => {
+    // Coalesce a history replay into small UI batches, not one render per row.
+    if (publishTimer !== undefined) return;
+    publishTimer = setTimeout(() => {
+      publishTimer = undefined;
+      const visible = sortItems(items);
+      const keep = new Set(visible.map((item) => item.id));
+      for (const id of items.keys()) if (!keep.has(id)) {
+        items.delete(id);
+        releaseImage(id);
+      }
+      set({ items: visible, tags: tagNames(items) });
+    }, 50);
+  };
+
+  const releaseImage = (id: string) => {
+    imageRequests.get(id)?.abort();
+    imageRequests.delete(id);
+    const url = imageUrls.get(id);
+    if (url) URL.revokeObjectURL(url);
+    imageUrls.delete(id);
+  };
+
+  const disconnect = () => {
+    generation++;
+    clearTimeout(retry);
+    clearInterval(ping);
+    const old = ws;
+    ws = undefined; // invalidate callbacks BEFORE close (including synchronous mocks)
+    old?.close();
+    messageQueue = Promise.resolve();
+    for (const id of new Set([...imageUrls.keys(), ...imageRequests.keys()])) releaseImage(id);
+    for (const [id, item] of items) if (item.kind === "image") {
+      items.set(id, { ...item, imagePath: null, thumbPath: null });
+    }
+    set({ connected: false });
+    publish();
+  };
+
+  let nativeQueue = Promise.resolve();
+  const provisionBackground = (): Promise<void> => {
+    // Serialize toggles/approval/mount calls; the final user's choice wins.
+    nativeQueue = nativeQueue.catch(() => {}).then(async () => {
+      if (!isTauri()) return;
+      const enabled = get().backgroundEnabled;
+      const secret = localStorage.getItem("gt.remote.secret") || "";
+      if (enabled && !secret) throw new Error("Connect to your PC before enabling background Notes.");
+      try {
+        await invoke("clipboard_service_start", {
+          enabled, secret, deviceId: ensureDeviceId(),
+          signalUrl: localStorage.getItem("gt.remote.signal") || DEFAULT_SIGNAL_URL,
+          sarvamKey: (localStorage.getItem(LS_SARVAM_KEY) || "").trim(),
+        });
+        nativeStartError = "";
+      } catch (e) {
+        nativeStartError = String(e);
+        throw e;
+      }
+    });
+    return nativeQueue;
+  };
+
+  const ensureDeviceId = () => {
+    let deviceId = localStorage.getItem("gt.clip.device") || "";
+    if (!deviceId) {
+      deviceId = `phone-${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem("gt.clip.device", deviceId);
+    }
+    set({ deviceId });
+    return deviceId;
+  };
 
   const ready = () => !!ws && ws.readyState === WebSocket.OPEN && !!key;
 
@@ -163,25 +240,9 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       return false;
     }
   };
-  const fetchBlob = async (id: string): Promise<Uint8Array | null> => {
-    try {
-      const r = await fetch(`${httpBase}/clip/blob/${clipId}/${id}`);
-      if (!r.ok) return null;
-      return new Uint8Array(await r.arrayBuffer());
-    } catch {
-      return null;
-    }
-  };
-
-  const handle = async (v: any) => {
-    if (v.t === "synced") {
-      if (v.rev > lastRev) lastRev = v.rev;
-      localStorage.setItem(`gt.clip.rev.${clipId}`, String(lastRev));
-      return;
-    }
+  const handle = async (v: any, current: () => boolean) => {
+    if (v.t === "synced") return;
     if (v.t !== "item" || !v.itemId || !key) return;
-    if (v.rev > lastRev) lastRev = v.rev;
-    localStorage.setItem(`gt.clip.rev.${clipId}`, String(lastRev));
 
     // Folder entity (empty-folder registry): a content-less kind='folder' row.
     if (v.kind === "folder") {
@@ -192,6 +253,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     }
 
     if (v.deleted) {
+      releaseImage(v.itemId);
       items.delete(v.itemId);
       folderEntities.delete(v.itemId); // a deleted folder entity has no kind field
       publish();
@@ -215,9 +277,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       publish();
       return;
     }
-    // Our own items already local — keep them (an echo can't improve on them).
-    if (v.deviceId === get().deviceId && existing) return;
-
+    if (v.kind === undefined) return; // metadata for an evicted row isn't a new empty note
     try {
       const base: ClipItem = {
         id: v.itemId,
@@ -236,17 +296,14 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         tags: Array.isArray(v.tags) ? v.tags : (v.folder ? [v.folder] : []),
         copies: v.copies ?? undefined,
       };
-      if (v.kind === "image" && v.hasBlob) {
-        const bytes = await fetchBlob(v.itemId);
-        if (bytes) {
-          const raw = await decryptBytes(key, bytes);
-          const url = `data:${v.mime ?? "image/png"};base64,${bytesToB64(raw)}`;
-          base.imagePath = url;
-          base.thumbPath = url;
-        }
+      if (v.kind === "image") {
+        // Metadata only. Download encrypted media only after an explicit tap.
+        base.imagePath = existing?.imagePath ?? null;
+        base.thumbPath = existing?.thumbPath ?? null;
       } else if (v.textCipher) {
         base.text = await decryptText(key, v.textCipher);
       }
+      if (!current()) return;
       items.set(v.itemId, base);
       publish();
     } catch {
@@ -255,7 +312,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
   };
 
   const connect = () => {
-    if (!started) return;
+    if (!started || ws) return;
     let sock: WebSocket;
     try {
       sock = new WebSocket(
@@ -266,32 +323,48 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       return;
     }
     ws = sock;
+    const current = () => started && ws === sock;
+    let replaying = true;
+    let replayRev = lastRev;
     sock.onopen = () => {
+      if (!current()) return;
       backoff = 1000;
       set({ connected: true });
-      // The phone keeps history only in memory (no local SQLite like the desktop),
-      // so ask for the FULL history (since=0) on connect — otherwise `since=lastRev`
-      // skips everything copied before this session and "old history can't be seen".
-      // The relay streams oldest→newest; we dedupe into a Map and keep the newest
-      // MAX_ITEMS, so memory stays bounded regardless of how much history exists.
-      sock.send(JSON.stringify({ t: "hello", since: 0 }));
+      // Full history on a cold start, incremental replay while this cache lives.
+      // Never persist a cursor without persisting its corresponding history.
+      sock.send(JSON.stringify({ t: "hello", since: lastRev }));
       clearInterval(ping);
       ping = setInterval(() => {
-        if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ t: "ping" }));
+        if (current() && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ t: "ping" }));
       }, 30000);
     };
     sock.onmessage = (ev) => {
+      if (!current()) return;
       try {
-        void handle(JSON.parse(ev.data as string));
+        const notice = JSON.parse(ev.data as string);
+        messageQueue = messageQueue.then(async () => {
+          if (!current()) return;
+          await handle(notice, current);
+          if (!current()) return;
+          replayRev = Math.max(replayRev, Number(notice.rev) || 0);
+          // Do not advance past a partial replay (live notices can interleave).
+          // A reconnect before `synced` must retry the unfinished history.
+          if (notice.t === "synced") replaying = false;
+          if (!replaying) lastRev = Math.max(lastRev, replayRev);
+        }).catch(() => {});
       } catch {
         /* ignore */
       }
     };
     sock.onclose = () => {
+      if (!current()) return;
+      ws = undefined;
+      messageQueue = Promise.resolve();
       set({ connected: false });
       scheduleReconnect();
     };
     sock.onerror = () => {
+      if (!current()) return;
       try {
         sock.close();
       } catch {
@@ -311,42 +384,28 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
   // Derive the key + relay space from a secret, remember it, and connect. Shared
   // by the first-run init() and the live-secret path (host pushed it post-auth).
   startWithSecret = async (secret: string) => {
-    wsBase = (localStorage.getItem("gt.remote.signal") || DEFAULT_SIGNAL_URL).replace(/\/+$/, "");
+    const base = (localStorage.getItem("gt.remote.signal") || DEFAULT_SIGNAL_URL).replace(/\/+$/, "");
+    if (key && activeSecret === secret && base === wsBase) {
+      connect();
+      return;
+    }
+    disconnect();
+    const token = generation;
+    items.clear();
+    folderEntities.clear();
+    lastRev = 0;
+    key = undefined;
+    set({ ready: false, items: [], tags: [] });
+    const derived = await deriveKey(secret);
+    const space = await deriveClipId(secret);
+    if (!started || token !== generation) return;
+    wsBase = base;
     httpBase = wsBase.replace(/^ws/, "http");
-    key = await deriveKey(secret);
-    clipId = await deriveClipId(secret);
+    key = derived;
+    clipId = space;
     activeSecret = secret;
-    lastRev = Number(localStorage.getItem(`gt.clip.rev.${clipId}`) || 0);
-    let deviceId = localStorage.getItem("gt.clip.device") || "";
-    if (!deviceId) {
-      deviceId = `phone-${Math.random().toString(36).slice(2, 10)}`;
-      localStorage.setItem("gt.clip.device", deviceId);
-    }
-    started = true;
-    set({ ready: true, deviceId });
+    set({ ready: true, deviceId: ensureDeviceId() });
     connect();
-
-    // Provision + (re)start the native Android foreground service with this
-    // config. This is THE auto-start path: the host pushes the secret on every
-    // approved connect, so the background service always ends up configured
-    // (hasKey/relayHost set) without the user ever visiting the Clipboard screen.
-    // Previously only the "Turn on floating widget" button did this, which left
-    // the service running with empty prefs — connected to nothing, silently.
-    if (isTauri()) {
-      try {
-        await invoke("clipboard_service_start", {
-          enabled: true,
-          secret,
-          deviceId,
-          signalUrl: wsBase,
-          sarvamKey: (localStorage.getItem(LS_SARVAM_KEY) || "").trim(),
-        });
-        nativeStartError = "";
-      } catch (e) {
-        nativeStartError = e instanceof Error ? e.message : String(e);
-        console.warn("clipboard: native service provisioning failed:", nativeStartError);
-      }
-    }
   };
 
   const addLocal = async (item: ClipItem, cipherPayload: object) => {
@@ -414,42 +473,54 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     connected: false,
     ready: false,
     deviceId: "",
+    backgroundEnabled: localStorage.getItem(BACKGROUND_OPT_IN) === "true",
+
+    initializeBackground: async () => {
+      // Also stops legacy auto-enabled services on upgrade. No history is erased.
+      await provisionBackground().catch(() => {});
+    },
+
+    setBackgroundEnabled: async (enabled) => {
+      if (enabled && !localStorage.getItem("gt.remote.secret")) {
+        throw new Error("Connect to your PC before enabling background Notes.");
+      }
+      localStorage.setItem(BACKGROUND_OPT_IN, String(enabled));
+      set({ backgroundEnabled: enabled });
+      await provisionBackground();
+    },
+
+    loadImage: async (id) => {
+      const item = items.get(id);
+      if (!started || !key || !item || item.kind !== "image" || item.imagePath || imageRequests.has(id)) return;
+      if (imageRequests.size >= 2) throw new Error("Please wait for the current images to load.");
+      const controller = new AbortController();
+      const token = generation;
+      const imageKey = key;
+      imageRequests.set(id, controller);
+      try {
+        const response = await fetch(`${httpBase}/clip/blob/${clipId}/${id}`, { signal: controller.signal });
+        if (!response.ok) throw new Error("Image download failed. Tap to retry.");
+        const raw = await decryptBytes(imageKey, new Uint8Array(await response.arrayBuffer()));
+        if (controller.signal.aborted || token !== generation || !items.has(id)) return;
+        // Blob URLs avoid retaining a second, base64-expanded copy of every image.
+        while (imageUrls.size >= 12) {
+          const old = imageUrls.keys().next().value!;
+          releaseImage(old);
+          const cached = items.get(old);
+          if (cached) items.set(old, { ...cached, imagePath: null, thumbPath: null });
+        }
+        const url = URL.createObjectURL(new Blob([raw as BlobPart], { type: item.mime || "image/png" }));
+        imageUrls.set(id, url);
+        items.set(id, { ...items.get(id)!, imagePath: url, thumbPath: url });
+        publish();
+      } finally {
+        if (imageRequests.get(id) === controller) imageRequests.delete(id);
+      }
+    },
 
     init: async () => {
       if (started) return;
-      
-      if (isTauri()) {
-        try {
-          const snapStr = await invoke<string>("clipboard_service_snapshot");
-          if (snapStr && snapStr !== "{}") {
-            const snap = JSON.parse(snapStr);
-            if (snap.items && Array.isArray(snap.items)) {
-              for (const e of snap.items) {
-                if (!items.has(e.id)) {
-                  items.set(e.id, {
-                    id: e.id,
-                    kind: "text",
-                    text: e.text,
-                    imagePath: null,
-                    thumbPath: null,
-                    mime: "text/plain",
-                    size: e.text.length,
-                    createdUtc: new Date(e.createdAtMs).toISOString(),
-                    deviceId: get().deviceId + "-native",
-                    deviceName: "Phone",
-                    source: "android",
-                    pinned: !!e.pinned,
-                    folder: e.folder || "",
-                    tags: Array.isArray(e.tags) ? e.tags : (e.folder ? [e.folder] : []),
-                  });
-                }
-              }
-              publish();
-            }
-          }
-        } catch {}
-      }
-
+      started = true;
       const secret = localStorage.getItem("gt.remote.secret") || "";
       if (!secret) {
         set({ ready: false });
@@ -464,34 +535,13 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       // Remember it so a re-open of the Clipboard tab (or an app restart before
       // the host re-approves) can still sync.
       localStorage.setItem("gt.remote.secret", s);
-      // Already running with THIS secret — nothing to do.
-      if (started && key && activeSecret === s) return;
-      // Tear down any prior session (different/empty secret) then start fresh.
-      if (started) {
-        started = false;
-        clearTimeout(retry);
-        clearInterval(ping);
-        try {
-          ws?.close();
-        } catch {
-          /* ignore */
-        }
-        ws = undefined;
-      }
-      await startWithSecret?.(s);
+      if (started) await startWithSecret?.(s);
+      if (get().backgroundEnabled) await provisionBackground().catch(() => {});
     },
 
     stop: () => {
       started = false;
-      clearTimeout(retry);
-      clearInterval(ping);
-      try {
-        ws?.close();
-      } catch {
-        /* ignore */
-      }
-      ws = undefined;
-      set({ connected: false });
+      disconnect();
     },
 
     addText: async (text, tags = []) => {
@@ -676,6 +726,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     },
 
     remove: async (id) => {
+      releaseImage(id);
       items.delete(id);
       set({ items: sortItems(items) });
       if (ready()) ws!.send(JSON.stringify({ t: "delete", itemId: id }));
@@ -737,6 +788,8 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
           deviceId: get().deviceId,
           hasKey: !!key,
           lastRev,
+          retainedItems: items.size,
+          backgroundEnabled: get().backgroundEnabled,
           backoffMs: backoff,
           nativeStartError: nativeStartError || "(none)",
         },

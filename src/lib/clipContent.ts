@@ -376,10 +376,12 @@ const CLASSIFY_CACHE_MAX = 400;
 
 /** Decide how a note should be presented. Never throws. */
 export function classifyClip(text?: string | null): ClipContent {
-  const key = text ?? "";
+  // Large pasted logs/webpages are valid notes, but classification is just a
+  // preview heuristic. Bound CPU AND cache-key memory without changing content.
+  const key = (text ?? "").slice(0, 32 * 1024);
   const hit = CLASSIFY_CACHE.get(key);
   if (hit) return hit;
-  const result = classifyUncached(text);
+  const result = classifyUncached(key);
   if (CLASSIFY_CACHE.size >= CLASSIFY_CACHE_MAX) {
     CLASSIFY_CACHE.delete(CLASSIFY_CACHE.keys().next().value!);
   }

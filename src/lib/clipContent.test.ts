@@ -292,6 +292,13 @@ describe("C# detection", () => {
 });
 
 describe("tokenizeCode", () => {
+  it("bounds classification and its cache key for multi-megabyte notes", () => {
+    const prefix = "This is a long plain note.\n".repeat(1400).slice(0, 32 * 1024);
+    const full = prefix + "tail ".repeat(500000);
+    expect(classifyClip(full)).toBe(classifyClip(prefix));
+    expect(full.length).toBeGreaterThan(2_000_000); // content itself is untouched
+  });
+
   it("round-trips the source exactly", () => {
     const src = 'const x = "a\\"b"; // note\nfn main() { 0x1F }';
     expect(tokenizeCode(src).map((t) => t.text).join("")).toBe(src);
