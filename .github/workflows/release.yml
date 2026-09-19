@@ -77,11 +77,19 @@ jobs:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        # v3 requested the retired `tools` package by default. Current Android
+        # command-line tools replace that package; v4 installs cmdline-tools and
+        # platform-tools without asking for `tools`.
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Install NDK + build-tools
         run: |
-          sdkmanager "ndk;27.2.12479018" "build-tools;35.0.0" "platform-tools"
+          sdkmanager --install "ndk;27.2.12479018" "build-tools;35.0.0" "platform-tools"
+          test -x "$ANDROID_HOME/platform-tools/adb"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -d "$ANDROID_HOME/ndk/27.2.12479018"
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
