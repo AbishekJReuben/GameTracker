@@ -40,7 +40,9 @@ pub const NATIVE_HEADER_LEN: usize = 8;
 
 /// Wrap an Annex-B frame in the container the webview expects.
 fn wrap(annexb: &[u8], key: bool, w: u32, h: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(NATIVE_HEADER_LEN + annexb.len());
+    // Spare bytes for opt-in delivery timing/credit header; avoids a second
+    // allocation when that header is inserted. Classic wire length is unchanged.
+    let mut out = Vec::with_capacity(NATIVE_HEADER_LEN + 16 + annexb.len());
     out.extend_from_slice(&NATIVE_MAGIC);
     out.push(if key { 1 } else { 0 });
     out.push(0);
@@ -267,5 +269,60 @@ mod tests {
         // Clamps hold at the extremes.
         assert_eq!(auto_bitrate_bps(320, 180, 1, 20), 2_000_000);
         assert_eq!(auto_bitrate_bps(7680, 4320, 240, 95), 40_000_000);
+    }
+
+    /// Numerical hardware validation only: synthetic pixels, no window or screen
+    /// capture. Emits Annex-B fixtures for ffmpeg's strict decoder verification.
+    #[test]
+    #[ignore = "requires NVIDIA GPU; writes fixtures under target/perf-validation"]
+    fn native_delivery_smoke() {
+        use super::super::delivery::Gate;
+        use std::collections::VecDeque;
+        let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-validation");
+        std::fs::create_dir_all(&output).unwrap();
+        for (name, fast, congested) in [("classic", false, false), ("fast", true, false), ("fast-pressure", true, true)] {
+            let gate = Gate::new(); gate.start(1); gate.enable(fast);
+            let (w, h) = (1920u32, 1080u32);
+            let mut encoder = NativeEncoder::new(None, w, h, 60, 16_000_000).expect("NVENC hardware required");
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            for (i, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                let x = i as u32 % w; let y = i as u32 / w;
+                pixel.copy_from_slice(&[(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255]);
+            }
+            let mut acks = VecDeque::new();
+            let mut bitstream = Vec::new();
+            let mut times = Vec::new();
+            let mut count = 0;
+            for tick in 0..120u64 {
+                // Moving high-contrast content; update only a small region so
+                // CPU fixture generation is outside the measured encoding cost.
+                for y in 200..360u32 { for x in 400..600u32 {
+                    let at = ((y * w + x) * 4) as usize;
+                    let value = if (x + tick as u32 * 4) % 100 < 50 { 235 } else { 20 };
+                    pixels[at..at + 3].fill(value);
+                } }
+                if congested && tick % 4 == 0 { if let Some(seq) = acks.pop_front() { gate.ack(1, seq); } }
+                let Some(permit) = gate.reserve(1) else { continue; };
+                let start = Instant::now();
+                let bytes = encoder.encode_pixels(&pixels, w, h, count == 0, tick * 16_667).expect("encode");
+                let bytes = permit.packet(bytes);
+                if count > 0 { times.push(start.elapsed().as_secs_f64() * 1000.0); }
+                if fast {
+                    assert_eq!(bytes[3], 1);
+                    let seq = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+                    bitstream.extend_from_slice(&bytes[24..]);
+                    if congested { acks.push_back(seq); } else { gate.ack(1, seq); }
+                } else { bitstream.extend_from_slice(&bytes[8..]); }
+                count += 1;
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            let median = times[times.len() / 2];
+            let p95 = times[times.len() * 95 / 100];
+            assert!(median < 10.0, "unexpected encode latency: {median}");
+            if congested { assert!(count < 40 && count >= 30); } else { assert_eq!(count, 120); }
+            let file = output.join(format!("{name}.h264"));
+            std::fs::write(&file, bitstream).unwrap();
+            eprintln!("{name}: {count} frames; encode+wrap median={median:.3}ms p95={p95:.3}ms; pre-encode skipped={}; fixture={}", gate.stats().skipped, file.display());
+        }
     }
 }

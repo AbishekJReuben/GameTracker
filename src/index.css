@@ -876,3 +876,10 @@ html[data-perf="lite"] .shadow-float {
 html[data-perf="lite"] .animate-scan {
   animation: none !important;
 }
+/* Pause CSS decoration when the native desktop window is hidden/minimized. */
+html[data-ui-visible="false"] *,
+[data-fx-paused="true"] *,
+html[data-ui-visible="false"] *::before,
+html[data-ui-visible="false"] *::after {
+  animation-play-state: paused !important;
+}

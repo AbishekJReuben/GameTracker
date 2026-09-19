@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { MarqueeShader } from "./MarqueeShader";
 import { useMotionEnabled } from "@/store/app";
 import { cn } from "@/lib/cn";
+import { useDocumentVisible, useInView } from "@/lib/useVisible";
 
 /**
  * A premium showcase that cross-dissolves through a set of game images using
@@ -114,12 +115,22 @@ function useGlTransition(canvasRef: RefObject<HTMLCanvasElement | null>, urls: s
     const cleanupFns: Array<() => void> = [];
 
     (async () => {
-      const imgs = (await Promise.all(urls.map(loadImage))).filter((i): i is HTMLImageElement => !!i);
+      const first = await loadImage(urls[0]);
       if (disposed) return;
-      if (imgs.length < 2) {
+      if (!first || urls.length < 2) {
         onDegrade();
         return;
       }
+      // Keep only the current image and its next transition target decoded.
+      // Previously every showcase eagerly retained every full-size screenshot.
+      const imgs = new Map<number, HTMLImageElement>([[0, first]]);
+      const preload = async (index: number) => {
+        const img = await loadImage(urls[index]);
+        if (disposed) return;
+        if (img) imgs.set(index, img);
+        else onDegrade();
+      };
+      void preload(1);
 
       const compile = (type: number, src: string) => {
         const s = gl.createShader(type)!;
@@ -128,8 +139,10 @@ function useGlTransition(canvasRef: RefObject<HTMLCanvasElement | null>, urls: s
         return s;
       };
       const prog = gl.createProgram()!;
-      gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
-      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+      const vs = compile(gl.VERTEX_SHADER, VERT);
+      const fs = compile(gl.FRAGMENT_SHADER, FRAG);
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
       gl.linkProgram(prog);
       gl.useProgram(prog);
 
@@ -163,6 +176,17 @@ function useGlTransition(canvasRef: RefObject<HTMLCanvasElement | null>, urls: s
       };
       const texFrom = mkTex(0);
       const texTo = mkTex(1);
+      // Register cleanup before the first upload: tainted local image sources
+      // can fail there and must not leak shaders/textures during repeated shows.
+      cleanupFns.push(() => {
+        gl.deleteProgram(prog);
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        gl.deleteBuffer(buf);
+        gl.deleteTexture(texFrom);
+        gl.deleteTexture(texTo);
+        imgs.clear();
+      });
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
       gl.uniform1i(U.from, 0);
       gl.uniform1i(U.to, 1);
@@ -181,12 +205,12 @@ function useGlTransition(canvasRef: RefObject<HTMLCanvasElement | null>, urls: s
 
       let cur = 0;
       const setFrom = (i: number) => {
-        upload(0, texFrom, imgs[i]!);
-        gl.uniform2f(U.fromRes, imgs[i]!.naturalWidth, imgs[i]!.naturalHeight);
+        upload(0, texFrom, imgs.get(i)!);
+        gl.uniform2f(U.fromRes, imgs.get(i)!.naturalWidth, imgs.get(i)!.naturalHeight);
       };
       const setTo = (i: number) => {
-        upload(1, texTo, imgs[i]!);
-        gl.uniform2f(U.toRes, imgs[i]!.naturalWidth, imgs[i]!.naturalHeight);
+        upload(1, texTo, imgs.get(i)!);
+        gl.uniform2f(U.toRes, imgs.get(i)!.naturalWidth, imgs.get(i)!.naturalHeight);
       };
       setFrom(0);
       setTo(0);
@@ -217,9 +241,9 @@ function useGlTransition(canvasRef: RefObject<HTMLCanvasElement | null>, urls: s
         const elapsed = now - phaseStart;
         let p = 0;
         if (phase === "hold") {
-          if (imgs.length > 1 && elapsed > HOLD_MS) {
+          if (imgs.has((cur + 1) % urls.length) && elapsed > HOLD_MS) {
             // Begin a transition to the next image with the next shader mode.
-            const next = (cur + 1) % imgs.length;
+            const next = (cur + 1) % urls.length;
             setFrom(cur);
             setTo(next);
             mode = (mode + 1) % 4;
@@ -230,12 +254,15 @@ function useGlTransition(canvasRef: RefObject<HTMLCanvasElement | null>, urls: s
         } else {
           p = elapsed / TRANS_MS;
           if (p >= 1) {
-            cur = (cur + 1) % imgs.length;
+            const previous = cur;
+            cur = (cur + 1) % urls.length;
             phase = "hold";
             phaseStart = now;
             p = 0;
             setFrom(cur);
             setTo(cur);
+            imgs.delete(previous);
+            void preload((cur + 1) % urls.length);
           }
         }
         gl.uniform2f(U.res, canvas.width, canvas.height);
@@ -250,12 +277,6 @@ function useGlTransition(canvasRef: RefObject<HTMLCanvasElement | null>, urls: s
         raf = requestAnimationFrame(draw);
       };
       raf = requestAnimationFrame(draw);
-      cleanupFns.push(() => {
-        gl.deleteProgram(prog);
-        gl.deleteBuffer(buf);
-        gl.deleteTexture(texFrom);
-        gl.deleteTexture(texTo);
-      });
     })();
 
     return () => {
@@ -268,20 +289,21 @@ function useGlTransition(canvasRef: RefObject<HTMLCanvasElement | null>, urls: s
 }
 
 /** Reliable DOM fallback: ken-burns crossfade + sweeping light + shader overlay. */
-function DomCrossfade({ images, labels }: { images: string[]; labels?: string[] }) {
+function DomCrossfade({ images, labels, active }: { images: string[]; labels?: string[]; active: boolean }) {
   const enabled = useMotionEnabled();
   const [i, setI] = useState(0);
+  const index = images.length ? i % images.length : 0;
   useEffect(() => {
-    if (images.length <= 1) return;
+    if (images.length <= 1 || !active) return;
     const id = window.setInterval(() => setI((v) => (v + 1) % images.length), HOLD_MS + TRANS_MS);
     return () => window.clearInterval(id);
-  }, [images.length]);
+  }, [images.length, active]);
 
   return (
     <>
       <AnimatePresence mode="popLayout" initial={false}>
         <motion.div
-          key={images[i]}
+          key={images[index]}
           className="absolute inset-0"
           initial={enabled ? { opacity: 0, scale: 1.1, filter: "blur(6px)" } : false}
           animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
@@ -289,16 +311,18 @@ function DomCrossfade({ images, labels }: { images: string[]; labels?: string[] 
           transition={{ duration: TRANS_MS / 1000, ease: [0.22, 1, 0.36, 1] }}
         >
           <motion.img
-            src={images[i]}
+            src={images[index]}
             alt=""
             draggable={false}
+            decoding="async"
+            loading="lazy"
             className="h-full w-full object-cover"
-            animate={enabled ? { scale: [1, 1.08] } : undefined}
+            animate={enabled && active ? { scale: [1, 1.08] } : undefined}
             transition={{ duration: (HOLD_MS + TRANS_MS) / 1000, ease: "linear" }}
           />
         </motion.div>
       </AnimatePresence>
-      {enabled && (
+      {enabled && active && (
         <motion.div
           className="pointer-events-none absolute inset-y-0 w-1/3 -skew-x-12 bg-gradient-to-r from-transparent via-white/15 to-transparent"
           animate={{ x: ["-60%", "360%"] }}
@@ -306,16 +330,16 @@ function DomCrossfade({ images, labels }: { images: string[]; labels?: string[] 
         />
       )}
       <MarqueeShader />
-      {labels?.[i] && (
+      {labels?.[index] && (
         <div className="pointer-events-none absolute inset-x-0 bottom-0 p-3">
           <motion.p
-            key={labels[i]}
+            key={labels[index]}
             className="truncate font-display text-sm font-800 text-ink drop-shadow"
             initial={enabled ? { opacity: 0, y: 6 } : false}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.45 }}
           >
-            {labels[i]}
+            {labels[index]}
           </motion.p>
         </div>
       )}
@@ -335,21 +359,25 @@ export function ShaderImageTransition({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [degraded, setDegraded] = useState(false);
   const enabled = useMotionEnabled();
+  const { ref, inView } = useInView<HTMLDivElement>("120px", false);
+  const visible = useDocumentVisible();
+  const active = inView && visible;
 
   // Run the GPU path unless we've degraded or motion is off.
-  useGlTransition(canvasRef, images, !degraded && enabled, () => setDegraded(true));
+  useGlTransition(canvasRef, images, !degraded && enabled && active, () => setDegraded(true));
 
   if (images.length === 0) return null;
 
   return (
     <div
+      ref={ref}
       className={cn("relative overflow-hidden rounded-2xl border border-line/60 bg-bg-900/80 shadow-card", className)}
       aria-label="Game showcase"
     >
       {!degraded && enabled ? (
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
       ) : (
-        <DomCrossfade images={images} labels={labels} />
+        <DomCrossfade images={images} labels={labels} active={active} />
       )}
 
       {/* Shared scrims so any foreground label/UI stays readable. */}

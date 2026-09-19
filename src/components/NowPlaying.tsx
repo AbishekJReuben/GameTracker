@@ -8,6 +8,7 @@ import { useDashboard, useGames } from "@/lib/queries";
 import { GameArt } from "./GameArt";
 import { CoverMarquee } from "./CoverMarquee";
 import { clockString, dur, relativeTime } from "@/lib/format";
+import { useDocumentVisible } from "@/lib/useVisible";
 
 export function NowPlaying() {
   const tracking = useApp((s) => s.tracking);
@@ -16,6 +17,7 @@ export function NowPlaying() {
   const { data: games } = useGames();
   const enabled = useMotionEnabled();
   const playing = !!tracking?.isPlaying && !tracking?.paused;
+  const visible = useDocumentVisible();
   const idle = !!tracking?.isIdle;
 
   const lastGame = dashboard?.recentSessions.find((s) => s.kind !== "app") ?? null;
@@ -25,10 +27,10 @@ export function NowPlaying() {
     setTick(0);
   }, [tracking?.sessionActiveSeconds, tracking?.sessionRuntimeSeconds, tracking?.gameId]);
   useEffect(() => {
-    if (!playing) return;
+    if (!playing || !visible) return;
     const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
-  }, [playing]);
+  }, [playing, visible]);
 
   const runtime = (tracking?.sessionRuntimeSeconds ?? 0) + (playing ? tick : 0);
   const active = (tracking?.sessionActiveSeconds ?? 0) + (playing && !idle ? tick : 0);

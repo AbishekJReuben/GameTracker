@@ -26,6 +26,7 @@ mod steam_openid;
 mod suggestions;
 mod system;
 mod tracking;
+mod thumbnails;
 mod tray;
 mod util;
 
@@ -385,6 +386,7 @@ pub fn run() {
             commands::import_games_csv,
             commands::default_csv_path,
             commands::list_screenshots,
+            commands::image_thumbnail,
             commands::delete_screenshot,
             commands::list_sessions,
             commands::dashboard,
@@ -490,6 +492,7 @@ pub fn run() {
             commands::remote_request_keyframe,
             commands::remote_set_encode_paused,
             commands::remote_set_capture_native,
+            commands::remote_ack_native_frame,
             commands::remote_stop_capture,
             commands::remote_start_aux_capture,
             commands::remote_stop_aux_capture,

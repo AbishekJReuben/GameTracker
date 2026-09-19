@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.9.97"
+version = "3.9.98"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -23,6 +23,7 @@ tauri-plugin-updater = "2"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 anyhow = "1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }

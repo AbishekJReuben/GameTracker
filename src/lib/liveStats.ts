@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { EntryKind, Session } from "@/lib/api";
 import { useApp } from "@/store/app";
+import { useDocumentVisible } from "./useVisible";
 
 export interface EntryTotals {
   totalRuntimeSeconds: number;
@@ -43,6 +44,7 @@ export function useLiveEntryStats(
 ) {
   const tracking = useApp((s) => s.tracking);
   const live = !!entryId && !!totals && isLiveEntry(entryId, kind, tracking);
+  const visible = useDocumentVisible();
   const idle = !!tracking?.isIdle;
 
   const [tick, setTick] = useState(0);
@@ -59,10 +61,10 @@ export function useLiveEntryStats(
   ]);
 
   useEffect(() => {
-    if (!live) return;
+    if (!live || !visible) return;
     const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
-  }, [live]);
+  }, [live, visible]);
 
   return useMemo(() => {
     if (!totals) {
@@ -108,6 +110,7 @@ export function useLiveSessionBonus(
   kind: EntryKind
 ): number {
   const tracking = useApp((s) => s.tracking);
+  const visible = useDocumentVisible();
   const [tick, setTick] = useState(0);
 
   const hasLiveOpen = useMemo(() => {
@@ -129,10 +132,10 @@ export function useLiveSessionBonus(
   ]);
 
   useEffect(() => {
-    if (!hasLiveOpen) return;
+    if (!hasLiveOpen || !visible) return;
     const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
-  }, [hasLiveOpen]);
+  }, [hasLiveOpen, visible]);
 
   if (!hasLiveOpen || !tracking) return 0;
   const idle = tracking.isIdle;

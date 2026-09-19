@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo } from "react";
 import { useMotionEnabled, useReduceEffects } from "@/store/app";
 import { cn } from "@/lib/cn";
+import { useDocumentVisible, useInView } from "@/lib/useVisible";
 
 /* A self-contained WebGL overlay used by the "shader" marquee variant and other
    decorative surfaces. It ships a *family* of procedural effects (plasma,
@@ -104,14 +105,17 @@ const FRAGS: Record<ShaderKind, string> = {
 };
 
 export function MarqueeShader({ className, kind }: { className?: string; kind?: ShaderKind }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  const enabled = useMotionEnabled() && !useReduceEffects();
+  const { ref, elementRef, inView } = useInView<HTMLCanvasElement>("120px", false);
+  const motionOn = useMotionEnabled();
+  const reduce = useReduceEffects();
+  const visible = useDocumentVisible();
+  const enabled = motionOn && !reduce && inView && visible;
   // Pick a stable effect for this instance if the caller didn't specify one, so
   // different panels get visibly different shaders.
   const seeded = useMemo<ShaderKind>(() => kind ?? SHADER_KINDS[Math.floor(Math.random() * SHADER_KINDS.length)]!, [kind]);
 
   useEffect(() => {
-    const canvas = ref.current;
+    const canvas = elementRef.current;
     if (!canvas || !enabled) return;
     const gl = canvas.getContext("webgl", { alpha: true, premultipliedAlpha: false });
     if (!gl) return;
@@ -123,8 +127,10 @@ export function MarqueeShader({ className, kind }: { className?: string; kind?: 
       return s;
     };
     const prog = gl.createProgram()!;
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAGS[seeded]));
+    const vs = compile(gl.VERTEX_SHADER, VERT);
+    const fs = compile(gl.FRAGMENT_SHADER, FRAGS[seeded]);
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
     gl.linkProgram(prog);
     gl.useProgram(prog);
 
@@ -168,6 +174,8 @@ export function MarqueeShader({ className, kind }: { className?: string; kind?: 
       cancelAnimationFrame(raf);
       ro.disconnect();
       gl.deleteProgram(prog);
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
       gl.deleteBuffer(buf);
     };
   }, [enabled, seeded]);

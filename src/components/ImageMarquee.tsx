@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { assetUrl } from "@/lib/api";
 import { useMarqueeTier, useMotionEnabled } from "@/store/app";
 import { cn } from "@/lib/cn";
+import { useInView } from "@/lib/useVisible";
 
 /**
  * A slowly drifting strip of landscape images (game screenshots / posters),
@@ -23,6 +24,7 @@ export function ImageMarquee({
   fade?: boolean;
 }) {
   const enabled = useMotionEnabled();
+  const { ref, inView } = useInView<HTMLDivElement>();
   const showMarquee = useMarqueeTier("base");
   const shots = useMemo(
     () => images.map((u) => assetUrl(u)).filter((u): u is string => !!u).slice(0, 16),
@@ -34,6 +36,8 @@ export function ImageMarquee({
 
   return (
     <div
+      ref={ref}
+      data-fx-paused={!inView}
       className={cn("relative overflow-hidden rounded-2xl border border-line/60 bg-bg-900/70", className)}
       aria-label="Screenshot showcase"
     >
@@ -51,7 +55,7 @@ export function ImageMarquee({
               key={`${i}-${src}`}
               className="aspect-video h-full shrink-0 overflow-hidden rounded-xl border border-white/5 bg-black/40 shadow-card"
             >
-              <img src={src} alt="" loading="lazy" draggable={false} className="h-full w-full object-cover" />
+              <img src={src} alt="" loading="lazy" decoding="async" draggable={false} className="h-full w-full object-cover" />
             </div>
           ))}
         </div>

@@ -1,4 +1,4 @@
-import { memo, useRef } from "react";
+import { memo } from "react";
 import { Link } from "react-router-dom";
 import { motion, useMotionValue, useSpring, useTransform } from "motion/react";
 import { Pencil, Clock, Gamepad2, Play } from "lucide-react";
@@ -11,6 +11,7 @@ import { dur } from "@/lib/format";
 import { useApp, useMotionEnabled } from "@/store/app";
 import { GameScores, hasAnyScore } from "./GameScores";
 import { pulseGlow, staggerTransition } from "@/lib/motion";
+import { useDocumentVisible, useInView } from "@/lib/useVisible";
 
 /** Neighbours in the grid arrive from alternating edges for a lively,
  *  "assembling" entrance (cycles up → left → right → down). */
@@ -33,10 +34,12 @@ export const GameCard = memo(function GameCard({ game, index = 0 }: { game: Game
   const liveGameId = useApp((s) => (s.tracking?.isPlaying ? s.tracking.gameId : null));
   const isLive = liveGameId === game.id;
   const launchable = canLaunchGame(game);
-  const enabled = useMotionEnabled();
+  const motionOn = useMotionEnabled();
+  const visible = useDocumentVisible();
+  const { ref: cardRef, elementRef: cardElement, inView } = useInView<HTMLDivElement>();
+  const enabled = motionOn && visible && inView;
   const color = isLive ? "#34d399" : statusColor(game.status);
   const playtime = game.totalRuntimeSeconds;
-  const cardRef = useRef<HTMLDivElement>(null);
 
   const mx = useMotionValue(0);
   const my = useMotionValue(0);
@@ -44,8 +47,8 @@ export const GameCard = memo(function GameCard({ game, index = 0 }: { game: Game
   const rotateY = useSpring(useTransform(mx, [-0.5, 0.5], [-6, 6]), { stiffness: 280, damping: 28 });
 
   const onMove = (e: React.MouseEvent) => {
-    if (!enabled || !cardRef.current) return;
-    const r = cardRef.current.getBoundingClientRect();
+    if (!enabled || !cardElement.current) return;
+    const r = cardElement.current.getBoundingClientRect();
     mx.set((e.clientX - r.left) / r.width - 0.5);
     my.set((e.clientY - r.top) / r.height - 0.5);
   };

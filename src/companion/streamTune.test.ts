@@ -91,3 +91,12 @@ describe("normalizeStreamTune", () => {
     });
   });
 });
+describe("experimental delivery", () => {
+  it("requires explicit opt-in and counts as custom tuning", () => {
+    expect(normalizeStreamTune({}).nvencFast).toBe(false);
+    expect(normalizeStreamTune({ nvencFast: "true" as unknown as boolean }).nvencFast).toBe(false);
+    expect(normalizeStreamTune({ nvencFast: true }).nvencFast).toBe(true);
+    expect(streamTuneIsCustom(normalizeStreamTune({ nvencFast: true }))).toBe(true);
+    expect(streamTuneIsCustom(normalizeStreamTune({ nvencFast: false }))).toBe(false);
+  });
+});

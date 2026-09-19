@@ -1217,7 +1217,7 @@ export const api = {
   // Streaming capture for the cloud WebRTC video-track path (frames arrive as
   // ArrayBuffer JPEGs over the channel; no per-frame invoke round-trip).
   remoteStartCapture: (onFrame: Channel<ArrayBuffer>, maxW: number, fps: number, quality: number) =>
-    call<void>("remote_start_capture", { onFrame, maxW, fps, quality }),
+    call<number>("remote_start_capture", { onFrame, maxW, fps, quality }),
   remoteStartAuxCapture: (
     monitor: number,
     onFrame: Channel<ArrayBuffer>,
@@ -1243,7 +1243,9 @@ export const api = {
   /// Allow native H.264 frames. Only DIRECT guests can take them — the RTC track path
   /// needs pixels for its canvas, so this must be false whenever DIRECT isn't up.
   /// Resolves true when this host actually has a native (NVENC) encoder.
-  remoteSetCaptureNative: (on: boolean) => call<boolean>("remote_set_capture_native", { on }),
+  remoteSetCaptureNative: (on: boolean, fastDelivery = false) => call<boolean>("remote_set_capture_native", { on, fastDelivery }),
+  remoteAckNativeFrame: (generation: number, sequence: number) =>
+    call<void>("remote_ack_native_frame", { generation, sequence }),
   remoteStopCapture: () => call<void>("remote_stop_capture"),
   remoteStopAuxCapture: (monitor?: number) => call<void>("remote_stop_aux_capture", { monitor }),
   // Desktop-audio (WASAPI loopback) for the WebRTC audio track. PCM float32 frames
@@ -1318,6 +1320,10 @@ export interface RemoteCaptureStats {
   zeroCopy?: boolean;
   /** Captures skipped BEFORE the encoder under channel backpressure (reference-safe). */
   pauseSkips?: number;
+  fastDelivery?: boolean;
+  deliveryPending?: number;
+  deliverySkips?: number;
+  deliveryTimeouts?: number;
 }
 
 export interface RemoteStatus {

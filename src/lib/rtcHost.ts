@@ -18,6 +18,7 @@ import { auxMonitorRoom } from "./remoteConfig";
 import { AUDIO_HDR_BYTES, StreamingAudioResampler, audioPacket, audioRedPacket } from "./audioWire";
 // Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
 import audioFeederWorkletUrl from "./audioFeeder.worklet.js?url";
+import { parseNativeFrame, videoFragmentSize } from "./nativeDelivery";
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
 export interface HostLiveStats {
@@ -139,8 +140,6 @@ function streamLogFormat(): string {
 // ships Constrained Baseline so Android HW can enter low-latency mode (Moonlight
 // errata #8). High stays on the ladder for the JPEG→WebCodecs fallback encoder.
 const WC_CODECS = ["avc1.42C028", "avc1.42E028", "avc1.4d0028", "avc1.640028", "avc1.640034"];
-/** Fragment size for encoded frames on the SCTP channel (< 64KB interop limit). */
-const WC_FRAG = 61440;
 /** Skip encoding new frames while this many bytes sit unsent in the channel —
  *  a backlog can only become latency, and the next frame supersedes this one. */
 const WC_MAX_BUFFERED = 262144;
@@ -570,6 +569,7 @@ export function startHost(opts: HostOptions): () => void {
     // Let Rust encode natively (NVENC). The phone can turn this off to fall back to
     // the long-standing JPEG→canvas→WebCodecs path.
     hostNvenc: true,
+    nvencFast: false,
     // Drive the DIRECT bitrate from the guest's own link reports (see ABR v2
     // below) instead of from our send-queue depth alone.
     abrV2: true,
@@ -1066,11 +1066,15 @@ export function startHost(opts: HostOptions): () => void {
    * the JPEG decode and the WebCodecs encoder are all bypassed. Null ⇒ Rust must send
    * JPEG (the RTC track needs real pixels to composite).
    */
-  let nativeSink: ((payload: Uint8Array<ArrayBuffer>, key: boolean, w?: number, h?: number) => void) | null = null;
+  let nativeSink: ((payload: Uint8Array<ArrayBuffer>, key: boolean, w?: number, h?: number, tsMs?: number, fast?: boolean) => void) | null = null;
   /** True once Rust has told us (via the frame container) that it's encoding natively. */
   let nativeActive = false;
+  let nativeDeliveryMs = 0;
+  let captureEpoch = 0;
+  let restoreCaptureMode: (() => Promise<void>) | null = null;
 
   const stopCapture = () => {
+    captureEpoch++;
     try {
       if (opts.fixedMonitor != null) api.remoteStopAuxCapture(opts.fixedMonitor);
       else api.remoteStopCapture();
@@ -1237,6 +1241,8 @@ export function startHost(opts: HostOptions): () => void {
    * hardware-encodes with inter-frame compression and adaptive bitrate.
    */
   const buildVideoTrack = async (): Promise<{ track: MediaStreamTrack; start: () => Promise<void> } | null> => {
+    let feedEpoch = -1;
+    let feedGeneration: number | null = null;
     const canvas = document.createElement("canvas");
     canvas.width = 1280;
     canvas.height = 720;
@@ -1373,6 +1379,7 @@ export function startHost(opts: HostOptions): () => void {
 
     const ch = new Channel<ArrayBuffer>();
     ch.onmessage = (buf) => {
+      if (feedEpoch !== captureEpoch) return;
       const bytes = buf as unknown as ArrayBuffer;
       // Native container ('G' 'N' | flags | rsv | w u16 | h u16 | Annex-B): Rust
       // encoded this with NVENC, so there is nothing to do but forward it. This is
@@ -1385,9 +1392,18 @@ export function startHost(opts: HostOptions): () => void {
         // the first native frame can announce a codec+size to the guest before
         // any Annex-B lands (without that JSON the guest never builds a
         // VideoDecoder and sits on "Waking your screen…" forever).
-        const nw = u8[4] | (u8[5] << 8);
-        const nh = u8[6] | (u8[7] << 8);
-        nativeSink?.(u8.subarray(8), (u8[2] & 1) === 1, nw, nh);
+        const frame = parseNativeFrame(bytes);
+        if (!frame) return;
+        if (frame.fast && frame.generation !== feedGeneration) return;
+        nativeDeliveryMs = frame.hostAgeMs;
+        try {
+          nativeSink?.(frame.payload, frame.key, frame.w, frame.h, frame.timestamp, frame.fast);
+        } finally {
+          // Credit is returned only AFTER the frame reached the send/gate logic.
+          // Never wait for ACK on the main thread. Stale generations are ignored
+          // by Rust; a missing ACK automatically falls back to classic delivery.
+          if (frame.fast) void api.remoteAckNativeFrame(frame.generation, frame.sequence).catch(() => {});
+        }
         return;
       }
       nativeActive = false;
@@ -1421,10 +1437,20 @@ export function startHost(opts: HostOptions): () => void {
     // source, so the OS "Choose what to share" picker popped up on the host every
     // connection. The Rust DXGI pipeline (persistent duplication + GPU downscale +
     // parallel encode) needs no picker and is already heavily optimized.
-    const start = () =>
-      opts.fixedMonitor != null
-        ? api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap))
-        : api.remoteStartCapture(ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap));
+    const start = async () => {
+      const startedEpoch = ++captureEpoch;
+      feedEpoch = startedEpoch;
+      if (opts.fixedMonitor != null) {
+        await api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap));
+      } else {
+        const generation = await api.remoteStartCapture(ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap));
+        if (startedEpoch !== captureEpoch) return;
+        feedGeneration = generation;
+        // Restart resets Rust to JPEG. Restore the negotiated DIRECT/fast mode
+        // and both pause owners after focus recovery, resize rebuild, or watchdog.
+        await restoreCaptureMode?.();
+      }
+    };
     return { track, start };
   };
 
@@ -2261,11 +2287,11 @@ export function startHost(opts: HostOptions): () => void {
 
     const wcTargetBps = () => (quality.bitrate > 0 ? quality.bitrate * 1000 : bitrateFor(quality));
 
-    /** Ship one encoded frame: 20-byte header, then ≤WC_FRAG fragments. The payload is
+    /** Ship one encoded frame: 20-byte header, then bounded fragments. The payload is
      *  a view (not a copy) so the native path can forward Rust's bytes as-is. */
     // `Uint8Array<ArrayBuffer>` (not the default `ArrayBufferLike`): RTCDataChannel.send
     // won't take a possibly-SharedArrayBuffer-backed view.
-    const wcSendBytes = (payload: Uint8Array<ArrayBuffer>, key: boolean, tsMs: number): boolean => {
+    const wcSendBytes = (payload: Uint8Array<ArrayBuffer>, key: boolean, tsMs: number, fast = false): boolean => {
       if (videoCh.readyState !== "open") return false;
       const head = new ArrayBuffer(20);
       const dv = new DataView(head);
@@ -2276,10 +2302,12 @@ export function startHost(opts: HostOptions): () => void {
       dv.setUint32(4, wcSeq++ >>> 0, true);
       dv.setFloat64(8, tsMs, true); // host perf.now() ms at capture
       dv.setUint32(16, payload.byteLength, true);
+      const fragment = videoFragmentSize(fast, myPc.sctp?.maxMessageSize);
+      if (fragment < head.byteLength) return false;
       try {
         videoCh.send(head);
-        for (let off = 0; off < payload.byteLength; off += WC_FRAG) {
-          videoCh.send(payload.subarray(off, Math.min(off + WC_FRAG, payload.byteLength)));
+        for (let off = 0; off < payload.byteLength; off += fragment) {
+          videoCh.send(payload.subarray(off, Math.min(off + fragment, payload.byteLength)));
         }
       } catch {
         // A partial frame is as harmful as a dropped one for an H.264 P-frame
@@ -2379,6 +2407,13 @@ export function startHost(opts: HostOptions): () => void {
      *  drain poller clearing the flag out from under an idle guest would restart
      *  a 30Mbps encode into a screen nobody is looking at. */
     let encodePauseWire = false;
+    const restoreMode = async () => {
+      if (!sessionAlive || pc !== myPc || opts.fixedMonitor != null) return;
+      if (wcSink || nativeActive) await api.remoteSetCaptureNative(quality.hostNvenc, quality.nvencFast);
+      await api.remoteSetEncodePaused(encodePaused || guestIdle);
+    };
+    restoreCaptureMode = restoreMode;
+    sessionCleanups.add(() => { if (restoreCaptureMode === restoreMode) restoreCaptureMode = null; });
     const applyEncodePause = () => {
       const want = encodePaused || guestIdle;
       if (want === encodePauseWire) return;
@@ -2547,7 +2582,8 @@ export function startHost(opts: HostOptions): () => void {
       if (skipsSinceKey < SKIP_RECOVER_AT) return;
       if (armNativeRecovery(true)) skipsSinceKey = 0;
     };
-    nativeSink = (payload, key, w = 0, h = 0) => {
+    nativeSink = (payload, key, w = 0, h = 0, tsMs = performance.now(), fast = false) => {
+      if (!sessionAlive || pc !== myPc) return;
       if (videoCh.readyState !== "open") return;
       if (!nativeAnnounced || w !== nativeConfigW || h !== nativeConfigH) {
         nativeAnnounced = true;
@@ -2640,11 +2676,10 @@ export function startHost(opts: HostOptions): () => void {
         }
         adaptFromBuffer(buffered, maxBuffered, false);
       }
-      // Stamped on arrival rather than at capture: the host and Rust don't share a
-      // clock, and now that a frame is ~30KB instead of 334KB the IPC hop it folds
-      // into the measurement is small (it lands in `net+enc`, never unaccounted).
+      // Fast delivery carries the native encode-submission time, converted to
+      // this clock on arrival. Classic retains its original arrival timestamp.
       noteFrameBytes(payload.byteLength);
-      if (!wcSendBytes(payload, key, performance.now())) {
+      if (!wcSendBytes(payload, key, tsMs, fast)) {
         // Channel threw mid-frame — the guest received a partial access unit, which
         // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
         slog("fault", `channel send threw mid-${key ? "keyframe" : "P-frame"} (partial AU) — hard gate`);
@@ -2816,7 +2851,7 @@ export function startHost(opts: HostOptions): () => void {
       // the canvas path has to be ready to carry the stream.
       let nativeOk = false;
       try {
-        nativeOk = quality.hostNvenc && (await api.remoteSetCaptureNative(true));
+        nativeOk = quality.hostNvenc && (await api.remoteSetCaptureNative(true, quality.nvencFast));
       } catch {
         /* not on desktop */
       }
@@ -3249,11 +3284,14 @@ export function startHost(opts: HostOptions): () => void {
           // Native encode on/off takes effect live — the whole point is to A/B it (or
           // escape a bad picture) without reconnecting. Only meaningful while DIRECT
           // is up; wcActivate reads `quality.hostNvenc` when it isn't.
-          if (typeof msg.hostNvenc === "boolean" && msg.hostNvenc !== quality.hostNvenc) {
-            quality.hostNvenc = msg.hostNvenc;
+          const nativeChanged = typeof msg.hostNvenc === "boolean" && msg.hostNvenc !== quality.hostNvenc;
+          const fastChanged = typeof msg.nvencFast === "boolean" && msg.nvencFast !== quality.nvencFast;
+          if (nativeChanged || fastChanged) {
+            if (typeof msg.hostNvenc === "boolean") quality.hostNvenc = msg.hostNvenc;
+            if (typeof msg.nvencFast === "boolean") quality.nvencFast = msg.nvencFast;
             if (wcSink || nativeActive) {
               try {
-                void api.remoteSetCaptureNative(quality.hostNvenc);
+                void api.remoteSetCaptureNative(quality.hostNvenc, quality.nvencFast).catch(() => {});
               } catch {
                 /* not on desktop */
               }
@@ -3558,6 +3596,7 @@ export function startHost(opts: HostOptions): () => void {
                           // `native` tells the HUD which encoder produced these
                           // numbers — "H264 enc 1.2ms" is only believable with it.
                           native: nativeActive,
+                          deliveryMs: nativeActive && cs?.fastDelivery ? Math.round(nativeDeliveryMs * 10) / 10 : undefined,
                           codec: nativeActive ? "NVENC/H264" : wcCodec,
                           // On the native path the webview never encodes, so wcEncMs
                           // would sit at 0 forever; report Rust's real NVENC time.

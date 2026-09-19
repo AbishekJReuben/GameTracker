@@ -66,6 +66,8 @@ export type StreamTune = {
    * misbehaves. No-op on a PC without NVENC (it's already on the JPEG path).
    */
   hostNvenc: boolean;
+  /** Experimental NVENC subpath: bounded host IPC and small reliable fragments. */
+  nvencFast: boolean;
   /**
    * Guest (Android APK only): decode DIRECT H.264 with native MediaCodec → Surface
    * instead of WebCodecs → canvas. ON is the low-latency path (Moonlight-style).
@@ -137,6 +139,7 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   jbGrowAt: 15,
   directRetrySec: 15,
   hostNvenc: true,
+  nvencFast: false,
   preferNativeDecode: true,
   preferDirectAudio: true,
   audioJbMs: 100,
@@ -203,6 +206,8 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     // Same `!== false` shape as preferDirect: absent (an older saved tune) means the
     // default, and only an explicit false turns it off.
     hostNvenc: r.hostNvenc !== false,
+    // Experiments must never turn on for existing installs or malformed prefs.
+    nvencFast: r.nvencFast === true,
     preferNativeDecode: r.preferNativeDecode !== false,
     preferDirectAudio: r.preferDirectAudio !== false,
     abrV2: r.abrV2 !== false,
@@ -296,6 +301,7 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.jbGrowAt !== d.jbGrowAt ||
     t.directRetrySec !== d.directRetrySec ||
     t.hostNvenc !== d.hostNvenc ||
+    t.nvencFast !== d.nvencFast ||
     t.preferNativeDecode !== d.preferNativeDecode ||
     t.preferDirectAudio !== d.preferDirectAudio ||
     t.audioJbMs !== d.audioJbMs ||

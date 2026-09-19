@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { assetUrl } from "@/lib/api";
 import { accentFor, initials } from "@/lib/format";
 import { cn } from "@/lib/cn";
 import { useMotionEnabled } from "@/store/app";
+import { useDocumentVisible, useInView } from "@/lib/useVisible";
 
 interface Props {
   id: string;
@@ -19,7 +20,7 @@ interface Props {
 }
 
 /** Renders cover art, icon, or a deterministic gradient placeholder with initials. */
-export function GameArt({
+export const GameArt = memo(function GameArt({
   id,
   name,
   cover,
@@ -31,7 +32,10 @@ export function GameArt({
   variant = "cover",
   kenBurns = false,
 }: Props) {
-  const enabled = useMotionEnabled();
+  const motionOn = useMotionEnabled();
+  const visible = useDocumentVisible();
+  const { ref, inView } = useInView<HTMLDivElement>();
+  const enabled = motionOn && visible && inView;
   const src = assetUrl(variant === "cover" ? cover || icon : icon || cover);
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -59,7 +63,7 @@ export function GameArt({
   const animateGradient = enabled && !(showImage && loaded);
 
   return (
-    <div className={cn("relative overflow-hidden [container-type:inline-size]", rounded, className)}>
+    <div ref={ref} className={cn("relative overflow-hidden [container-type:inline-size]", rounded, className)}>
       {/* Animated gradient base — always present as fallback */}
       {animateGradient ? (
         <motion.div
@@ -115,6 +119,8 @@ export function GameArt({
               alt={name}
               className="absolute inset-0 h-full w-full object-cover"
               draggable={false}
+              loading="lazy"
+              decoding="async"
               initial={enabled ? { opacity: 0 } : false}
               animate={{ opacity: loaded ? 1 : 0 }}
               transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
@@ -126,4 +132,4 @@ export function GameArt({
       )}
     </div>
   );
-}
+});

@@ -590,6 +590,7 @@ pub fn set_capture_native(on: bool) {
     if on {
         request_keyframe();
     } else {
+        super::delivery::DELIVERY.enable(false);
         // Drop the zero-copy claim so a later re-enable (or the JPEG fallback)
         // isn't blocked by a stale interlock from the previous DIRECT session.
         ST_ZC_LIVE.store(false, Ordering::Relaxed);
@@ -625,10 +626,15 @@ pub struct CaptureStats {
     /// up (reference-safe backpressure). Non-zero here with a healthy link means
     /// the phone's radio is stalling in bursts, not that bandwidth is short.
     pub pause_skips: u32,
+    pub fast_delivery: bool,
+    pub delivery_pending: u32,
+    pub delivery_skips: u32,
+    pub delivery_timeouts: u32,
 }
 
 /// Read the latest host-side capture telemetry.
 pub fn capture_stats() -> CaptureStats {
+    let delivery = super::delivery::DELIVERY.stats();
     CaptureStats {
         capture_ms: ST_CAP_US.load(Ordering::Relaxed) as f32 / 1000.0,
         scale_ms: ST_SCALE_US.load(Ordering::Relaxed) as f32 / 1000.0,
@@ -647,6 +653,10 @@ pub fn capture_stats() -> CaptureStats {
         native: ST_NATIVE.load(Ordering::Relaxed),
         zero_copy: ST_ZEROCOPY.load(Ordering::Relaxed),
         pause_skips: ST_PAUSE_SKIPS.load(Ordering::Relaxed),
+        fast_delivery: delivery.enabled && ST_NATIVE.load(Ordering::Relaxed),
+        delivery_pending: delivery.pending,
+        delivery_skips: delivery.skipped,
+        delivery_timeouts: delivery.timeouts,
     }
 }
 
@@ -665,6 +675,7 @@ pub fn set_capture_content(mode: u32) {
 
 /// Stop the capture threads (if any).
 pub fn stop_capture() {
+    super::delivery::DELIVERY.enable(false);
     CAP_RUNNING.store(false, Ordering::SeqCst);
     CAP_GEN.fetch_add(1, Ordering::SeqCst);
 }
@@ -874,7 +885,7 @@ struct RawFrame {
 /// thread change-detects + SIMD-JPEG-encodes and calls `emit` with a full-frame
 /// JPEG for every changed frame plus a ~1s keep-alive. Runs until `stop_capture`;
 /// any existing pipeline is superseded (generation bump), so it's safe to re-call.
-pub fn start_capture<F>(max_w: u32, fps: u32, quality: u32, emit: F)
+pub fn start_capture<F>(max_w: u32, fps: u32, quality: u32, emit: F) -> u32
 where
     F: Fn(Vec<u8>) + Send + Sync + 'static,
 {
@@ -885,6 +896,7 @@ where
     let cap_emit = emit.clone();
     set_capture_quality(max_w, fps, quality);
     let my_gen = CAP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    super::delivery::DELIVERY.start(my_gen);
     CAP_RUNNING.store(true, Ordering::SeqCst);
     ST_PRODUCED.store(0, Ordering::Relaxed);
     // Per-session, like `produced`. Left cumulative these read as tens of
@@ -944,6 +956,18 @@ where
             };
             let budget_ms = (1000 / fps).clamp(1, 1000);
             let sel = selected_monitor();
+
+            // Nothing will be encoded while paused. Avoid DXGI/mip generation
+            // and cursor compositing too; the next acquisition after resume
+            // returns the latest desktop. Keep IDR recovery requests responsive.
+            if CAP_NATIVE_OK.load(Ordering::Relaxed)
+                && NATIVE_ENCODE_PAUSED.load(Ordering::Relaxed)
+                && !NATIVE_FORCE_KEY.load(Ordering::Relaxed)
+            {
+                ST_PAUSE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(budget_ms.min(50) as u64));
+                continue;
+            }
 
             let cap0 = Instant::now();
             // Capture + downscale one frame → packed 4-byte pixels (kept in the
@@ -1020,30 +1044,32 @@ where
                                 {
                                     ST_PAUSE_SKIPS.fetch_add(1, Ordering::Relaxed);
                                 } else if ok {
-                                    let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
-                                    let ts_us = zc_started.elapsed().as_micros() as u64;
-                                    let e0 = Instant::now();
-                                    if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
-                                        ST_CAP_US.store(cap_us, Ordering::Relaxed);
-                                        // The composite IS the scale; there is no
-                                        // separate CPU resize pass to report.
-                                        ST_SCALE_US.store(0, Ordering::Relaxed);
-                                        ST_ENC_US.store(e0.elapsed().as_micros() as u32, Ordering::Relaxed);
-                                        ST_NAT_W.store(native_w, Ordering::Relaxed);
-                                        ST_NAT_H.store(native_h, Ordering::Relaxed);
-                                        ST_OUT_W.store(ow, Ordering::Relaxed);
-                                        ST_OUT_H.store(oh, Ordering::Relaxed);
-                                        ST_BYTES.store(pkt.len() as u32, Ordering::Relaxed);
-                                        ST_NATIVE.store(true, Ordering::Relaxed);
-                                        ST_ZEROCOPY.store(true, Ordering::Relaxed);
-                                        ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                                        cap_emit(pkt);
-                                        zc_last_emit = Instant::now();
-                                    } else {
-                                        // Encode faulted: drop the session (stays
-                                        // retryable — the next frame rebuilds it).
-                                        zc = None;
-                                        ST_ZC_LIVE.store(false, Ordering::Relaxed);
+                                    if let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) {
+                                        let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        let ts_us = zc_started.elapsed().as_micros() as u64;
+                                        let e0 = Instant::now();
+                                        if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
+                                            ST_CAP_US.store(cap_us, Ordering::Relaxed);
+                                            // The composite IS the scale; there is no
+                                            // separate CPU resize pass to report.
+                                            ST_SCALE_US.store(0, Ordering::Relaxed);
+                                            ST_ENC_US.store(e0.elapsed().as_micros() as u32, Ordering::Relaxed);
+                                            ST_NAT_W.store(native_w, Ordering::Relaxed);
+                                            ST_NAT_H.store(native_h, Ordering::Relaxed);
+                                            ST_OUT_W.store(ow, Ordering::Relaxed);
+                                            ST_OUT_H.store(oh, Ordering::Relaxed);
+                                            ST_BYTES.store(pkt.len() as u32, Ordering::Relaxed);
+                                            ST_NATIVE.store(true, Ordering::Relaxed);
+                                            ST_ZEROCOPY.store(true, Ordering::Relaxed);
+                                            ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
+                                            cap_emit(permit.packet(pkt));
+                                            zc_last_emit = Instant::now();
+                                        } else {
+                                            // Encode faulted: drop the session (stays
+                                            // retryable — the next frame rebuilds it).
+                                            zc = None;
+                                            ST_ZC_LIVE.store(false, Ordering::Relaxed);
+                                        }
                                     }
                                 }
                             }
@@ -1063,13 +1089,15 @@ where
                                     || (!NATIVE_ENCODE_PAUSED.load(Ordering::Relaxed)
                                         && zc_last_emit.elapsed() >= Duration::from_millis(700))
                                 {
-                                    let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
-                                    let ts_us = zc_started.elapsed().as_micros() as u64;
-                                    if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
-                                        ST_BYTES.store(pkt.len() as u32, Ordering::Relaxed);
-                                        ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                                        cap_emit(pkt);
-                                        zc_last_emit = Instant::now();
+                                    if let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) {
+                                        let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        let ts_us = zc_started.elapsed().as_micros() as u64;
+                                        if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
+                                            ST_BYTES.store(pkt.len() as u32, Ordering::Relaxed);
+                                            ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
+                                            cap_emit(permit.packet(pkt));
+                                            zc_last_emit = Instant::now();
+                                        }
                                     }
                                 }
                             }
@@ -1303,6 +1331,9 @@ where
                         continue;
                     }
                     let (nw, nh) = n.size();
+                    let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) else {
+                        continue;
+                    };
                     // First frame of a session, a guest keyframe request, or the ~1s
                     // keep-alive on a static screen all need a self-contained IDR.
                     let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed) || stale;
@@ -1317,7 +1348,7 @@ where
                         // thread last claimed, this frame is not zero-copy.
                         ST_ZEROCOPY.store(false, Ordering::Relaxed);
                         ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                        emit(pkt);
+                        emit(permit.packet(pkt));
                         last_emit = Instant::now();
                         cached = None;
                         continue;
@@ -1363,6 +1394,7 @@ where
             }
         }
     });
+    my_gen
 }
 
 /// Nudge the encoder thread's condvar (used on capture-thread exit).

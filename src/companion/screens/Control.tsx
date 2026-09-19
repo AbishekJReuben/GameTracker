@@ -143,6 +143,7 @@ type HostWcStats = {
   on: boolean;
   /** PC encoded this itself with NVENC (no JPEG/canvas/WebCodecs round trip). */
   native?: boolean;
+  deliveryMs?: number;
   codec?: string;
   encMs?: number;
   frames?: number;
@@ -1277,6 +1278,7 @@ export function ControlScreen({
       wcBufKB: tune.wcBufKB,
       wcQueueMax: tune.wcQueueMax,
       hostNvenc: tune.hostNvenc,
+      nvencFast: tune.nvencFast,
       audioHostMs: tune.audioHostMs,
       abrV2: tune.abrV2,
     }),
@@ -3906,6 +3908,10 @@ export function ControlScreen({
                       />
                     )}
                     <StatCell k="Ch buf" v={`${hostStats.wc.bufKB ?? 0} KB`} hi={(hostStats.wc.bufKB ?? 0) > 128} />
+                    <StatCell k="Delivery" v={hostStats.fastDelivery ? "FAST" : (hostStats.deliveryTimeouts ?? 0) > 0 ? "Classic (fallback)" : "Classic"} />
+                    {hostStats.fastDelivery && <StatCell k="IPC frames" v={`${hostStats.deliveryPending ?? 0}/2`} />}
+                    {hostStats.wc.deliveryMs != null && <StatCell k="Host handoff" v={`${hostStats.wc.deliveryMs} ms`} />}
+                    {(hostStats.deliverySkips ?? 0) > 0 && <StatCell k="IPC skips" v={`${hostStats.deliverySkips}`} />}
                     {(hostStats.wc.adaptKbps ?? 0) > 0 && (
                       <StatCell
                         k="Adapt ↑"
@@ -4374,6 +4380,21 @@ export function ControlScreen({
                     <b className="text-ink-dim"> NVENC</b> badge whenever it's actually live.
                   </p>
                 )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    NVENC fast delivery (experimental) <ScopeTag scope="host" />
+                  </span>
+                  <button type="button" aria-pressed={tune.nvencFast}
+                    onClick={() => patchTune({ nvencFast: !tune.nvencFast })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${tune.nvencFast ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"}`}>
+                    {tune.nvencFast ? "ON" : "OFF"}
+                  </button>
+                </div>
+                {tuneHints && <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                  Limits queued video on the PC and sends smaller chunks so input and sound get more frequent turns.
+                  Keeps the same picture quality. Requires DIRECT + PC NVENC and an updated desktop;
+                  OFF restores classic delivery immediately. No effect on LAN, RTC, or immersive VR.
+                </p>}
                 <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
                   <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
                     Phone decoder (MediaCodec) <ScopeTag scope="direct" />
@@ -5442,6 +5463,10 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
     long: "Captures skipped pre-encode",
     info: "Individual capture ticks Rust discarded while the encoder was paused. Harmless — these never entered NVENC, so they can't corrupt the bitstream. High with Paused climbing = radio stalls; high with Dropped climbing = something else is wrong.",
   },
+  Delivery: { long: "Native delivery path", info: "FAST is the optional bounded NVENC handoff. Classic is the original path; fallback means native acknowledgements timed out. Toggle fast off/on to retry." },
+  "IPC frames": { long: "Frames awaiting the host WebView", info: "FAST permits at most two encoded frames in transit to the PC WebView, preventing a busy UI from accumulating old frames." },
+  "IPC skips": { long: "Capture ticks skipped before NVENC", info: "FAST skipped work before encoding because its two-frame delivery window was full. The H.264 reference chain is preserved." },
+  "Host handoff": { long: "Encode submission to host WebView", info: "Includes NVENC and the native-to-browser handoff. FAST includes this cost in E2E; classic timestamps on WebView arrival, so the E2E numbers have different starting points." },
   Skipped: { long: "Frames skipped (PC)", info: "Legacy label — see Dropped. Frames the PC discarded rather than send into a dead channel." },
   "Ch buf": { long: "Channel backlog", info: "Data queued and unsent on the video channel. A backlog can only ever become lag." },
   "Adapt ↑": {

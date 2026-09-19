@@ -16,6 +16,7 @@
 pub(crate) mod adb;
 pub(crate) mod audio;
 pub(crate) mod capture;
+pub(crate) mod delivery;
 #[cfg(windows)]
 pub(crate) mod dxdupe;
 pub(crate) mod focus;

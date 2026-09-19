@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "motion/react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -7,12 +7,13 @@ import { api, assetUrl, Screenshot } from "@/lib/api";
 import { keys } from "@/lib/queries";
 import { dateLabel, timeLabel } from "@/lib/format";
 import { useApp, useMotionEnabled } from "@/store/app";
+import { CaptureThumbnail } from "./CaptureThumbnail";
 
 /**
  * Grid of auto-captured in-game screenshots (newest first) with a lightbox,
  * per-shot capture time, and delete. Kept separate from curated Steam media.
  */
-export function Captures({ shots, gameId, name }: { shots: Screenshot[]; gameId: string; name: string }) {
+export const Captures = memo(function Captures({ shots, gameId, name }: { shots: Screenshot[]; gameId: string; name: string }) {
   const enabled = useMotionEnabled();
   const use24 = useApp((s) => s.prefs.timeFormat === "24h");
   const pushToast = useApp((s) => s.pushToast);
@@ -60,11 +61,9 @@ export function Captures({ shots, gameId, name }: { shots: Screenshot[]; gameId:
               transition={{ delay: Math.min(i * 0.03, 0.3), duration: 0.4 }}
             >
               <button onClick={() => setOpen(i)} className="block h-full w-full">
-                <img
-                  src={src}
+                <CaptureThumbnail
+                  path={shot.path}
                   alt={`${name} capture ${i + 1}`}
-                  className="h-full w-full object-cover transition duration-300 group-hover:brightness-110"
-                  draggable={false}
                 />
               </button>
               <span className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-2 pb-1.5 pt-6 text-[10px] font-700 text-white/90">
@@ -131,4 +130,4 @@ export function Captures({ shots, gameId, name }: { shots: Screenshot[]; gameId:
       )}
     </>
   );
-}
+});

@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "gametracker"
-version = "3.9.97"
+version = "3.9.98"
 dependencies = [
  "anyhow",
  "axum",
@@ -1856,6 +1856,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "tauri",
  "tauri-build",

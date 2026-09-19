@@ -7,6 +7,8 @@ import { isCompanion } from "./remoteClient";
 import { useApp } from "@/store/app";
 import { useProgress } from "@/store/progress";
 import { useMediaStore } from "@/store/media";
+import { isUiVisible, subscribeUiVisibility } from "./useVisible";
+import { VisibleQueryRefresh } from "./visibleQueryRefresh";
 
 interface SessionEvent {
   kind: "start" | "end";
@@ -33,21 +35,31 @@ export function useTauriBridge() {
   useEffect(() => {
     if (isCompanion() || !isTauri()) return;
     let mounted = true;
+    const refresh = new VisibleQueryRefresh(qc, isUiVisible);
+    let pendingTracking: TrackingState | null = null;
+    let pendingMedia: MediaState | null = null;
+    const unsubscribeVisibility = subscribeUiVisibility(() => {
+      if (!isUiVisible()) return;
+      if (pendingTracking) { setTracking(pendingTracking); pendingTracking = null; }
+      if (pendingMedia) { useMediaStore.getState().setMedia(pendingMedia); pendingMedia = null; }
+      refresh.flush();
+    });
 
     // Seed initial state.
     api.trackingState().then((t) => mounted && setTracking(t)).catch(() => {});
 
     const unlistenState = listen<TrackingState>("tracking://state", (e) => {
       const st = e.payload;
-      setTracking(st);
+      if (isUiVisible()) setTracking(st);
+      else pendingTracking = st;
       // While something is actively tracked, keep timelines/sessions live by
       // refreshing the in-progress session rows — throttled so we don't thrash.
       if (st.isPlaying || st.appIsActive) {
         const now = Date.now();
         if (now - lastLiveRefresh.current > 4000) {
           lastLiveRefresh.current = now;
-          qc.invalidateQueries({ queryKey: ["sessions"] });
-          qc.invalidateQueries({ queryKey: ["systemHistory"] });
+          refresh.invalidate(["sessions"]);
+          refresh.invalidate(["systemHistory"]);
         }
       }
     });
@@ -56,13 +68,14 @@ export function useTauriBridge() {
     // music analytics queries only when the track actually changes (throttled).
     const unlistenMedia = listen<MediaState>("media://state", (e) => {
       const st = e.payload;
-      useMediaStore.getState().setMedia(st);
+      if (isUiVisible()) useMediaStore.getState().setMedia(st);
+      else pendingMedia = st;
       const key = `${st.title ?? ""}|${st.artist ?? ""}|${st.playing}`;
       const now = Date.now();
       if (key !== lastMediaKey.current && now - lastMediaRefresh.current > 4000) {
         lastMediaKey.current = key;
         lastMediaRefresh.current = now;
-        qc.invalidateQueries({ queryKey: ["music"] });
+        refresh.invalidate(["music"]);
       }
     });
 
@@ -75,24 +88,24 @@ export function useTauriBridge() {
         icon: iconPath,
       });
       // A session boundary changes what's on the timeline — refresh either way.
-      qc.invalidateQueries({ queryKey: ["sessions"] });
-      qc.invalidateQueries({ queryKey: ["systemHistory"] });
+      refresh.invalidate(["sessions"]);
+      refresh.invalidate(["systemHistory"]);
       if (kind === "end") {
-        qc.invalidateQueries({ queryKey: ["dashboard"] });
-        qc.invalidateQueries({ queryKey: ["games"] });
-        qc.invalidateQueries({ queryKey: ["heatmap"] });
+        refresh.invalidate(["dashboard"]);
+        refresh.invalidate(["games"]);
+        refresh.invalidate(["heatmap"]);
       }
     });
 
     const unlistenShot = listen<{ gameId: string }>("screenshot://captured", (e) => {
-      qc.invalidateQueries({ queryKey: ["screenshots", e.payload.gameId] });
+      refresh.invalidate(["screenshots", e.payload.gameId]);
     });
 
     // Auto-enrichment finished for a freshly added game — refresh so its cover,
     // tags, and metadata appear without the user reloading.
     const unlistenEnriched = listen<{ id: string }>("game://enriched", (e) => {
-      qc.invalidateQueries({ queryKey: ["games"] });
-      qc.invalidateQueries({ queryKey: ["game", e.payload.id] });
+      refresh.invalidate(["games"]);
+      refresh.invalidate(["game", e.payload.id]);
     });
 
     const unlistenBreak = listen<{ minutes: number }>("reminder://break", (e) => {
@@ -118,6 +131,7 @@ export function useTauriBridge() {
 
     return () => {
       mounted = false;
+      unsubscribeVisibility();
       unlistenState.then((f) => f());
       unlistenMedia.then((f) => f());
       unlistenSession.then((f) => f());

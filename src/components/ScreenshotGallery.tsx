@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "motion/react";
 import { X, ChevronLeft, ChevronRight } from "lucide-react";
@@ -6,10 +6,10 @@ import { assetUrl } from "@/lib/api";
 import { useMotionEnabled } from "@/store/app";
 
 /** Responsive screenshot grid with a full-screen lightbox (keyboard + arrows). */
-export function ScreenshotGallery({ urls, name }: { urls: string[]; name: string }) {
+export const ScreenshotGallery = memo(function ScreenshotGallery({ urls, name }: { urls: string[]; name: string }) {
   const enabled = useMotionEnabled();
   const [open, setOpen] = useState<number | null>(null);
-  const shots = urls.map((u) => assetUrl(u)).filter((u): u is string => !!u);
+  const shots = useMemo(() => urls.map((u) => assetUrl(u)).filter((u): u is string => !!u), [urls]);
 
   const close = useCallback(() => setOpen(null), []);
   const step = useCallback(
@@ -49,6 +49,8 @@ export function ScreenshotGallery({ urls, name }: { urls: string[]; name: string
               alt={`${name} screenshot ${i + 1}`}
               className="h-full w-full object-cover transition duration-300 group-hover:brightness-110"
               draggable={false}
+              loading="lazy"
+              decoding="async"
             />
             <span className="pointer-events-none absolute inset-0 ring-1 ring-inset ring-white/10 transition group-hover:ring-white/25" />
           </motion.button>
@@ -105,4 +107,4 @@ export function ScreenshotGallery({ urls, name }: { urls: string[]; name: string
       )}
     </>
   );
-}
+});

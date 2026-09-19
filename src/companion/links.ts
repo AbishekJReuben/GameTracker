@@ -77,6 +77,7 @@ export type QualitySettings = {
   wcQueueMax?: number;
   /** Host: allow native NVENC encode (false = force the JPEG→WebCodecs path). */
   hostNvenc?: boolean;
+  nvencFast?: boolean;
   /** Host/DIRECT: drive the encode bitrate from the guest's link reports
    *  (measured receive rate + delay gradient) instead of send-queue depth. */
   abrV2?: boolean;

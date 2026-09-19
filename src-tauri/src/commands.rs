@@ -887,6 +887,11 @@ pub fn default_csv_path() -> Option<String> {
 // ---------- screenshots (auto-captured in-game) ----------
 
 #[tauri::command]
+pub async fn image_thumbnail(state: State<'_, AppState>, path: String) -> AppResult<String> {
+    crate::thumbnails::get(state.media_dir.clone(), path.into()).await
+}
+
+#[tauri::command]
 pub fn list_screenshots(state: State<AppState>, game_id: String) -> AppResult<Vec<ScreenshotDto>> {
     screenshots::list(&state.pool, &game_id)
 }
@@ -2326,13 +2331,13 @@ pub fn remote_start_capture(
     max_w: Option<u32>,
     fps: Option<u32>,
     quality: Option<u32>,
-) {
+) -> u32 {
     let w = max_w.unwrap_or(1600);
     let f = fps.unwrap_or(30);
     let q = quality.unwrap_or(70);
     crate::remote::capture::start_capture(w, f, q, move |jpg| {
         let _ = on_frame.send(tauri::ipc::InvokeResponseBody::Raw(jpg));
-    });
+    })
 }
 
 /// Live-retune the streaming capture (resolution / fps / JPEG quality, and the
@@ -2376,6 +2381,11 @@ pub fn remote_set_encode_paused(paused: bool) {
     crate::remote::capture::set_encode_paused(paused);
 }
 
+#[tauri::command]
+pub fn remote_ack_native_frame(generation: u32, sequence: u32) {
+    crate::remote::delivery::DELIVERY.ack(generation, sequence);
+}
+
 /// Allow (or forbid) native H.264 frames from the capture pipeline.
 ///
 /// Only the DIRECT guest can consume pre-encoded H.264 — the WebRTC track path needs
@@ -2385,8 +2395,9 @@ pub fn remote_set_encode_paused(paused: bool) {
 /// Returns whether this machine actually *has* a native encoder, so the host knows
 /// whether to expect native frames (and whether a missing WebCodecs encoder is fatal).
 #[tauri::command]
-pub fn remote_set_capture_native(on: bool) -> bool {
+pub fn remote_set_capture_native(on: bool, fast_delivery: Option<bool>) -> bool {
     crate::remote::capture::set_capture_native(on);
+    crate::remote::delivery::DELIVERY.enable(on && fast_delivery.unwrap_or(false));
     #[cfg(windows)]
     {
         crate::remote::nvenc::available()

@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import type { HeroSlide } from "@/lib/heroSlides";
 import { useMotionEnabled } from "@/store/app";
 import { cn } from "@/lib/cn";
+import { useDocumentVisible, useInView } from "@/lib/useVisible";
 
 const VERT = `
 attribute vec2 aPos;
@@ -139,15 +140,18 @@ export function ShaderSlideshow({
 }) {
   const enabled = useMotionEnabled();
   const [index, setIndex] = useState(0);
-  const canvasRef = useShaderOverlay(slides.length > 0);
+  const { ref, inView } = useInView<HTMLDivElement>("120px", false);
+  const visible = useDocumentVisible();
+  const active = inView && visible;
+  const canvasRef = useShaderOverlay(slides.length > 0 && active);
 
   const slideKey = slides.map((s) => s.id).join("|");
 
   useEffect(() => {
-    if (slides.length <= 1) return;
+    if (slides.length <= 1 || !active) return;
     const id = window.setInterval(() => setIndex((i) => (i + 1) % slides.length), INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [slides.length]);
+  }, [slides.length, active]);
 
   useEffect(() => {
     setIndex(0);
@@ -155,10 +159,11 @@ export function ShaderSlideshow({
 
   if (slides.length === 0) return null;
 
-  const current = slides[index]!;
+  const current = slides[index % slides.length]!;
 
   return (
     <div
+      ref={ref}
       className={cn(
         "relative min-h-[140px] overflow-hidden rounded-2xl border border-line/50 bg-bg-900/80 shadow-card transition-opacity",
         dimmed && "opacity-40",
@@ -180,7 +185,9 @@ export function ShaderSlideshow({
             alt=""
             className="h-full w-full object-cover"
             draggable={false}
-            animate={enabled ? { scale: [1, 1.07] } : undefined}
+            decoding="async"
+            loading="lazy"
+            animate={enabled && active ? { scale: [1, 1.07] } : undefined}
             transition={{ duration: INTERVAL_MS / 1000, ease: "linear" }}
           />
         </motion.div>

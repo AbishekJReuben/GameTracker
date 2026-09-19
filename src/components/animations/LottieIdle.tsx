@@ -3,6 +3,7 @@ import Lottie, { type LottieRefCurrentProps } from "lottie-react";
 import { useRef } from "react";
 import { useMotionEnabled } from "@/store/app";
 import { cn } from "@/lib/cn";
+import { useDocumentVisible } from "@/lib/useVisible";
 
 type LottieData = object;
 
@@ -33,6 +34,7 @@ export function LottieIdle({
   opacity?: number;
 }) {
   const enabled = useMotionEnabled();
+  const visible = useDocumentVisible();
   const lottieRef = useRef<LottieRefCurrentProps>(null);
   const [data, setData] = useState<LottieData | null>(() => cache.get(src) ?? null);
   const [failed, setFailed] = useState(false);
@@ -57,6 +59,11 @@ export function LottieIdle({
     lottieRef.current.setSpeed(speed);
   }, [speed, data, enabled]);
 
+  useEffect(() => {
+    if (visible) lottieRef.current?.play();
+    else lottieRef.current?.pause();
+  }, [visible, data]);
+
   if (!enabled || failed) return null;
   if (!data) {
     return (
@@ -72,6 +79,7 @@ export function LottieIdle({
       lottieRef={lottieRef}
       animationData={data}
       loop={loop}
+      autoplay={visible}
       className={cn("pointer-events-none", className)}
       style={{ opacity }}
       aria-hidden
