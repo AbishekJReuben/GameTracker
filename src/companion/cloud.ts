@@ -42,6 +42,7 @@ import {
 import { hitchMaybeE2eJump, hitchMaybeFrameGap, hitchNote } from "./hitchLog";
 import { isImmersiveActive, onImmersiveActiveChange } from "./runtime";
 import { loadStreamTune, resetStreamTune, type StreamTune } from "./streamTune";
+import { VideoAssembler, decodeOverloaded, type VideoHeader } from "./videoReceive";
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 /** "pending" = link up, awaiting host approval; "denied" = host rejected us. */
@@ -431,8 +432,15 @@ export class CloudConn {
    * of WebCodecs → canvas. Web/Quest keep WebCodecs — browsers don't expose MediaCodec.
    */
   private wcNative = false;
+  private wcNativeReady = false;
   private wcNativeFrames = 0;
   private wcNativePoll: number | null = null;
+  private wcNativePollBusy = false;
+  private wcNativeQueue = 0;
+  private wcNativePollAt = 0;
+  private wcNativeFps = 0;
+  /** Invalidate async native init/polls when a mode/session changes. */
+  private wcBuildGeneration = 0;
   /** When the native path first looked stalled (complete frames handed to
    *  MediaCodec but zero decoded frames coming back). Drives the watchdog that
    *  self-heals onto WebCodecs — a silent native decoder is a blank screen, and
@@ -459,11 +467,12 @@ export class CloudConn {
   private wcHostRecovered = -1;
   private wcHostRecovering = false;
   private wcFrameCb: ((f: VideoFrame) => void) | null = null;
-  private wcHead: { key: boolean; seq: number; tsMs: number; len: number } | null = null;
-  private wcBuf: Uint8Array | null = null;
-  private wcGot = 0;
+  private wcAssembler = new VideoAssembler(() => {
+    this.wcAwaitKey = true;
+    this.wcRequestKeyframe();
+  });
   /** Per-frame bookkeeping keyed by chunk timestamp (µs) for latency stats. */
-  private wcMeta = new Map<number, { arrivedAt: number; tsMs: number; bytes: number }>();
+  private wcMeta = new Map<number, { arrivedAt: number; submittedAt: number; tsMs: number; bytes: number }>();
   private wcFrames = 0;
   private wcKeys = 0;
   private wcBytes = 0;
@@ -482,6 +491,8 @@ export class CloudConn {
   private wcPaceMs = 0;
   private wcPlayQ: { frame: VideoFrame; showAt: number }[] = [];
   private wcPlayTimer: number | null = null;
+  private wcImmediateFrame: VideoFrame | null = null;
+  private wcImmediateScheduled = false;
   /** NTP-style clock samples from the data-channel heartbeat (host perf clock). */
   private clockSamples: { rtt: number; off: number }[] = [];
   // ---- link reports for the host's ABR v2 controller ------------------------
@@ -767,6 +778,7 @@ export class CloudConn {
     const idle = document.hidden && !w.__GT_PIP_ACTIVE__ && !isImmersiveActive();
     if (idle === this.powerIdle) return;
     this.powerIdle = idle;
+    if (idle) this.wcFlushPaceQueue(false);
     // Resuming: the decoder threw away everything that arrived while hidden, so
     // ask for the IDR before the host's own resume keyframe races us.
     if (!idle) {
@@ -1194,7 +1206,9 @@ export class CloudConn {
         // WebCodecs direct-video path: H.264 frames as [20-byte header + fragments].
         this.chVideo = ch;
         ch.binaryType = "arraybuffer";
-        ch.onmessage = (ev) => this.onWcMsg(ev.data);
+        ch.onmessage = (ev) => {
+          if (!this.closed && this.pc === pc && this.chVideo === ch) this.onWcMsg(ev.data);
+        };
       } else if (ch.label === "audio") {
         // DIRECT audio: float32 PCM (or JSON cfg).
         this.chAudio = ch;
@@ -1351,20 +1365,19 @@ export class CloudConn {
 
   /** Reset all wc state (new session / teardown). `reprobe` re-allows opt-in. */
   private wcReset(reprobe: boolean) {
+    this.wcBuildGeneration++;
     const wasActive = this.wcActive;
     this.wcActive = false;
     this.stopLinkReports();
     this.wcRequestedAt = 0;
     this.wcAwaitKey = true;
-    this.wcHead = null;
-    this.wcBuf = null;
-    this.wcGot = 0;
+    this.wcAssembler.reset();
     this.wcMeta.clear();
     this.wcStallTicks = 0;
     this.wcErrors = 0;
     this.wcErrorTimes = [];
     this.chVideo = undefined;
-    this.wcFlushPaceQueue();
+    this.wcFlushPaceQueue(false);
     this.wcStopNativePoll();
     if (this.wcNative) {
       void teardownNativeDecoder();
@@ -2012,11 +2025,14 @@ export class CloudConn {
   private wcFallback(reason: string, hard = false) {
     if (!this.wcActive && !this.wcRequestedAt) return;
     const wasActive = this.wcActive;
+    this.wcBuildGeneration++;
     this.wcActive = false;
     this.stopLinkReports();
     this.wcRequestedAt = 0;
     this.wcAwaitKey = true;
-    this.wcFlushPaceQueue();
+    this.wcFlushPaceQueue(false);
+    this.wcMeta.clear();
+    this.wcAssembler.reset();
     this.wcStopNativePoll();
     if (this.wcNative) {
       void teardownNativeDecoder();
@@ -2044,6 +2060,9 @@ export class CloudConn {
 
   /** Build (or rebuild) the VideoDecoder / native MediaCodec for the host codec. */
   private wcBuildDecoder(): boolean {
+    const generation = ++this.wcBuildGeneration;
+    this.wcMeta.clear();
+    this.wcFlushPaceQueue(false);
     // Safety net for hosts that ship NVENC frames without a prior codec JSON
     // (pre-announce bug): Constrained Baseline matches what NVENC emits; the
     // in-band SPS is what the decoder actually keys off of once configured.
@@ -2084,14 +2103,17 @@ export class CloudConn {
       }
       this.wcDecoder = null;
       this.wcNative = true;
+      this.wcNativeReady = false;
       this.wcAwaitKey = true;
       this.wcNativeFrames = 0;
+      this.wcNativePollAt = 0;
+      this.wcNativeFps = 0;
       this.wcNativeStallAt = 0;
       this.wcStartNativePoll();
       void (async () => {
         const p = await probeNativeDecoder();
+        if (generation !== this.wcBuildGeneration || this.closed) return;
         if (!p.available) {
-          this.wcNative = false;
           this.wcStopNativePoll();
           // Surface the bridge's own reason so "MediaCodec unavailable" stops
           // being a mystery — `detail` carries the FULL diagnostic (which decoder
@@ -2102,9 +2124,9 @@ export class CloudConn {
           return;
         }
         const initErr = await initNativeDecoder(w, h);
+        if (generation !== this.wcBuildGeneration || this.closed) return;
         if (initErr) {
           console.warn("[remote] native MediaCodec init failed — WebCodecs fallback:", initErr);
-          this.wcNative = false;
           this.wcStopNativePoll();
           // Lead with the real init error (Rust now attaches the Java throwable
           // + stack); the probe detail is secondary context.
@@ -2117,6 +2139,7 @@ export class CloudConn {
         // A follow-up reset stop+start'd a second session (journal: double
         // "MediaCodec started"), wiped the pre-Surface keyframe backlog, and
         // left the media-overlay Surface black until the next IDR / stall fallback.
+        this.wcNativeReady = true;
         if (this.wcActive) this.emitEvent({ event: "wc", active: true, native: true });
         this.emitEvent({ event: "decoder", state: "native", name: p.name || "hw" });
         console.info(`[remote] DIRECT via native MediaCodec (${p.name || "hw"})`);
@@ -2130,6 +2153,9 @@ export class CloudConn {
 
   /** WebCodecs path — used on discovery web / Quest and as Android fallback. */
   private wcBuildWebCodecsDecoder(): boolean {
+    this.wcBuildGeneration++;
+    this.wcMeta.clear();
+    this.wcFlushPaceQueue(false);
     // Leaving the native path: the MediaCodec SurfaceView sits ON TOP of the
     // WebView, so merely flipping `wcNative` left the Surface visible and
     // covering the canvas we're about to paint into — the picture stayed frozen
@@ -2154,14 +2180,20 @@ export class CloudConn {
       /* ignore */
     }
     const dec = new VideoDecoder({
-      output: (frame) => this.onWcFrameOut(frame),
+      output: (frame) => {
+        if (this.wcDecoder !== dec || this.closed || this.powerIdle) frame.close();
+        else this.onWcFrameOut(frame);
+      },
       error: (e) => {
+        if (this.wcDecoder !== dec) return;
         console.warn("[remote] wc decoder error:", e);
         this.wcErrors++;
         const now = Date.now();
         this.wcErrorTimes.push(now);
         while (this.wcErrorTimes.length && now - this.wcErrorTimes[0] > 20000) this.wcErrorTimes.shift();
         if (this.wcDecoder === dec) this.wcDecoder = null;
+        this.wcMeta.clear();
+        this.wcFlushPaceQueue(false);
         try {
           dec.close();
         } catch {
@@ -2253,28 +2285,32 @@ export class CloudConn {
 
   /** Pull decode-ms / frame count from Kotlin (Surface path has no VideoFrame). */
   private async wcPollNativeStats() {
-    if (!this.wcNative || !this.wcActive) return;
-    const st = await getNativeDecoderStats();
-    if (!st) return;
-    // Watchdog: MediaCodec accepting AUs but producing no picture → black
-    // media-overlay Surface. JS `wcFrames` also counts feeds Java dropped while
-    // awaitKey (deltas before the first IDR), so give a longer budget until CSD
-    // is queued; once CSD is in, 3s with frames=0 is a real hang.
-    if (this.wcFrames > 0 && st.frames === 0 && st.active !== false) {
+    if (!this.wcNative || !this.wcActive || this.wcNativePollBusy) return;
+    const generation = this.wcBuildGeneration;
+    this.wcNativePollBusy = true;
+    let st;
+    try { st = await getNativeDecoderStats(); }
+    finally { this.wcNativePollBusy = false; }
+    if (!st || generation !== this.wcBuildGeneration || !this.wcNative) return;
+    this.wcNativeQueue = st.queue;
+    if (st.awaitKey) this.wcRequestKeyframe();
+    // Detect initial AND mid-session stalls, but never penalize a static
+    // desktop that isn't sending new pictures. Startup gets more time for CSD.
+    if (this.wcFrames > 0 && st.frames === this.wcNativeFrames && Date.now() - this.wcLastFrameAt < 1500) {
       const now = Date.now();
       const budgetMs = st.csdQueued ? 3000 : 8000;
       if (this.wcNativeStallAt === 0) this.wcNativeStallAt = now;
       else if (now - this.wcNativeStallAt > budgetMs) {
         this.wcNativeStallAt = 0;
-        console.warn("[remote] native decoder produced no frames — falling back to WebCodecs");
-        hitchNote("native-stall", "MediaCodec produced 0 frames — falling back to WebCodecs", {
+        console.warn("[remote] native decoder stopped producing frames — falling back to WebCodecs");
+        hitchNote("native-stall", "MediaCodec stopped producing frames — falling back to WebCodecs", {
           fed: this.wcFrames,
           csdQueued: st.csdQueued ? 1 : 0,
           awaitKey: st.awaitKey ? 1 : 0,
         });
         void this.emitDecoderFallback(
           "Phone decoder produced no picture — using WebCodecs",
-          `MediaCodec accepted ${this.wcFrames} frame(s) but decoded 0 in ${Math.round(budgetMs / 1000)}s.` +
+          `MediaCodec was fed ${this.wcFrames} frame(s) but output stayed at ${st.frames} for ${Math.round(budgetMs / 1000)}s.` +
             (st.error ? `\ncodec error: ${st.error}` : "") +
             `\ncodec active=${st.active} surfaceReady=${st.surfaceReady ?? "?"} ` +
             `csdQueued=${st.csdQueued ?? "?"} awaitKey=${st.awaitKey ?? "?"} ` +
@@ -2287,23 +2323,28 @@ export class CloudConn {
         this.wcRequestKeyframe();
         return;
       }
-    } else if (st.frames > 0) {
+    } else {
       this.wcNativeStallAt = 0;
     }
     if (st.decodeMs > 0) {
       this.wcDecMs = this.wcDecMs === 0 ? st.decodeMs : this.wcDecMs * 0.7 + st.decodeMs * 0.3;
     }
+    const pollAt = performance.now();
+    if (this.wcNativePollAt > 0) {
+      // A 250ms poll normally covers 15 frames at 60fps. Capping its delta at
+      // eight falsely reported a healthy native decoder as at most 32fps.
+      this.wcNativeFps = Math.max(0, st.frames - this.wcNativeFrames) * 1000 /
+        Math.max(1, pollAt - this.wcNativePollAt);
+    }
+    this.wcNativePollAt = pollAt;
     if (st.frames > this.wcNativeFrames) {
-      const delta = Math.min(8, st.frames - this.wcNativeFrames);
       this.wcNativeFrames = st.frames;
-      const perfNow = performance.now();
-      for (let i = 0; i < delta; i++) this.wcTimes.push(perfNow);
-      while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
       // Approximate e2e = net+enc (at arrival) + native decode — jump-clamped.
       if (this.wcNetMs > 0 && this.wcDecMs > 0) {
         this.wcE2eMs = this.smoothLatency(this.wcE2eMs, this.wcNetMs + this.wcDecMs);
       }
     }
+    this.wcNativeFrames = st.frames;
     // Only surface a decoder error when the codec is NOT producing frames. The
     // Java bridge's `lastError` is sticky across the progressive-configure
     // ladder: attempt 0 may log a configure failure that attempt 1 recovered
@@ -2353,38 +2394,12 @@ export class CloudConn {
       return;
     }
     if (!(data instanceof ArrayBuffer)) return;
-    // Header: 'G' 'V' flags 0 | seq u32 | tsMs f64 | len u32 (little-endian).
-    if (!this.wcHead) {
-      if (data.byteLength !== 20) return; // desync — wait for the next header
-      const dv = new DataView(data);
-      if (dv.getUint8(0) !== 0x47 || dv.getUint8(1) !== 0x56) return;
-      const len = dv.getUint32(16, true);
-      if (len === 0 || len > 16_000_000) return;
-      this.wcHead = {
-        key: (dv.getUint8(2) & 1) === 1,
-        seq: dv.getUint32(4, true),
-        tsMs: dv.getFloat64(8, true),
-        len,
-      };
-      this.wcBuf = new Uint8Array(len);
-      this.wcGot = 0;
-      return;
-    }
-    // Payload fragment (ordered reliable channel → simple append).
-    const head = this.wcHead;
-    const buf = this.wcBuf!;
-    const chunk = new Uint8Array(data);
-    const room = head.len - this.wcGot;
-    buf.set(chunk.subarray(0, Math.min(chunk.length, room)), this.wcGot);
-    this.wcGot += chunk.length;
-    if (this.wcGot < head.len) return;
-    this.wcHead = null;
-    this.wcBuf = null;
-    this.wcFeedFrame(head, buf);
+    const frame = this.wcAssembler.push(data);
+    if (frame) this.wcFeedFrame(frame.head, frame.bytes);
   }
 
   /** A complete encoded frame arrived — account for it and hand it to the decoder. */
-  private wcFeedFrame(head: { key: boolean; seq: number; tsMs: number; len: number }, bytes: Uint8Array) {
+  private wcFeedFrame(head: VideoHeader, bytes: Uint8Array<ArrayBuffer>) {
     const now = Date.now();
     if (!this.wcActive) {
       this.wcActive = true;
@@ -2400,7 +2415,7 @@ export class CloudConn {
     this.hitchLastFramePerf = perfNow;
     // Backgrounded (NOT PiP — a PiP window counts as visible): skip decoding to
     // save battery; resync off a fresh keyframe when the app comes back.
-    if (document.hidden && !(window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__ && !head.key) {
+    if (this.powerIdle || (document.hidden && !(window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__)) {
       this.wcAwaitKey = true;
       return;
     }
@@ -2416,7 +2431,7 @@ export class CloudConn {
 
     // ---- native MediaCodec path (APK) ----------------------------------------
     if (this.wcNative) {
-      if (!nativeFeedReady()) {
+      if (!this.wcNativeReady || !nativeFeedReady()) {
         // Bridge still attaching — hold for a keyframe once JS interface is up.
         if (head.key) this.wcAwaitKey = true;
         this.wcRequestKeyframe();
@@ -2455,20 +2470,33 @@ export class CloudConn {
       this.wcRequestKeyframe();
       return;
     }
+    const oldest = this.wcMeta.values().next().value;
+    if (decodeOverloaded(this.wcDecoder!.decodeQueueSize, this.wcMeta.size,
+      oldest ? perfNow - oldest.submittedAt : 0)) {
+      // Dropping one P-frame then submitting its dependants corrupts H.264.
+      // Abandon the old decoder/outputs and restart only from an IDR. A keyframe
+      // already in hand can recover immediately without another network roundtrip.
+      if (!this.wcBuildWebCodecsDecoder()) return;
+      if (!head.key) {
+        this.wcRequestKeyframe();
+        return;
+      }
+    }
     if (head.key) this.wcAwaitKey = false;
     const tsUs = Math.round(head.tsMs * 1000);
-    this.wcMeta.set(tsUs, { arrivedAt: now, tsMs: head.tsMs, bytes: head.len });
-    if (this.wcMeta.size > 120) {
-      const first = this.wcMeta.keys().next().value;
-      if (first !== undefined) this.wcMeta.delete(first);
-    }
+    this.wcMeta.set(tsUs, { arrivedAt: now, submittedAt: perfNow, tsMs: head.tsMs, bytes: head.len });
     try {
-      this.wcDecoder!.decode(
-        new EncodedVideoChunk({ type: head.key ? "key" : "delta", timestamp: tsUs, data: bytes }),
-      );
+      // These bytes belong exclusively to this AU. Chrome 120+ can adopt their
+      // buffer; older WebCodecs implementations ignore the optional dictionary
+      // member and keep the ordinary copy. No pixel readback/conversion needed.
+      const chunk: EncodedVideoChunkInit & { transfer: ArrayBuffer[] } = {
+        type: head.key ? "key" : "delta", timestamp: tsUs, data: bytes, transfer: [bytes.buffer],
+      };
+      this.wcDecoder!.decode(new EncodedVideoChunk(chunk));
       this.wcFrames++;
     } catch (e) {
       console.warn("[remote] wc decode submit failed:", e);
+      this.wcMeta.delete(tsUs);
       this.wcAwaitKey = true;
       this.wcRequestKeyframe();
     }
@@ -2481,7 +2509,7 @@ export class CloudConn {
     let capturedAtGuest = 0;
     if (meta) {
       this.wcMeta.delete(frame.timestamp);
-      const dec = now - meta.arrivedAt;
+      const dec = performance.now() - meta.submittedAt;
       this.wcDecMs = this.wcDecMs === 0 ? dec : this.wcDecMs * 0.85 + dec * 0.15;
       const clk = this.bestClock();
       if (clk) {
@@ -2503,9 +2531,10 @@ export class CloudConn {
     const perfNow = performance.now();
     this.wcTimes.push(perfNow);
     while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
-    // Responsiveness (pace 0): paint the instant it decodes — the shipped path.
+    // A codec may emit multiple pictures in one output task after a burst.
+    // A microtask paints only the newest, without waiting an extra rAF/vsync.
     if (this.wcPaceMs <= 0 || !capturedAtGuest) {
-      this.wcDeliver(frame);
+      this.wcDeliverSoon(frame);
       return;
     }
     // Smoothness: rebuild the HOST's capture cadence on the guest. Every frame is
@@ -2517,6 +2546,7 @@ export class CloudConn {
     const wait = showAt - now;
     if (wait <= 1 || wait > WC_PACE_MAX_WAIT_MS) {
       // Already late, or the estimate drifted absurdly far — show it now.
+      this.wcFlushPaceQueue(false);
       this.wcDeliver(frame);
       return;
     }
@@ -2528,6 +2558,20 @@ export class CloudConn {
       return;
     }
     this.wcPlayDrain();
+  }
+
+  /** Hand a frame to the render sink (sink owns it and must close() it). */
+  private wcDeliverSoon(frame: VideoFrame) {
+    this.wcImmediateFrame?.close();
+    this.wcImmediateFrame = frame;
+    if (this.wcImmediateScheduled) return;
+    this.wcImmediateScheduled = true;
+    queueMicrotask(() => {
+      this.wcImmediateScheduled = false;
+      const latest = this.wcImmediateFrame;
+      this.wcImmediateFrame = null;
+      if (latest) this.wcDeliver(latest);
+    });
   }
 
   /** Hand a frame to the render sink (sink owns it and must close() it). */
@@ -2550,21 +2594,32 @@ export class CloudConn {
       this.wcPlayTimer = null;
     }
     const now = Date.now();
+    let newest: VideoFrame | null = null;
     while (this.wcPlayQ.length && this.wcPlayQ[0].showAt <= now) {
-      this.wcDeliver(this.wcPlayQ.shift()!.frame);
+      newest?.close();
+      newest = this.wcPlayQ.shift()!.frame;
     }
+    if (newest) this.wcDeliver(newest);
     if (this.wcPlayQ.length) {
       this.wcPlayTimer = window.setTimeout(this.wcPlayDrain, Math.max(1, this.wcPlayQ[0].showAt - Date.now()));
     }
   };
 
-  /** Paint everything queued right now (pace off / teardown / backlog). */
-  private wcFlushPaceQueue() {
+  /** Only the latest decoded picture can be displayed now. Retire the rest
+   * without wasting GPU draws; teardown must not paint stale pictures at all. */
+  private wcFlushPaceQueue(present = true) {
+    if (!present) {
+      this.wcImmediateFrame?.close();
+      this.wcImmediateFrame = null;
+    }
     if (this.wcPlayTimer !== null) {
       window.clearTimeout(this.wcPlayTimer);
       this.wcPlayTimer = null;
     }
-    while (this.wcPlayQ.length) this.wcDeliver(this.wcPlayQ.shift()!.frame);
+    const newest = present ? this.wcPlayQ.pop()?.frame : undefined;
+    for (const item of this.wcPlayQ) item.frame.close();
+    this.wcPlayQ.length = 0;
+    if (newest) this.wcDeliver(newest);
   }
 
   /** Best (lowest-RTT) clock-offset sample from the recent heartbeat window. */
@@ -2640,8 +2695,8 @@ export class CloudConn {
         recvKbps: Math.round((winBytes * 8) / 1000),
         owdMs: Math.round(this.wcNetMs),
         owdMinMs: Math.round(this.owdMin),
-        fps: this.wcTimes.length,
-        queue: this.wcNative ? 0 : (this.wcDecoder?.decodeQueueSize ?? 0),
+        fps: this.wcNative ? this.wcNativeFps : this.wcTimes.length,
+        queue: this.wcNative ? this.wcNativeQueue : this.wcMeta.size,
       });
     }, 250);
   }
@@ -2673,7 +2728,7 @@ export class CloudConn {
     const clk = this.bestClock();
     return {
       active: true,
-      fps: this.wcTimes.length,
+      fps: this.wcNative ? (performance.now() - this.wcNativePollAt < 1500 ? Math.round(this.wcNativeFps) : 0) : this.wcTimes.length,
       kbps: Math.round((winBytes * 8) / 1000),
       frames: this.wcFrames,
       keyFrames: this.wcKeys,
@@ -2682,7 +2737,7 @@ export class CloudConn {
       decodeMs: Math.round(this.wcDecMs * 10) / 10,
       e2eMs: Math.round(this.wcE2eMs),
       netMs: Math.round(this.wcNetMs),
-      queue: this.wcNative ? 0 : (this.wcDecoder?.decodeQueueSize ?? 0),
+      queue: this.wcNative ? this.wcNativeQueue : this.wcMeta.size,
       codec: this.wcCodec,
       clockRttMs: clk ? Math.round(clk.rtt) : 0,
       native: this.wcNative,

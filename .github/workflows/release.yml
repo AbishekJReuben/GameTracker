@@ -96,6 +96,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Check phone decoder recovery and queue bounds
+        run: |
+          npx vitest run src/companion/videoReceive.test.ts src/companion/cloud.decoder.test.ts src/companion/nativeDecoder.test.ts
+          node scripts/test-decoder.mjs
+
       - name: Build web bundle
         run: npm run build
 

@@ -442,6 +442,11 @@ const save = (path, before, after, msg) => {
       `$&    implementation("com.squareup.okhttp3:okhttp:4.12.0")${eol}`,
     );
   }
+  // Binary MediaCodec feeds need AndroidX WebKit's ArrayBuffer message API.
+  // Current Tauri scaffolds this dependency; retain that version when present.
+  if (!g.includes("androidx.webkit:webkit")) {
+    g = g.replace(/dependencies\s*\{\r?\n/, `$&    implementation("androidx.webkit:webkit:1.14.0")${eol}`);
+  }
   // Optional privileged network toggle. Shizuku is not bundled as an app; the
   // dependency only lets GameTracker talk to a separately installed Shizuku
   // service when the user explicitly authorizes it.
@@ -745,6 +750,19 @@ const save = (path, before, after, msg) => {
       save(bridgePath, before, content, "updated WcDecoderBridge.java");
     }
   }
+}
+
+// Queue policy ships beside the bridge and also runs in standalone JVM tests.
+{
+  const conf = JSON.parse(readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"));
+  const pkg = String(conf.identifier || "");
+  if (!pkg) throw new Error("No Android package for DecoderInbox");
+  const path = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), "DecoderInbox.java");
+  const content = readFileSync(join(root, "scripts", "android-templates", "DecoderInbox.java"), "utf8")
+    .replace(/__PACKAGE__/g, pkg);
+  mkdirSync(dirname(path), { recursive: true });
+  const before = existsSync(path) ? readFileSync(path, "utf8") : "";
+  save(path, before, content, "updated DecoderInbox.java");
 }
 
 // --- 4c: proguard-gametracker.pro — keep JNI-facing symbols -----------------

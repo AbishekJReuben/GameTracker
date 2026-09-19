@@ -9,6 +9,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Base64;
 import android.util.Log;
@@ -23,9 +24,14 @@ import android.webkit.WebView;
 import android.widget.FrameLayout;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.HashSet;
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
+import androidx.webkit.WebMessageCompat;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -53,7 +59,8 @@ import java.util.concurrent.atomic.AtomicReference;
  *  - chiaki-ng video-decoder.c (AMediaCodec → Surface)
  *  - ALVR push_nal / deskstream VideoDecoder.kt (async callback, Annex-B AUs)
  *
- * Hot path: {@link JsApi#feed} via JavascriptInterface (base64 Annex-B).
+ * Hot path: ArrayBuffer WebMessage to a bounded inbox on current WebViews;
+ * {@link JsApi#feed} (base64 Annex-B) remains the compatibility path.
  * Lifecycle: static methods called from Rust over JNI.
  *
  * Compositing: {@link TextureView} under a transparent WebView (NOT
@@ -90,12 +97,16 @@ public final class WcDecoderBridge {
   private static final AtomicInteger initGen = new AtomicInteger(0);
   /** Prevents overlapping startCodec from surface-available + init races. */
   private static final AtomicBoolean starting = new AtomicBoolean(false);
-  private static MediaCodec codec;
+  private static volatile MediaCodec codec;
   private static HandlerThread codecThread;
   private static Handler codecHandler;
   private static final ConcurrentLinkedQueue<Integer> freeInputs = new ConcurrentLinkedQueue<>();
   private static final ConcurrentHashMap<Long, Long> pendingMeta = new ConcurrentHashMap<>();
-  private static final ConcurrentLinkedQueue<PendingFrame> backlog = new ConcurrentLinkedQueue<>();
+  private static final DecoderInbox backlog = new DecoderInbox();
+  private static final AtomicBoolean drainPosted = new AtomicBoolean(false);
+  private static final int MAX_CODEC_INPUTS = 6;
+  private static volatile int configuredWidth, configuredHeight;
+  private static int codecGeneration;
   private static final AtomicBoolean started = new AtomicBoolean(false);
   private static final AtomicBoolean surfaceReady = new AtomicBoolean(false);
   /**
@@ -126,6 +137,9 @@ public final class WcDecoderBridge {
   private static final AtomicBoolean lowLatency = new AtomicBoolean(false);
   private static volatile double decodeMsEwma = 0.0;
   private static volatile boolean webViewHooked = false;
+  private static WeakReference<WebView> hookedWebView;
+  private static volatile boolean binaryDisabled = false;
+  private static volatile long feedSession = 0;
   /**
    * Async codec errors survived this session. A {@link MediaCodec.CodecException}
    * kills the codec instance (it is typically already Released by the time
@@ -205,20 +219,6 @@ public final class WcDecoderBridge {
     journal.offer("+" + (t / 1000) + "." + String.format("%03d", t % 1000) + "s " + msg);
     while (journal.size() > JOURNAL_MAX) journal.poll();
     Log.i(TAG, msg);
-  }
-
-  private static final class PendingFrame {
-    final long tsUs;
-    final boolean key;
-    final byte[] data;
-    final long arrivedAt;
-
-    PendingFrame(long tsUs, boolean key, byte[] data, long arrivedAt) {
-      this.tsUs = tsUs;
-      this.key = key;
-      this.data = data;
-      this.arrivedAt = arrivedAt;
-    }
   }
 
   /**
@@ -430,11 +430,42 @@ public final class WcDecoderBridge {
    * URL. Idempotent.
    */
   public static void installJsInterface(WebView web) {
-    if (web == null || webViewHooked) return;
+    if (web == null || (hookedWebView != null && hookedWebView.get() == web)) return;
     try {
       web.addJavascriptInterface(new JsApi(), "__GT_DECODER__");
       webViewHooked = true;
+      hookedWebView = new WeakReference<>(web);
+      binaryDisabled = false;
       Log.i(TAG, "JavascriptInterface __GT_DECODER__ installed (pre-load)");
+      if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER) &&
+          WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_ARRAY_BUFFER)) {
+        // No wildcard origin: only the packaged Tauri app (dev keeps the legacy
+        // bridge). The listener runs on UI: only validate/enqueue here. Codec
+        // calls, CSD work and buffer writes run on the decoder HandlerThread.
+        HashSet<String> origins = new HashSet<>(Arrays.asList(
+            "http://tauri.localhost", "https://tauri.localhost"));
+        WebViewCompat.addWebMessageListener(web, "__GT_DECODER_BINARY__", origins,
+            (view, message, origin, mainFrame, reply) -> {
+              if (!mainFrame || message.getType() != WebMessageCompat.TYPE_ARRAY_BUFFER) return;
+              byte[] packet = message.getArrayBuffer();
+              boolean accepted = false;
+              long session = -1;
+              if (!binaryDisabled && packet != null && packet.length > 20 && packet.length <= DecoderInbox.MAX_BYTES + 20) {
+                ByteBuffer header = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN);
+                session = header.getInt(16) & 0xffffffffL;
+                double ts = header.getDouble(4);
+                if (packet[0] == 0x47 && packet[1] == 0x44 && packet[2] == 2 && session == feedSession &&
+                    header.getInt(12) == packet.length - 20 &&
+                    !Double.isNaN(ts) && !Double.isInfinite(ts) && ts >= 0 && ts <= Long.MAX_VALUE) {
+                  accepted = submit(Math.round(ts), (packet[3] & 1) != 0, packet, 20, packet.length - 20, session);
+                }
+              }
+              // A credit bounds WebView IPC itself; JS allows only four sends
+              // awaiting this reply. No decoded pixels ever cross the bridge.
+              reply.postMessage(session + (accepted ? ":ok" : ":key"));
+            });
+        jlog("binary decoder bridge installed");
+      }
     } catch (Exception e) {
       Log.w(TAG, "addJavascriptInterface failed", e);
     }
@@ -549,11 +580,12 @@ public final class WcDecoderBridge {
     // init used to flip awaitKey/csdQueued back to "need keyframe" WHILE the codec
     // was already running — every in-flight AU was then dropped or mis-fed, and
     // the TextureView stayed black with no error anywhere.
-    if (wanted.get() && started.get() && width.get() == w && height.get() == h) {
+    if (wanted.get() && started.get() && configuredWidth == w && configuredHeight == h) {
       jlog("init " + w + "x" + h + " — already running, skip");
       return;
     }
     final int gen = initGen.incrementAndGet();
+    backlog.clear();
     width.set(w);
     height.set(h);
     lastError.set("");
@@ -582,13 +614,13 @@ public final class WcDecoderBridge {
     act.runOnUiThread(
         () -> {
           // A newer init superseded us while we waited for the looper.
-          if (gen != initGen.get()) {
+          if (gen != initGen.get() || !wanted.get()) {
             jlog("init " + w + "x" + h + " — superseded by newer init, skip");
             return;
           }
           // UI-thread re-check: concurrent inits can both pass the outer guard
           // before either sets started — without this we triple-start the codec.
-          if (started.get() && width.get() == w && height.get() == h && surfaceReady.get()) {
+          if (started.get() && configuredWidth == w && configuredHeight == h && surfaceReady.get()) {
             jlog("init " + w + "x" + h + " — already running on UI thread, skip");
             return;
           }
@@ -763,12 +795,6 @@ public final class WcDecoderBridge {
   }
 
   public static void reset() {
-    awaitKey.set(true);
-    csdQueued.set(false);
-    pendingMeta.clear();
-    backlog.clear();
-    queueDepth.set(0);
-    freeInputs.clear();
     // Full stop+restart beats flush alone after a session gap (MediaCodec docs:
     // flush does not handle discontinuities; first input after restart must be
     // a keyframe — we gate that with awaitKey).
@@ -847,6 +873,7 @@ public final class WcDecoderBridge {
     // Clear the latch first, for the same reason init() sets it first: any
     // setBounds racing us must not re-show a view whose codec we just stopped.
     wanted.set(false);
+    initGen.incrementAndGet();
     jlog("teardown");
     // Stop trying to conjure a Surface for a decoder the JS side has torn down.
     cancelSurfaceWatchdog();
@@ -888,7 +915,7 @@ public final class WcDecoderBridge {
 
   /** True while the bridge is still waiting for an IDR (or CSD) before accepting deltas. */
   public static boolean statsAwaitKey() {
-    return awaitKey.get();
+    return awaitKey.get() || backlog.needsKey();
   }
 
   /** True once SPS/PPS were accepted as BUFFER_FLAG_CODEC_CONFIG for this codec session. */
@@ -1086,15 +1113,32 @@ public final class WcDecoderBridge {
   /** JavascriptInterface — installed as {@code window.__GT_DECODER__}. */
   public static final class JsApi {
     @JavascriptInterface
+    public void beginFeed(double session) {
+      synchronized (backlog) {
+        feedSession = Math.round(session);
+        backlog.clear();
+      }
+    }
+
+    @JavascriptInterface
+    public void disableBinary() {
+      synchronized (backlog) {
+        binaryDisabled = true;
+        feedSession = (feedSession + 1) & 0xffffffffL;
+        backlog.clear();
+      }
+    }
+
+    @JavascriptInterface
     public void feed(double tsUs, boolean key, String b64) {
-      if (b64 == null || b64.isEmpty()) return;
+      if (!wanted.get() || b64 == null || b64.isEmpty() || b64.length() > 21_333_336) return;
       byte[] data;
       try {
         data = Base64.decode(b64, Base64.DEFAULT);
       } catch (Exception e) {
         return;
       }
-      submit(Math.round(tsUs), key, data);
+      submit(Math.round(tsUs), key, data, 0, data.length, feedSession);
     }
 
     @JavascriptInterface
@@ -1103,114 +1147,97 @@ public final class WcDecoderBridge {
     }
   }
 
-  private static void submit(long tsUs, boolean key, byte[] data) {
-    if (!started.get() && surfaceReady.get() && width.get() > 0) {
-      Activity act = activity();
-      if (act != null) {
-        act.runOnUiThread(WcDecoderBridge::startCodecLocked);
-      }
+  private static synchronized Handler decoderHandler() {
+    if (codecThread == null) {
+      codecThread = new HandlerThread("gt-wc-decoder", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+      codecThread.start();
+      codecHandler = new Handler(codecThread.getLooper());
     }
-    if (awaitKey.get() && !key) return;
+    return codecHandler;
+  }
+
+  private static void onCodecThread(Runnable work) {
+    Handler handler = decoderHandler();
+    if (Looper.myLooper() == handler.getLooper()) work.run();
+    else handler.post(work);
+  }
+
+  private static boolean submit(long tsUs, boolean key, byte[] data, int offset, int length, long session) {
+    if (!wanted.get()) return false;
     long arrived = SystemClock.elapsedRealtime();
-    if (!started.get() || codec == null) {
-      // Codec still coming up — keep a tiny backlog of keyframes only.
-      if (key) {
-        backlog.clear();
-        backlog.offer(new PendingFrame(tsUs, true, data, arrived));
-      }
-      return;
+    boolean accepted;
+    synchronized (backlog) {
+      if (session != feedSession) return false;
+      accepted = backlog.offer(new DecoderInbox.Frame(tsUs, key, data, offset, length, arrived), arrived);
     }
-    // Extract SPS/PPS from the first keyframe and feed them as CSD before the
-    // slice. Most Android HW decoders REQUIRE this (Moonlight/ALVR/Chiaki).
-    // CRITICAL: after queuing CSD, strip SPS/PPS from the AU before queueInput —
-    // feeding parameter sets twice (CSD + inline) makes c2.qti stall with
-    // frames=0 / no error, which is exactly the black punched Surface.
-    boolean needsCsd = key && !csdQueued.get();
-    byte[] slice = data;
-    if (needsCsd) {
-      byte[] csd = extractCsd(data);
-      if (csd == null) {
-        jlog("submit: key without SPS/PPS — holding (await next IDR with param sets)");
-        backlog.clear();
-        backlog.offer(new PendingFrame(tsUs, true, data, arrived));
-        return;
-      }
-      Integer csdIdx = freeInputs.poll();
-      if (csdIdx == null) {
-        backlog.clear();
-        backlog.offer(new PendingFrame(tsUs, true, data, arrived));
-        return;
-      }
-      if (!queueCsd(csdIdx, csd)) {
-        // Start-code CSD rejected — try stripped (some OEM drivers want raw RBSP).
-        byte[] stripped = extractCsdRaw(data);
-        Integer retry = freeInputs.poll();
-        if (stripped == null || retry == null || !queueCsd(retry, stripped)) {
-          jlog("submit: CSD queue failed — holding keyframe");
+    if (!accepted) return false;
+    // One pending drain, irrespective of packet bursts. Never one Handler task
+    // per frame: that would merely move the unbounded queue into the Looper.
+    if (drainPosted.compareAndSet(false, true)) {
+      decoderHandler().post(() -> {
+        drainPosted.set(false);
+        if (!started.get() && wanted.get() && surfaceReady.get()) startCodecOnThread();
+        drainBacklog();
+      });
+    }
+    return true;
+  }
+
+  /** Runs only on the codec looper, including callbacks. New arrivals always
+   * join the FIFO; they must not jump ahead of a waiting P-frame or IDR. */
+  private static void drainBacklog() {
+    if (!started.get() || codec == null || !wanted.get() || codecGeneration != initGen.get()) return;
+    while (queueDepth.get() < MAX_CODEC_INPUTS) {
+      // Serialize the short queueInput operation with inbox overflow/reset so a
+      // frame prepared before a producer reset cannot consume its successor.
+      synchronized (backlog) {
+        DecoderInbox.Frame pf = backlog.peek(SystemClock.elapsedRealtime());
+        if (pf == null || freeInputs.isEmpty()) return;
+        byte[] slice = pf.data;
+        int offset = pf.offset;
+        int length = pf.length;
+        if (pf.key) {
+          // Delta frames go straight from the binary message into the codec
+          // ByteBuffer. Only IDRs need a scan/copy to remove repeated SPS/PPS.
+          byte[] annexB = offset == 0 && length == slice.length
+              ? slice : Arrays.copyOfRange(slice, offset, offset + length);
+          if (!csdQueued.get()) {
+            byte[] csd = extractCsd(annexB);
+            if (csd == null) {
+              backlog.clear();
+              awaitKey.set(true);
+              return;
+            }
+            Integer csdIdx = freeInputs.poll();
+            if (csdIdx == null) return;
+            if (!queueCsd(csdIdx, csd)) {
+              byte[] raw = extractCsdRaw(annexB);
+              Integer retry = freeInputs.poll();
+              if (raw == null || retry == null || !queueCsd(retry, raw)) {
+                backlog.clear();
+                awaitKey.set(true);
+                return;
+              }
+            }
+          }
+          slice = stripParameterSets(annexB);
+          if (slice == null || slice.length < 4) {
+            backlog.clear();
+            awaitKey.set(true);
+            return;
+          }
+          offset = 0;
+          length = slice.length;
+        }
+        Integer idx = freeInputs.poll();
+        if (idx == null) return;
+        backlog.remove(pf);
+        if (!queueInput(idx, pf.tsUs, pf.key, slice, offset, length, pf.arrivedAt)) {
           backlog.clear();
-          backlog.offer(new PendingFrame(tsUs, true, data, arrived));
+          awaitKey.set(true);
           return;
         }
       }
-      slice = stripParameterSets(data);
-      if (slice == null || slice.length < 4) {
-        jlog("submit: strip left no VCL NAL — dropping");
-        return;
-      }
-    } else if (key && csdQueued.get()) {
-      // Later IDRs still carry SPS/PPS (NVENC repeatSPSPPS). Feeding them again
-      // after CSD stalls c2.qti with frames=0 — always strip.
-      byte[] stripped = stripParameterSets(data);
-      if (stripped != null && stripped.length >= 4) slice = stripped;
-    }
-    Integer idx = freeInputs.poll();
-    if (idx == null) {
-      if (backlog.size() >= 2) backlog.poll();
-      // Prefer the (possibly stripped) slice so drainBacklog doesn't re-inject
-      // parameter sets after CSD was already queued on this attempt.
-      backlog.offer(new PendingFrame(tsUs, key, slice, arrived));
-      return;
-    }
-    queueInput(idx, tsUs, key, slice, arrived);
-    drainBacklog();
-  }
-
-  private static void drainBacklog() {
-    while (true) {
-      PendingFrame pf = backlog.peek();
-      if (pf == null) return;
-      byte[] slice = pf.data;
-      if (pf.key && !csdQueued.get()) {
-        byte[] csd = extractCsd(pf.data);
-        if (csd == null) {
-          jlog("drainBacklog: keyframe without SPS/PPS — drop and wait");
-          backlog.poll();
-          continue;
-        }
-        Integer csdIdx = freeInputs.poll();
-        if (csdIdx == null) return;
-        if (!queueCsd(csdIdx, csd)) {
-          byte[] stripped = extractCsdRaw(pf.data);
-          Integer retry = freeInputs.poll();
-          if (stripped == null || retry == null || !queueCsd(retry, stripped)) {
-            jlog("drainBacklog: CSD queue failed");
-            return;
-          }
-        }
-        slice = stripParameterSets(pf.data);
-        if (slice == null || slice.length < 4) {
-          backlog.poll();
-          continue;
-        }
-      } else if (pf.key && csdQueued.get()) {
-        // CSD already live — still strip param sets from this IDR.
-        byte[] stripped = stripParameterSets(pf.data);
-        if (stripped != null && stripped.length >= 4) slice = stripped;
-      }
-      Integer idx = freeInputs.poll();
-      if (idx == null) return;
-      backlog.poll();
-      queueInput(idx, pf.tsUs, pf.key, slice, pf.arrivedAt);
     }
   }
 
@@ -1392,40 +1419,38 @@ public final class WcDecoderBridge {
     }
   }
 
-  private static void queueInput(int index, long tsUs, boolean key, byte[] data, long arrivedAt) {
+  private static boolean queueInput(int index, long tsUs, boolean key, byte[] data, int offset, int length, long arrivedAt) {
     MediaCodec c = codec;
     if (c == null) {
       freeInputs.offer(index);
-      return;
+      return false;
     }
     try {
       ByteBuffer buf = c.getInputBuffer(index);
       if (buf == null) {
         freeInputs.offer(index);
-        return;
+        return false;
       }
       buf.clear();
-      if (buf.remaining() < data.length) {
+      if (buf.remaining() < length) {
         freeInputs.offer(index);
         lastError.set("input too small");
-        return;
+        return false;
       }
-      buf.put(data);
+      buf.put(data, offset, length);
       pendingMeta.put(tsUs, arrivedAt);
-      if (pendingMeta.size() > 120) {
-        // Drop oldest — ConcurrentHashMap has no order; clear if bloated.
-        pendingMeta.clear();
-        pendingMeta.put(tsUs, arrivedAt);
-      }
       int flags = key ? MediaCodec.BUFFER_FLAG_SYNC_FRAME : 0;
-      c.queueInputBuffer(index, 0, data.length, tsUs, flags);
+      c.queueInputBuffer(index, 0, length, tsUs, flags);
       if (key) awaitKey.set(false);
       queueDepth.incrementAndGet();
+      return true;
     } catch (Exception e) {
       freeInputs.offer(index);
       lastError.set(String.valueOf(e.getMessage()));
+      pendingMeta.remove(tsUs);
       awaitKey.set(true);
       Log.w(TAG, "queueInput failed", e);
+      return false;
     }
   }
 
@@ -1494,16 +1519,15 @@ public final class WcDecoderBridge {
             Surface s = surface;
             surface = null;
             surfaceTexture = null;
-            if (s != null) {
-              try {
-                s.release();
-              } catch (Exception ignored) {
-              }
-            }
             jlog("surfaceTextureDestroyed");
-            stopCodecLocked();
-            // true → TextureView releases the SurfaceTexture.
-            return true;
+            // Own release until the decoder has stopped using this Surface.
+            // Waiting synchronously on MediaCodec here blocks Android's UI.
+            onCodecThread(() -> {
+              stopCodecOnThread();
+              if (s != null) s.release();
+              st.release();
+            });
+            return false;
           }
 
           @Override
@@ -1650,8 +1674,15 @@ public final class WcDecoderBridge {
     return null;
   }
 
-  private static synchronized void startCodecLocked() {
-    if (started.get()) return;
+  private static void startCodecLocked() {
+    onCodecThread(WcDecoderBridge::startCodecOnThread);
+  }
+
+  private static void startCodecOnThread() {
+    if (!wanted.get()) return;
+    final int generation = initGen.get();
+    if (started.get() && codecGeneration == generation) return;
+    if (started.get()) stopCodecOnThread();
     // Feed-driven retries (submit() kicks a start on every AU while down) must
     // not hammer a driver that just rejected the whole ladder — that storm is
     // the "configure/start attempt N failed" wall in the 3.9.x journals.
@@ -1669,12 +1700,6 @@ public final class WcDecoderBridge {
     }
     codecName.set(name);
     lowLatency.set(probeLowLatency());
-
-    if (codecThread == null) {
-      codecThread = new HandlerThread("gt-wc-decoder", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
-      codecThread.start();
-      codecHandler = new Handler(codecThread.getLooper());
-    }
 
     // Moonlight-style progressive configure: try the most aggressive low-latency
     // MediaFormat first, then peel keys off until configure() accepts one. A
@@ -1703,19 +1728,27 @@ public final class WcDecoderBridge {
         c.setCallback(callback, codecHandler);
         c.configure(fmt, s, null, 0);
         applyRuntimeLowLatency(c);
+        if (!wanted.get() || generation != initGen.get()) {
+          c.release();
+          return;
+        }
         freeInputs.clear();
         // Do NOT clear backlog here — keyframes often arrive while the Surface is
         // still coming up (submit() parks them). Wiping them left awaitKey=true
         // with no IDR until the next host keyframe (~GOP), during which the
         // media-overlay Surface stayed black and the JS stall watchdog fell back.
         pendingMeta.clear();
+        queueDepth.set(0);
         frames.set(0);
         decodeMsEwma = 0.0;
-        c.start();
         codec = c;
-        started.set(true);
         awaitKey.set(true);
         csdQueued.set(false);
+        configuredWidth = w;
+        configuredHeight = h;
+        codecGeneration = generation;
+        c.start();
+        started.set(true);
         // Successful start clears any prior error: the progressive ladder may
         // have logged a configure/start failure on an earlier attempt, and that
         // stale string would otherwise be reported forever by statsError() —
@@ -1736,6 +1769,8 @@ public final class WcDecoderBridge {
                 + i);
         return;
       } catch (Exception e) {
+        codec = null;
+        started.set(false);
         lastEx = e;
         jlog("configure/start attempt " + i + " failed: " + e.getMessage());
         if (c != null) {
@@ -1774,7 +1809,11 @@ public final class WcDecoderBridge {
     }
   }
 
-  private static synchronized void stopCodecLocked() {
+  private static void stopCodecLocked() {
+    onCodecThread(WcDecoderBridge::stopCodecOnThread);
+  }
+
+  private static void stopCodecOnThread() {
     started.set(false);
     MediaCodec c = codec;
     codec = null;
@@ -1782,6 +1821,7 @@ public final class WcDecoderBridge {
     backlog.clear();
     pendingMeta.clear();
     queueDepth.set(0);
+    awaitKey.set(true);
     csdQueued.set(false);
     if (c != null) {
       try {
@@ -1799,6 +1839,7 @@ public final class WcDecoderBridge {
       new MediaCodec.Callback() {
         @Override
         public void onInputBufferAvailable(MediaCodec codec, int index) {
+          if (codec != WcDecoderBridge.codec || !started.get()) return;
           freeInputs.offer(index);
           drainBacklog();
         }
@@ -1806,6 +1847,11 @@ public final class WcDecoderBridge {
         @Override
         public void onOutputBufferAvailable(
             MediaCodec codec, int index, MediaCodec.BufferInfo info) {
+          if (codec != WcDecoderBridge.codec || !started.get()) return;
+          if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+            try { codec.releaseOutputBuffer(index, false); } catch (Exception ignored) { }
+            return;
+          }
           long now = SystemClock.elapsedRealtime();
           Long arrived = pendingMeta.remove(info.presentationTimeUs);
           if (arrived != null) {
@@ -1816,8 +1862,9 @@ public final class WcDecoderBridge {
           queueDepth.updateAndGet(v -> Math.max(0, v - 1));
           try {
             // Render immediately to the Surface (Moonlight/deskstream path).
-            codec.releaseOutputBuffer(index, true);
-            frames.incrementAndGet();
+            boolean display = wanted.get() && codecGeneration == initGen.get();
+            codec.releaseOutputBuffer(index, display);
+            if (display) frames.incrementAndGet();
             // Codec is producing frames → any prior error is stale. Clear it so
             // statsError() stops reporting a configure-time failure that the
             // progressive ladder already recovered from. Also refund the
@@ -1829,10 +1876,12 @@ public final class WcDecoderBridge {
           } catch (Exception e) {
             lastError.set(String.valueOf(e.getMessage()));
           }
+          drainBacklog();
         }
 
         @Override
         public void onError(MediaCodec codec, MediaCodec.CodecException e) {
+          if (codec != WcDecoderBridge.codec) return;
           lastError.set(String.valueOf(e.getDiagnosticInfo()));
           awaitKey.set(true);
           csdQueued.set(false);
@@ -1843,22 +1892,18 @@ public final class WcDecoderBridge {
           started.set(false);
           fmtSkip.incrementAndGet();
           int n = errorRestarts.incrementAndGet();
-          Activity act = activity();
-          if (act == null) return;
           if (n > ERROR_RESTART_MAX) {
             jlog("codec error-restart budget exhausted (" + ERROR_RESTART_MAX + ") — stopping (JS watchdog will fall back)");
-            act.runOnUiThread(WcDecoderBridge::stopCodecLocked);
+            stopCodecOnThread();
             return;
           }
-          act.runOnUiThread(
-              () -> {
-                stopCodecLocked();
-                if (wanted.get() && surfaceReady.get() && width.get() > 0) startCodecLocked();
-              });
+          stopCodecOnThread();
+          if (wanted.get() && surfaceReady.get() && width.get() > 0) startCodecOnThread();
         }
 
         @Override
         public void onOutputFormatChanged(MediaCodec codec, MediaFormat format) {
+          if (codec != WcDecoderBridge.codec || !started.get()) return;
           try {
             // Prefer the crop rect: KEY_WIDTH/HEIGHT are the CODED size, which
             // includes alignment padding (1080p decodes as 1088 rows on many

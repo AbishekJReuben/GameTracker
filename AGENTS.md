@@ -1493,3 +1493,15 @@ frames when the screen actually changes, so a static desktop already encodes
 almost nothing. The stats intervals in `Control.tsx` (the `netStats()` getStats
 sweep and the fps sampler) skip their work while hidden.
 
+### Phone decoder efficiency and recovery (September 2026)
+
+See `docs/PHONE_DECODER_PERFORMANCE.md` for the receive/decoder ownership rules,
+current queue limits, sources, benchmark scope and non-visual checks. Native
+MediaCodec operations belong to one HandlerThread; UI code only owns view geometry
+and surface notifications. Binary WebView feeds use bounded credits with legacy
+Base64 fallback. `DecoderInbox.java` is a shipping template applied by the Android
+patcher and tested by `node scripts/test-decoder.mjs`. Compressed H.264 frames must
+stay FIFO: after any loss, gate until IDR. Only decoded pictures can be coalesced.
+WebCodecs pending-work limits include submitted inputs awaiting output, not just
+`decodeQueueSize`. Close superseded frames and ignore retired-decoder callbacks.
+

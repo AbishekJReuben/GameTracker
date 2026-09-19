@@ -2,14 +2,15 @@
  * Native MediaCodec decode bridge (Android APK companion only).
  *
  * Lifecycle / bounds / stats: Tauri `invoke` → Rust JNI → `WcDecoderBridge`.
- * Hot path: `window.__GT_DECODER__.feed(tsUs, key, b64)` (JavascriptInterface)
- * so Annex-B frames never cross the Tauri IPC boundary.
+ * Hot path: ArrayBuffer WebMessage on current WebViews; JavascriptInterface
+ * Base64 as compatibility fallback. Annex-B never crosses Tauri's JSON IPC.
  *
  * Browsers (discovery web / Quest) cannot expose MediaCodec — they stay on
  * WebCodecs. This module probes false there and is a no-op.
  */
 
 import { isTauri } from "@/lib/tauri";
+import { nativeVideoPacket } from "./videoReceive";
 
 export type DecoderProbe = {
   available: boolean;
@@ -38,11 +39,17 @@ export type DecoderStats = {
 
 type GtDecoderJs = {
   feed: (tsUs: number, key: boolean, b64: string) => void;
+  disableBinary?: () => void;
+  beginFeed?: (session: number) => void;
 };
 
 declare global {
   interface Window {
     __GT_DECODER__?: GtDecoderJs;
+    __GT_DECODER_BINARY__?: {
+      postMessage: (data: ArrayBuffer) => void;
+      onmessage: ((event: { data: string }) => void) | null;
+    };
   }
 }
 
@@ -61,6 +68,24 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 let probeCache: DecoderProbe | null = null;
+let lifecycle: Promise<unknown> = Promise.resolve();
+
+/** JNI commands run in independent blocking tasks. Serialize lifecycle only so
+ * a slow init cannot reach Java after a later teardown or resolution change. */
+function lifecycleInvoke(cmd: string, args?: Record<string, unknown>) {
+  const next = lifecycle.then(() => {
+    if (cmd === "decoder_init" || cmd === "decoder_teardown") {
+      nativeFeedSession = (nativeFeedSession + 1) >>> 0;
+      binaryPendingKeys.length = 0;
+      binaryInFlight = 0;
+      binaryNeedsKey = true;
+      window.__GT_DECODER__?.beginFeed?.(nativeFeedSession);
+    }
+    return invoke(cmd, args);
+  });
+  lifecycle = next.catch(() => {});
+  return next;
+}
 
 /** Probe once per page load — MediaCodec availability doesn't change. */
 export async function probeNativeDecoder(): Promise<DecoderProbe> {
@@ -89,7 +114,7 @@ export async function probeNativeDecoder(): Promise<DecoderProbe> {
 export async function initNativeDecoder(width: number, height: number): Promise<string | null> {
   if (!nativeDecoderPossible()) return "not Tauri/companion";
   try {
-    await invoke("decoder_init", { width, height });
+    await lifecycleInvoke("decoder_init", { width, height });
     return null;
   } catch (e) {
     console.warn("[nativeDecoder] init failed:", e);
@@ -126,7 +151,7 @@ export async function setNativeDecoderBounds(opts: {
 export async function resetNativeDecoder(): Promise<void> {
   if (!nativeDecoderPossible()) return;
   try {
-    await invoke("decoder_reset");
+    await lifecycleInvoke("decoder_reset");
   } catch {
     /* ignore */
   }
@@ -135,7 +160,7 @@ export async function resetNativeDecoder(): Promise<void> {
 export async function teardownNativeDecoder(): Promise<void> {
   if (!nativeDecoderPossible()) return;
   try {
-    await invoke("decoder_teardown");
+    await lifecycleInvoke("decoder_teardown");
   } catch {
     /* ignore */
   }
@@ -185,7 +210,21 @@ export async function setStreamPowerActive(active: boolean): Promise<void> {
 
 /** True when the JavascriptInterface is installed (MainActivity attached). */
 export function nativeFeedReady(): boolean {
-  return typeof window.__GT_DECODER__?.feed === "function";
+  return typeof window.__GT_DECODER_BINARY__?.postMessage === "function" ||
+    typeof window.__GT_DECODER__?.feed === "function";
+}
+
+let binaryBridge: Window["__GT_DECODER_BINARY__"];
+let binaryInFlight = 0;
+let binaryBroken = false;
+let binaryNeedsKey = false;
+let binaryProgressAt = 0;
+const binaryPendingKeys: boolean[] = [];
+let nativeFeedSession = 0;
+
+function abandonBinary() {
+  binaryBroken = true;
+  try { window.__GT_DECODER__?.disableBinary?.(); } catch { /* compatibility */ }
 }
 
 /**
@@ -193,6 +232,48 @@ export function nativeFeedReady(): boolean {
  * ready (caller should fall back to WebCodecs or wait for a keyframe).
  */
 export function feedNativeDecoder(tsUs: number, key: boolean, bytes: Uint8Array): boolean {
+  const binary = window.__GT_DECODER_BINARY__;
+  if (binary && !binaryBroken) {
+    if (binaryBridge !== binary) {
+      binaryBridge = binary;
+      binaryInFlight = 0;
+      binaryPendingKeys.length = 0;
+      binary.onmessage = (event) => {
+        if (binaryBroken) return;
+        const [session, status] = event.data.split(":");
+        if (Number(session) !== nativeFeedSession) return;
+        binaryProgressAt = performance.now();
+        binaryInFlight = Math.max(0, binaryInFlight - 1);
+        const acknowledgedKey = binaryPendingKeys.shift();
+        // A late refusal for an older P-frame must not invalidate a newer IDR
+        // already in transit on the same ordered bridge.
+        if (status === "key" && !binaryPendingKeys.includes(true)) binaryNeedsKey = true;
+        else if (status === "ok" && acknowledgedKey) binaryNeedsKey = false;
+      };
+    }
+    // Bound messages waiting inside WebView too, not just the MediaCodec inbox.
+    // An overloaded UI must not collect seconds of encoded frames in IPC.
+    if (binaryInFlight >= 4) {
+      if (performance.now() - binaryProgressAt > 1500) abandonBinary();
+      return false;
+    }
+    if (binaryNeedsKey && !key) return false;
+    try {
+      if (binaryInFlight === 0) binaryProgressAt = performance.now();
+      binaryInFlight++;
+      binaryPendingKeys.push(key);
+      binary.postMessage(nativeVideoPacket(tsUs, key, bytes, nativeFeedSession));
+      if (key) binaryNeedsKey = false;
+      return true;
+    } catch {
+      binaryInFlight = Math.max(0, binaryInFlight - 1);
+      binaryPendingKeys.pop();
+      abandonBinary();
+      // Do not mix a late binary P-frame with a synchronous legacy feed. The
+      // caller gates until its next IDR, which restarts a valid reference chain.
+      return false;
+    }
+  }
   const api = window.__GT_DECODER__;
   if (!api?.feed) return false;
   try {
@@ -206,6 +287,8 @@ export function feedNativeDecoder(tsUs: number, key: boolean, bytes: Uint8Array)
 
 /** Chunked base64 — avoids call-stack limits on large AUs. */
 function u8ToBase64(u8: Uint8Array): string {
+  const fast = (u8 as Uint8Array & { toBase64?: () => string }).toBase64;
+  if (fast) return fast.call(u8);
   let s = "";
   const chunk = 0x8000;
   for (let i = 0; i < u8.length; i += chunk) {
