@@ -160,6 +160,16 @@ public class ClipboardService extends Service implements NotesDockHost {
       java.util.concurrent.Executors.newSingleThreadExecutor();
   private final java.util.concurrent.ExecutorService contentWorker =
       java.util.concurrent.Executors.newSingleThreadExecutor();
+  /** Link-preview pages + card art. Bounded: a screenful of link notes used to
+   *  start one thread each, all fetching and decoding at once while the dock was
+   *  animating open. Low priority so the UI thread wins the CPU. */
+  private final java.util.concurrent.ExecutorService previewPool =
+      java.util.concurrent.Executors.newFixedThreadPool(3, r -> {
+        Thread t = new Thread(r, "gt-link-preview");
+        t.setDaemon(true);
+        t.setPriority(Thread.MIN_PRIORITY);
+        return t;
+      });
   private long lastRevision; // memory cursor only: a fresh process still loads full history
   private long replayRevision;
   private boolean replaying;
@@ -850,8 +860,9 @@ public class ClipboardService extends Service implements NotesDockHost {
     for (int i = items.size() - 1; i >= 0 && items.size() > MAX_ITEMS; i--) {
       if (items.get(i).pinned) continue;
       ClipEntry gone = items.remove(i);
-      Bitmap b = thumbs.remove(gone.id);
-      if (b != null) b.recycle();
+      // Drop, never recycle(): the Compose dock may still be drawing it this
+      // frame, and drawing a recycled bitmap crashes the process. The GC frees it.
+      thumbs.remove(gone.id);
     }
   }
 
@@ -1946,8 +1957,7 @@ public class ClipboardService extends Service implements NotesDockHost {
       for (int i = items.size() - 1; i >= 0; i--) {
         if (e.id.equals(items.get(i).id)) {
           ClipEntry gone = items.remove(i);
-          Bitmap b = thumbs.remove(gone.id);
-          if (b != null) b.recycle();
+          thumbs.remove(gone.id); // not recycle(): see trimItemsLocked
         }
       }
     }
@@ -2003,23 +2013,70 @@ public class ClipboardService extends Service implements NotesDockHost {
   // Main-thread, cheap reads for the Compose dock. Slow work is always a
   // dockRequest… that answers later through refreshPanelIfOpen().
 
+  /** Main thread only. Last NoteUi built per entry id, and the last list handed out. */
+  private final java.util.HashMap<String, NoteUi> noteUiCache = new java.util.HashMap<>();
+  private java.util.List<NoteUi> lastDockNotes = java.util.Collections.emptyList();
+  /** Search and link detection look at this much of a note (huge pasted logs). */
+  private static final int NOTE_SCAN_CHARS = 32 * 1024;
+
+  /** The dock's note list. Called on every coalesced dock refresh (a thumbnail
+   *  landing, a link preview resolving, a relay notice), so it must be cheap: each
+   *  entry's NoteUi is REUSED while nothing about it changed, and the very same
+   *  List comes back when no entry changed — the dock's filters, tag/type tallies
+   *  and every card then skip their work instead of redoing it per refresh. */
   @Override
   public java.util.List<NoteUi> dockNotes() {
     ArrayList<ClipEntry> snap;
+    ArrayList<ArrayList<String>> tagSnaps;
     synchronized (this) {
       snap = new ArrayList<>(items);
+      tagSnaps = new ArrayList<>(snap.size());
+      for (ClipEntry e : snap) tagSnaps.add(new ArrayList<>(e.tags));
     }
     ArrayList<NoteUi> out = new ArrayList<>(snap.size());
-    for (ClipEntry e : snap) {
+    java.util.HashMap<String, NoteUi> next = new java.util.HashMap<>(snap.size() * 2);
+    boolean same = snap.size() == lastDockNotes.size();
+    for (int i = 0; i < snap.size(); i++) {
+      ClipEntry e = snap.get(i);
+      ArrayList<String> tags = tagSnaps.get(i);
       Content c = "text".equals(e.kind) ? contentFor(e) : PLAIN;
-      ArrayList<String> tags;
-      synchronized (this) {
-        tags = new ArrayList<>(e.tags);
+      String text = e.text == null ? "" : e.text;
+      String dev = deviceLabel(e);
+      NoteUi prev = noteUiCache.get(e.id);
+      NoteUi n;
+      if (prev != null
+          && (prev.getText() == text || prev.getText().equals(text))
+          && prev.getCreatedAtMs() == e.createdAtMs
+          && prev.getPinned() == e.pinned
+          && prev.getKind().equals(e.kind)
+          && prev.getTags().equals(tags)
+          && prev.getContentKind().equals(c.kind)
+          && java.util.Objects.equals(prev.getContentLabel(), c.label)
+          && prev.getMono() == c.mono
+          && prev.getDeviceName().equals(dev)) {
+        n = prev;
+      } else {
+        boolean isText = "text".equals(e.kind);
+        String head = text.length() > NOTE_SCAN_CHARS ? text.substring(0, NOTE_SCAN_CHARS) : text;
+        n = new NoteUi(e.id, e.kind, text, e.createdAtMs, e.pinned, tags, c.kind, c.label, c.mono, dev,
+            isText ? head.toLowerCase(java.util.Locale.US) : "",
+            isText && !c.mono ? firstHttpLink(head) : null,
+            isText && isTitleLine(text));
       }
-      out.add(new NoteUi(e.id, e.kind, e.text == null ? "" : e.text, e.createdAtMs, e.pinned,
-          tags, c.kind, c.label, c.mono, deviceLabel(e)));
+      next.put(e.id, n);
+      out.add(n);
+      if (same && lastDockNotes.get(i) != n) same = false;
     }
-    return out;
+    noteUiCache.clear();
+    noteUiCache.putAll(next);
+    if (same) return lastDockNotes;
+    lastDockNotes = java.util.Collections.unmodifiableList(out);
+    return lastDockNotes;
+  }
+
+  /** A single short line — a name, a code, a reminder — renders at title weight. */
+  private static boolean isTitleLine(String text) {
+    return text.length() <= 400 && text.indexOf('\n') < 0 && text.trim().length() <= 60;
   }
 
   /** Where a note came from, as the desktop panel shows it ("SENGALPC"). This
@@ -2064,8 +2121,6 @@ public class ClipboardService extends Service implements NotesDockHost {
     return buildProse(t);
   }
 
-  @Override public String dockLinkFor(String text) { return firstHttpLink(text); }
-
   @Override public LinkPreviewUi dockLinkPreview(String url) {
     LinkPreviewInfo i;
     synchronized (this) {
@@ -2079,14 +2134,14 @@ public class ClipboardService extends Service implements NotesDockHost {
     synchronized (this) {
       if (linkPreviewCache.containsKey(url) || !linkPreviewLoading.add(url)) return;
     }
-    new Thread(() -> {
+    runPreviewTask(() -> {
       LinkPreviewInfo resolved = resolvePreview(url);
       synchronized (this) {
         linkPreviewLoading.remove(url);
         linkPreviewCache.put(url, resolved);
       }
       refreshPanelIfOpen();
-    }, "gt-link-preview").start();
+    }, () -> { synchronized (this) { linkPreviewLoading.remove(url); } });
   }
 
   @Override public Bitmap dockBitmap(String url) {
@@ -2102,7 +2157,7 @@ public class ClipboardService extends Service implements NotesDockHost {
     synchronized (this) {
       if (linkArtCache.containsKey(url) || !bitmapLoading.add(url)) return;
     }
-    new Thread(() -> {
+    runPreviewTask(() -> {
       Bitmap bmp = loadPreviewBitmap(url);
       if (bmp == null && url.endsWith("/maxresdefault.jpg")) {
         bmp = loadPreviewBitmap(url.replace("/maxresdefault.jpg", "/hqdefault.jpg"));
@@ -2114,7 +2169,17 @@ public class ClipboardService extends Service implements NotesDockHost {
         cacheLinkArt(url, bmp);
         refreshPanelIfOpen();
       }
-    }, "gt-link-art").start();
+    }, () -> { synchronized (this) { bitmapLoading.remove(url); } });
+  }
+
+  /** Queue preview work on the bounded pool; `onRejected` undoes the in-flight
+   *  mark when the service is shutting down (so a later request can retry). */
+  private void runPreviewTask(Runnable task, Runnable onRejected) {
+    try {
+      previewPool.execute(task);
+    } catch (java.util.concurrent.RejectedExecutionException e) {
+      onRejected.run();
+    }
   }
 
   @Override public int dockMicState() { return micState; }
@@ -3175,10 +3240,15 @@ public class ClipboardService extends Service implements NotesDockHost {
     if (recording) { try { if (recorder != null) recorder.stop(); } catch (Exception ignored) {} }
     recording = false;
     safeReleaseRecorder();
+    // Dock first, so nothing can still be drawing a thumbnail we let go of.
+    if (dock != null) {
+      dock.destroy();
+      dock = null;
+    }
     synchronized (this) {
-      for (Bitmap b : thumbs.values()) { if (b != null) b.recycle(); }
       thumbs.clear();
     }
+    previewPool.shutdownNow();
     if (socket != null) socket.cancel();
     socket = null;
     if (http != null) {
@@ -3186,10 +3256,6 @@ public class ClipboardService extends Service implements NotesDockHost {
       http.dispatcher().executorService().shutdown();
     }
     http = null;
-    if (dock != null) {
-      dock.destroy();
-      dock = null;
-    }
     if (bubble != null && wm != null) {
       try {
         wm.removeView(bubble);

@@ -1614,10 +1614,60 @@ reproduction commands live in `docs/STREAMING_EFFICIENCY.md`.
   ~32 ms, so a 300-notice relay replay doesn't recompose 300 times).
 - **Window model:** ONE full-screen `TYPE_APPLICATION_OVERLAY` window, **added on open
   and removed on close**. Never leave it attached-but-hidden — an invisible full-screen
-  overlay that still takes touches freezes the phone. The *composition* outlives the
-  window (`ViewCompositionStrategy.DisposeOnLifecycleDestroyed` + `OverlayOwner`), so a
-  reopen is `addView` + recompose. `ui.visible` is set BEFORE `addView` so the first
-  frame starts the enter transition from hidden.
+  overlay that still takes touches freezes the phone. `ui.visible` is set BEFORE
+  `addView` so the first frame starts the enter transition from hidden.
+- **The view tree is SINGLE-USE (3.9.104, the "phone hangs" bug).**
+  - Each open builds a fresh `DockRoot` + `ComposeView` + `OverlayOwner`
+    (`ensureView`). The only reuse allowed is the tree the edge handle prewarmed on
+    touch-down, before it was ever attached. Every close disposes the tree:
+    `detach()` → `teardownView()`, and the strategy is `DisposeOnDetachedFromWindow`.
+  - 3.9.102 instead kept one composition and re-added the same views on each open.
+    Measured on the phone (Compose ui 1.9), that failed twice over:
+    1. The default window recomposer cancels itself on its root's first detach
+       (`onViewDetachedFromWindow` → `Recomposer.cancel()`, confirmed in the bytecode).
+       A reopen therefore had no frames, no animation and no input.
+    2. With a recomposer owned by the dock instead, the composition ran and the open
+       animation reached 1.0, yet the re-added window still rendered **nothing**.
+       Its render nodes held only 9 KB, and its accessibility tree was empty.
+  - Either way, a transparent full-screen window sat on top of everything and the
+    phone looked frozen (Back was the only way out). Two further lessons:
+    - Short taps near the left edge start and cancel the system back gesture
+      (`triggerBack=false`), so users couldn't escape.
+    - The watchdog's frame proof passes in failure 2. Only single-use trees prevent it.
+  - What survives across opens lives outside the composition: `DockUiState`, the
+    composer `EditText` (draft and selection), the formatted-body LRU, and the
+    service's reused `NoteUi` list. Rebuilding is cheap: warm open → first frame is
+    about 62–147 ms on the Moto g57.
+  - Never reuse a tree that has been attached. Never re-arm the watchdog for a
+    `show()` on an already-open dock.
+  - **Watchdog:** every real open must prove a frame (`LaunchedEffect(ui.visible)` →
+    `withFrameNanos` → `onFrameDrawn`) within 1.5 s. Otherwise the window is torn down
+    and rebuilt once; if that also fails, it stays closed.
+  - Logcat `NotesDock: open → first frame N ms` is the open-latency probe.
+  - `onExitFinished` posts its `detach()` because it runs inside one of the
+    composition's own effects.
+- **Render cost (3.9.104):**
+  - The sheet has no elevation shadow. The render thread was redrawing a 28 dp shadow
+    of a full-height sheet every frame.
+  - Cards use plain colours instead of two `animate*AsState` each.
+  - Text selection (`SelectableIf`) only on expanded notes, not a `SelectionContainer`
+    per card.
+  - The glow and border brushes are cached.
+  - The list composes one frame after the chrome, so an open's first frame, which gates
+    the slide-in, is cheaper.
+  - Measured flinging through about 170 real notes at 120 Hz: jank 3.9–5.1 % →
+    2.6–3.6 %, UI-thread p99 8–18 → 5–7 ms.
+- **Main-thread budget (3.9.104):**
+  - `dockNotes()` reuses each note's `NoteUi` while it is unchanged, and returns the
+    *same list instance* when nothing changed. That lets `remember(notes)` and card
+    skipping work on every coalesced refresh.
+  - `searchKey`, `link` and `title` are computed once per note, over at most 32 KB.
+  - Collapsed cards format only their visible slice (`collapsedSlice`).
+  - Formatted bodies live in an LRU (`NotesDock.bodies`); the first screenful is
+    formatted off-main on prewarm/open. So `dockBody` must stay thread-safe.
+  - Nothing recomposes while the dock is closed.
+  - Link previews and card art run on a bounded 3-thread, low-priority pool.
+  - Thumbnails are dropped, never `recycle()`d: the dock may still be drawing one.
 - **Insets:** API 30+ uses `fitInsetsTypes = 0` + `SOFT_INPUT_ADJUST_NOTHING`; Compose
   pads the sheet with `WindowInsets.safeDrawing` (bars + cutout + **IME**) so the keyboard
   shrinks the sheet smoothly. API < 30 falls back to `ADJUST_RESIZE`.

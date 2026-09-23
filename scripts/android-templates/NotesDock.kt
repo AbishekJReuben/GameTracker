@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.Editable
 import android.text.InputType
 import android.text.Spanned
@@ -19,6 +20,8 @@ import android.text.style.StrikethroughSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
 import android.text.style.UnderlineSpan
+import android.util.Log
+import android.util.LruCache
 import android.view.ContextThemeWrapper
 import android.view.Gravity
 import android.view.KeyEvent
@@ -140,6 +143,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -186,6 +190,7 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import java.util.Locale
+import java.util.concurrent.Executors
 import kotlinx.coroutines.delay
 
 /**
@@ -199,10 +204,22 @@ import kotlinx.coroutines.delay
  *
  * Window model: one full-screen TYPE_APPLICATION_OVERLAY window, attached on
  * open and REMOVED on close (never left attached-but-hidden: an invisible
- * full-screen overlay that still took touches would freeze the phone). The
- * composition itself outlives the window — [ViewCompositionStrategy.
- * DisposeOnLifecycleDestroyed] — so a reopen is an addView plus a recompose,
- * not a rebuild.
+ * full-screen overlay that still took touches would freeze the phone).
+ *
+ * The view tree is SINGLE-USE: every open builds a fresh DockRoot + ComposeView
+ * (or takes the one prewarmed on the edge handle's touch-down), and every close
+ * disposes it. 3.9.102 kept one composition and re-added the same views on each
+ * open; that broke twice over, both measured on the phone (Compose ui 1.9):
+ *  - the default window recomposer cancels itself on its root's first detach
+ *    (onViewDetachedFromWindow → Recomposer.cancel()), so a reopen had no frames,
+ *    no animation and no input;
+ *  - with a recomposer we owned instead, the composition ran and the open
+ *    animation reached 1.0 — and the re-added window still rendered NOTHING.
+ * Either way: a transparent full-screen window over the whole phone, i.e. the
+ * "phone hangs" report. Everything worth keeping across opens lives outside the
+ * composition (DockUiState, the composer EditText, the formatted-body LRU, the
+ * service's reused NoteUi list), so a rebuild is cheap. A watchdog also tears the
+ * window down (and rebuilds once) if an open draws no frame.
  */
 
 /** One note as the dock renders it. Immutable so Compose can skip unchanged rows. */
@@ -222,6 +239,12 @@ data class NoteUi(
   val mono: Boolean,
   /** Source device ("SENGALPC", "This phone"); empty when unknown. */
   val deviceName: String,
+  /** Lower-cased text (bounded) for search — computed once per note, not per keystroke. */
+  val searchKey: String,
+  /** First link in the text for the preview card, or null. Computed once per note. */
+  val link: String?,
+  /** One short line: renders at title weight. */
+  val title: Boolean,
 )
 
 @Immutable
@@ -243,8 +266,8 @@ interface NotesDockHost {
   fun dockStatusTone(): Int
   fun dockThumb(id: String): Bitmap?
   fun dockRequestThumb(id: String)
+  /** Thread-safe: also called from the dock's background body prefetch. */
   fun dockBody(text: String, kind: String): CharSequence
-  fun dockLinkFor(text: String): String?
   fun dockLinkPreview(url: String): LinkPreviewUi?
   fun dockRequestLinkPreview(url: String)
   fun dockBitmap(url: String): Bitmap?
@@ -295,6 +318,48 @@ internal class DockUiState {
 
 internal data class DockSnack(val text: String, val seq: Long)
 
+/** A formatted note body; [truncated] = only the collapsed slice was formatted. */
+@Immutable
+internal class DockBody(val text: AnnotatedString, val truncated: Boolean)
+
+private const val TAG = "NotesDock"
+/** An open must draw within this, or the window is torn down (see NotesDock.show). */
+private const val NO_FRAME_TIMEOUT_MS = 1500L
+/** Text notes formatted in the background on open/prewarm — about two screens. */
+private const val PREFETCH_BODIES = 16
+/** Collapsed cards show 6 (prose) / 8 (mono) lines; format a little more than that. */
+private const val COLLAPSED_PROSE_LINES = 8
+private const val COLLAPSED_MONO_LINES = 10
+private const val COLLAPSED_MAX_CHARS = 1600
+private const val COLLAPSED_MONO_MAX_CHARS = 4000
+
+private fun bodyKey(n: NoteUi, expanded: Boolean): String =
+  n.id + '|' + n.contentKind + '|' + n.text.length + '|' + n.text.hashCode() + if (expanded) "|x" else "|c"
+
+/** The part of a note a collapsed card can show, or null when the whole note fits.
+ *  Formatting and laying out an 8 KB log for an 8-line card was the per-row cost. */
+private fun collapsedSlice(text: String, mono: Boolean): String? {
+  val maxLines = if (mono) COLLAPSED_MONO_LINES else COLLAPSED_PROSE_LINES
+  val maxChars = if (mono) COLLAPSED_MONO_MAX_CHARS else COLLAPSED_MAX_CHARS
+  var cut = -1
+  var lines = 0
+  var i = 0
+  while (i < text.length && i < maxChars) {
+    val nl = text.indexOf('\n', i)
+    if (nl < 0) break
+    if (++lines >= maxLines) {
+      cut = nl
+      break
+    }
+    i = nl + 1
+  }
+  if (cut < 0 && text.length > maxChars) cut = maxChars
+  if (cut < 0) return null
+  // Never split a surrogate pair (emoji) — the half would render as a box.
+  if (cut > 0 && Character.isHighSurrogate(text[cut - 1])) cut--
+  return text.substring(0, cut)
+}
+
 class NotesDock(service: Context, private val host: NotesDockHost) {
   // Dark Material context: EditText cursor/handles and the floating text
   // toolbar come from the theme, and a Service context has no dark theme.
@@ -303,23 +368,43 @@ class NotesDock(service: Context, private val host: NotesDockHost) {
   private val main = Handler(Looper.getMainLooper())
   internal val ui = DockUiState()
   private var root: DockRoot? = null
+  private var composeView: ComposeView? = null
   private var owner: OverlayOwner? = null
   private var attached = false
+  /** The current view tree has been attached once — it must never be attached again. */
+  private var viewUsed = false
   private var invalidateQueued = false
   private var composer: EditText? = null
   private var snackSeq = 0L
   private var backCallback: Any? = null
+  /** Open counter + the last open the composition proved alive for (watchdog). */
+  private var showSeq = 0L
+  private var drawnSeq = 0L
+  private var rebuiltForSeq = 0L
+  /** When the current open started — for the open → first frame log line. */
+  private var openedAtMs = 0L
+
+  /** Formatted note bodies. Rows are disposed when they scroll off, so without this
+   *  every scroll back re-ran the formatter (7 regex passes for prose, a tokenizer
+   *  for code) on the main thread. Thread-safe; the prefetch fills it off-main. */
+  private val bodies = LruCache<String, DockBody>(160)
+  private val bodyWorker = Executors.newSingleThreadExecutor { r ->
+    Thread(r, "gt-dock-bodies").apply { priority = Thread.NORM_PRIORITY - 1; isDaemon = true }
+  }
 
   val isOpen: Boolean
     get() = ui.visible
 
   /** Any thread. Coalesced to one recompose per ~2 frames, so a relay replay of
-   *  300 notices doesn't recompose 300 times. */
+   *  300 notices doesn't recompose 300 times — and none at all while the dock is
+   *  closed (the next open recomposes once with whatever is current). */
   fun invalidate() {
     if (Looper.myLooper() != Looper.getMainLooper()) {
       main.post { invalidate() }
       return
     }
+    // Closed: skip. show() recomposes once with whatever is current.
+    if (!ui.visible) return
     if (invalidateQueued) return
     invalidateQueued = true
     main.postDelayed({
@@ -328,15 +413,23 @@ class NotesDock(service: Context, private val host: NotesDockHost) {
     }, 32)
   }
 
-  /** Build the view tree while the finger is still down on the edge handle. */
+  /** Build the view tree (and format the top notes off-main) while the finger is
+   *  still down on the edge handle. */
   fun prewarm() {
     try {
       ensureView()
+      prefetchBodies()
     } catch (_: Throwable) {
     }
   }
 
   fun show(): Boolean {
+    if (ui.visible && attached) {
+      // Already open (tile / notification tapped again): just refresh. Re-arming
+      // the watchdog here would find no new frame proof and kill a healthy dock.
+      ui.version++
+      return true
+    }
     val r = try {
       ensureView()
     } catch (_: Throwable) {
@@ -350,14 +443,76 @@ class NotesDock(service: Context, private val host: NotesDockHost) {
       try {
         wm.addView(r, layoutParams())
         attached = true
+        viewUsed = true
       } catch (_: Throwable) {
         ui.visible = false
+        teardownView()
         return false
       }
       registerBack(r)
     }
     ui.version++
+    prefetchBodies()
+    // The watchdog: an open must produce a frame. If the composition can't (dead
+    // recomposer, wedged render), the window is a transparent full-screen touch
+    // trap — take it down rather than leave the phone unusable.
+    val seq = ++showSeq
+    openedAtMs = SystemClock.uptimeMillis()
+    main.postDelayed({ if (ui.visible && drawnSeq < seq) onNoFrame(seq) }, NO_FRAME_TIMEOUT_MS)
     return true
+  }
+
+  /** The composition drew a frame for the current open (see DockContent). */
+  internal fun onFrameDrawn() {
+    if (drawnSeq < showSeq) Log.i(TAG, "open → first frame " + (SystemClock.uptimeMillis() - openedAtMs) + " ms")
+    drawnSeq = showSeq
+  }
+
+  private fun onNoFrame(seq: Long) {
+    Log.w(TAG, "Notes dock drew no frame ${NO_FRAME_TIMEOUT_MS}ms after opening — tearing the window down")
+    val wasRebuild = seq == rebuiltForSeq
+    teardownView()
+    ui.visible = false
+    if (!wasRebuild) {
+      // One rebuild from scratch (fresh views, owner and composition). If that one
+      // fails too, stay closed: never loop on a broken window.
+      rebuiltForSeq = showSeq + 1
+      show()
+    }
+  }
+
+  /** Collapsed or expanded body for a note, formatted once and cached. */
+  internal fun bodyFor(n: NoteUi, expanded: Boolean): DockBody {
+    val key = bodyKey(n, expanded)
+    bodies.get(key)?.let { return it }
+    val slice = if (expanded) null else collapsedSlice(n.text, n.mono)
+    val src = slice ?: n.text
+    val body = DockBody(host.dockBody(src, n.contentKind).toAnnotated { host.dockOpenUrl(it) }, slice != null)
+    bodies.put(key, body)
+    return body
+  }
+
+  /** Format what the first screenful will show before it's composed. */
+  private fun prefetchBodies() {
+    val notes = try {
+      host.dockNotes()
+    } catch (_: Throwable) {
+      return
+    }
+    val top = notes.asSequence().filter { it.kind == "text" }.take(PREFETCH_BODIES).toList()
+    if (top.isEmpty()) return
+    try {
+      bodyWorker.execute {
+        for (n in top) {
+          if (bodies.get(bodyKey(n, false)) != null) continue
+          try {
+            bodyFor(n, false)
+          } catch (_: Throwable) {
+          }
+        }
+      }
+    } catch (_: Throwable) {
+    }
   }
 
   fun hide() {
@@ -387,15 +542,32 @@ class NotesDock(service: Context, private val host: NotesDockHost) {
   }
 
   fun destroy() {
+    teardownView()
+    composer = null
+    bodyWorker.shutdownNow()
+    bodies.evictAll()
+  }
+
+  /** Everything view-side, gone: window, composition (and with it its window
+   *  recomposer), lifecycle. The next show() builds from scratch. The composer
+   *  EditText survives on purpose — it carries the draft and the selection. */
+  private fun teardownView() {
     detach()
+    try {
+      composeView?.disposeComposition()
+    } catch (_: Throwable) {
+    }
     owner?.destroy()
     owner = null
+    composeView = null
     root = null
-    composer = null
+    viewUsed = false
   }
 
   internal fun onExitFinished() {
-    if (!ui.visible) detach()
+    // Posted, not inline: this runs inside one of the composition's own effects,
+    // and detach() disposes that composition.
+    main.post { if (!ui.visible) detach() }
   }
 
   internal fun submitComposer() {
@@ -511,8 +683,12 @@ class NotesDock(service: Context, private val host: NotesDockHost) {
     return e
   }
 
+  /** The live view tree, or a fresh one. A tree is reused only while it is attached
+   *  (reopen during the exit animation) or was prewarmed and never attached — a
+   *  ComposeView re-added to a new window renders nothing (see the file header). */
   private fun ensureView(): DockRoot {
-    root?.let { return it }
+    root?.let { if (attached || !viewUsed) return it }
+    teardownView()
     val o = OverlayOwner()
     o.create()
     owner = o
@@ -520,9 +696,12 @@ class NotesDock(service: Context, private val host: NotesDockHost) {
     r.setViewTreeLifecycleOwner(o)
     r.setViewTreeSavedStateRegistryOwner(o)
     val cv = ComposeView(ctx)
-    cv.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnLifecycleDestroyed(o))
+    // The composition lives exactly as long as this window: disposed on detach,
+    // together with the window recomposer it created — nothing runs while closed.
+    cv.setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
     cv.setContent { DockContent(this, ui, host) }
     r.addView(cv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    composeView = cv
     root = r
     return r
   }
@@ -567,11 +746,12 @@ class NotesDock(service: Context, private val host: NotesDockHost) {
     } catch (_: Throwable) {
     }
     attached = false
-    owner?.pause()
     ui.tagPickerFor = null
     ui.pendingDelete = null
     ui.menuOpen = false
     if (ui.editingId != null) cancelEdit()
+    // Single-use tree: dispose it now so nothing runs while the dock is closed.
+    teardownView()
   }
 
   private fun hideIme() {
@@ -637,10 +817,6 @@ private class OverlayOwner : LifecycleOwner, SavedStateRegistryOwner {
     if (registry.currentState != Lifecycle.State.DESTROYED) registry.currentState = Lifecycle.State.RESUMED
   }
 
-  fun pause() {
-    if (registry.currentState.isAtLeast(Lifecycle.State.STARTED)) registry.currentState = Lifecycle.State.CREATED
-  }
-
   fun destroy() {
     if (registry.currentState != Lifecycle.State.INITIALIZED) registry.currentState = Lifecycle.State.DESTROYED
   }
@@ -667,6 +843,7 @@ private object P {
   val text2 = Color(0xFFA7B0C0)
   val text3 = Color(0xFF6B7588)
   val brand = Brush.linearGradient(listOf(Color(0xFF7C5CFF), Color(0xFF22D3EE)))
+  val sheetBorder = Brush.linearGradient(listOf(Color(0x807C5CFF), Color(0x3322D3EE), Color(0x0FFFFFFF)))
 }
 
 private val TYPE_ORDER = listOf("link", "code", "json", "log", "command", "path", "text")
@@ -717,14 +894,17 @@ private fun relativeTime(then: Long, now: Long): String {
 
 private fun filterNotes(all: List<NoteUi>, q: String, kind: String, type: String?, tag: String?): List<NoteUi> {
   val query = q.trim().lowercase(Locale.US)
+  if (query.isEmpty() && kind.isEmpty() && type == null && tag == null) return all
   return all.filter { n ->
     (kind.isEmpty() || n.kind == kind) &&
       (type == null || (n.kind == "text" && n.contentKind == type)) &&
       (tag == null || n.tags.any { it.equals(tag, ignoreCase = true) }) &&
       (
         query.isEmpty() ||
-          (n.kind == "text" && n.text.lowercase(Locale.US).contains(query)) ||
-          n.tags.any { it.lowercase(Locale.US).contains(query) }
+          // searchKey is lower-cased once per note by the service — lower-casing
+          // every note's full text on every keystroke was the search lag.
+          (n.kind == "text" && n.searchKey.contains(query)) ||
+          n.tags.any { it.contains(query, ignoreCase = true) }
         )
   }
 }
@@ -772,9 +952,11 @@ private fun CharSequence.toAnnotated(onLink: (String) -> Unit): AnnotatedString 
 
 private val noRipple = MutableInteractionSource()
 
+/** "3 min ago" clock: ticks only while the dock is on screen. */
 @Composable
-private fun rememberNow(): State<Long> = produceState(System.currentTimeMillis()) {
-  while (true) {
+private fun rememberNow(visible: Boolean): State<Long> = produceState(System.currentTimeMillis(), visible) {
+  value = System.currentTimeMillis()
+  while (visible) {
     delay(30_000)
     value = System.currentTimeMillis()
   }
@@ -788,7 +970,15 @@ private fun rememberNow(): State<Long> = produceState(System.currentTimeMillis()
 internal fun DockContent(dock: NotesDock, ui: DockUiState, host: NotesDockHost) {
   val onRight = remember(ui.version) { host.dockPinOnRight() }
   val shown = remember { MutableTransitionState(false) }
-  LaunchedEffect(ui.visible) { shown.targetState = ui.visible }
+  LaunchedEffect(ui.visible) {
+    shown.targetState = ui.visible
+    // Proof of life for the open watchdog: this only resumes if the recomposer,
+    // the effect scope and the frame clock are all running.
+    if (ui.visible) {
+      withFrameNanos { }
+      dock.onFrameDrawn()
+    }
+  }
   LaunchedEffect(shown.isIdle, shown.currentState) {
     if (shown.isIdle && !shown.currentState && !ui.visible) dock.onExitFinished()
   }
@@ -857,37 +1047,39 @@ private fun DockSheet(dock: NotesDock, ui: DockUiState, host: NotesDockHost, onR
     if (t != null && (!typeCounts.containsKey(t) || typeCounts.size < 2)) ui.typeFilter = null
   }
   LaunchedEffect(ui.tagFilter) { host.dockSetTagFilter(ui.tagFilter) }
+  var listReady by remember { mutableStateOf(false) }
+  LaunchedEffect(Unit) {
+    withFrameNanos { }
+    listReady = true
+  }
   val filtered = remember(notes, ui.search, ui.kindFilter, ui.typeFilter, ui.tagFilter) {
     filterNotes(notes, ui.search, ui.kindFilter, ui.typeFilter, ui.tagFilter)
   }
 
   Box(
     modifier
-      .shadow(28.dp, shape, ambientColor = Color(0x667C5CFF), spotColor = Color.Black)
+      // No elevation shadow: over the dark scrim it was barely visible, and the
+      // render thread redrew a 28 dp shadow of a full-height sheet every frame.
       .clip(shape)
       .background(P.sheet)
-      .border(
-        1.dp,
-        Brush.linearGradient(listOf(Color(0x807C5CFF), Color(0x3322D3EE), Color(0x0FFFFFFF))),
-        shape,
-      )
+      .border(1.dp, P.sheetBorder, shape)
       // Swallow taps that land on the sheet's own background — otherwise they'd
       // fall through to the scrim and close the dock.
       .clickable(interactionSource = noRipple, indication = null) { ui.menuOpen = false },
   ) {
-    // Soft brand glow in the corner nearest the edge the dock slid in from.
+    // Soft brand glow in the corner nearest the edge the dock slid in from. The
+    // shader is built once per size (drawWithCache), not on every frame.
     Box(
       Modifier
         .fillMaxWidth()
         .height(220.dp)
-        .drawBehind {
-          drawRect(
-            Brush.radialGradient(
-              listOf(Color(0x337C5CFF), Color(0x0022D3EE)),
-              center = Offset(if (onRight) size.width else 0f, 0f),
-              radius = size.width * 0.9f,
-            ),
+        .drawWithCache {
+          val glow = Brush.radialGradient(
+            listOf(Color(0x337C5CFF), Color(0x0022D3EE)),
+            center = Offset(if (onRight) size.width else 0f, 0f),
+            radius = size.width * 0.9f,
           )
+          onDrawBehind { drawRect(glow) }
         },
     )
     Column(Modifier.fillMaxSize().padding(horizontal = 14.dp).padding(top = 14.dp)) {
@@ -925,7 +1117,10 @@ private fun DockSheet(dock: NotesDock, ui: DockUiState, host: NotesDockHost, onR
       }
       Spacer(Modifier.height(10.dp))
       Box(Modifier.weight(1f).fillMaxWidth()) {
-        NotesList(dock, ui, host, notes, filtered)
+        // The list joins one frame after the chrome: the first frame of an open
+        // (which gates the slide-in) then composes only header, composer and filters.
+        // The sheet is still mostly off-screen when the cards arrive.
+        if (listReady) NotesList(dock, ui, host, notes, filtered)
         TagPicker(ui, host, notes, tags)
         SnackHost(ui, Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp))
       }
@@ -1292,7 +1487,7 @@ private fun NotesList(dock: NotesDock, ui: DockUiState, host: NotesDockHost, all
     return
   }
   val previews = remember(ui.version) { host.dockPreviewsOn() }
-  val now by rememberNow()
+  val now by rememberNow(ui.visible)
   val pinned = remember(notes) { notes.filter { it.pinned } }
   val rest = remember(notes) { notes.filter { !it.pinned } }
   val listState = rememberLazyListState()
@@ -1354,15 +1549,14 @@ private fun EmptyState(any: Boolean) {
 private fun LazyItemScope.NoteCard(n: NoteUi, dock: NotesDock, ui: DockUiState, host: NotesDockHost, previews: Boolean, now: Long) {
   val pending = ui.pendingDelete == n.id
   val shape = RoundedCornerShape(20.dp)
-  val borderColor by animateColorAsState(
-    when {
-      pending -> Color(0xB3F87171)
-      n.pinned -> Color(0x737C5CFF)
-      else -> Color(0x10FFFFFF)
-    },
-    label = "cardBorder",
-  )
-  val bg by animateColorAsState(if (pending) Color(0x26EF4444) else P.card, label = "cardBg")
+  // Plain colours, not animate*AsState: two Animatables per card were a real
+  // share of what composing a card costs while a fling brings new ones on screen.
+  val borderColor = when {
+    pending -> Color(0xB3F87171)
+    n.pinned -> Color(0x737C5CFF)
+    else -> Color(0x10FFFFFF)
+  }
+  val bg = if (pending) Color(0x26EF4444) else P.card
   Column(
     Modifier
       .animateItem()
@@ -1373,17 +1567,28 @@ private fun LazyItemScope.NoteCard(n: NoteUi, dock: NotesDock, ui: DockUiState, 
       .padding(start = 13.dp, end = 6.dp, top = 12.dp, bottom = 4.dp),
   ) {
     Box(Modifier.padding(end = 7.dp)) {
-      if (n.kind == "image") ImageBody(n, ui, host) else TextBody(n, ui, host, previews)
+      if (n.kind == "image") ImageBody(n, ui, host) else TextBody(n, dock, ui, host, previews)
     }
     NoteMeta(n, dock, ui, host, now, pending)
   }
 }
 
+/** Text selection only where it earns its cost: a SelectionContainer per card was
+ *  the heaviest part of composing a card mid-fling. Collapsed cards copy with one
+ *  tap (Copy) and edit with full selection; expanded notes are selectable in place. */
 @Composable
-private fun TextBody(n: NoteUi, ui: DockUiState, host: NotesDockHost, previews: Boolean) {
+private fun SelectableIf(on: Boolean, content: @Composable () -> Unit) {
+  if (on) SelectionContainer(content = content) else content()
+}
+
+@Composable
+private fun TextBody(n: NoteUi, dock: NotesDock, ui: DockUiState, host: NotesDockHost, previews: Boolean) {
   val expanded = ui.expanded[n.id] == true
   var overflow by remember(n.id, n.text) { mutableStateOf(false) }
-  val body = remember(n.text, n.contentKind) { host.dockBody(n.text, n.contentKind).toAnnotated { host.dockOpenUrl(it) } }
+  // Collapsed cards format only what they can show; the cache survives rows
+  // scrolling off and the dock closing (and the open prefetch fills it off-main).
+  val formatted = remember(n, expanded) { dock.bodyFor(n, expanded) }
+  val body = formatted.text
   Column {
     if (n.mono) {
       val accent = accentFor(n.contentKind)
@@ -1399,7 +1604,7 @@ private fun TextBody(n: NoteUi, ui: DockUiState, host: NotesDockHost, previews: 
           .background(Color(0x47000000))
           .drawBehind { drawRect(accent.copy(alpha = 0.75f), size = Size(3.dp.toPx(), size.height)) },
       ) {
-        SelectionContainer {
+        SelectableIf(expanded) {
           Text(
             body,
             modifier = Modifier.horizontalScroll(rememberScrollState()).padding(start = 12.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
@@ -1417,8 +1622,8 @@ private fun TextBody(n: NoteUi, ui: DockUiState, host: NotesDockHost, previews: 
     } else {
       // A third of all notes are a single short line — a name, a code, a
       // reminder. At title weight they read as the label they are.
-      val title = !n.text.contains('\n') && n.text.trim().length <= 60
-      SelectionContainer {
+      val title = n.title
+      SelectableIf(expanded) {
         Text(
           body,
           color = if (title) P.text else Color(0xFFE2E8F0),
@@ -1431,7 +1636,7 @@ private fun TextBody(n: NoteUi, ui: DockUiState, host: NotesDockHost, previews: 
         )
       }
     }
-    if (overflow || expanded) {
+    if (overflow || expanded || formatted.truncated) {
       Row(
         Modifier
           .padding(top = 4.dp)
@@ -1450,7 +1655,7 @@ private fun TextBody(n: NoteUi, ui: DockUiState, host: NotesDockHost, previews: 
       }
     }
     if (previews && !n.mono) {
-      val url = remember(n.text) { host.dockLinkFor(n.text) }
+      val url = n.link
       if (url != null) {
         Spacer(Modifier.height(8.dp))
         LinkCard(url, ui, host)
