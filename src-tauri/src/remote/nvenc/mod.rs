@@ -90,6 +90,8 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     // Spatial AQ: spend more bits on complex tiles (webcam, text) and fewer on
     // flat desktop regions. Zero latency cost; big quality win under CBR.
     rc.set_enable_aq(true);
+    rc.set_enable_min_qp(true);
+    rc.minQP = NV_ENC_QP { qpInterP: MIN_QP_P, qpInterB: MIN_QP_P, qpIntra: 0 };
     // Two-pass (quarter-res first pass) makes each frame's size track the VBV budget
     // more tightly — fewer oversized frames queueing on the wire and fewer starved
     // ones. Opt-in from Tune; single pass stays the default.
@@ -119,16 +121,24 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     // can start from the next keyframe without a side-channel config message.
     h264.set_repeat_sps_pps(true);
     h264.set_output_aud(false);
+    // Intra refresh on demand only: the automatic period is effectively never
+    // (≈ half an hour at 60 fps); `encode_ex(.., force_ir, ..)` starts a wave.
+    // The host's periodic safety net asks for a wave instead of an IDR.
+    h264.set_enable_intra_refresh(true);
+    h264.intraRefreshPeriod = 100_000;
+    h264.intraRefreshCnt = INTRA_REFRESH_FRAMES;
     // Ask for the VUI bitstream-restriction block; `sps::fixup` then corrects the
     // reorder/buffering values inside it (NVENC exposes no field for them).
     h264.h264VUIParameters.bitstreamRestrictionFlag = 1;
     h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
     h264.h264VUIParameters.videoFullRangeFlag = 0;
-    // Say which matrix NVENC actually used. Its ARGB input path converts with
-    // BT.601 limited range (measured by `colour_matrix_probe`: pure red → Y81 U90
-    // V240; BT.709 would be Y63 U102). Without a colour description, Chromium and
-    // Android both assume BT.709 for HD, so greens came out ~15% dark and reds
-    // orange-shifted. Desktop pixels are sRGB, whose primaries are BT.709's.
+    // Label the matrix explicitly — NVENC's ARGB input path picks its RGB→YUV
+    // matrix FROM this label, and when there is none it picks by resolution:
+    // BT.601 at small sizes (256×256: red → Y81 U90 V240) but BT.709 at 1080p
+    // (red → Y63 U102 V240), for H.264, HEVC and AV1 alike (research R8). With matrix 6
+    // set here the conversion and the label agree at every size, including the
+    // odd downscaled sizes the phone asks for. Any new codec must set its own label.
+    // Desktop pixels are sRGB, whose primaries are BT.709's.
     h264.h264VUIParameters.videoFormat = VUI_VIDEO_FORMAT_UNSPECIFIED;
     h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
     h264.h264VUIParameters.colourPrimaries = VUI_COLOUR_PRIMARIES_BT709;
@@ -229,7 +239,22 @@ pub fn available() -> bool {
 pub struct Frame<'a> {
     pub data: &'a [u8],
     pub key: bool,
+    /// NVENC's average QP for the frame (`frameAvgQP`). The capture loop's
+    /// refinement burst stops once a still screen has converged (see capture.rs).
+    pub avg_qp: u32,
 }
+
+/// P-frame QP floor. Without it a still screen keeps "refining" toward QP 1 —
+/// every 700 ms keep-alive re-spent ~3.7 KB polishing noise on a photo. At 12
+/// the keep-alive is ~25 B and the steady picture is still ~52 dB PSNR
+/// (research R10, measured with this exact config). I-frames get no floor.
+pub const MIN_QP_P: u32 = 12;
+
+/// Frames an intra-refresh wave is spread over (research R2). A wave is ordinary
+/// P-slices with intra macroblocks: it heals any silent corruption like an IDR
+/// would, without the IDR's one-frame budget crushing a detailed desktop into a
+/// 25 dB blur that takes ~30 encodes to sharpen.
+pub const INTRA_REFRESH_FRAMES: u32 = 30;
 
 /// Default NVENC preset: **P2**. Measured on an RTX 4070 Ti (`preset_latency_1080p`,
 /// `encoder_tuning_matrix`): P2 encodes a 1080p frame as fast as P1 (~1.2 ms median,
@@ -524,6 +549,12 @@ impl Encoder {
     /// Returns the Annex-B frame, already SPS-fixed. Borrows `self` for the frame's
     /// lifetime because the bytes live in our reusable scratch buffer.
     pub fn encode(&mut self, tex: &ID3D11Texture2D, force_key: bool, ts_us: u64) -> Result<Frame<'_>, String> {
+        self.encode_ex(tex, force_key, false, ts_us)
+    }
+
+    /// [`Self::encode`] plus `force_ir`: start an intra-refresh wave on this frame
+    /// (ignored when `force_key` already makes it an IDR).
+    pub fn encode_ex(&mut self, tex: &ID3D11Texture2D, force_key: bool, force_ir: bool, ts_us: u64) -> Result<Frame<'_>, String> {
         unsafe {
             let mapped = self.map(tex)?;
 
@@ -545,6 +576,9 @@ impl Encoder {
                 pictureStruct: NV_ENC_PIC_STRUCT_FRAME,
                 ..Default::default()
             };
+            if force_ir && !force_key {
+                pic.codecPicParams.h264PicParams.forceIntraRefreshWithFrameCnt = INTRA_REFRESH_FRAMES;
+            }
             let st = (self.funcs.nvEncEncodePicture.ok_or("no EncodePicture")?)(self.enc, &mut pic);
             // Unmap before bailing on an error — a leaked mapping wedges the session.
             let unmap = || {
@@ -571,6 +605,7 @@ impl Encoder {
 
             let src = std::slice::from_raw_parts(lock.bitstreamBufferPtr as *const u8, lock.bitstreamSizeInBytes as usize);
             let key = lock.pictureType == NV_ENC_PIC_TYPE_IDR || lock.pictureType == NV_ENC_PIC_TYPE_I;
+            let avg_qp = lock.frameAvgQP;
 
             // Only keyframes carry an SPS (repeatSPSPPS + OUTPUT_SPSPPS ride the IDR),
             // so P-frames skip the NAL scan entirely and are copied through as-is.
@@ -595,6 +630,7 @@ impl Encoder {
             Ok(Frame {
                 data: &self.out,
                 key,
+                avg_qp,
             })
         }
     }
@@ -734,6 +770,131 @@ mod tests {
         }
     }
 
+    /// Still-screen behaviour behind the capture loop's refinement burst (research R2
+    /// / R10): an IDR of a detailed still frame starts blurry at a high QP, re-encoding
+    /// the same texture converges, the P-frame QP floor holds, and an intra-refresh
+    /// request is a P-frame (not an IDR) that still carries real intra data. Writes
+    /// `target/perf-validation/refine-src.bgra` + `refine-6m.h264` for an ffmpeg PSNR
+    /// check (see docs/STREAMING_EFFICIENCY.md).
+    ///   `cargo test --lib remote::nvenc::tests::still_screen_refinement -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs an NVIDIA GPU; writes fixtures under target/perf-validation"]
+    fn still_screen_refinement() {
+        if !available() {
+            eprintln!("no NVENC on this machine — skipping");
+            return;
+        }
+        let (w, h) = (1920u32, 1080u32);
+        // Text-like still: glyph rows, fine diagonals, a checker and a gradient —
+        // the content that an IDR squeezed into two frames of budget ruins.
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let v: u8 = if x < w / 2 {
+                    if y % 13 < 9 && (x / 3 + y / 13) % 5 != 0 && x % 3 != 2 { 30 } else { 235 }
+                } else if y < h / 3 {
+                    if (x + y) % 5 == 0 { 20 } else { 240 }
+                } else if y < 2 * h / 3 {
+                    if ((x / 2) + (y / 2)) % 2 == 0 { 0 } else { 255 }
+                } else {
+                    ((x * 255) / w) as u8
+                };
+                px[i] = v;
+                px[i + 1] = v.wrapping_add((x % 7) as u8);
+                px[i + 2] = v;
+                px[i + 3] = 255;
+            }
+        }
+        unsafe {
+            let mut device = None;
+            D3D11CreateDevice(
+                None::<&windows::Win32::Graphics::Dxgi::IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .expect("create d3d11 device");
+            let device = device.expect("device");
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                ..Default::default()
+            };
+            let mut tex = None;
+            device.CreateTexture2D(&desc, None, Some(&mut tex)).expect("texture");
+            let tex = tex.expect("texture");
+            let ctx = device.GetImmediateContext().expect("context");
+            let res: windows::Win32::Graphics::Direct3D11::ID3D11Resource = tex.cast().expect("resource");
+            ctx.UpdateSubresource(&res, 0, None, px.as_ptr() as *const _, w * 4, 0);
+
+            let mut enc = Encoder::new(&device, Params::new(w, h, 60, 6_000_000)).expect("NVENC session");
+            let mut stream = Vec::new();
+            let mut log = Vec::new();
+            for i in 0..121u64 {
+                let f = enc.encode_ex(&tex, i == 0, false, i * 16_667).expect("encode");
+                log.push((f.key, f.data.len(), f.avg_qp));
+                stream.extend_from_slice(f.data);
+            }
+            // Intra-refresh wave: must be a P-frame (no IDR, no SPS) that still carries
+            // intra data — far bigger than the skip frames before it.
+            let ir = enc.encode_ex(&tex, false, true, 121 * 16_667).expect("encode");
+            let ir_len = ir.data.len();
+            let ir_key = ir.key;
+            stream.extend_from_slice(ir.data);
+            let mut wave = Vec::new();
+            for i in 122..152u64 {
+                let f = enc.encode_ex(&tex, false, false, i * 16_667).expect("encode");
+                wave.push((f.data.len(), f.avg_qp));
+                stream.extend_from_slice(f.data);
+            }
+
+            for (i, (k, len, qp)) in log.iter().enumerate().filter(|(i, _)| i % 5 == 0) {
+                eprintln!("frame {i:2}: key={k} bytes={len:6} avgQP={qp}");
+            }
+            eprintln!("IR wave start: key={ir_key} bytes={ir_len}; next: {:?}", &wave[..6]);
+
+            let (key0, _, qp0) = log[0];
+            assert!(key0, "frame 0 must be the IDR");
+            // Converged within the burst budget (45 frames at frame cadence).
+            // Same stop rule as capture.rs: avg QP ≤ 18, or three tiny frames in a row
+            // once QP is already ≤ 26 (tiny frames right after the IDR are the buffer
+            // draining, not convergence).
+            // Within the production burst cap (capture.rs REFINE_FRAMES = 120).
+            let converged = (1..=120usize).find(|&i| {
+                log[i].2 <= 18 || (i >= 3 && log[i].2 <= 26 && (i - 2..=i).all(|j| log[j].1 < 512))
+            });
+            eprintln!("refinement stop rule met at frame {converged:?}");
+            assert!(converged.is_some(), "still frame did not converge within 120 re-encodes: {log:?}");
+            assert!(converged.unwrap() > 15, "stop rule fired during the post-IDR buffer drain");
+            let steady_qp = log[120].2;
+            assert!(steady_qp < qp0, "refinement must lower QP ({qp0} → {steady_qp})");
+            assert!(
+                steady_qp + 1 >= MIN_QP_P,
+                "P-frame QP floor must hold: steady avg QP {steady_qp} < {MIN_QP_P}"
+            );
+            assert!(!ir_key, "an intra-refresh request must not become an IDR");
+            assert!(ir_len > log[120].1 * 2, "an IR wave frame must carry intra data ({ir_len} vs {})", log[120].1);
+
+            let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-validation");
+            let _ = std::fs::create_dir_all(&out_dir);
+            std::fs::write(out_dir.join("refine-src.bgra"), &px).expect("write source");
+            std::fs::write(out_dir.join("refine-6m.h264"), &stream).expect("write stream");
+            eprintln!("wrote {} ({} frames)", out_dir.join("refine-6m.h264").display(), 152);
+        }
+    }
+
     /// Writes one short H.264 clip per solid colour so the RGB→YUV matrix NVENC uses
     /// can be read back with ffmpeg (`-f rawvideo -pix_fmt yuv420p`). Pure-red Y is
     /// the tell: BT.601 limited = 81, BT.709 limited = 63.
@@ -762,7 +923,9 @@ mod tests {
             )
             .expect("create d3d11 device");
             let device = device.expect("device");
-            let (w, h) = (256u32, 256u32);
+            // 1080p on purpose: unlabelled, NVENC converts with BT.601 at small sizes but
+            // BT.709 at HD, so only an HD probe proves the VUI label drives the matrix.
+            let (w, h) = (1920u32, 1080u32);
             // BGRA byte order (what Desktop Duplication hands the encoder).
             for (name, bgra) in [
                 ("red", [0u8, 0, 255, 255]),

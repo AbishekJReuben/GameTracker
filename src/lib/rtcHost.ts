@@ -147,7 +147,10 @@ const WC_CODECS = ["avc1.42C028", "avc1.42E028", "avc1.4d0028", "avc1.640028", "
 const WC_MAX_BUFFERED = 262144;
 /** Recovery keyframe cadence (ms). Transport is reliable, so keyframes are only
  *  for decoder recovery/joins — long GOPs also avoid Chromium's ~1Hz IDR hitch. */
-const WC_KEY_INTERVAL_MS = 10000;
+// Periodic safety net cadence. On the native path it is an intra-refresh wave
+// (not an IDR); every real reference break already requests its own IDR, so this
+// only guards against silent corruption and can be long (research R2).
+const WC_KEY_INTERVAL_MS = 30000;
 
 // ---- DIRECT audio ("amode: pcm") -------------------------------------------
 // Raw float32 PCM costs sampleRate × channels × 4 = 384 KB/s ≈ 3.1 Mbps at 48k
@@ -2395,6 +2398,8 @@ export function startHost(opts: HostOptions): () => void {
     let wcSeq = 0;
     let wcForceKey = false;
     let wcLastKeyAt = 0;
+    /** Last periodic intra-refresh request (the safety net no longer sends IDRs). */
+    let wcLastRefreshAt = 0;
     let wcEncMs = 0; // EWMA encode latency (frame submit → encoded chunk out)
     let wcFrames = 0;
     let wcBytes = 0;
@@ -2719,10 +2724,25 @@ export function startHost(opts: HostOptions): () => void {
         slog("config", `announce ${w}x${h}`);
         requestNativeKeyframe("config/announce");
       }
-      // Periodic safety-net IDR (Tune wcKeyMs). This is routine hygiene, NOT an
-      // artifact event — never arm the recovering/HUD counters for it.
-      if (!key && performance.now() - wcLastKeyAt >= quality.wcKeyMs) {
-        requestNativeKeyframe("periodic safety net");
+      // Periodic safety net (Tune wcKeyMs), now an intra-refresh WAVE, not an IDR.
+      // An IDR of a still, detailed desktop is squeezed into ~2 frames of VBV:
+      // it decoded at 25–31 dB and needed ~30 encodes to sharpen, longer than the
+      // 10 s interval, so a still screen never looked sharp (research R2). The
+      // wave heals silent corruption the same way without that blur. Routine
+      // hygiene, NOT an artifact event — never arm the recovering/HUD counters.
+      if (!key) {
+        const now = performance.now();
+        if (now - Math.max(wcLastKeyAt, wcLastRefreshAt) >= quality.wcKeyMs) {
+          wcLastRefreshAt = now;
+          if (sessionAlive) {
+            slog("idr", "intra-refresh wave (periodic safety net)");
+            try {
+              void api.remoteRequestRefresh();
+            } catch {
+              /* not on desktop / no native encoder */
+            }
+          }
+        }
       }
       const maxBuffered = wcBufBudget();
       const buffered = videoCh.bufferedAmount;

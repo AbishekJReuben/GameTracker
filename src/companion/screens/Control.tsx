@@ -79,6 +79,7 @@ import type { ContentMode, ControlMsg, QualitySettings, RemoteLink } from "../li
 import { startGamepadBridge } from "../gamepad";
 import { apiGet } from "../link";
 import type { AudioStats, ConnectSnapshot, WcStats } from "../cloud";
+import { POWER_IDLE_GRACE_MS } from "../cloud";
 import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { tabAllowed } from "@/lib/setupMode";
@@ -1477,10 +1478,35 @@ export function ControlScreen({
   // long as the Control screen stayed MOUNTED, which meant an eight-hour
   // background sit kept the Wi-Fi radio out of power save for a session nobody
   // was watching. PiP and immersive VR still count as on-screen.
+  //
+  // Release is debounced by the same grace the host-encoder idle uses: a PiP
+  // enter/exit briefly reads as "hidden, not PiP", and dropping the lock plus
+  // the 120 Hz display mode there cost a radio power-save round trip and a
+  // display mode switch on every transition — part of the resume hitch.
   useEffect(() => {
     const w = window as Window & { __GT_PIP_ACTIVE__?: boolean };
+    const onScreen = () => !document.hidden || !!w.__GT_PIP_ACTIVE__ || isImmersiveActive();
+    let held: boolean | null = null;
+    let releaseTimer: number | null = null;
+    const set = (on: boolean) => {
+      if (held === on) return;
+      held = on;
+      void setStreamPowerActive(on);
+    };
     const apply = () => {
-      void setStreamPowerActive(!document.hidden || !!w.__GT_PIP_ACTIVE__ || isImmersiveActive());
+      if (onScreen()) {
+        if (releaseTimer !== null) {
+          window.clearTimeout(releaseTimer);
+          releaseTimer = null;
+        }
+        set(true);
+        return;
+      }
+      if (releaseTimer !== null) return;
+      releaseTimer = window.setTimeout(() => {
+        releaseTimer = null;
+        if (!onScreen()) set(false);
+      }, POWER_IDLE_GRACE_MS);
     };
     apply();
     document.addEventListener("visibilitychange", apply);
@@ -1490,6 +1516,7 @@ export function ControlScreen({
       document.removeEventListener("visibilitychange", apply);
       window.removeEventListener("gt:pip", apply);
       unsub?.();
+      if (releaseTimer !== null) window.clearTimeout(releaseTimer);
       void setStreamPowerActive(false);
     };
   }, []);
@@ -4183,10 +4210,10 @@ export function ControlScreen({
                 />
                 <TuneSection label="DIRECT path — H.264 over the data channel" />
                 <TuneRow
-                  label="Keyframe every"
+                  label="Refresh every"
                   scope="direct"
                   showHint={tuneHints}
-                  hint="Recovery keyframe cadence. The channel is reliable, so keyframes are only for decoder recovery — long is good and dodges the ~1s IDR hitch. Short costs bandwidth for faster recovery from a glitch."
+                  hint="Safety-net cadence. With the PC’s NVENC encoder this is an intra-refresh wave (no blurry keyframe on a still screen); otherwise a keyframe. The channel is reliable and real breaks request their own keyframe, so long is good. Short costs bandwidth."
                   value={tune.wcKeyMs}
                   min={1000}
                   max={30000}

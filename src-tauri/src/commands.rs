@@ -2373,6 +2373,14 @@ pub fn remote_request_keyframe() {
     crate::remote::capture::request_keyframe();
 }
 
+/// Ask the native encoder for an intra-refresh wave instead of an IDR — the host's
+/// periodic safety net. Heals any silent corruption like an IDR would, without the
+/// IDR's blurry frame on a still desktop (see `capture::NATIVE_FORCE_IR`).
+#[tauri::command]
+pub fn remote_request_refresh() {
+    crate::remote::capture::request_refresh();
+}
+
 /// Backpressure gate for the native H.264 path. While set, captures are skipped
 /// BEFORE NVENC (keyframes still encode), so the reference chain stays intact —
 /// dropping already-encoded P-frames is what corrupted the picture until the

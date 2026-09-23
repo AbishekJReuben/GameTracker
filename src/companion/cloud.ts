@@ -293,6 +293,11 @@ const BACKOFF_MAX = 30000;
  *  it out; `onVisibility` retries immediately the moment anyone is looking. */
 const BACKOFF_MAX_HIDDEN = 300_000;
 const WATCHDOG_MS = 3000; // health-check cadence
+/** How long the page must stay hidden (and not in PiP / VR) before we tell the
+ *  host to stop encoding. Longer than any PiP enter/exit handoff (~0.5 s on a
+ *  moto g57 running Android 17), short enough that a real background stops
+ *  burning radio and GPU almost at once. Shared with Control.tsx's radio lock. */
+export const POWER_IDLE_GRACE_MS = 1500;
 const HARD_RESET_MS = 60000; // transport down this long → full teardown + rebuild
 // First-connection wedges (cold start) get a much shorter fuse: nothing is
 // established yet, so a fast clean rebuild beats waiting out the full backstop.
@@ -534,6 +539,8 @@ export class CloudConn {
   private vstatTimer: number | null = null;
   /** Host has been told to stop encoding because we're backgrounded. */
   private powerIdle = false;
+  /** Pending "go idle" — see POWER_IDLE_GRACE_MS. */
+  private powerIdleTimer: number | null = null;
 
   // ---- DIRECT audio (PCM over data channel) ---------------------------------
   private chAudio?: RTCDataChannel;
@@ -798,10 +805,30 @@ export class CloudConn {
    * PiP is NOT idle: the mini window is on screen and genuinely rendering.
    * Immersive VR is not idle either — WebXR runs with the page hidden.
    */
-  private syncPowerIdle() {
+  private syncPowerIdle(commit = false) {
     const w = window as Window & { __GT_PIP_ACTIVE__?: boolean };
     const idle = document.hidden && !w.__GT_PIP_ACTIVE__ && !isImmersiveActive();
+    // Going idle is DEBOUNCED; waking is immediate. Android reports the page
+    // hidden a beat before the PiP flag lands (enter) and drops the flag a beat
+    // before the page turns visible again (exit), so every PiP transition used
+    // to look like "backgrounded" for a few hundred ms: host encoder paused,
+    // decoder gated to the next IDR, then resumed — a visible freeze on the way
+    // into AND out of the mini window. A real background outlasts the grace.
+    if (!idle && this.powerIdleTimer !== null) {
+      window.clearTimeout(this.powerIdleTimer);
+      this.powerIdleTimer = null;
+    }
     if (idle === this.powerIdle) return;
+    if (idle && !commit) {
+      if (this.powerIdleTimer === null) {
+        // Timers are throttled once hidden; the grace is a floor, not a promise.
+        this.powerIdleTimer = window.setTimeout(() => {
+          this.powerIdleTimer = null;
+          if (!this.closed) this.syncPowerIdle(true);
+        }, POWER_IDLE_GRACE_MS);
+      }
+      return;
+    }
     this.powerIdle = idle;
     if (idle) this.wcFlushPaceQueue(false);
     // Resuming: the decoder threw away everything that arrived while hidden, so
@@ -2445,8 +2472,11 @@ export class CloudConn {
     hitchMaybeFrameGap(this.hitchLastFramePerf, perfNow, expectMs);
     this.hitchLastFramePerf = perfNow;
     // Backgrounded (NOT PiP — a PiP window counts as visible): skip decoding to
-    // save battery; resync off a fresh keyframe when the app comes back.
-    if (this.powerIdle || (document.hidden && !(window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__)) {
+    // save battery; resync off a fresh keyframe when the app comes back. Gated on
+    // the DEBOUNCED idle, not raw document.hidden: frames that land during a PiP
+    // handoff must keep the reference chain alive, or the mini window (and the
+    // full screen after it) freezes until the next IDR.
+    if (this.powerIdle) {
       this.wcAwaitKey = true;
       return;
     }
@@ -3429,6 +3459,10 @@ export class CloudConn {
   }
   close() {
     this.closed = true;
+    if (this.powerIdleTimer !== null) {
+      window.clearTimeout(this.powerIdleTimer);
+      this.powerIdleTimer = null;
+    }
     // Belt-and-braces: Control.tsx owns the Wi-Fi low-latency lock's lifetime
     // (mount/unmount), but a session close must never strand a held lock.
     void setStreamPowerActive(false);

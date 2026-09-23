@@ -105,7 +105,7 @@ import org.json.JSONObject;
  * `remote_secret_code` via HKDF-SHA256 (salt = "gt-clipboard-v1"). Wire format is
  * `iv(12) || ciphertext+tag(16)`; text payloads are base64-encoded on the wire.
  */
-public class ClipboardService extends Service {
+public class ClipboardService extends Service implements NotesDockHost {
   private static final Pattern HTTP_LINK = Pattern.compile("https?://[^\\s<>()]+", Pattern.CASE_INSENSITIVE);
   /** Recognized TLDs, so a bare host (amazon.in/dp/…) previews but a file name
    *  (main.rs) or a version (3.9.81) does not. Mirrors the web client's list. */
@@ -120,15 +120,20 @@ public class ClipboardService extends Service {
    *  {@code ClipboardPickActivity} proxy (services can't open the photo picker
    *  themselves — no Activity result callback). Reads + syncs the bytes. */
   public static final String ACTION_UPLOAD_IMAGE = "__PACKAGE__.CLIP_UPLOAD_IMAGE";
+  /** Open the Notes dock over whatever is on screen (Quick Settings tile, the
+   *  notification). Routed through NotesDockActivity so the shade collapses. */
+  public static final String ACTION_SHOW_DOCK = "__PACKAGE__.CLIP_SHOW_DOCK";
+  /** Re-read the edge-handle preference (the tile was just added). */
+  public static final String ACTION_EDGE_HANDLE = "__PACKAGE__.CLIP_EDGE_HANDLE";
+  /** Pref: draw the always-on edge handle. Unset = on; adding the Quick Settings
+   *  tile switches it off (the tile is the screenshot-free way in). */
+  public static final String PREF_EDGE_HANDLE = "edgeHandle";
   private static final String CHANNEL = "gt_clipboard";
   private static final int NOTIF_ID = 0x6C69; // "li"
   // Keep a large backlog so the full history is browsable in the dock (lazy-rendered
-  // on scroll — see renderLimit). Text rows are cheap; images are kept as small
+  // lazily by the Compose list). Text rows are cheap; images are kept as small
   // downscaled thumbnails (see thumbs), so memory stays bounded even at this size.
   private static final int MAX_ITEMS = 300;
-  // How many rows to render at once; grows as the user scrolls (see dock scroll
-  // listener) so a 300-item history doesn't inflate hundreds of views up front.
-  private static final int RENDER_PAGE = 30;
   // Longest edge (px) of a decoded image thumbnail — keeps the dock light even
   // with many images. Full images are viewed by opening the app.
   private static final int THUMB_MAX_PX = 240;
@@ -142,57 +147,13 @@ public class ClipboardService extends Service {
   private WindowManager wm;
   private View bubble; // the flat edge pin (mostly off-screen until swiped in)
   private WindowManager.LayoutParams bubbleLp;
-  private View panel;
-  private LinearLayout panelList; // the row container inside the panel's ScrollView
-  private ScrollView dockScroll;
-  // ---- view recycling for the history list -----------------------------------
-  // The dock used to removeAllViews() + re-inflate every visible row on every
-  // refresh (relay notices, thumbnail decode, pin/delete toggles…) — ~10 Views
-  // per row × ~30 rendered rows per refresh, immediately GC'd. That churn was
-  // the lag. Rows are now built once and REBOUND: liveRows keeps the row View
-  // (and its RowHolder tag) for every id currently on screen; on a refresh we
-  // detach survivors, drop the rest into per-kind pools, then re-add survivors
-  // in order and pull fresh rows from the pools only for genuinely new ids.
-  // listeners are wired once in buildRow and read holder.entry at click time, so
-  // a rebind never allocates a lambda.
-  private final HashMap<String, View> liveRows = new HashMap<>();
-  private final ArrayList<View> poolText = new ArrayList<>();
-  private final ArrayList<View> poolImage = new ArrayList<>();
-  private static final int ROW_POOL_MAX = 24;
-  private TextView panelStatusText; // status label in floating panel header
+  /** The Compose dock (NotesDock.kt). Created on first open, kept for the
+   *  service's life so reopening is an addView, not a rebuild. */
+  private NotesDock dock;
   private volatile boolean socketConnected;
-  private WindowManager.LayoutParams panelLp;
   // Which screen edge the pin/dock lives on. The dock slides in from this side.
   private boolean pinOnRight = true;
   private final Handler main = new Handler(Looper.getMainLooper());
-  // Relay history is delivered one item at a time. Coalescing its redraws keeps
-  // the floating dock's input responsive while socket and crypto work stay off
-  // the main thread.
-  private boolean panelRefreshQueued;
-  /** Timestamp of the last list gesture; never rebuild rows under an active fling. */
-  private long lastDockScrollAt;
-  private final Runnable renderPanel = () -> {
-    panelRefreshQueued = false;
-    if (panel != null && panelList != null) {
-      // A render is deferred until a fling settles so the compositor's scroll
-      // path stays free even while a relay catch-up or image thumbnail lands in
-      // the background. (renderList now recycles rows rather than rebuilding
-      // them all, but re-adding/detaching during a fling still costs layout.)
-      long sinceScroll = SystemClock.uptimeMillis() - lastDockScrollAt;
-      if (sinceScroll < 180) {
-        panelRefreshQueued = false;
-        main.postDelayed(this::refreshPanelIfOpen, 180 - sinceScroll);
-        return;
-      }
-      int oldY = dockScroll == null ? 0 : dockScroll.getScrollY();
-      populateFolderStrip();
-      panelList.removeAllViews();
-      renderList(panelList);
-      if (dockScroll != null && oldY > 0) {
-        dockScroll.post(() -> dockScroll.scrollTo(0, oldY));
-      }
-    }
-  };
   private OkHttpClient http;
   private volatile WebSocket socket;
   private final java.util.concurrent.ExecutorService syncWorker =
@@ -255,11 +216,31 @@ public class ClipboardService extends Service {
     return 0xFFFBBF24;
   }
 
+  private boolean lastTileConnected;
+
   private void refreshStatusIfOpen() {
-    if (panelStatusText != null) {
-      panelStatusText.setText(getSyncStatusText());
-      panelStatusText.setTextColor(getSyncStatusColor());
+    refreshPanelIfOpen();
+    // The Quick Settings tile shows the sync state as its subtitle; nudge it only
+    // when that state actually flips (requestListeningState is a binder call).
+    boolean connected = socketConnected && cryptoKey != null;
+    if (connected != lastTileConnected) {
+      lastTileConnected = connected;
+      try {
+        android.service.quicksettings.TileService.requestListeningState(this,
+            new android.content.ComponentName(this, NotesTileService.class));
+      } catch (Exception ignored) {
+      }
     }
+  }
+
+  /** Tile subtitle / state, readable without an instance. */
+  static boolean isRunning() {
+    return INSTANCE != null;
+  }
+
+  static String tileSubtitle() {
+    ClipboardService s = INSTANCE;
+    return s == null ? "Off" : s.getSyncStatusText();
   }
 
   /** Decrypted items, newest first. Synced on `this` (touched from the WS thread
@@ -279,8 +260,8 @@ public class ClipboardService extends Service {
     boolean pinned;      // toggled by the pin button / relay pin notices
     String folder = "";  // folder/list label ("" = unfiled)
     final ArrayList<String> tags = new ArrayList<>();
-    boolean pendingDelete; // armed by a first tap on ✕ (two-tap confirm)
     String mime = "image/png"; // for images (used when sharing)
+    String deviceName = "";    // relay's deviceName ("SENGALPC", "Pixel 8 (Overlay)")
     ClipEntry(String id, String kind, String text, long createdAtMs, String deviceId) {
       this.id = id;
       this.kind = kind;
@@ -306,31 +287,6 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Cached handles to a row's child views + the entry it currently shows, plus
-   *  the bits bindRow needs to decide whether to touch a child (so a refresh that
-   *  didn't change the body text, say, skips setText entirely). Stored as the
-   *  row's tag so a pooled row keeps its holder for its whole life. */
-  static final class RowHolder {
-    String kind;          // "text" | "image" — fixed at build, survives pooling
-    ClipEntry entry; // null while pooled
-    TextView body;        // text rows only
-    android.widget.HorizontalScrollView bodyScroll; // code stays unwrapped and pans horizontally
-    Content content;      // what the body currently is (drives chrome + type chips)
-    ImageView image;      // image rows only
-    LinearLayout metaRow;
-    TextView meta;        // tags + relative time (left of the action buttons)
-    TextView expand;      // text rows only (null when never long)
-    View linkCard;        // the preview card, when one is attached
-    Button pinBtn;        // rebind updates glyph + colour
-    Button folderBtn;     // rebind updates colour
-    String linkUrl;       // url the current linkCard shows ("" = none)
-    boolean linkPreviewOn;// dockShowLinkPreviews at last bind (card reconciles on change)
-    String monoLabel;     // "Error"/"Code"/"Shell"/… when the body is monospaced, else null
-    String lastBody;      // body text last bound (skip re-setText/re-style when unchanged)
-    boolean lastHadLink;  // whether lastBody had an http link (drives configureBody)
-    String lastMeta;      // meta text last bound (skip re-setText when unchanged)
-    boolean expanded;     // current Show more/less state
-  }
   private final ArrayList<ClipEntry> items = new ArrayList<>();
 
   /** Keep `items` in display order: pinned first, then newest→oldest by timestamp.
@@ -364,7 +320,9 @@ public class ClipboardService extends Service {
     INSTANCE = this;
     startForegroundNotif();
     trackOwnForeground();
+    if (ACTION_EDGE_HANDLE.equals(action) && !edgeHandleEnabled()) removeBubble();
     showBubble();
+    if (ACTION_SHOW_DOCK.equals(action)) main.post(this::showDock);
     // A gallery upload coming in from ClipboardPickActivity — handle it before the
     // usual connect cycle so the bytes are read + sent even if config is unchanged.
     final Uri upload = ACTION_UPLOAD_IMAGE.equals(action) && intent != null
@@ -823,6 +781,7 @@ public class ClipboardService extends Service {
       boolean own = nativeDeviceId.equals(v.optString("deviceId"));
       long created = parseIsoMs(v.optString("createdUtc", ""));
       String dev = v.optString("deviceId", "");
+      String devName = v.optString("deviceName", "");
       boolean pinned = v.optBoolean("pinned", false);
       String folder = v.optString("folder", "");
       ArrayList<String> tags = tagsFrom(v);
@@ -836,6 +795,7 @@ public class ClipboardService extends Service {
         synchronized (this) {
           existed = removeByIdLocked(id);
           ClipEntry e = new ClipEntry(id, "image", null, created, dev);
+          e.deviceName = devName;
           e.pinned = pinned;
           e.folder = folder;
           e.tags.addAll(tags);
@@ -856,6 +816,7 @@ public class ClipboardService extends Service {
         // Dedupe by id (rev-driven re-broadcasts + edits happen).
         existed = removeByIdLocked(id);
         ClipEntry e = new ClipEntry(id, "text", plain, created, dev);
+        e.deviceName = devName;
         e.pinned = pinned;
         e.folder = folder;
         e.tags.addAll(tags);
@@ -901,7 +862,7 @@ public class ClipboardService extends Service {
    *  Called only when the dock actually renders the row, so background catch-ups
    *  never re-download blobs. Best-effort; refreshes the panel when done. */
   private void fetchImageThumb(String id) {
-    if (stopping || panel == null || http == null || clipSpace.isEmpty() || httpBase.isEmpty()) return;
+    if (stopping || dock == null || !dock.isOpen() || http == null || clipSpace.isEmpty() || httpBase.isEmpty()) return;
     final String space = clipSpace;
     synchronized (this) {
       if (thumbs.containsKey(id) || !thumbFetching.add(id)) return;
@@ -965,7 +926,8 @@ public class ClipboardService extends Service {
         : new Notification.Builder(this);
     nm.notify(NOTIF_ID, b.setSmallIcon(base.getSmallIcon())
         .setContentTitle("New shared note")
-        .setContentText("Tap the edge pin to view and copy it")
+        .setContentText("Open Notes to view and copy it")
+        .setContentIntent(dockPendingIntent())
         .setOngoing(true)
         .setOnlyAlertOnce(false)
         .build());
@@ -1228,6 +1190,20 @@ public class ClipboardService extends Service {
   /** Live built-in recognition session (keyless path). Main-thread only. */
   private android.speech.SpeechRecognizer speechRec;
   private boolean nativeListening;
+  /** What the dock's mic button shows: 0 idle, 1 listening/recording, 2 transcribing. */
+  private volatile int micState;
+
+  private void setMicState(int state) {
+    micState = state;
+    refreshPanelIfOpen();
+  }
+
+  /** A finished transcript goes to the end of the dock's composer. */
+  private void appendTranscript(String text) {
+    if (text == null || text.isEmpty()) return;
+    NotesDock d = dock;
+    if (d != null) d.appendToComposer(text);
+  }
 
   private boolean hasSarvamKey() {
     return sarvamKey != null && !sarvamKey.trim().isEmpty();
@@ -1237,7 +1213,7 @@ public class ClipboardService extends Service {
    *  keyed path, better for long dictation). Without one: the phone's BUILT-IN
    *  SpeechRecognizer, so the mic always works. Needs RECORD_AUDIO — if not
    *  granted, routes the user to the app to grant it. */
-  private void toggleMic(Button micBtn) {
+  private void toggleMic() {
     if (nativeListening) {
       // Gentle stop: let onResults/onError deliver the transcript, then clean up.
       main.post(() -> {
@@ -1248,7 +1224,7 @@ public class ClipboardService extends Service {
       });
       return;
     }
-    if (recording) { stopRecordingAndTranscribe(micBtn); return; }
+    if (recording) { stopRecordingAndTranscribe(); return; }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
         && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
@@ -1257,7 +1233,7 @@ public class ClipboardService extends Service {
       return;
     }
     if (!hasSarvamKey()) {
-      startNativeStt(micBtn);
+      startNativeStt();
       return;
     }
     try {
@@ -1272,37 +1248,35 @@ public class ClipboardService extends Service {
       recorder.prepare();
       recorder.start();
       recording = true;
-      micBtn.setText("■");
+      setMicState(1);
       toast("Recording… tap to stop");
     } catch (Exception e) {
       recording = false;
       safeReleaseRecorder();
+      setMicState(0);
       toast("Mic unavailable");
     }
   }
 
-  private void stopRecordingAndTranscribe(Button micBtn) {
+  private void stopRecordingAndTranscribe() {
     recording = false;
-    micBtn.setText("…");
+    setMicState(2);
     try {
       if (recorder != null) { recorder.stop(); }
     } catch (Exception ignored) {
     }
     safeReleaseRecorder();
     final File f = audioFile;
-    final EditText composer = dockComposer;
     if (f == null || !f.exists() || http == null) {
-      micBtn.setText("🎤");
+      setMicState(0);
       return;
     }
     new Thread(() -> {
       String text = transcribeViaSarvam(f);
       main.post(() -> {
-        if (dockMic instanceof Button) ((Button) dockMic).setText("🎤");
-        if (text != null && !text.isEmpty() && composer != null) {
-          String cur = composer.getText().toString();
-          composer.setText(cur.isEmpty() ? text : cur + " " + text);
-          composer.setSelection(composer.getText().length());
+        setMicState(0);
+        if (text != null && !text.isEmpty()) {
+          appendTranscript(text);
         } else if (text == null) {
           toast("Transcription failed");
         }
@@ -1345,7 +1319,7 @@ public class ClipboardService extends Service {
 
   /** Built-in (on-device / Google) speech recognition — the keyless voice path.
    *  Appends the final transcript to the composer, same as the Sarvam flow. */
-  private void startNativeStt(Button micBtn) {
+  private void startNativeStt() {
     main.post(() -> {
       try {
         if (!android.speech.SpeechRecognizer.isRecognitionAvailable(this)) {
@@ -1370,44 +1344,38 @@ public class ClipboardService extends Service {
           @Override public void onRmsChanged(float rmsdB) {}
           @Override public void onBufferReceived(byte[] buffer) {}
           @Override public void onEndOfSpeech() {
-            if (micBtn != null) micBtn.setText("…");
+            setMicState(2);
           }
           @Override public void onError(int error) {
             boolean noSpeech = error == android.speech.SpeechRecognizer.ERROR_NO_MATCH
                 || error == android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT;
             if (!noSpeech) toast("Speech recognition failed (" + error + ")");
             else toast("Didn't catch that — try again");
-            finishNativeStt(micBtn);
+            finishNativeStt();
           }
           @Override public void onResults(android.os.Bundle results) {
             ArrayList<String> out = results == null ? null
                 : results.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION);
-            if (out != null && !out.isEmpty() && dockComposer != null) {
-              String cur = dockComposer.getText().toString();
-              String t = out.get(0);
-              dockComposer.setText(cur.isEmpty() ? t : cur + " " + t);
-              dockComposer.setSelection(dockComposer.getText().length());
-            }
-            finishNativeStt(micBtn);
+            if (out != null && !out.isEmpty()) appendTranscript(out.get(0));
+            finishNativeStt();
           }
           @Override public void onPartialResults(android.os.Bundle partialResults) {}
           @Override public void onEvent(int eventType, android.os.Bundle params) {}
         });
         nativeListening = true;
-        if (micBtn != null) micBtn.setText("■");
+        setMicState(1);
         speechRec.startListening(intent);
         toast("Listening…");
       } catch (Exception e) {
-        finishNativeStt(micBtn);
+        finishNativeStt();
         toast("Mic unavailable");
       }
     });
   }
 
-  private void finishNativeStt(Button micBtn) {
+  private void finishNativeStt() {
     nativeListening = false;
-    if (micBtn != null) micBtn.setText("🎤");
-    else if (dockMic instanceof Button) ((Button) dockMic).setText("🎤");
+    setMicState(0);
     try {
       if (speechRec != null) speechRec.destroy();
     } catch (Exception ignored) {
@@ -1422,7 +1390,7 @@ public class ClipboardService extends Service {
         if (speechRec != null) speechRec.cancel();
       } catch (Exception ignored) {
       }
-      finishNativeStt(dockMic instanceof Button ? (Button) dockMic : null);
+      finishNativeStt();
     });
   }
 
@@ -1459,18 +1427,37 @@ public class ClipboardService extends Service {
     Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
     int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) piFlags |= PendingIntent.FLAG_IMMUTABLE;
-    PendingIntent pi = PendingIntent.getActivity(this, 0, open, piFlags);
+    PendingIntent appPi = open == null ? null : PendingIntent.getActivity(this, 0, open, piFlags);
 
     Notification.Builder b =
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
             ? new Notification.Builder(this, CHANNEL)
             : new Notification.Builder(this);
-    return b.setSmallIcon(getApplicationInfo().icon)
+    b.setSmallIcon(getApplicationInfo().icon)
         .setContentTitle("Shared notes")
-        .setContentText("Tap the edge pin to view recent notes")
-        .setContentIntent(pi)
-        .setOngoing(true)
-        .build();
+        .setContentText("Tap to open Notes — or use the Quick Settings tile")
+        // Tapping the notification opens the dock itself (via the trampoline, so
+        // the shade collapses) rather than the whole app.
+        .setContentIntent(dockPendingIntent())
+        .setOngoing(true);
+    if (appPi != null) {
+      b.addAction(new Notification.Action.Builder(
+          android.graphics.drawable.Icon.createWithResource(this, getApplicationInfo().icon),
+          "Open app", appPi).build());
+    }
+    return b.build();
+  }
+
+  /** Opens the dock over the current app and collapses the notification shade
+   *  (an Activity PendingIntent does; a Service one leaves the shade covering
+   *  the dock). */
+  private PendingIntent dockPendingIntent() {
+    Intent i = new Intent(this, NotesDockActivity.class);
+    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION
+        | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+    int flags = PendingIntent.FLAG_UPDATE_CURRENT
+        | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0);
+    return PendingIntent.getActivity(this, 7, i, flags);
   }
 
   // Density captured once at first use; getResources().getDisplayMetrics() is a
@@ -1497,6 +1484,7 @@ public class ClipboardService extends Service {
    *  the edge; a horizontal drag toward the centre opens the dock. */
   private void showBubble() {
     if (bubble != null) return;
+    if (!edgeHandleEnabled()) return; // Quick Settings tile / notification only
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(this)) {
       return; // no overlay permission — the FGS still runs; pin appears once granted
     }
@@ -1767,608 +1755,81 @@ public class ClipboardService extends Service {
     }
   }
 
-  // ---- side dock ------------------------------------------------------------
+  // ---- dock (Compose UI in NotesDock.kt; this is its host) ------------------
 
-  private EditText dockComposer; // live handle so the mic can append transcripts
-  private View dockMic;          // mic button (Sarvam-keyed or built-in recognizer)
-  private Button dockAddBtn;     // flips Add ↔ Save while editing a note
-  private String dockFilter = ""; // native search text
-  private boolean dockShowLinkPreviews = true;
-  // Filter chip: "" = all, "text", "image". Mirrors the desktop panel's All / Text /
-  // Images tabs so the floating dock has the same content-type filtering.
-  private String dockFilterKind = "";
-  // Tag filter: null = All, "" = Untagged, else a tag. New items inherit the
-  // selected tag, and each existing item can hold multiple tags.
+  // Filters that the service itself needs: the tag new items adopt (the one
+  // being viewed) and whether link cards are drawn. Everything else — search,
+  // All/Text/Images, type chips, editing, the tag picker — is UI state and
+  // lives in NotesDock.kt.
   private String dockFolderFilter = null;
-  private LinearLayout dockFolderStrip; // rebuilt when folders change
-  // Content-type filter: null = Any, else a Content.kind ("link", "code", …).
-  // Parity with the desktop panel's type chips.
-  private String dockTypeFilter = null;
-  private LinearLayout dockTypeStrip;   // rebuilt when the item set changes
-  private View dockTypeScroll;          // hidden outright when there's nothing to pick
-  // Note editing: non-null while the composer is editing this entry in place.
-  private String dockEditingId = null;
-  // Folder chooser: non-null while the list shows "move to folder" options for
-  // this entry instead of the history.
-  private String folderPickForId = null;
-  // Lazy render window: only the first N matching rows are inflated as Views; grows
-  // by RENDER_PAGE as the user scrolls near the bottom so a 300-item history doesn't
-  // inflate hundreds of rows up front. Reset when the filter/search changes.
-  private int renderLimit = RENDER_PAGE;
+  private boolean dockShowLinkPreviews = true;
+  private boolean dockPrefsLoaded;
+  /** Link artwork / favicon downloads in flight (dedupe). Guarded by `this`. */
+  private final HashSet<String> bitmapLoading = new HashSet<>();
 
-  /** Slide the dock in from the pin's edge. Full-height, translucent-frosted, with
-   *  the same features as the app screen: compose (text + image + mic), search,
-   *  history (text + image thumbnails), copy-last, open-app. Idempotent (toggles). */
+  private boolean canOverlay() {
+    return Build.VERSION.SDK_INT < Build.VERSION_CODES.M || android.provider.Settings.canDrawOverlays(this);
+  }
+
+  private NotesDock dock() {
+    if (dock == null) {
+      if (!dockPrefsLoaded) {
+        dockPrefsLoaded = true;
+        dockShowLinkPreviews = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+            .getBoolean("dockShowLinkPreviews", true);
+      }
+      dock = new NotesDock(this, this);
+    }
+    return dock;
+  }
+
+  /** Edge handle tap: toggle the dock. */
   private void showPanel() {
-    if (panel != null) {
-      hidePanel();
+    if (!canOverlay()) return;
+    NotesDock d = dock();
+    if (d.isOpen()) d.hide();
+    else d.show();
+  }
+
+  /** Quick Settings tile / notification: always open (never toggle closed). */
+  private void showDock() {
+    if (!canOverlay()) {
+      openApp();
       return;
     }
-    if (!buildPanelTree()) return;
-    final LinearLayout root = panelRoot;
-    final int widthPx = panelRootWidth;
-    final int heightPx = getResources().getDisplayMetrics().heightPixels;
-
-    int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-        ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        : WindowManager.LayoutParams.TYPE_PHONE;
-    panelLp = new WindowManager.LayoutParams(
-        widthPx,
-        heightPx,
-        type,
-        // Drop NOT_FOCUSABLE so the composer/search EditTexts receive keystrokes;
-        // WATCH_OUTSIDE_TOUCH dismisses on an outside tap.
-        WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
-            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-        PixelFormat.TRANSLUCENT);
-    panelLp.gravity = Gravity.TOP | (pinOnRight ? Gravity.END : Gravity.START);
-    panelLp.x = 0;
-    panelLp.y = 0;
-
-    panel = root;
-    // Populate the history BEFORE the window is shown so there's no empty→filled
-    // pop-in during the slide.
-    renderList(panelList);
-    // Set the slide-in offset + transparent state BEFORE attaching: View transform
-    // properties persist while detached, so the very first frame the compositor
-    // draws is already off-screen and faded. Setting them AFTER addView (the old
-    // order) drew one frame at the final position, then jumped to the offset to
-    // animate — that one-frame jump was the open flicker.
-    root.animate().cancel();
-    // Reopening during the 160ms exit animation would otherwise hit
-    // "already added to the window manager": the tree is now REUSED, so the
-    // close is not guaranteed to have detached it yet. Detach synchronously.
-    if (root.getParent() != null) {
-      try {
-        wm.removeView(root);
-      } catch (Exception ignored) {
-      }
-    }
-    root.setTranslationX(pinOnRight ? widthPx : -widthPx);
-    root.setAlpha(0f);
-    try {
-      wm.addView(root, panelLp);
-      root.animate()
-          .translationX(0f).alpha(1f)
-          .setDuration(220)
-          .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f))
-          .start();
-    } catch (Exception ignored) {
-      panel = null;
-    }
+    dock().show();
   }
 
-  /**
-   * Build the dock's chrome once and keep it.
-   *
-   * Inflating ~60 views by hand is a few milliseconds of work, and it used to
-   * happen between the finger lifting off the pin and the first frame of the
-   * slide — which is precisely where a delay is felt. The tree is detached (not
-   * destroyed) on close, so a reopen costs an `addView`, and {@link
-   * #prewarmPanel} moves even the first build to ACTION_DOWN, while the finger
-   * is still on the pin.
-   *
-   * Rebuilt only when something baked into it changes: the side it hugs (corner
-   * radii, flip arrow, gravity) or the screen width (rotation, fold).
-   *
-   * @return false when the dock cannot be shown at all (no overlay permission).
-   */
-  private boolean buildPanelTree() {
-    if (wm == null) wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
-    if (wm == null) return false;
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(this)) {
-      return false;
-    }
-    DisplayMetrics m = getResources().getDisplayMetrics();
-    final int widthPx = Math.min(dp(372), m.widthPixels - dp(24));
-    if (panelRoot != null && panelRootRight == pinOnRight && panelRootWidth == widthPx) {
-      // Reusable — just re-adopt the live handles hidePanel() cleared.
-      panelList = panelRootList;
-      dockScroll = panelRootScroll;
-      dockComposer = panelRootComposer;
-      dockMic = panelRootMic;
-      dockAddBtn = panelRootAddBtn;
-      panelStatusText = panelRootStatus;
-      dockFolderStrip = panelRootFolderStrip;
-      dockTypeStrip = panelRootTypeStrip;
-      dockTypeScroll = panelRootTypeScroll;
-      if (panelStatusText != null) {
-        panelStatusText.setText(getSyncStatusText());
-        panelStatusText.setTextColor(getSyncStatusColor());
-      }
-      // `dockEditingId` is cleared on close, so a reused composer must not come
-      // back still labelled "Save" — it would save into a note nothing is
-      // editing any more. (Draft TEXT deliberately survives, same as before:
-      // it was already persisted to prefs and restored on open.)
-      if (dockAddBtn != null && dockEditingId == null) dockAddBtn.setText("Add");
-      populateFolderStrip();
-      populateTypeStrip();
-      return true;
-    }
-    discardPanelTree();
-    dockShowLinkPreviews = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
-        .getBoolean("dockShowLinkPreviews", true);
-    panelRootRight = pinOnRight;
-    panelRootWidth = widthPx;
-
-    LinearLayout root = new LinearLayout(this);
-    root.setOrientation(LinearLayout.VERTICAL);
-    GradientDrawable card = new GradientDrawable();
-    // Translucent frosted fill (not fully transparent) so text stays readable over
-    // whatever app is behind. Rounded only on the inner edge (it hugs a screen side).
-    card.setColor(0xF70A0D17);
-    float r = dp(22);
-    card.setCornerRadii(pinOnRight
-        ? new float[] {r, r, 0, 0, 0, 0, r, r}
-        : new float[] {0, 0, r, r, r, r, 0, 0});
-    card.setStroke(dp(1), 0x557C5CFF);
-    root.setBackground(card);
-    root.setElevation(dp(16));
-    root.setPadding(dp(14), dp(16), dp(14), dp(14));
-
-    root.addView(buildDockHeader());
-    root.addView(buildDockComposer());
-
-    // Search box (parity with the app screen's history filter).
-    final EditText searchField = new EditText(this);
-    searchField.setHint("Search notes, links and tags");
-    searchField.setHintTextColor(0xFF64748B);
-    searchField.setTextColor(0xFFE2E8F0);
-    searchField.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-    searchField.setSingleLine(true);
-    GradientDrawable sBg = new GradientDrawable();
-    sBg.setColor(0x14FFFFFF);
-    sBg.setCornerRadius(dp(9));
-    searchField.setBackground(sBg);
-    searchField.setPadding(dp(9), dp(4), dp(9), dp(4));
-    searchField.addTextChangedListener(new android.text.TextWatcher() {
-      @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
-      @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
-      @Override public void afterTextChanged(android.text.Editable s) {
-        dockFilter = s.toString().trim().toLowerCase(Locale.US);
-        renderLimit = RENDER_PAGE; // new filter → restart from the top
-        refreshPanelIfOpen();
-      }
-    });
-    LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    searchLp.topMargin = dp(6);
-    root.addView(searchField, searchLp);
-
-    // All / Text / Images filter strip — parity with the desktop panel's tabs so
-    // the dock can browse by content type. Each chip resets the render window so
-    // switching filter shows the top of the new set.
-    root.addView(buildFilterStrip());
-
-    // Folder chips (All · Unfiled · one per folder) — the notes "lists" selector,
-    // parity with the app screens. Hidden until a folder exists.
-    root.addView(buildFolderStrip());
-
-    // Content-type chips (Any · Links · Code · Logs · …) — parity with the desktop
-    // panel's type filter. Hidden while every note is the same kind.
-    root.addView(buildTypeStrip());
-
-    // Scrollable history.
-    ScrollView scroll = new ScrollView(this);
-    scroll.setVerticalScrollBarEnabled(false);
-    // Lazy-render: as the user approaches the bottom, grow the render window by
-    // RENDER_PAGE so a 300-item history doesn't inflate hundreds of views up front.
-    scroll.getViewTreeObserver().addOnScrollChangedListener(() -> {
-      lastDockScrollAt = SystemClock.uptimeMillis();
-      if (dockScroll == null || panelList == null) return;
-      View child = dockScroll.getChildAt(0);
-      if (child == null) return;
-      int scrollY = dockScroll.getScrollY();
-      int total = child.getHeight() - dockScroll.getHeight();
-      // Within ~2 screen heights of the end → fetch the next page of rows.
-      if (total - scrollY < dockScroll.getHeight() * 2) {
-        int before = renderLimit;
-        int totalItems;
-        synchronized (this) {
-          totalItems = countShownLocked();
-        }
-        if (renderLimit < totalItems) {
-          renderLimit = Math.min(totalItems, renderLimit + RENDER_PAGE);
-          if (renderLimit != before) refreshPanelIfOpen();
-        }
-      }
-    });
-    dockScroll = scroll;
-    LinearLayout list = new LinearLayout(this);
-    list.setOrientation(LinearLayout.VERTICAL);
-    panelList = list;
-    LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
-    scrollLp.topMargin = dp(8);
-    scroll.addView(list);
-    root.addView(scroll, scrollLp);
-
-    root.addView(buildDockFooter());
-
-    root.setOnTouchListener((v, ev) -> {
-      if (ev.getAction() == MotionEvent.ACTION_OUTSIDE) {
-        hidePanel();
-        return true;
-      }
-      return false;
-    });
-
-    panelRoot = root;
-    panelRootList = list;
-    panelRootScroll = scroll;
-    panelRootComposer = dockComposer;
-    panelRootMic = dockMic;
-    panelRootAddBtn = dockAddBtn;
-    panelRootStatus = panelStatusText;
-    panelRootFolderStrip = dockFolderStrip;
-    panelRootTypeStrip = dockTypeStrip;
-    panelRootTypeScroll = dockTypeScroll;
-    return true;
+  private void hidePanel() {
+    NotesDock d = dock;
+    if (d != null) d.hide();
   }
 
-  /** Cached dock chrome (see buildPanelTree) and the handles into it. */
-  private LinearLayout panelRoot;
-  private boolean panelRootRight;
-  private int panelRootWidth = -1;
-  private LinearLayout panelRootList;
-  private ScrollView panelRootScroll;
-  private EditText panelRootComposer;
-  private View panelRootMic;
-  private Button panelRootAddBtn;
-  private TextView panelRootStatus;
-  private LinearLayout panelRootFolderStrip;
-  private LinearLayout panelRootTypeStrip;
-  private View panelRootTypeScroll;
-
-  /** Drop the cached tree (side/width changed, or the service is going away). */
-  private void discardPanelTree() {
-    panelRoot = null;
-    panelRootList = null;
-    panelRootScroll = null;
-    panelRootComposer = null;
-    panelRootMic = null;
-    panelRootAddBtn = null;
-    panelRootStatus = null;
-    panelRootFolderStrip = null;
-    panelRootTypeStrip = null;
-    panelRootTypeScroll = null;
-    panelRootWidth = -1;
-    // The pooled rows are CHILDREN of the tree being thrown away. Keeping them
-    // would hand the next tree a View that still has a parent, and `addView`
-    // throws on that ("already has a parent") — the flip-side path reached
-    // exactly that. Rows are cheap to rebuild; the tree is what was worth
-    // keeping.
-    liveRows.clear();
-    poolText.clear();
-    poolImage.clear();
-  }
-
-  /**
-   * Build the dock's views while the finger is still on the pin, so the release
-   * only has to attach a window. Cheap and idempotent once the tree is cached;
-   * skipped entirely when the panel is already up.
-   */
+  /** Called on the edge handle's ACTION_DOWN, while the finger is still down. */
   private void prewarmPanel() {
-    if (panel != null) return;
-    if (panelRoot != null && panelRootRight == pinOnRight) return;
-    try {
-      buildPanelTree();
-    } catch (Exception ignored) {
-      // A failed prewarm must never block the tap — showPanel rebuilds.
-      discardPanelTree();
+    if (canOverlay()) dock().prewarm();
+  }
+
+  /** Any thread; NotesDock coalesces the recompositions. */
+  private void refreshPanelIfOpen() {
+    NotesDock d = dock;
+    if (d != null) d.invalidate();
+  }
+
+  /** No-op hook kept for startSync (the mic is always shown). */
+  private void refreshComposerIfOpen() {}
+
+  /** Move the dock (and handle) to the opposite edge, remembering the choice. */
+  private void flipSide() {
+    pinOnRight = !pinOnRight;
+    settlePin();
+    if (bubble != null && bubbleLp != null) {
+      DisplayMetrics m = getResources().getDisplayMetrics();
+      styleEdgePin(bubble);
+      bubbleLp.x = pinOnRight ? m.widthPixels - dp(PIN_TOUCH_W) : 0;
+      try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
     }
-  }
-
-  /** Header: app icon, title, live sync status, flip-side + close controls. */
-  private LinearLayout buildDockHeader() {
-    LinearLayout header = new LinearLayout(this);
-    header.setOrientation(LinearLayout.HORIZONTAL);
-    header.setGravity(Gravity.CENTER_VERTICAL);
-
-    ImageView icon = new ImageView(this);
-    icon.setImageResource(getApplicationInfo().icon);
-    icon.setColorFilter(0xFF22D3EE);
-    LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(20), dp(20));
-    iconLp.rightMargin = dp(8);
-    header.addView(icon, iconLp);
-
-    TextView title = new TextView(this);
-    title.setText("Notes");
-    title.setTextColor(Color.WHITE);
-    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
-
-    TextView statusView = new TextView(this);
-    statusView.setText(getSyncStatusText());
-    statusView.setTextColor(getSyncStatusColor());
-    statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-    panelStatusText = statusView;
-
-    LinearLayout titleWrap = new LinearLayout(this);
-    titleWrap.setOrientation(LinearLayout.VERTICAL);
-    titleWrap.addView(title);
-    titleWrap.addView(statusView);
-    header.addView(titleWrap, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-    // Flip the dock to the other edge.
-    Button flip = new Button(this);
-    flip.setText(pinOnRight ? "⇤" : "⇥");
-    flip.setTextColor(0xFF94A3B8);
-    flip.setBackgroundColor(Color.TRANSPARENT);
-    flip.setAllCaps(false);
-    flip.setStateListAnimator(null);
-    flip.setPadding(0, 0, 0, 0);
-    flip.setOnClickListener((v) -> flipSide());
-    header.addView(flip, new LinearLayout.LayoutParams(dp(36), dp(30)));
-
-    Button previews = new Button(this);
-    previews.setText(dockShowLinkPreviews ? "Preview on" : "Preview off");
-    previews.setTextColor(dockShowLinkPreviews ? 0xFF67E8F9 : 0xFF64748B);
-    previews.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
-    previews.setAllCaps(false);
-    previews.setStateListAnimator(null);
-    previews.setBackgroundColor(Color.TRANSPARENT);
-    previews.setPadding(0, 0, 0, 0);
-    previews.setOnClickListener((v) -> {
-      dockShowLinkPreviews = !dockShowLinkPreviews;
-      getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE).edit()
-          .putBoolean("dockShowLinkPreviews", dockShowLinkPreviews).apply();
-      // The header is built once per panel open, so the label has to follow the
-      // state here — otherwise it keeps saying "Preview on" with previews off.
-      previews.setText(dockShowLinkPreviews ? "Preview on" : "Preview off");
-      previews.setTextColor(dockShowLinkPreviews ? 0xFF67E8F9 : 0xFF64748B);
-      refreshPanelIfOpen();
-    });
-    header.addView(previews, new LinearLayout.LayoutParams(dp(72), dp(30)));
-
-    Button close = new Button(this);
-    close.setText("✕");
-    close.setTextColor(0xFF94A3B8);
-    close.setBackgroundColor(Color.TRANSPARENT);
-    close.setAllCaps(false);
-    close.setStateListAnimator(null);
-    close.setPadding(dp(6), 0, 0, 0);
-    close.setOnClickListener((v) -> hidePanel());
-    header.addView(close, new LinearLayout.LayoutParams(dp(36), dp(30)));
-    return header;
-  }
-
-  /** All / Text / Images filter strip — parity with the desktop ClipboardPanel's
-   *  All/Text/Images segmented control. A tap clears the search filter too (so
-   *  picking "Images" doesn't keep filtering for an unrelated search term). */
-  private LinearLayout buildFilterStrip() {
-    LinearLayout strip = new LinearLayout(this);
-    strip.setOrientation(LinearLayout.HORIZONTAL);
-    strip.setGravity(Gravity.CENTER_VERTICAL);
-    LinearLayout.LayoutParams stripLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    stripLp.topMargin = dp(6);
-    strip.setLayoutParams(stripLp);
-    GradientDrawable bg = new GradientDrawable();
-    bg.setColor(0x10FFFFFF);
-    bg.setCornerRadius(dp(10));
-    strip.setBackground(bg);
-    String[] labels = {"All", "Text", "Images"};
-    String[] kinds = {"", "text", "image"};
-    for (int i = 0; i < labels.length; i++) {
-      final String kind = kinds[i];
-      Button chip = new Button(this);
-      chip.setText(labels[i]);
-      chip.setAllCaps(false);
-      chip.setStateListAnimator(null);
-      chip.setPadding(0, dp(2), 0, dp(2));
-      chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-      chip.setMinWidth(0);
-      chip.setMinimumWidth(0);
-      chip.setMinHeight(0);
-      chip.setMinimumHeight(0);
-      LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(
-          0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-      if (i > 0) chipLp.leftMargin = dp(2);
-      strip.addView(chip, chipLp);
-      styleFilterChip(chip, kind.equals(dockFilterKind));
-      chip.setOnClickListener((v) -> {
-        dockFilterKind = kind;
-        renderLimit = RENDER_PAGE;
-        for (int j = 0; j < strip.getChildCount(); j++) {
-          View c = strip.getChildAt(j);
-          if (c instanceof Button) {
-            styleFilterChip((Button) c, kinds[j].equals(dockFilterKind));
-          }
-        }
-        refreshPanelIfOpen();
-      });
-    }
-    return strip;
-  }
-
-  private void styleFilterChip(Button b, boolean active) {
-    GradientDrawable bg = new GradientDrawable();
-    bg.setCornerRadius(dp(8));
-    if (active) {
-      bg.setColor(0xFF7C5CFF);
-      b.setTextColor(Color.WHITE);
-    } else {
-      bg.setColor(0x00FFFFFF);
-      b.setTextColor(0xFF94A3B8);
-    }
-    b.setBackground(bg);
-  }
-
-  /** Horizontally-scrollable folder chips (All · Unfiled · one per folder). */
-  private View buildFolderStrip() {
-    android.widget.HorizontalScrollView sv = new android.widget.HorizontalScrollView(this);
-    sv.setHorizontalScrollBarEnabled(false);
-    LinearLayout strip = new LinearLayout(this);
-    strip.setOrientation(LinearLayout.HORIZONTAL);
-    sv.addView(strip);
-    dockFolderStrip = strip;
-    populateFolderStrip();
-    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    lp.topMargin = dp(5);
-    sv.setLayoutParams(lp);
-    return sv;
-  }
-
-  /** (Re)build the folder chips to match the current folder set + selection.
-   *  Must run on the main thread. */
-  private void populateFolderStrip() {
-    LinearLayout strip = dockFolderStrip;
-    if (strip == null) return;
-    strip.removeAllViews();
-    ArrayList<String> folders;
-    synchronized (this) {
-      folders = foldersLocked();
-    }
-    // A dock left filtered to "Untagged" before that chip was removed would have
-    // no way back to All — drop the selection instead of stranding it.
-    if ("".equals(dockFolderFilter)) dockFolderFilter = null;
-    if (folders.isEmpty() && dockFolderFilter == null) return; // nothing to filter
-    addFolderChip(strip, "All", null);
-    // No "Untagged" chip: filtering *to* the unfiled pile is not something anyone
-    // reaches for, and it pushed the real tags off the edge of a narrow dock.
-    // Notes are still moved out of a folder from the row's own folder picker.
-    for (String f : folders) addFolderChip(strip, f, f);
-  }
-
-  // Type chips, in the desktop panel's order.
-  private static final String[] TYPE_KINDS = { "link", "code", "json", "log", "command", "path", "text" };
-  private static final String[] TYPE_LABELS = { "Links", "Code", "JSON", "Logs", "Commands", "Paths", "Notes" };
-
-  /** Horizontally-scrollable content-type chips (Any · Links · Code · …). */
-  private View buildTypeStrip() {
-    android.widget.HorizontalScrollView sv = new android.widget.HorizontalScrollView(this);
-    sv.setHorizontalScrollBarEnabled(false);
-    LinearLayout strip = new LinearLayout(this);
-    strip.setOrientation(LinearLayout.HORIZONTAL);
-    sv.addView(strip);
-    dockTypeStrip = strip;
-    dockTypeScroll = sv;
-    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    lp.topMargin = dp(5);
-    sv.setLayoutParams(lp);
-    populateTypeStrip();
-    return sv;
-  }
-
-  /** (Re)build the type chips from what's actually in the history. One kind
-   *  covering everything is the same as no filter at all, so the strip hides
-   *  itself until there are at least two to choose between. Must run on the main
-   *  thread. */
-  private void populateTypeStrip() {
-    LinearLayout strip = dockTypeStrip;
-    if (strip == null) return;
-    HashMap<String, Integer> counts = new HashMap<>();
-    synchronized (this) {
-      for (ClipEntry e : items) {
-        if (!"text".equals(e.kind)) continue;
-        String k = contentFor(e).kind;
-        Integer n = counts.get(k);
-        counts.put(k, n == null ? 1 : n + 1);
-      }
-    }
-    int present = 0;
-    for (String k : TYPE_KINDS) if (counts.containsKey(k)) present++;
-    // A filter left on a kind that no longer exists would strand the dock on an
-    // empty list with no obvious way back.
-    if (dockTypeFilter != null && !counts.containsKey(dockTypeFilter)) dockTypeFilter = null;
-    strip.removeAllViews();
-    if (present < 2) {
-      if (dockTypeScroll != null) dockTypeScroll.setVisibility(View.GONE);
-      return;
-    }
-    if (dockTypeScroll != null) dockTypeScroll.setVisibility(View.VISIBLE);
-    addTypeChip(strip, "Any", null);
-    for (int i = 0; i < TYPE_KINDS.length; i++) {
-      Integer n = counts.get(TYPE_KINDS[i]);
-      if (n == null) continue;
-      addTypeChip(strip, TYPE_LABELS[i] + "  " + n, TYPE_KINDS[i]);
-    }
-  }
-
-  private void addTypeChip(LinearLayout strip, String label, final String kind) {
-    Button chip = new Button(this);
-    chip.setText(label);
-    chip.setAllCaps(false);
-    chip.setStateListAnimator(null);
-    chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-    chip.setPadding(dp(8), dp(2), dp(8), dp(2));
-    chip.setMinWidth(0);
-    chip.setMinimumWidth(0);
-    chip.setMinHeight(0);
-    chip.setMinimumHeight(0);
-    boolean active = kind == null ? dockTypeFilter == null : kind.equals(dockTypeFilter);
-    GradientDrawable bg = new GradientDrawable();
-    bg.setCornerRadius(dp(8));
-    bg.setColor(active ? 0x5938BDF8 : 0x10FFFFFF);
-    chip.setBackground(bg);
-    chip.setTextColor(active ? Color.WHITE : 0xFF94A3B8);
-    chip.setOnClickListener((v) -> {
-      dockTypeFilter = kind != null && kind.equals(dockTypeFilter) ? null : kind;
-      renderLimit = RENDER_PAGE;
-      populateTypeStrip();
-      refreshPanelIfOpen();
-    });
-    LinearLayout.LayoutParams lp =
-        new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(24));
-    if (strip.getChildCount() > 0) lp.leftMargin = dp(4);
-    strip.addView(chip, lp);
-  }
-
-  private void addFolderChip(LinearLayout strip, String label, String value) {
-    Button chip = new Button(this);
-    chip.setText(label);
-    chip.setAllCaps(false);
-    chip.setStateListAnimator(null);
-    chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-    chip.setPadding(dp(8), dp(2), dp(8), dp(2));
-    chip.setMinWidth(0);
-    chip.setMinimumWidth(0);
-    chip.setMinHeight(0);
-    chip.setMinimumHeight(0);
-    boolean active = value == null ? dockFolderFilter == null : value.equals(dockFolderFilter);
-    GradientDrawable bg = new GradientDrawable();
-    bg.setCornerRadius(dp(8));
-    bg.setColor(active ? 0xFF7C5CFF : 0x10FFFFFF);
-    chip.setBackground(bg);
-    chip.setTextColor(active ? Color.WHITE : 0xFF94A3B8);
-    chip.setOnClickListener((v) -> {
-      dockFolderFilter = value;
-      renderLimit = RENDER_PAGE;
-      populateFolderStrip();
-      refreshPanelIfOpen();
-    });
-    LinearLayout.LayoutParams lp =
-        new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(24));
-    if (strip.getChildCount() > 0) lp.leftMargin = dp(4);
-    strip.addView(chip, lp);
-  }
-
-  /** Rebuild the folder chips from any thread. */
-  private void rebuildFolderStripIfOpen() {
-    main.post(this::populateFolderStrip);
+    refreshPanelIfOpen();
   }
 
   /** Every distinct non-empty folder across items, alphabetical. Caller holds `this`. */
@@ -2380,8 +1841,8 @@ public class ClipboardService extends Service {
     return new ArrayList<>(set);
   }
 
-  /** Move an entry to a folder ('' = unfiled) locally + broadcast the bare folder
-   *  notice (relay flips + rebroadcasts — same shape as pin). */
+  /** Add or remove one tag on an entry locally + broadcast the new tag set (the
+   *  relay flips + rebroadcasts — same shape as pin). */
   private void toggleTag(ClipEntry e, String tag) {
     if (e == null) return;
     String clean = tag == null ? "" : tag.trim();
@@ -2404,9 +1865,7 @@ public class ClipboardService extends Service {
       if (socket != null) socket.send(m.toString());
     } catch (Exception ignored) {
     }
-    rebuildFolderStripIfOpen();
     refreshPanelIfOpen();
-    toast(removed ? "Tag removed" : "Tag added");
   }
 
   /** Insert + send a brand-new text note (composer Add, paste, share). The LOCAL
@@ -2430,221 +1889,10 @@ public class ClipboardService extends Service {
     refreshPanelIfOpen();
   }
 
-  /** Begin editing a text note in the composer (Add becomes Save). */
-  private void startEditEntry(ClipEntry e) {
-    if (e == null || dockComposer == null || !"text".equals(e.kind)) return;
-    dockEditingId = e.id;
-    dockComposer.setText(e.text == null ? "" : e.text);
-    dockComposer.setSelection(dockComposer.getText().length());
-    dockComposer.requestFocus();
-    if (dockAddBtn != null) dockAddBtn.setText("Save");
-    toast("Editing — Save when done");
-  }
-
-  /** Composer keeps text and actions on one row while short, then grows with its
-   * content up to five lines without moving the controls out of reach. */
-  private LinearLayout buildDockComposer() {
-    LinearLayout wrap = new LinearLayout(this);
-    wrap.setOrientation(LinearLayout.VERTICAL);
-    LinearLayout.LayoutParams wrapLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    wrapLp.topMargin = dp(10);
-    wrap.setLayoutParams(wrapLp);
-
-    final EditText composer = new EditText(this);
-    dockComposer = composer;
-    composer.setHint("Type a note…");
-    composer.setHintTextColor(0xFF64748B);
-    composer.setTextColor(0xFFE2E8F0);
-    composer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-    composer.setSingleLine(false);
-    // Overlay windows do not inherit the Activity's usual text-selection setup.
-    // Keep the editable field focusable/long-clickable so Android shows Select,
-    // Copy, Paste and Share in the native floating context toolbar.
-    composer.setTextIsSelectable(true);
-    composer.setLongClickable(true);
-    composer.setMinLines(1);
-    composer.setMaxLines(5);
-    composer.setHorizontallyScrolling(false);
-    composer.setGravity(Gravity.TOP | Gravity.START);
-    GradientDrawable fieldBg = new GradientDrawable();
-    fieldBg.setColor(0x14FFFFFF);
-    fieldBg.setCornerRadius(dp(10));
-    composer.setBackground(fieldBg);
-    composer.setPadding(dp(9), dp(6), dp(9), dp(6));
-    // Restore the unsent draft (survives dock close / service restart) and keep
-    // it persisted on every keystroke. Edits don't touch the draft slot.
-    String draft = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
-        .getString("draftText", "");
-    if (draft != null && !draft.isEmpty()) {
-      composer.setText(draft);
-      composer.setSelection(composer.getText().length());
-    }
-    composer.addTextChangedListener(new android.text.TextWatcher() {
-      @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
-      @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
-      @Override public void afterTextChanged(android.text.Editable s) {
-        if (dockEditingId != null) return; // edits are not drafts
-        getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
-            .edit().putString("draftText", s.toString()).apply();
-      }
-    });
-    // Keyboard image paste (Gboard rich content): on Android 12+ the IME can hand
-    // image URIs straight to the focused EditText via OnReceiveContentListener.
-    // Without this, pasting an image from the keyboard does nothing in the
-    // floating panel (the desktop panel has the same parity via Composer's
-    // onPaste handler). Wrapped defensively — some OEM builds ship a broken impl.
-    // The contract: return null when we've fully handled the payload (images),
-    // or return the payload to let the EditText do its default text insert.
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-      try {
-        composer.setOnReceiveContentListener(new String[]{"image/*"},
-            (android.view.View view, android.view.ContentInfo payload) -> {
-              android.content.ClipData clip = payload.getClip();
-              if (clip != null && clip.getItemCount() > 0) {
-                android.content.ClipDescription desc = clip.getDescription();
-                if (desc != null && desc.hasMimeType("image/*")) {
-                  android.content.ClipData.Item it = clip.getItemAt(0);
-                  if (it != null && it.getUri() != null) {
-                    handleUploadImage(it.getUri());
-                    return null; // we consumed it — don't let EditText insert text
-                  }
-                }
-              }
-              return payload;
-            });
-      } catch (NoSuchMethodError ignored) {
-        // Older runtime than the compile-time type — silently skip (the gallery +
-        // clipboard-paste buttons still work).
-      } catch (Throwable ignored) {
-        // Some OEM builds ship a broken impl; the other two upload paths still work.
-      }
-    }
-    final LinearLayout actions = new LinearLayout(this);
-    actions.setOrientation(LinearLayout.HORIZONTAL);
-    actions.setGravity(Gravity.BOTTOM | Gravity.CENTER_VERTICAL);
-    LinearLayout.LayoutParams actionsLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    actionsLp.topMargin = dp(6);
-    actions.setLayoutParams(actionsLp);
-
-    final LinearLayout.LayoutParams composerLp = new LinearLayout.LayoutParams(
-        0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-    composerLp.rightMargin = dp(4);
-    actions.addView(composer, composerLp);
-
-    final LinearLayout controls = new LinearLayout(this);
-    controls.setOrientation(LinearLayout.HORIZONTAL);
-    controls.setGravity(Gravity.CENTER_VERTICAL);
-    final LinearLayout.LayoutParams controlsLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    controlsLp.leftMargin = dp(4);
-
-    // Compact action row: paste (text OR image) · upload · mic · Add/Save.
-    Button pasteBtn = new Button(this);
-    pasteBtn.setText("📋");
-    styleCompactBtn(pasteBtn, false);
-    pasteBtn.setOnClickListener((v) -> pasteFromClipboard());
-    controls.addView(pasteBtn, new LinearLayout.LayoutParams(dp(38), dp(28)));
-
-    // Upload button: opens the photo gallery via a transparent proxy Activity
-    // (services can't get an Activity result callback). Picks an image, hands the
-    // content:// URI back here via ACTION_UPLOAD_IMAGE. Full-res image sync.
-    Button uploadBtn = new Button(this);
-    uploadBtn.setText("🖼");
-    styleCompactBtn(uploadBtn, false);
-    uploadBtn.setOnClickListener((v) -> launchImagePicker());
-    LinearLayout.LayoutParams uploadLp = new LinearLayout.LayoutParams(dp(38), dp(28));
-    uploadLp.leftMargin = dp(4);
-    controls.addView(uploadBtn, uploadLp);
-
-    // Mic: Sarvam when a key is set; the phone's built-in recognizer otherwise —
-    // so voice input always exists.
-    Button mic = new Button(this);
-    mic.setText("🎤");
-    styleCompactBtn(mic, false);
-    dockMic = mic;
-    mic.setOnClickListener((v) -> toggleMic((Button) v));
-    LinearLayout.LayoutParams micLp = new LinearLayout.LayoutParams(dp(38), dp(28));
-    micLp.leftMargin = dp(4);
-    controls.addView(mic, micLp);
-
-    Button addBtn = new Button(this);
-    dockAddBtn = addBtn;
-    addBtn.setText(dockEditingId != null ? "Save" : "Add");
-    styleCompactBtn(addBtn, true);
-    addBtn.setOnClickListener((v) -> {
-      String t = composer.getText().toString().trim();
-      if (t.isEmpty()) return;
-      if (dockEditingId != null) {
-        // Save an in-place edit: same id + original timestamp → every device
-        // replaces its copy without changing the note's position.
-        ClipEntry target = null;
-        synchronized (this) {
-          for (ClipEntry e : items) {
-            if (dockEditingId.equals(e.id)) { target = e; break; }
-          }
-        }
-        if (target != null) {
-          target.text = t;
-          target.createdAtMs = System.currentTimeMillis();
-          synchronized (this) { sortItemsLocked(); }
-          sendTextItem(target.id, t, isoFromMs(target.createdAtMs),
-              new ArrayList<>(target.tags), target.pinned);
-        }
-        dockEditingId = null;
-        addBtn.setText("Add");
-        String saved = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
-            .getString("draftText", "");
-        composer.setText(saved == null ? "" : saved);
-        refreshPanelIfOpen();
-        toast("Saved");
-        return;
-      }
-      addTextLocalAndSend(t);
-      composer.setText("");
-      getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
-          .edit().remove("draftText").apply();
-      rebuildFolderStripIfOpen();
-      toast("Sent");
-    });
-    LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(54), dp(28));
-    addLp.leftMargin = dp(4);
-    controls.addView(addBtn, addLp);
-    actions.addView(controls, controlsLp);
-
-    final boolean[] composerExpanded = {composer.getText().length() > 0};
-    final Runnable reflowComposer = () -> {
-      boolean expanded = composer.getText().length() > 0;
-      if (composerExpanded[0] == expanded) return;
-      composerExpanded[0] = expanded;
-      actions.setOrientation(expanded ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
-      composerLp.width = expanded ? LinearLayout.LayoutParams.MATCH_PARENT : 0;
-      composerLp.weight = expanded ? 0f : 1f;
-      composerLp.rightMargin = expanded ? 0 : dp(4);
-      controlsLp.topMargin = expanded ? dp(5) : 0;
-      controlsLp.leftMargin = expanded ? 0 : dp(4);
-      composer.setMaxLines(expanded ? 5 : 1);
-      actions.requestLayout();
-    };
-    composer.addTextChangedListener(new android.text.TextWatcher() {
-      @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
-      @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
-      @Override public void afterTextChanged(android.text.Editable s) { reflowComposer.run(); }
-    });
-    if (composerExpanded[0]) {
-      composerExpanded[0] = false;
-      reflowComposer.run();
-    } else {
-      composer.setMaxLines(1);
-    }
-
-    wrap.addView(actions);
-    return wrap;
-  }
-
   /** Paste whatever the OS clipboard holds: an image → image note, else text →
-   *  text note (deduped against the newest note so re-taps don't spam). */
+   *  text note (deduped against the newest note so re-taps don't spam). Works
+   *  from a Service only while the dock's window has input focus (Android 10+
+   *  clipboard rule) — which it does whenever the dock is open. */
   private void pasteFromClipboard() {
     try {
       ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
@@ -2678,10 +1926,9 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Launch the system photo picker (or open the gallery as a fallback on older
-   *  devices) via a transparent proxy Activity — services can't receive Activity
-   *  results. {@code ClipboardPickActivity} hands the picked URI back to this
-   *  service as {@link #ACTION_UPLOAD_IMAGE}. */
+  /** Launch the system photo picker via a transparent proxy Activity — services
+   *  can't receive Activity results. {@code ClipboardPickActivity} hands the
+   *  picked URI back to this service as {@link #ACTION_UPLOAD_IMAGE}. */
   private void launchImagePicker() {
     try {
       Intent launch = new Intent(this, ClipboardPickActivity.class);
@@ -2692,153 +1939,286 @@ public class ClipboardService extends Service {
     }
   }
 
-  /** Footer: copy the newest text + open the full app. */
-  private LinearLayout buildDockFooter() {
-    LinearLayout footer = new LinearLayout(this);
-    footer.setOrientation(LinearLayout.HORIZONTAL);
-    footer.setGravity(Gravity.CENTER_VERTICAL);
-    LinearLayout.LayoutParams footerLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    footerLp.topMargin = dp(10);
-    footer.setLayoutParams(footerLp);
-
-    Button copyLast = new Button(this);
-    copyLast.setText("Copy last");
-    styleCompactBtn(copyLast, true);
-    copyLast.setOnClickListener((v) -> {
-      String t = newestText();
-      if (t == null) { toast("Nothing to copy yet"); return; }
-      setOsClipboard(t);
-      toast("Copied");
-    });
-    footer.addView(copyLast, new LinearLayout.LayoutParams(0, dp(30), 1f));
-
-    Button openApp = new Button(this);
-    openApp.setText("Open app");
-    styleCompactBtn(openApp, false);
-    LinearLayout.LayoutParams openLp = new LinearLayout.LayoutParams(0, dp(30), 1f);
-    openLp.leftMargin = dp(6);
-    openApp.setOnClickListener((v) -> { hidePanel(); openApp(); });
-    footer.addView(openApp, openLp);
-    return footer;
-  }
-
-  /** Move the dock (and pin) to the opposite edge, remembering the choice. */
-  private void flipSide() {
-    pinOnRight = !pinOnRight;
-    // Corner radii, the flip arrow and the window gravity are all baked into
-    // the cached tree — it has to be rebuilt for the other edge.
-    discardPanelTree();
-    settlePin();
-    if (bubble != null && bubbleLp != null) {
-      DisplayMetrics m = getResources().getDisplayMetrics();
-      styleEdgePin(bubble);
-      bubbleLp.x = pinOnRight ? m.widthPixels - dp(PIN_TOUCH_W) : 0;
-      try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
+  /** Remove an item from the local list + send a relay delete notice. */
+  private void deleteEntry(ClipEntry e) {
+    if (e == null) return;
+    synchronized (this) {
+      for (int i = items.size() - 1; i >= 0; i--) {
+        if (e.id.equals(items.get(i).id)) {
+          ClipEntry gone = items.remove(i);
+          Bitmap b = thumbs.remove(gone.id);
+          if (b != null) b.recycle();
+        }
+      }
     }
-    // Re-open on the new side.
-    hidePanel();
-    main.postDelayed(this::showPanel, 180);
-  }
-
-  private void hidePanel() {
-    if (panel == null || wm == null) return;
-    final View p = panel;
-    panel = null; // clear immediately so a re-tap toggles cleanly
-    panelList = null;
-    panelStatusText = null;
-    dockComposer = null;
-    dockMic = null;
-    dockAddBtn = null;
-    dockScroll = null;
-    dockFolderStrip = null;
-    dockTypeStrip = null;
-    dockTypeScroll = null;
-    dockEditingId = null;
-    folderPickForId = null;
-    panelRefreshQueued = false;
-    main.removeCallbacks(renderPanel);
-    // Return built rows to their pools (capped) so the next open reuses them
-    // instead of rebuilding — the panel View tree is about to leave the WindowManager.
-    recycleAllRows();
-    // The chrome itself is kept (detached) for the next open; only the live
-    // handles are cleared above, and buildPanelTree re-adopts them.
-    if (p != panelRoot) discardPanelTree();
-    final boolean right = pinOnRight;
-    // Fall back to the laid-out width if getWidth() is 0 (rapid open→close before
-    // a layout pass) — a 0 slide would just alpha-blink instead of sliding out.
-    int width = p.getWidth();
-    if (width <= 0 && panelLp != null) width = panelLp.width;
-    final int w = width;
-    // Cancel any in-flight enter animation so the exit starts from the current
-    // position instead of fighting it (a visible stutter when you close mid-open).
-    p.animate().cancel();
-    p.animate()
-        .translationX(right ? w : -w).alpha(0f)
-        .setDuration(160)
-        .setInterpolator(new android.view.animation.AccelerateInterpolator())
-        .withEndAction(() -> {
-          // The same view can be back on screen by now (reopened mid-exit) —
-          // removing it then would blank the panel the user just asked for.
-          if (panel == p) return;
-          try {
-            if (wm != null && p.getParent() != null) wm.removeView(p);
-          } catch (Exception ignored) {
-          }
-        })
-        .start();
-  }
-
-  /** If the panel is open, batch history refreshes so a cold relay replay never
-   * rebuilds the entire view tree once per received item. */
-  private void refreshPanelIfOpen() {
-    if (Looper.myLooper() != Looper.getMainLooper()) {
-      main.post(this::refreshPanelIfOpen);
-      return;
+    try {
+      JSONObject d = new JSONObject();
+      d.put("t", "delete");
+      d.put("itemId", e.id);
+      if (socket != null) socket.send(d.toString());
+    } catch (Exception ignored) {
     }
-    if (panel == null || panelList == null || panelRefreshQueued) return;
-    panelRefreshQueued = true;
-    main.postDelayed(renderPanel, 48);
+    refreshPanelIfOpen();
+    toast("Deleted");
   }
 
-  /** No-op hook kept for startSync (mic is always visible now — Sarvam when a key
-   *  is set, the built-in recognizer otherwise). */
-  private void refreshComposerIfOpen() {}
+  private ClipEntry findEntry(String id) {
+    if (id == null) return null;
+    synchronized (this) {
+      for (ClipEntry e : items) if (id.equals(e.id)) return e;
+    }
+    return null;
+  }
 
-  /** Items that pass the search text filter, the All/Text/Images kind filter AND
-   *  the folder filter, in display order (pinned first, then newest). Caller holds
-   *  `this`. */
-  private ArrayList<ClipEntry> filteredLocked() {
-    ArrayList<ClipEntry> out = new ArrayList<>();
-    for (ClipEntry e : items) {
-      if (!dockFilterKind.isEmpty() && !dockFilterKind.equals(e.kind)) continue;
-      if (dockTypeFilter != null) {
-        if (!"text".equals(e.kind)) continue;
-        if (!dockTypeFilter.equals(contentFor(e).kind)) continue;
+  // ---- edge handle preference -------------------------------------------------
+
+  boolean edgeHandleEnabled() {
+    return getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+        .getBoolean(PREF_EDGE_HANDLE, true);
+  }
+
+  private void setEdgeHandle(boolean on) {
+    getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE)
+        .edit().putBoolean(PREF_EDGE_HANDLE, on).apply();
+    if (on) showBubble();
+    else removeBubble();
+    refreshPanelIfOpen();
+  }
+
+  /** Take the edge handle (and its fullscreen probe) off screen. */
+  private void removeBubble() {
+    if (wm == null) return;
+    if (bubble != null) {
+      try { wm.removeView(bubble); } catch (Exception ignored) {}
+      bubble = null;
+    }
+    if (fsProbe != null) {
+      try { wm.removeView(fsProbe); } catch (Exception ignored) {}
+      fsProbe = null;
+    }
+    pinHidden = false;
+  }
+
+  // ---- NotesDockHost ----------------------------------------------------------
+  // Main-thread, cheap reads for the Compose dock. Slow work is always a
+  // dockRequest… that answers later through refreshPanelIfOpen().
+
+  @Override
+  public java.util.List<NoteUi> dockNotes() {
+    ArrayList<ClipEntry> snap;
+    synchronized (this) {
+      snap = new ArrayList<>(items);
+    }
+    ArrayList<NoteUi> out = new ArrayList<>(snap.size());
+    for (ClipEntry e : snap) {
+      Content c = "text".equals(e.kind) ? contentFor(e) : PLAIN;
+      ArrayList<String> tags;
+      synchronized (this) {
+        tags = new ArrayList<>(e.tags);
       }
-      if (dockFolderFilter != null) {
-        if (dockFolderFilter.isEmpty()) {
-          if (!e.tags.isEmpty()) continue;
-        } else if (!hasTag(e, dockFolderFilter)) continue;
-      }
-      if (dockFilter.isEmpty()) { out.add(e); continue; }
-      if ("text".equals(e.kind) && e.text != null
-          && e.text.toLowerCase(Locale.US).contains(dockFilter)) {
-        out.add(e);
-        continue;
-      }
-      for (String tag : e.tags) if (tag.toLowerCase(Locale.US).contains(dockFilter)) {
-        out.add(e);
-        break;
-      }
+      out.add(new NoteUi(e.id, e.kind, e.text == null ? "" : e.text, e.createdAtMs, e.pinned,
+          tags, c.kind, c.label, c.mono, deviceLabel(e)));
     }
     return out;
   }
 
-  /** Total matching rows (used by the lazy-render scroll listener to know when to
-   *  stop growing renderLimit). Caller holds `this`. */
-  private int countShownLocked() {
-    return filteredLocked().size();
+  /** Where a note came from, as the desktop panel shows it ("SENGALPC"). This
+   *  phone's own notes say so instead of repeating the model name. */
+  private String deviceLabel(ClipEntry e) {
+    // Same phone = this dock ("<id>-native") or this phone's webview ("<id>").
+    if (deviceId != null && !deviceId.isEmpty() && e.deviceId != null
+        && (e.deviceId.equals(deviceId + "-native") || e.deviceId.equals(deviceId))) {
+      return "This phone";
+    }
+    String n = e.deviceName == null ? "" : e.deviceName.trim();
+    if (n.endsWith("(Overlay)")) n = n.substring(0, n.length() - "(Overlay)".length()).trim();
+    return n;
+  }
+
+  @Override public String dockStatusText() { return getSyncStatusText(); }
+
+  @Override public int dockStatusTone() {
+    if (cryptoKey == null) return 0;
+    return socketConnected ? 1 : 2;
+  }
+
+  @Override public Bitmap dockThumb(String id) {
+    synchronized (this) {
+      return thumbs.get(id);
+    }
+  }
+
+  @Override public void dockRequestThumb(String id) { fetchImageThumb(id); }
+
+  /** The note body, styled as whatever it is. Bounded: a multi-MB log must not
+   *  reach the text layout — Copy / Share / Edit still use the full entry. */
+  @Override public CharSequence dockBody(String text, String kind) {
+    String t = text == null ? "" : text;
+    if (t.length() > 8192) {
+      t = t.substring(0, 8192) + "\n[Preview shortened — Copy, Share or Edit for the full note]";
+    }
+    if ("command".equals(kind)) return buildCommand(t);
+    if ("log".equals(kind)) return buildLog(t);
+    if ("code".equals(kind) || "json".equals(kind)) return buildCode(t);
+    if ("path".equals(kind)) return t;
+    return buildProse(t);
+  }
+
+  @Override public String dockLinkFor(String text) { return firstHttpLink(text); }
+
+  @Override public LinkPreviewUi dockLinkPreview(String url) {
+    LinkPreviewInfo i;
+    synchronized (this) {
+      i = linkPreviewCache.get(url);
+    }
+    return i == null ? null : new LinkPreviewUi(i.title, i.description, i.image, i.host, i.hero);
+  }
+
+  @Override public void dockRequestLinkPreview(String url) {
+    if (url == null) return;
+    synchronized (this) {
+      if (linkPreviewCache.containsKey(url) || !linkPreviewLoading.add(url)) return;
+    }
+    new Thread(() -> {
+      LinkPreviewInfo resolved = resolvePreview(url);
+      synchronized (this) {
+        linkPreviewLoading.remove(url);
+        linkPreviewCache.put(url, resolved);
+      }
+      refreshPanelIfOpen();
+    }, "gt-link-preview").start();
+  }
+
+  @Override public Bitmap dockBitmap(String url) {
+    synchronized (this) {
+      return linkArtCache.get(url);
+    }
+  }
+
+  /** Card artwork or favicon. YouTube's maxresdefault 404s on older uploads, so a
+   *  miss silently retries hqdefault, which every video has. */
+  @Override public void dockRequestBitmap(String url) {
+    if (url == null || url.isEmpty()) return;
+    synchronized (this) {
+      if (linkArtCache.containsKey(url) || !bitmapLoading.add(url)) return;
+    }
+    new Thread(() -> {
+      Bitmap bmp = loadPreviewBitmap(url);
+      if (bmp == null && url.endsWith("/maxresdefault.jpg")) {
+        bmp = loadPreviewBitmap(url.replace("/maxresdefault.jpg", "/hqdefault.jpg"));
+      }
+      synchronized (this) {
+        bitmapLoading.remove(url);
+      }
+      if (bmp != null) {
+        cacheLinkArt(url, bmp);
+        refreshPanelIfOpen();
+      }
+    }, "gt-link-art").start();
+  }
+
+  @Override public int dockMicState() { return micState; }
+
+  @Override public boolean dockPreviewsOn() { return dockShowLinkPreviews; }
+
+  @Override public void dockSetPreviews(boolean on) {
+    dockShowLinkPreviews = on;
+    getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE).edit()
+        .putBoolean("dockShowLinkPreviews", on).apply();
+    refreshPanelIfOpen();
+  }
+
+  @Override public boolean dockEdgeHandleOn() { return edgeHandleEnabled(); }
+
+  @Override public void dockSetEdgeHandle(boolean on) { setEdgeHandle(on); }
+
+  @Override public boolean dockPinOnRight() { return pinOnRight; }
+
+  @Override public void dockFlipSide() { flipSide(); }
+
+  @Override public String dockDraft() {
+    String d = getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE).getString("draftText", "");
+    return d == null ? "" : d;
+  }
+
+  @Override public void dockSetDraft(String text) {
+    android.content.SharedPreferences.Editor ed =
+        getSharedPreferences(ClipboardBridge.PREFS, Context.MODE_PRIVATE).edit();
+    if (text == null || text.isEmpty()) ed.remove("draftText");
+    else ed.putString("draftText", text);
+    ed.apply();
+  }
+
+  @Override public void dockSetTagFilter(String tag) { dockFolderFilter = tag; }
+
+  @Override public void dockAdd(String text) {
+    if (text == null || text.trim().isEmpty()) return;
+    addTextLocalAndSend(text.trim());
+  }
+
+  /** Save an in-place edit: same id → every device replaces its copy. A save is
+   *  a meaningful touch, so it takes a fresh timestamp and moves to the top. */
+  @Override public void dockSaveEdit(String id, String text) {
+    ClipEntry target = findEntry(id);
+    if (target == null || text == null) return;
+    target.text = text;
+    target.createdAtMs = System.currentTimeMillis();
+    ArrayList<String> tags;
+    synchronized (this) {
+      sortItemsLocked();
+      tags = new ArrayList<>(target.tags);
+    }
+    sendTextItem(target.id, text, isoFromMs(target.createdAtMs), tags, target.pinned);
+    refreshPanelIfOpen();
+  }
+
+  @Override public void dockCopy(String id) {
+    ClipEntry e = findEntry(id);
+    if (e == null || e.text == null) return;
+    setOsClipboard(e.text);
+  }
+
+  @Override public void dockCopyLatest() {
+    String t = newestText();
+    if (t == null) { toast("Nothing to copy yet"); return; }
+    setOsClipboard(t);
+    toast("Copied the latest note");
+  }
+
+  @Override public void dockTogglePin(String id) { togglePin(findEntry(id)); }
+
+  /** The share sheet is an Activity: close the dock first or it opens UNDER the
+   *  overlay window. */
+  @Override public void dockShare(String id) {
+    ClipEntry e = findEntry(id);
+    if (e == null) return;
+    hidePanel();
+    shareEntry(e);
+  }
+
+  @Override public void dockDelete(String id) { deleteEntry(findEntry(id)); }
+
+  @Override public void dockToggleTag(String id, String tag) { toggleTag(findEntry(id), tag); }
+
+  @Override public void dockPaste() { pasteFromClipboard(); }
+
+  @Override public void dockPickImage() {
+    hidePanel();
+    launchImagePicker();
+  }
+
+  @Override public void dockReceiveImage(Uri uri) { handleUploadImage(uri); }
+
+  @Override public void dockToggleMic() { toggleMic(); }
+
+  @Override public void dockOpenApp() {
+    hidePanel();
+    openApp();
+  }
+
+  @Override public void dockOpenUrl(String url) {
+    hidePanel();
+    openUrl(url);
   }
 
   // --- content classification -------------------------------------------------
@@ -3389,16 +2769,27 @@ public class ClipboardService extends Service {
       case MARK_LINK:
         out.setSpan(new ForegroundColorSpan(0xFF38BDF8), from, to, flags);
         out.setSpan(new UnderlineSpan(), from, to, flags);
-        out.setSpan(new ClickableSpan() {
-          @Override public void onClick(View widget) { openUrl(url); }
-          @Override public void updateDrawState(android.text.TextPaint ds) {
-            ds.setColor(0xFF38BDF8);
-            ds.setUnderlineText(true);
-          }
-        }, from, to, flags);
+        out.setSpan(new UrlSpan(url), from, to, flags);
         break;
       default:
         break;
+    }
+  }
+
+  /** A link inside a note. Named (not anonymous) so the Compose dock can read the
+   *  target and turn it into a LinkAnnotation. */
+  static final class UrlSpan extends ClickableSpan {
+    final String url;
+    UrlSpan(String url) { this.url = url; }
+    @Override public void onClick(View widget) {
+      try {
+        widget.getContext().startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+      } catch (Exception ignored) { }
+    }
+    @Override public void updateDrawState(android.text.TextPaint ds) {
+      ds.setColor(0xFF38BDF8);
+      ds.setUnderlineText(true);
     }
   }
 
@@ -3484,96 +2875,6 @@ public class ClipboardService extends Service {
     out.setSpan(new ForegroundColorSpan(0xB334D399), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
     out.append(text);
     return out;
-  }
-
-  /** Native overlay counterpart to the web link card. OG image wins, then a
-   *  Twitter-card image, then the site's favicon. Returns the card View (the
-   *  caller inserts it into the row); the card itself opens the URL on tap.
-   *  Reuses the link cache + loading guard, so re-adding a card for the same url
-   *  (row rebound) is instant and never re-fetches. */
-  private View buildLinkCard(final String url) {
-    final LinearLayout card = new LinearLayout(this);
-    card.setOrientation(LinearLayout.VERTICAL);
-    GradientDrawable bg = new GradientDrawable(); bg.setColor(0x1638BDF8); bg.setCornerRadius(dp(11)); card.setBackground(bg);
-    card.setClipToOutline(true); // so the hero image's top corners follow the card
-    card.setOnClickListener((v) -> { try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); } catch (Exception ignored) {} });
-
-    // Full-bleed artwork. Hidden until a real og:image lands — a card that
-    // reserves space for artwork it never gets just looks broken.
-    final ImageView hero = new ImageView(this);
-    hero.setScaleType(ImageView.ScaleType.CENTER_CROP);
-    hero.setVisibility(View.GONE);
-    card.addView(hero, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(150)));
-
-    final LinearLayout text = new LinearLayout(this);
-    text.setOrientation(LinearLayout.VERTICAL);
-    text.setPadding(dp(10), dp(8), dp(10), dp(9));
-    card.addView(text, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-
-    final TextView site = new TextView(this);
-    site.setTextColor(0xFF67E8F9);
-    site.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-    site.setTypeface(site.getTypeface(), android.graphics.Typeface.BOLD);
-    site.setMaxLines(1);
-    site.setEllipsize(android.text.TextUtils.TruncateAt.END);
-    site.setCompoundDrawablePadding(dp(5));
-    text.addView(site);
-
-    final TextView title = new TextView(this);
-    title.setTextColor(0xFFF1F5F9);
-    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
-    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
-    title.setMaxLines(2);
-    title.setEllipsize(android.text.TextUtils.TruncateAt.END);
-    title.setPadding(0, dp(1), 0, 0);
-    text.addView(title);
-
-    final TextView desc = new TextView(this);
-    desc.setTextColor(0xFF94A3B8);
-    desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-    desc.setMaxLines(2);
-    desc.setEllipsize(android.text.TextUtils.TruncateAt.END);
-    desc.setVisibility(View.GONE);
-    text.addView(desc);
-
-    LinkPreviewInfo cached;
-    synchronized (this) { cached = linkPreviewCache.get(url); }
-    if (cached != null) { applyLinkCard(cached, hero, site, title, desc); return card; }
-
-    site.setText(hostForLink(url));
-    title.setText("Loading preview…");
-    synchronized (this) {
-      // A row can be rebound while the same preview is loading. Leave the stable
-      // domain card in place instead of starting a second identical request.
-      if (!linkPreviewLoading.add(url)) return card;
-    }
-    new Thread(() -> {
-      LinkPreviewInfo resolved = resolvePreview(url);
-      main.post(() -> {
-        synchronized (this) { linkPreviewLoading.remove(url); linkPreviewCache.put(url, resolved); }
-        applyLinkCard(resolved, hero, site, title, desc);
-      });
-    }, "gt-link-preview").start();
-    return card;
-  }
-
-  /** Paint resolved metadata into a card's children (main thread). */
-  private void applyLinkCard(LinkPreviewInfo info, ImageView hero, TextView site, TextView title, TextView desc) {
-    site.setText(info.host);
-    title.setText(info.title);
-    if (info.description.isEmpty()) {
-      desc.setVisibility(View.GONE);
-    } else {
-      desc.setText(info.description);
-      desc.setVisibility(View.VISIBLE);
-    }
-    if (info.image != null && info.hero) {
-      fetchLinkArt(info.image, hero);
-    } else {
-      // No artwork: keep the hero hidden and mark the site line with the favicon.
-      hero.setVisibility(View.GONE);
-      fetchFavicon("https://www.google.com/s2/favicons?domain=" + Uri.encode(info.host) + "&sz=64", site);
-    }
   }
 
   /** Resolve a URL's card metadata off the main thread. YouTube is special-cased
@@ -3690,51 +2991,6 @@ public class ClipboardService extends Service {
     return m.find() ? m.group(2) : null;
   }
 
-  /** Load a card's hero artwork. YouTube's maxresdefault 404s on older uploads,
-   *  so a miss silently retries hqdefault, which every video has. Decoded bitmaps
-   *  are cached by URL — a dock rebuild must not re-download the same thumbnail. */
-  private void fetchLinkArt(final String url, final ImageView hero) {
-    if (url == null || url.isEmpty()) return;
-    Bitmap cached;
-    synchronized (this) { cached = linkArtCache.get(url); }
-    if (cached != null) { hero.setImageBitmap(cached); hero.setVisibility(View.VISIBLE); return; }
-    new Thread(() -> {
-      Bitmap bmp = loadPreviewBitmap(url);
-      if (bmp == null && url.endsWith("/maxresdefault.jpg")) {
-        bmp = loadPreviewBitmap(url.replace("/maxresdefault.jpg", "/hqdefault.jpg"));
-      }
-      final Bitmap art = bmp;
-      if (art == null) return;
-      main.post(() -> {
-        cacheLinkArt(url, art);
-        hero.setImageBitmap(art);
-        hero.setVisibility(View.VISIBLE);
-      });
-    }, "gt-link-art").start();
-  }
-
-  /** Small site mark drawn inline with the host label when there is no artwork. */
-  private void fetchFavicon(final String url, final TextView site) {
-    if (url == null || url.isEmpty()) return;
-    Bitmap cached;
-    synchronized (this) { cached = linkArtCache.get(url); }
-    if (cached != null) { applyFavicon(cached, site); return; }
-    new Thread(() -> {
-      final Bitmap icon = loadPreviewBitmap(url);
-      if (icon == null) return;
-      main.post(() -> {
-        cacheLinkArt(url, icon);
-        applyFavicon(icon, site);
-      });
-    }, "gt-link-icon").start();
-  }
-
-  private void applyFavicon(Bitmap icon, TextView site) {
-    BitmapDrawable d = new BitmapDrawable(getResources(), icon);
-    d.setBounds(0, 0, dp(13), dp(13));
-    site.setCompoundDrawables(d, null, null, null);
-  }
-
   /** Card artwork spans the row's full width, so it needs more resolution than a
    *  list thumbnail — decoding it at THUMB_MAX_PX would visibly blur the hero. */
   private static final int CARD_ART_MAX_PX = 640;
@@ -3783,816 +3039,6 @@ public class ClipboardService extends Service {
     return value.isEmpty() ? null : value;
   }
 
-  /** Populate the list with the matching items (search + kind filter), rendering
-   *  only the first {@link #renderLimit} rows so a 300-item history doesn't inflate
-   *  hundreds of views up front — the scroll listener grows renderLimit as the user
-   *  approaches the bottom. Text rows tap-to-copy; image rows show a thumbnail.
-   *  Each row carries a Pin and a Share action (parity with the desktop panel). */
-  private void renderList(LinearLayout list) {
-    // Folder-chooser mode: a row's 📁 was tapped — show the move targets instead
-    // of the history until a pick or cancel. Rendered directly (small + rare); the
-    // shared removeAllViews() below already detached recycled rows, and the
-    // liveRows cache is reused when history returns.
-    if (folderPickForId != null) {
-      ClipEntry target = null;
-      synchronized (this) {
-        for (ClipEntry e : items) {
-          if (folderPickForId.equals(e.id)) { target = e; break; }
-        }
-      }
-      if (target != null) {
-        list.removeAllViews();
-        recycleAllRows();
-        renderFolderChooser(list, target);
-        return;
-      }
-      folderPickForId = null;
-    }
-    // The kinds present move as notes arrive and leave, so the chips are recounted
-    // with the list rather than only when the panel opens.
-    populateTypeStrip();
-    ArrayList<ClipEntry> snapshot;
-    synchronized (this) {
-      snapshot = filteredLocked();
-    }
-    final int limit = Math.min(renderLimit, snapshot.size());
-
-    // Build a set of ids we want on screen so survivors stay and the rest recycle.
-    final java.util.HashSet<String> keep = new java.util.HashSet<>(limit);
-    for (int i = 0; i < limit; i++) keep.add(snapshot.get(i).id);
-
-    // Detach rows that dropped out of the window / filter, returning them to pools.
-    // Iterate liveRows' keys (not panelList children) so the order rows were added
-    // last frame doesn't matter.
-    java.util.Iterator<java.util.Map.Entry<String, View>> it = liveRows.entrySet().iterator();
-    while (it.hasNext()) {
-      java.util.Map.Entry<String, View> me = it.next();
-      if (!keep.contains(me.getKey())) {
-        View v = me.getValue();
-        if (v.getParent() == list) list.removeView(v);
-        RowHolder h = (RowHolder) v.getTag();
-        String kind = rowKindOf(v); // capture kind BEFORE nulling entry (rowKindOf reads it)
-        if (h != null) h.entry = null;
-        poolForKind(kind).add(v);
-        it.remove();
-      }
-    }
-    // Cap pools so a one-time huge history can't wedge memory forever.
-    trimPool(poolText);
-    trimPool(poolImage);
-
-    // removeAllViews drops section labels/dividers AND detaches surviving rows
-    // (they're kept alive in liveRows); we re-add them in order below.
-    list.removeAllViews();
-
-    if (snapshot.isEmpty()) {
-      TextView empty = new TextView(this);
-      boolean any;
-      synchronized (this) { any = !items.isEmpty(); }
-      empty.setText(any
-          ? "No matches"
-          : "Nothing here yet\nCopy on your PC and it appears here, or add something above.");
-      empty.setTextColor(0xFF94A3B8);
-      empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-      empty.setLineSpacing(dp(2), 1f);
-      empty.setPadding(dp(8), dp(16), dp(8), dp(16));
-      list.addView(empty);
-      return;
-    }
-
-    long now = System.currentTimeMillis();
-    boolean pinnedHeaderShown = false;
-    boolean dividerShown = false;
-    for (int idx = 0; idx < limit; idx++) {
-      final ClipEntry e = snapshot.get(idx);
-      // Section labels for parity with the desktop panel's "Pinned" header + the
-      // divider between pinned and the rest (items is sorted pinned-first).
-      if (e.pinned && !pinnedHeaderShown) {
-        list.addView(makeSectionLabel("PINNED"));
-        pinnedHeaderShown = true;
-      } else if (!e.pinned && pinnedHeaderShown && !dividerShown) {
-        list.addView(makeSectionDivider());
-        dividerShown = true;
-      }
-      // Reuse the row we already built for this id, else pull one from the right
-      // pool (or build fresh). bindRow then refreshes only the visuals that moved.
-      View row = liveRows.get(e.id);
-      if (row == null) {
-        row = obtainRow(e.kind);
-        liveRows.put(e.id, row);
-      }
-      bindRow(row, e, now);
-      LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
-          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-      rowLp.bottomMargin = dp(6);
-      list.addView(row, rowLp);
-    }
-    // Trailing "load more" hint when the window is shorter than the match set.
-    if (limit < snapshot.size()) {
-      TextView more = new TextView(this);
-      more.setText("↓ " + (snapshot.size() - limit) + " more  ·  scroll to load");
-      more.setTextColor(0xFF64748B);
-      more.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-      more.setPadding(dp(8), dp(8), dp(8), dp(8));
-      list.addView(more);
-    }
-  }
-
-  /** Which pool a row belongs to. Read from the holder's fixed kind (NOT the
-   *  entry, which may already be nulled during recycling). */
-  private static String rowKindOf(View row) {
-    RowHolder h = (RowHolder) row.getTag();
-    return h != null && h.kind != null ? h.kind : "text";
-  }
-  private ArrayList<View> poolForKind(String kind) {
-    return "image".equals(kind) ? poolImage : poolText;
-  }
-  private void trimPool(ArrayList<View> pool) {
-    while (pool.size() > ROW_POOL_MAX) pool.remove(pool.size() - 1);
-  }
-
-  /** Pop a row of this kind from its pool if one is free, else build a fresh one.
-   *  A pooled row keeps its built views + wired listeners, but its diff-cache
-   *  (lastBody/lastMeta/…) is cleared so the next bindRow fully repopulates it
-   *  for the new entry rather than trusting a stale match. */
-  private View obtainRow(String kind) {
-    ArrayList<View> pool = poolForKind(kind);
-    // Belt and braces: a pooled row must never still be attached. renderList's
-    // removeAllViews() normally guarantees it, but the panel tree is reused
-    // across opens now, so make the invariant local instead of inherited.
-    for (int i = pool.size() - 1; i >= 0; i--) {
-      View v = pool.get(i);
-      if (v.getParent() instanceof android.view.ViewGroup) {
-        ((android.view.ViewGroup) v.getParent()).removeView(v);
-      }
-    }
-    View row;
-    if (!pool.isEmpty()) {
-      row = pool.remove(pool.size() - 1);
-      RowHolder h = (RowHolder) row.getTag();
-      resetHolderCache(h);
-      // A row pooled via the inline renderList path may still carry its old link
-      // card as a child (recycleAllRows detaches it, that path doesn't). Drop it so
-      // the first bindRow starts clean — syncLinkCard adds the right card if any.
-      if (h != null && h.linkCard != null && h.linkCard.getParent() == row) {
-        ((LinearLayout) row).removeView(h.linkCard);
-      }
-      if (h != null) { h.linkCard = null; }
-    } else {
-      row = buildRow(kind);
-    }
-    return row;
-  }
-
-  /** Clear a holder's "what did I last show" fields so bindRow treats the next
-   *  entry as brand new (forces setText/re-style instead of skipping). */
-  private void resetHolderCache(RowHolder h) {
-    if (h == null) return;
-    h.lastBody = null;
-    h.lastHadLink = false;
-    h.lastMeta = null;
-    h.linkUrl = null;
-    h.linkPreviewOn = false;
-    h.monoLabel = null;
-    h.content = null;
-    h.expanded = false;
-  }
-
-  /** Construct a row's View tree ONCE and wire its listeners to a fresh
-   *  RowHolder (stored as the row's tag). Listeners read holder.entry at click
-   *  time, so they never need rebinding and never capture a stale entry. The
-   *  entry is left null here; bindRow sets it. */
-  private View buildRow(String kind) {
-    LinearLayout row = new LinearLayout(this);
-    row.setOrientation(LinearLayout.VERTICAL);
-    row.setPadding(dp(11), dp(9), dp(11), dp(9));
-    final RowHolder h = new RowHolder();
-    h.kind = kind; // fixed for the row's life; survives pooling (entry is nulled)
-    row.setTag(h);
-
-    if ("image".equals(kind)) {
-      ImageView iv = new ImageView(this);
-      iv.setAdjustViewBounds(true);
-      iv.setMaxHeight(dp(160));
-      iv.setScaleType(ImageView.ScaleType.FIT_START);
-      GradientDrawable ph = new GradientDrawable();
-      ph.setColor(0x22FFFFFF);
-      ph.setCornerRadius(dp(8));
-      iv.setBackground(ph);
-      iv.setMinimumHeight(dp(72));
-      iv.setMinimumWidth(dp(120));
-      h.image = iv;
-      row.addView(iv, new LinearLayout.LayoutParams(
-          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-      h.metaRow = buildMetaActionsRowForHolder(h, "image");
-      row.addView(h.metaRow);
-      // Tap an image row to share; long-press opens the app (parity with before).
-      row.setOnClickListener((v) -> { if (h.entry != null) shareEntry(h.entry); });
-      row.setOnLongClickListener((v) -> { hidePanel(); openApp(); return true; });
-      return row;
-    }
-
-    // Text row. The body always lives in one HorizontalScrollView: prose fills
-    // the viewport and wraps normally, while code switches its child to
-    // WRAP_CONTENT and disables wrapping so long source lines pan horizontally.
-    // The scroller remains the row's one child before meta, preserving the link
-    // card's fixed insertion position.
-    final android.widget.HorizontalScrollView bodyScroll =
-        new android.widget.HorizontalScrollView(this);
-    bodyScroll.setFillViewport(true);
-    bodyScroll.setHorizontalScrollBarEnabled(false);
-    bodyScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
-    final TextView body = new TextView(this);
-    body.setTextColor(0xFFF1F5F9);
-    body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-    body.setMaxLines(COLLAPSED_LINES);
-    body.setEllipsize(android.text.TextUtils.TruncateAt.END);
-    body.setLineSpacing(dp(1), 1f);
-    body.setTextIsSelectable(true); // default for non-link notes; configureBody flips it off for link notes
-    h.body = body;
-    h.bodyScroll = bodyScroll;
-    bodyScroll.addView(body, new android.widget.HorizontalScrollView.LayoutParams(
-        android.widget.HorizontalScrollView.LayoutParams.MATCH_PARENT,
-        android.widget.HorizontalScrollView.LayoutParams.WRAP_CONTENT));
-    row.addView(bodyScroll, new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-    h.metaRow = buildMetaActionsRowForHolder(h, "text");
-    row.addView(h.metaRow);
-    final TextView expand = new TextView(this);
-    expand.setTextColor(0xFFA78BFA);
-    expand.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-    expand.setTypeface(expand.getTypeface(), android.graphics.Typeface.BOLD);
-    expand.setGravity(Gravity.CENTER_VERTICAL);
-    expand.setPadding(0, dp(7), 0, dp(2));
-    expand.setOnClickListener((v) -> toggleExpand(h));
-    h.expand = expand;
-    // Selecting or pressing the row never copies. Use the explicit Copy action.
-    row.setOnLongClickListener((v) -> { toggleExpand(h); return true; });
-    return row;
-  }
-
-  private static final int COLLAPSED_LINES = 6;
-  private void toggleExpand(RowHolder h) {
-    if (h.body == null) return;
-    boolean hasExpand = h.expand != null && h.expand.getParent() != null;
-    if (!hasExpand) return;
-    h.expanded = !h.expanded;
-    h.body.setMaxLines(h.expanded ? Integer.MAX_VALUE : COLLAPSED_LINES);
-    h.body.setEllipsize(h.expanded ? null : android.text.TextUtils.TruncateAt.END);
-    h.expand.setText(h.expanded ? "Show less  ↑" : "Show more  ↓");
-  }
-
-  /** Bind an image row: show the cached thumbnail if present, else keep the soft
-   *  placeholder and kick the lazy fetch (refreshPanelIfOpen repaints when the
-   *  thumb lands). Updates the meta label with "Image · <relative time>". */
-  private void bindImageRow(RowHolder h, final ClipEntry e, long now) {
-    Bitmap bmp;
-    synchronized (this) { bmp = thumbs.get(e.id); }
-    if (bmp != null) {
-      h.image.setImageBitmap(bmp);
-      h.image.setBackground(null);
-    } else {
-      // Placeholder until refreshPanelIfOpen repaints with the decoded thumb.
-      h.image.setImageDrawable(null);
-      GradientDrawable ph = new GradientDrawable();
-      ph.setColor(0x22FFFFFF);
-      ph.setCornerRadius(dp(8));
-      h.image.setBackground(ph);
-      fetchImageThumb(e.id);
-    }
-    bindMetaActionsRow(h.metaRow, h, "Image · " + relativeTime(e.createdAtMs, now));
-  }
-
-  /** Refresh a row's visuals to match a (possibly different) entry. Allocates
-   *  nothing on the steady-state path: background is mutated in place, body text
-   *  is only re-set when it changed, the link card is added/removed only when the
-   *  url or the preview toggle actually moved. */
-  private void bindRow(View row, final ClipEntry e, long now) {
-    final RowHolder h = (RowHolder) row.getTag();
-    h.entry = e;
-    // Every row buildRow() produces is a vertical LinearLayout; the parameter is
-    // typed View only because the pools and liveRows map hold plain Views.
-    final LinearLayout box = (LinearLayout) row;
-
-    // --- background (pinned stroke / pending-delete tint) ---------------------
-    GradientDrawable bg = (GradientDrawable) row.getBackground();
-    if (bg == null) { bg = new GradientDrawable(); row.setBackground(bg); }
-    bg.setColor(e.pendingDelete ? 0x33EF4444 : 0x14FFFFFF);
-    bg.setCornerRadius(dp(12));
-    if (e.pendingDelete) {
-      bg.setStroke(dp(1), 0xFFEF4444);
-    } else if (e.pinned) {
-      bg.setStroke(dp(1), 0x557C5CFF);
-    } else {
-      bg.setStroke(0, 0); // clear any prior stroke (reused row, was pinned/deleted)
-    }
-
-    if ("image".equals(e.kind)) {
-      bindImageRow(h, e, now);
-      return;
-    }
-
-    // --- body text ------------------------------------------------------------
-    final String fullText = e.text == null ? "" : e.text;
-    if (!fullText.equals(h.lastBody)) {
-      h.lastBody = fullText;
-      h.lastHadLink = firstHttpLink(fullText) != null;
-      configureBody(h, fullText);
-    } else if (h.linkPreviewOn != dockShowLinkPreviews || h.content != contentFor(e)) {
-      // Preview toggle flipped but text is identical: still reconfigure the body's
-      // link handling (selectable ↔ tappable) and reconcile the card below.
-      configureBody(h, fullText);
-    }
-
-    // --- link preview card (only when previews are ON) ------------------------
-    syncLinkCard(h, box, fullText);
-
-    // --- meta + actions -------------------------------------------------------
-    // The content type earns its place in the meta line: it is the one thing the
-    // row can't show any other way once the body is just monospaced text.
-    String meta = relativeTime(e.createdAtMs, now);
-    if (h.monoLabel != null) meta = h.monoLabel + " · " + meta;
-    bindMetaActionsRow(h.metaRow, h, meta);
-
-    // --- show more / less -----------------------------------------------------
-    h.body.setMaxLines(h.expanded ? Integer.MAX_VALUE : COLLAPSED_LINES);
-    h.body.setEllipsize(h.expanded ? null : android.text.TextUtils.TruncateAt.END);
-    syncExpandAffordance(h, box);
-  }
-
-  /** Show "Show more" only when the collapsed body is genuinely truncated.
-   *  A character-count guess gets this wrong constantly — the same note is one
-   *  line on a wide dock and three on a narrow one — so this asks the finished
-   *  layout whether it had to ellipsize, which is only knowable after measure. */
-  private void syncExpandAffordance(final RowHolder h, final LinearLayout box) {
-    h.body.post(() -> {
-      if (h.body == null || h.expand == null) return;
-      boolean truncated = h.expanded;
-      android.text.Layout layout = h.body.getLayout();
-      if (!truncated && layout != null) {
-        int last = layout.getLineCount() - 1;
-        truncated = last >= 0 && (layout.getEllipsisCount(last) > 0 || layout.getLineCount() > COLLAPSED_LINES);
-      }
-      if (truncated) {
-        if (h.expand.getParent() != box) {
-          box.addView(h.expand, new LinearLayout.LayoutParams(
-              LinearLayout.LayoutParams.MATCH_PARENT, dp(30)));
-        }
-        h.expand.setText(h.expanded ? "Show less  ↑" : "Show more  ↓");
-      } else if (h.expand.getParent() == box) {
-        box.removeView(h.expand);
-        h.expanded = false;
-      }
-    });
-  }
-
-  /** Accent stripe colour per block kind — the fastest "what is this" signal. */
-  private static int accentFor(String kind) {
-    if ("json".equals(kind)) return 0xFF38BDF8;
-    if ("log".equals(kind)) return 0xFFFB7185;
-    if ("command".equals(kind)) return 0xFF34D399;
-    if ("path".equals(kind)) return 0xFF22D3EE;
-    return 0xFF7C5CFF; // code / diff
-  }
-
-  /** A recessed panel with a coloured stripe down its leading edge. */
-  private Drawable blockBackground(int accent) {
-    GradientDrawable stripe = new GradientDrawable();
-    stripe.setColor(accent & 0x66FFFFFF);
-    stripe.setCornerRadius(dp(9));
-    GradientDrawable fill = new GradientDrawable();
-    fill.setColor(0x3D000000);
-    fill.setCornerRadius(dp(9));
-    LayerDrawable layers = new LayerDrawable(new Drawable[] { stripe, fill });
-    layers.setLayerInset(1, dp(2), 0, 0, 0);
-    return layers;
-  }
-
-  /** Set the body text, styled as whatever the note actually is, and choose its
-   *  link behaviour.
-   *  - Prose keeps its inline formatting and gets blue underlined links.
-   *  - Code / JSON / logs / commands / paths become a monospaced, non-wrapping
-   *    block with a coloured stripe, syntax/severity colouring and horizontal
-   *    scrolling — the same behavior as the desktop Notes view.
-   *  A note that contains a link is tappable rather than selectable (the two are
-   *  mutually exclusive in a TextView); the explicit Copy action still copies. */
-  /**
-   * Width prose is allowed to occupy, in pixels: the dock's window minus the
-   * root's horizontal padding minus a row's own. Derived rather than measured so
-   * it is correct on the very first layout pass (a measured width is 0 then, and
-   * a 0 maxWidth would collapse every line to one character).
-   */
-  private int proseMaxWidthPx() {
-    int panelW = panelRootWidth;
-    if (panelW <= 0) {
-      DisplayMetrics m = getResources().getDisplayMetrics();
-      panelW = Math.min(dp(372), m.widthPixels - dp(24));
-    }
-    // root padding dp(14)*2 (see buildPanelTree) + row padding dp(11)*2.
-    return Math.max(dp(80), panelW - dp(14) * 2 - dp(11) * 2);
-  }
-
-  private void configureBody(RowHolder h, String fullText) {
-    // Syntax highlighting and TextView layout must be bounded even when the
-    // source is a multi-MB log. Copy/edit/share still use the complete entry.
-    if (fullText.length() > 8192) fullText = fullText.substring(0, 8192)
-        + "\n[Preview shortened — Copy, Share or Edit for the full note]";
-    TextView body = h.body;
-    h.linkPreviewOn = dockShowLinkPreviews;
-    Content c = contentFor(h.entry);
-    h.content = c;
-    h.monoLabel = c.mono ? c.label : null;
-
-    if (c.mono) {
-      body.setHorizontallyScrolling(true);
-      body.setMaxWidth(Integer.MAX_VALUE);
-      if (h.bodyScroll != null) {
-        h.bodyScroll.setFillViewport(true);
-        h.bodyScroll.setHorizontalScrollBarEnabled(true);
-        h.bodyScroll.scrollTo(0, 0);
-      }
-      body.setLayoutParams(new android.widget.HorizontalScrollView.LayoutParams(
-          android.widget.HorizontalScrollView.LayoutParams.WRAP_CONTENT,
-          android.widget.HorizontalScrollView.LayoutParams.WRAP_CONTENT));
-      body.setTypeface(Typeface.MONOSPACE);
-      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
-      body.setLineSpacing(dp(1), 1f);
-      if ("command".equals(c.kind)) {
-        body.setTextColor(0xFFD1FAE5);
-        body.setText(buildCommand(fullText));
-      } else if ("path".equals(c.kind)) {
-        body.setTextColor(0xFFCFFAFE);
-        body.setText(fullText);
-      } else if ("log".equals(c.kind)) {
-        body.setTextColor(0xFFE2E8F0);
-        body.setText(buildLog(fullText));
-      } else {
-        body.setTextColor(0xFFE2E8F0);
-        body.setText(buildCode(fullText));
-      }
-      // No badge on the block: the meta line directly beneath already reads
-      // "TypeScript · 2h", and a corner badge would either cover the first line of
-      // code or cost every line the width it reserved. The stripe carries the kind.
-      body.setBackground(blockBackground(accentFor(c.kind)));
-      body.setPadding(dp(9), dp(7), dp(9), dp(7));
-    } else {
-      body.setHorizontallyScrolling(false);
-      // MATCH_PARENT is NOT enough to make prose wrap in here.
-      // HorizontalScrollView.measureChild always measures its child with an
-      // UNSPECIFIED width spec (that is how horizontal panning works), so the
-      // TextView reports the width of the WHOLE paragraph laid out on one line.
-      // setFillViewport only stretches a child that measured NARROWER than the
-      // viewport, so a long note sailed past it and became a horizontal
-      // scroller. An explicit maxWidth is the one constraint the measure pass
-      // does respect, and it makes the layout wrap at the panel's width again.
-      body.setMaxWidth(proseMaxWidthPx());
-      if (h.bodyScroll != null) {
-        h.bodyScroll.setHorizontalScrollBarEnabled(false);
-        h.bodyScroll.scrollTo(0, 0);
-      }
-      body.setLayoutParams(new android.widget.HorizontalScrollView.LayoutParams(
-          android.widget.HorizontalScrollView.LayoutParams.MATCH_PARENT,
-          android.widget.HorizontalScrollView.LayoutParams.WRAP_CONTENT));
-      // A third of all notes are a single short line — a name, a code, a reminder.
-      // Setting those as a runt paragraph wastes them; at title weight they read as
-      // the label they are, and the list gets a rhythm instead of a grey wall.
-      boolean title = !fullText.contains("\n") && fullText.trim().length() <= 60;
-      body.setTypeface(title ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
-      body.setTextSize(TypedValue.COMPLEX_UNIT_SP, title ? 15f : 13.5f);
-      body.setTextColor(title ? 0xFFF8FAFC : 0xFFE2E8F0);
-      body.setLineSpacing(dp(title ? 1 : 3), 1f);
-      body.setBackground(null);
-      body.setPadding(0, 0, 0, 0);
-      body.setText(buildProse(fullText));
-    }
-
-    if (h.lastHadLink && !c.mono) {
-      // The prose builder already made every URL blue, underlined and clickable;
-      // it just needs a movement method to receive the taps. Code blocks keep
-      // selection instead — a URL inside a stack trace is not the point of the row.
-      body.setMovementMethod(LinkMovementMethod.getInstance());
-      body.setTextIsSelectable(false);
-    } else {
-      body.setMovementMethod(null);
-      body.setTextIsSelectable(true);
-    }
-  }
-
-  /** Attach/detach the link preview card so it sits between body and meta. Only
-   *  adds a card when previews are ON and the note has a link, and only rebuilds
-   *  the card when the url or the preview mode actually changed (the link cache
-   *  makes a re-add for the same url instant — no re-fetch). */
-  private void syncLinkCard(RowHolder h, LinearLayout row, String fullText) {
-    String wantUrl = (dockShowLinkPreviews && h.lastHadLink) ? firstHttpLink(fullText) : "";
-    String haveUrl = h.linkUrl == null ? "" : h.linkUrl;
-    if (wantUrl.equals(haveUrl)) return; // nothing to do
-    // Remove the old card if any.
-    if (h.linkCard != null && h.linkCard.getParent() == row) {
-      row.removeView(h.linkCard);
-    }
-    h.linkCard = null;
-    h.linkUrl = wantUrl;
-    if (wantUrl.isEmpty()) return;
-    // Insert the new card right after the body (index 1: body=0, then card, then meta).
-    View card = buildLinkCard(wantUrl);
-    h.linkCard = card;
-    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    lp.topMargin = dp(6);
-    // body is always child 0 on a text row; meta may or may not follow yet.
-    row.addView(card, Math.min(1, row.getChildCount()), lp);
-  }
-
-  /** Return the dock to a clean slate on close: drop every live row into its pool
-   *  (capped) so the next open reuses them instead of rebuilding. */
-  private void recycleAllRows() {
-    for (View v : liveRows.values()) {
-      RowHolder h = (RowHolder) v.getTag();
-      String kind = rowKindOf(v); // capture kind BEFORE nulling entry (rowKindOf reads it)
-      if (h != null) {
-        h.entry = null;
-        if (h.linkCard != null && h.linkCard.getParent() != null) {
-          ((android.view.ViewGroup) h.linkCard.getParent()).removeView(h.linkCard);
-        }
-        h.linkCard = null;
-        h.linkUrl = null;
-      }
-      poolForKind(kind).add(v);
-    }
-    liveRows.clear();
-    trimPool(poolText);
-    trimPool(poolImage);
-  }
-
-  /** One borderless glyph action button for a row's meta strip. */
-  private Button rowActionBtn(String glyph, int color, View.OnClickListener onClick) {
-    Button b = new Button(this);
-    b.setText(glyph);
-    b.setTextColor(color);
-    b.setBackgroundColor(Color.TRANSPARENT);
-    b.setAllCaps(false);
-    b.setStateListAnimator(null);
-    b.setPadding(dp(4), dp(2), dp(4), dp(2));
-    b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-    b.setMinWidth(0);
-    b.setMinimumWidth(0);
-    b.setMinHeight(0);
-    b.setMinimumHeight(0);
-    b.setContentDescription(glyph);
-    b.setOnClickListener((v) -> {
-      v.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
-      onClick.onClick(v);
-    });
-    return b;
-  }
-
-  /** Build the meta + actions row ONCE, wiring every listener to the holder (so
-   *  the same row can be rebound to many entries without re-allocating lambdas).
-   *  kind is "text" or "image" and decides whether Copy/Edit appear. Stores the
-   *  refs bindMetaActionsRow needs to touch (meta label, pin, folder) on the holder. */
-  private LinearLayout buildMetaActionsRowForHolder(final RowHolder h, String kind) {
-    LinearLayout row = new LinearLayout(this);
-    row.setOrientation(LinearLayout.HORIZONTAL);
-    row.setGravity(Gravity.CENTER_VERTICAL);
-
-    TextView meta = new TextView(this);
-    meta.setTextColor(0xFF64748B);
-    meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-    meta.setSingleLine(true);
-    meta.setEllipsize(android.text.TextUtils.TruncateAt.END);
-    LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
-        0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-    metaLp.topMargin = dp(4);
-    row.addView(meta, metaLp);
-    h.meta = meta;
-
-    LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(dp(34), dp(30));
-    btnLp.leftMargin = dp(2);
-
-    if ("text".equals(kind)) {
-      row.addView(rowActionBtn("Copy", 0xFF67E8F9, (v) -> {
-        if (h.entry == null) return;
-        setOsClipboard(h.entry.text == null ? "" : h.entry.text);
-        toast("Copied");
-      }), new LinearLayout.LayoutParams(dp(48), dp(30)));
-      row.addView(rowActionBtn("✎", 0xFF94A3B8, (v) -> { if (h.entry != null) startEditEntry(h.entry); }),
-          new LinearLayout.LayoutParams(dp(34), dp(30)));
-    }
-    // Folder button: colour reflects whether the entry has tags. Re-coloured on bind.
-    Button folderBtn = rowActionBtn("#", 0xFF94A3B8, (v) -> {
-      if (h.entry == null) return;
-      folderPickForId = h.entry.id;
-      refreshPanelIfOpen();
-    });
-    row.addView(folderBtn, new LinearLayout.LayoutParams(btnLp));
-    h.folderBtn = folderBtn;
-    // Pin button: glyph + colour flip on bind (📌 accent when pinned, 📍 muted when not).
-    Button pin = rowActionBtn("📍", 0xFF94A3B8, (v) -> { if (h.entry != null) togglePin(h.entry); });
-    row.addView(pin, new LinearLayout.LayoutParams(btnLp));
-    h.pinBtn = pin;
-    row.addView(rowActionBtn("↗", 0xFF94A3B8, (v) -> { if (h.entry != null) shareEntry(h.entry); }),
-        new LinearLayout.LayoutParams(btnLp));
-    row.addView(rowActionBtn("✕", 0xFFF87171, (v) -> { if (h.entry != null) confirmDelete(h.entry); }),
-        new LinearLayout.LayoutParams(btnLp));
-    return row;
-  }
-
-  /** Update only the meta-row visuals that depend on the current entry: the tags
-   *  + relative-time label (skipped when unchanged), plus the pin glyph/colour and
-   *  the folder button colour (cheap, always applied so a recycled row can't keep
-   *  a stale style from a prior entry). */
-  private void bindMetaActionsRow(LinearLayout row, final RowHolder h, String metaText) {
-    final ClipEntry e = h.entry;
-    StringBuilder tagText = new StringBuilder();
-    for (int i = 0; i < Math.min(2, e.tags.size()); i++) {
-      if (i > 0) tagText.append("  ");
-      tagText.append("#").append(e.tags.get(i));
-    }
-    if (e.tags.size() > 2) tagText.append(" +").append(e.tags.size() - 2);
-    if (tagText.length() > 0) tagText.append("  ·  ");
-    String meta = tagText.toString() + metaText;
-    if (!meta.equals(h.lastMeta)) {
-      h.lastMeta = meta;
-      h.meta.setText(meta);
-    }
-    h.pinBtn.setText(e.pinned ? "📌" : "📍");
-    h.pinBtn.setTextColor(e.pinned ? 0xFF7C5CFF : 0xFF94A3B8);
-    h.folderBtn.setTextColor(e.tags.isEmpty() ? 0xFF94A3B8 : 0xFFA78BFA);
-  }
-
-  /** Replace the history with the "move to folder" targets for one entry:
-   *  No folder · every existing folder · a new-folder field · Cancel. */
-  private void renderFolderChooser(LinearLayout list, final ClipEntry target) {
-    TextView title = new TextView(this);
-    title.setText("Tags  ·  choose as many as you like");
-    title.setTextColor(Color.WHITE);
-    title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-    title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
-    title.setPadding(dp(4), dp(6), dp(4), dp(8));
-    list.addView(title);
-
-    ArrayList<String> folders;
-    synchronized (this) {
-      folders = foldersLocked();
-    }
-    for (final String f : folders) {
-      addChooserRow(list, (hasTag(target, f) ? "✓  " : "○  ") + f,
-          () -> toggleTag(target, f));
-    }
-
-    // New-folder row: name + create.
-    LinearLayout newRow = new LinearLayout(this);
-    newRow.setOrientation(LinearLayout.HORIZONTAL);
-    newRow.setGravity(Gravity.CENTER_VERTICAL);
-    final EditText name = new EditText(this);
-    name.setHint("New tag…");
-    name.setHintTextColor(0xFF64748B);
-    name.setTextColor(0xFFE2E8F0);
-    name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-    name.setSingleLine(true);
-    GradientDrawable nBg = new GradientDrawable();
-    nBg.setColor(0x14FFFFFF);
-    nBg.setCornerRadius(dp(9));
-    name.setBackground(nBg);
-    name.setPadding(dp(9), dp(5), dp(9), dp(5));
-    newRow.addView(name, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-    Button create = new Button(this);
-    create.setText("Create");
-    styleCompactBtn(create, true);
-    create.setOnClickListener((v) -> {
-      String n = name.getText().toString().trim();
-      if (!n.isEmpty()) toggleTag(target, n);
-    });
-    LinearLayout.LayoutParams createLp = new LinearLayout.LayoutParams(dp(64), dp(28));
-    createLp.leftMargin = dp(6);
-    newRow.addView(create, createLp);
-    LinearLayout.LayoutParams newRowLp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    newRowLp.topMargin = dp(4);
-    newRowLp.bottomMargin = dp(4);
-    list.addView(newRow, newRowLp);
-
-    addChooserRow(list, "Done", () -> {
-      folderPickForId = null;
-      refreshPanelIfOpen();
-    });
-  }
-
-  private void addChooserRow(LinearLayout list, String label, final Runnable onPick) {
-    TextView row = new TextView(this);
-    row.setText(label);
-    row.setTextColor(0xFFE2E8F0);
-    row.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-    GradientDrawable bg = new GradientDrawable();
-    bg.setColor(0x14FFFFFF);
-    bg.setCornerRadius(dp(10));
-    row.setBackground(bg);
-    row.setPadding(dp(11), dp(9), dp(11), dp(9));
-    row.setOnClickListener((v) -> onPick.run());
-    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    lp.bottomMargin = dp(5);
-    list.addView(row, lp);
-  }
-
-  /** Delete an item locally + broadcast the deletion to other devices (parity
-   *  with the desktop panel's per-row delete). Two-tap confirm: the first tap
-   *  marks the row pending (red), the second within 3s removes it. */
-  private void confirmDelete(final ClipEntry e) {
-    if (e == null) return;
-    final boolean[] armed = new boolean[]{e.pendingDelete};
-    if (!armed[0]) {
-      e.pendingDelete = true;
-      toast("Tap ✕ again to delete");
-      refreshPanelIfOpen();
-      main.postDelayed(() -> {
-        if (e.pendingDelete) {
-          e.pendingDelete = false;
-          refreshPanelIfOpen();
-        }
-      }, 3000);
-      return;
-    }
-    deleteEntry(e);
-  }
-
-  /** Remove an item from the local list + send a relay delete notice. */
-  private void deleteEntry(ClipEntry e) {
-    synchronized (this) {
-      for (int i = items.size() - 1; i >= 0; i--) {
-        if (e.id.equals(items.get(i).id)) {
-          ClipEntry gone = items.remove(i);
-          Bitmap b = thumbs.remove(gone.id);
-          if (b != null) b.recycle();
-        }
-      }
-    }
-    try {
-      JSONObject d = new JSONObject();
-      d.put("t", "delete");
-      d.put("itemId", e.id);
-      if (socket != null) socket.send(d.toString());
-    } catch (Exception ignored) {
-    }
-    refreshPanelIfOpen();
-    toast("Deleted");
-  }
-
-  /** Small uppercase section label (e.g. "PINNED") — parity with the desktop
-   *  panel's pinned-section header. */
-  private TextView makeSectionLabel(String text) {
-    TextView label = new TextView(this);
-    label.setText(text);
-    label.setTextColor(0xFF64748B);
-    label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-    label.setTypeface(label.getTypeface(), android.graphics.Typeface.BOLD);
-    label.setPadding(dp(4), dp(6), dp(4), dp(2));
-    return label;
-  }
-
-  /** Thin divider between the pinned section and the rest — parity with the
-   *  desktop panel's `h-px bg-white/[0.06]` divider. */
-  private View makeSectionDivider() {
-    View div = new View(this);
-    div.setBackgroundColor(0x14FFFFFF);
-    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
-    lp.topMargin = dp(6);
-    lp.bottomMargin = dp(4);
-    div.setLayoutParams(lp);
-    return div;
-  }
-
-  private void styleBtn(Button b, boolean primary) {
-    GradientDrawable bg = new GradientDrawable();
-    bg.setCornerRadius(dp(10));
-    if (primary) {
-      bg.setColor(0xFF7C5CFF);
-      b.setTextColor(Color.WHITE);
-    } else {
-      bg.setColor(0x1FFFFFFF);
-      b.setTextColor(0xFFE2E8F0);
-    }
-    b.setBackground(bg);
-    b.setPadding(0, 0, 0, 0);
-    b.setAllCaps(false);
-    b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-    b.setStateListAnimator(null);
-  }
-
-  /** Tighter variant for the composer/footer rows — the dock's controls must stay
-   *  small so the history owns the space. */
-  private void styleCompactBtn(Button b, boolean primary) {
-    styleBtn(b, primary);
-    GradientDrawable bg = (GradientDrawable) b.getBackground();
-    bg.setCornerRadius(dp(8));
-    b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-    b.setMinWidth(0);
-    b.setMinimumWidth(0);
-    b.setMinHeight(0);
-    b.setMinimumHeight(0);
-  }
-
   private String newestText() {
     synchronized (this) {
       for (ClipEntry e : items) {
@@ -4610,28 +3056,24 @@ public class ClipboardService extends Service {
     }
   }
 
+  /** Feedback line: the dock's own snackbar while it is open (a system toast
+   *  would pop up behind/over the sheet), a plain Toast otherwise. */
   private void toast(String msg) {
+    if (Looper.myLooper() != Looper.getMainLooper()) {
+      main.post(() -> toast(msg));
+      return;
+    }
+    NotesDock d = dock;
+    if (d != null && d.isOpen()) {
+      d.snack(msg);
+      return;
+    }
     try {
       Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
     } catch (Exception ignored) {
     }
   }
 
-
-  private static String relativeTime(long then, long now) {
-    long sec = Math.max(0, (now - then) / 1000);
-    if (sec < 45) return "just now";
-    if (sec < 90) return "a minute ago";
-    long min = sec / 60;
-    if (min < 45) return min + " minutes ago";
-    if (min < 90) return "an hour ago";
-    long hr = min / 60;
-    if (hr < 24) return hr + " hours ago";
-    long day = hr / 24;
-    if (day == 1) return "yesterday";
-    if (day < 7) return day + " days ago";
-    return day / 7 + (day / 7 == 1 ? " week ago" : " weeks ago");
-  }
 
   /** JSON snapshot of the service state for the webview (and diagnostics).
    *  Shape: { running, connected, hasKey, socketUrl, reconnectMs, items: [{id, text, createdAtMs}] }.
@@ -4744,14 +3186,10 @@ public class ClipboardService extends Service {
       http.dispatcher().executorService().shutdown();
     }
     http = null;
-    if (panel != null && wm != null) {
-      try {
-        wm.removeView(panel);
-      } catch (Exception ignored) {
-      }
-      panel = null;
+    if (dock != null) {
+      dock.destroy();
+      dock = null;
     }
-    discardPanelTree();
     if (bubble != null && wm != null) {
       try {
         wm.removeView(bubble);

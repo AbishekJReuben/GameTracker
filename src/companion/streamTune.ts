@@ -147,7 +147,7 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   jbMin: 40,
   preferDirect: true,
   pace: 0,
-  wcKeyMs: 10000,
+  wcKeyMs: 30000,
   wcBufKB: 384,
   wcQueueMax: 3,
   jbGrowAt: 15,

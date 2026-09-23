@@ -490,6 +490,7 @@ pub fn run() {
             commands::remote_poll_state,
             commands::remote_set_capture_quality,
             commands::remote_request_keyframe,
+            commands::remote_request_refresh,
             commands::remote_set_encode_paused,
             commands::remote_set_capture_native,
             commands::remote_ack_native_frame,

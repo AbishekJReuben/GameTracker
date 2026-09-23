@@ -56,6 +56,37 @@ const save = (path, before, after, msg) => {
   return false;
 };
 
+// Kotlin/Compose toolchain for the Notes dock (see the gradle section below).
+const KOTLIN_VERSION = "2.1.0";
+const COMPOSE_BOM = "2025.08.00";
+
+// --- 0: root build.gradle.kts — Kotlin 2 + the Compose compiler plugin -------
+// Tauri scaffolds Kotlin 1.9.25. Compose 1.9 (what lifecycle 2.10 resolves to)
+// needs a Kotlin 2 compiler; the Compose compiler ships as a Kotlin Gradle
+// plugin from 2.0 on, so both go on the buildscript classpath together.
+{
+  const rootGradle = join(androidDir, "build.gradle.kts");
+  if (existsSync(rootGradle)) {
+    const before = readFileSync(rootGradle, "utf8");
+    const eol = before.includes("\r\n") ? "\r\n" : "\n";
+    let r = before.replace(
+      /org\.jetbrains\.kotlin:kotlin-gradle-plugin:[0-9][0-9.]*/,
+      `org.jetbrains.kotlin:kotlin-gradle-plugin:${KOTLIN_VERSION}`,
+    );
+    r = r.replace(
+      /org\.jetbrains\.kotlin:compose-compiler-gradle-plugin:[0-9][0-9.]*/,
+      `org.jetbrains.kotlin:compose-compiler-gradle-plugin:${KOTLIN_VERSION}`,
+    );
+    if (!r.includes("compose-compiler-gradle-plugin")) {
+      r = r.replace(
+        /([ \t]*)classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:[^"]*"\)\r?\n/,
+        `$&$1classpath("org.jetbrains.kotlin:compose-compiler-gradle-plugin:${KOTLIN_VERSION}")${eol}`,
+      );
+    }
+    save(rootGradle, before, r, `root build.gradle.kts: Kotlin ${KOTLIN_VERSION} + Compose compiler plugin`);
+  }
+}
+
 // --- 1 & 2: AndroidManifest.xml ---------------------------------------------
 {
   const before = readFileSync(manifestPath, "utf8");
@@ -214,6 +245,37 @@ const save = (path, before, after, msg) => {
       `        <activity${eol}` +
       `          android:name=".ClipboardPickActivity"${eol}` +
       `          android:exported="false"${eol}` +
+      `          android:theme="@android:style/Theme.Translucent.NoTitleBar" />${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${act}$1`);
+  }
+
+  // Notes Quick Settings tile + its trampoline. The tile opens the floating
+  // Notes dock without anything being drawn on screen beforehand (the edge
+  // handle is a permanent overlay, so it lands in every screenshot). The
+  // trampoline runs in an EMPTY task affinity so finishing it returns to the
+  // app you were in rather than surfacing GameTracker.
+  if (!m.includes(".NotesTileService")) {
+    const tile =
+      `        <service${eol}` +
+      `          android:name=".NotesTileService"${eol}` +
+      `          android:exported="true"${eol}` +
+      `          android:icon="@drawable/ic_qs_notes"${eol}` +
+      `          android:label="Notes"${eol}` +
+      `          android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">${eol}` +
+      `          <intent-filter>${eol}` +
+      `            <action android:name="android.service.quicksettings.action.QS_TILE" />${eol}` +
+      `          </intent-filter>${eol}` +
+      `        </service>${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${tile}$1`);
+  }
+  if (!m.includes(".NotesDockActivity")) {
+    const act =
+      `        <activity${eol}` +
+      `          android:name=".NotesDockActivity"${eol}` +
+      `          android:exported="false"${eol}` +
+      `          android:excludeFromRecents="true"${eol}` +
+      `          android:noHistory="true"${eol}` +
+      `          android:taskAffinity=""${eol}` +
       `          android:theme="@android:style/Theme.Translucent.NoTitleBar" />${eol}`;
     m = m.replace(/([ \t]*<\/application>)/, `${act}$1`);
   }
@@ -457,6 +519,32 @@ const save = (path, before, after, msg) => {
         `    implementation("dev.rikka.shizuku:provider:13.1.5")${eol}`,
     );
   }
+  // Jetpack Compose + Material 3 for the floating Notes dock (NotesDock.kt).
+  // The BOM must match the Compose runtime lifecycle 2.10 already drags in
+  // (1.9.x) — pairing an older BOM with it ends in "couldn't find inline method
+  // remember" from the compiler. Compose 1.9 needs a Kotlin 2 compiler, so the
+  // project's Kotlin plugin is raised to KOTLIN_VERSION below and the Compose
+  // compiler comes from its Gradle plugin (not composeOptions). Icons come from
+  // material-icons-extended — R8 strips every icon we don't reference.
+  if (!/compose\s*=\s*true/.test(g)) {
+    g = g.replace(/buildFeatures\s*\{\r?\n/, `$&        compose = true${eol}`);
+  }
+  // Kotlin 1.9-era composeOptions from an earlier revision: the compose plugin owns this now.
+  g = g.replace(/[ \t]*composeOptions\s*\{[^}]*\}\r?\n/, "");
+  if (!g.includes("org.jetbrains.kotlin.plugin.compose")) {
+    g = g.replace(/([ \t]*)id\("org\.jetbrains\.kotlin\.android"\)\r?\n/, `$&$1id("org.jetbrains.kotlin.plugin.compose")${eol}`);
+  }
+  g = g.replace(/androidx\.compose:compose-bom:2024\.09\.03/, `androidx.compose:compose-bom:${COMPOSE_BOM}`);
+  if (!g.includes("androidx.compose:compose-bom")) {
+    g = g.replace(
+      /dependencies\s*\{\r?\n/,
+      `$&    implementation(platform("androidx.compose:compose-bom:${COMPOSE_BOM}"))${eol}` +
+        `    implementation("androidx.compose.ui:ui")${eol}` +
+        `    implementation("androidx.compose.foundation:foundation")${eol}` +
+        `    implementation("androidx.compose.material3:material3")${eol}` +
+        `    implementation("androidx.compose.material:material-icons-extended")${eol}`,
+    );
+  }
   // The toggle uses a hand-written Binder so Windows AIDL path comments cannot
   // produce illegal Java unicode escapes in the generated source tree.
   g = g.replace(/^[ \t]*aidl = true[ \t]*\r?\n/m, "");
@@ -658,6 +746,20 @@ const save = (path, before, after, msg) => {
       `    // documented way for auto-enter to quietly do nothing.\n` +
       `    updatePipParams()\n` +
       `  }\n\n` +
+      `  // WryActivity.onPause() calls WebView.onPause(), which stops the page\n` +
+      `  // painting and marks it hidden. In picture-in-picture the activity is\n` +
+      `  // paused but ON SCREEN, so the mini window froze on the last full-screen\n` +
+      `  // frame: the top bar stayed up, the video layer kept its full-screen\n` +
+      `  // rect (a sliver of picture over black) and nothing updated. Keep the\n` +
+      `  // WebView live while pinned; a real background (onStop) still pauses it.\n` +
+      `  override fun onPause() {\n` +
+      `    super.onPause()\n` +
+      `    if (isInPictureInPictureMode) appWebView?.onResume()\n` +
+      `  }\n\n` +
+      `  override fun onStop() {\n` +
+      `    super.onStop()\n` +
+      `    appWebView?.onPause()\n` +
+      `  }\n\n` +
       `  // Home / recents while connected → floating 16:9 mini window.\n` +
       `  //\n` +
       `  // This runs on ALL API >= O, including 12+ where setAutoEnterEnabled is\n` +
@@ -686,6 +788,8 @@ const save = (path, before, after, msg) => {
       `    newConfig: Configuration\n` +
       `  ) {\n` +
       `    super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)\n` +
+      `    // Entering PiP can land after onPause — keep the page painting here too.\n` +
+      `    if (isInPictureInPictureMode) appWebView?.onResume()\n` +
       `    val active = if (isInPictureInPictureMode) "true" else "false"\n` +
       `    appWebView?.evaluateJavascript("window.__GT_PIP_ACTIVE__=" + active + ";window.dispatchEvent(new CustomEvent('gt:pip',{detail:{active:" + active + "}}));", null)\n` +
       `    if (!isInPictureInPictureMode) hideSystemBars()\n` +
@@ -815,6 +919,8 @@ const save = (path, before, after, msg) => {
       `-keep class ${pkg}.ClipboardService { *; }\n` +
       `-keep class ${pkg}.ClipboardBootReceiver { *; }\n` +
       `-keep class ${pkg}.ClipboardPickActivity { *; }\n` +
+      `-keep class ${pkg}.NotesTileService { *; }\n` +
+      `-keep class ${pkg}.NotesDockActivity { *; }\n` +
       `\n` +
       `# The mobile-network icon is reached only through the launcher manifest.\n` +
       `# Keep the activity stable in release R8.\n` +
@@ -1156,22 +1262,38 @@ const save = (path, before, after, msg) => {
   if (!pkg) {
     console.warn("[patch-android] no identifier — skipping clipboard components.");
   } else {
-    for (const name of ["ClipboardBridge", "ClipboardService", "ClipboardBootReceiver", "ClipboardPickActivity", "ClipboardNetworkState"]) {
-      const templatePath = join(root, "scripts", "android-templates", `${name}.java`);
+    for (const file of ["ClipboardBridge.java", "ClipboardService.java", "ClipboardBootReceiver.java", "ClipboardPickActivity.java", "ClipboardNetworkState.java", "NotesTileService.java", "NotesDockActivity.java", "NotesDock.kt"]) {
+      const name = file.replace(/\.(java|kt)$/, "");
+      const templatePath = join(root, "scripts", "android-templates", file);
       if (!existsSync(templatePath)) {
         console.warn(`[patch-android] ${templatePath} missing — skipping ${name}.`);
         continue;
       }
-      const dest = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), `${name}.java`);
+      const dest = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), file);
       const content = readFileSync(templatePath, "utf8").replace(/__PACKAGE__/g, pkg);
       const exists = existsSync(dest);
       const before = exists ? readFileSync(dest, "utf8") : "";
       if (!exists) {
         mkdirSync(dirname(dest), { recursive: true });
         writeFileSync(dest, content);
-        note(`created ${name}.java`);
+        note(`created ${file}`);
       } else {
-        save(dest, before, content, `updated ${name}.java`);
+        save(dest, before, content, `updated ${file}`);
+      }
+    }
+    // The tile's icon (vector drawable referenced from the manifest).
+    {
+      const src = join(root, "scripts", "android-templates", "notes_tile_icon.xml");
+      const dest = join(androidDir, "app", "src", "main", "res", "drawable", "ic_qs_notes.xml");
+      const content = readFileSync(src, "utf8");
+      const exists = existsSync(dest);
+      const before = exists ? readFileSync(dest, "utf8") : "";
+      if (!exists) {
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, content);
+        note("created res/drawable/ic_qs_notes.xml (Notes tile icon)");
+      } else {
+        save(dest, before, content, "updated res/drawable/ic_qs_notes.xml (Notes tile icon)");
       }
     }
   }

@@ -353,6 +353,37 @@ fn native_out_size(native_w: u32, native_h: u32, max_w: u32) -> (u32, u32) {
 /// decoder, a resolution change). Consumed by the encoder thread on the next frame.
 static NATIVE_FORCE_KEY: AtomicBool = AtomicBool::new(false);
 
+/// Set by [`request_refresh`]: the next encoded frame starts an intra-refresh wave
+/// instead of an IDR. The host's periodic safety net uses this — an IDR on a still,
+/// detailed desktop is squeezed into ~2 frames of VBV and decodes at 25–31 dB, then
+/// needs ~30 encodes to sharpen (research R2).
+static NATIVE_FORCE_IR: AtomicBool = AtomicBool::new(false);
+
+/// Still-screen refinement burst (research R2). After an IDR, an intra-refresh
+/// wave, or the screen settling after motion, keep re-encoding the SAME composited
+/// texture at frame cadence (not the 700 ms keep-alive) until it converges: the
+/// frame's average QP reaches [`REFINE_QP_DONE`], or three frames in a row are tiny
+/// while QP is already at most [`REFINE_QP_SETTLED`], or [`REFINE_FRAMES`] have gone
+/// out. Tiny frames alone do NOT mean converged: right after an IDR (161 KB at QP 50
+/// against a 12.5 KB/frame budget on a detailed 1080p still, 6 Mb/s) the rate control
+/// emits ~250 B skip frames for ~15 frames while the buffer drains, and only then
+/// walks QP down about one step per two frames (`still_screen_refinement`). Measured: a still text page goes from a
+/// 28 dB time average (blur that never cleared between safety IDRs) to ~62 dB.
+#[cfg(windows)]
+const REFINE_FRAMES: u32 = 120;
+#[cfg(windows)]
+const REFINE_QP_DONE: u32 = 18;
+#[cfg(windows)]
+const REFINE_QP_SETTLED: u32 = 26;
+/// Below this a refinement P-frame is (nearly) all skip blocks — nothing left to fix.
+#[cfg(windows)]
+const REFINE_SMALL_BYTES: usize = 512;
+
+/// Ask the native encoder for an intra-refresh wave (see [`NATIVE_FORCE_IR`]).
+pub fn request_refresh() {
+    NATIVE_FORCE_IR.store(true, Ordering::Relaxed);
+}
+
 /// Backpressure gate for the native H.264 path: while set, captures are NOT fed
 /// to NVENC (keyframe requests still are). The host JS sets this when the video
 /// data channel backs up, instead of dropping already-encoded frames — a dropped
@@ -790,6 +821,12 @@ where
         // (`Grab::Timeout`) without spinning the encoder every tick.
         #[cfg(windows)]
         let mut zc_last_emit = Instant::now() - Duration::from_secs(2);
+        // Refinement burst state (see REFINE_FRAMES): frames left in the burst, how
+        // many consecutive tiny frames it produced, intra-refresh frames still owed
+        // (a wave must not be cut short by the QP test), and whether the screen
+        // changed since the last settle.
+        #[cfg(windows)]
+        let (mut refine_left, mut refine_small, mut ir_left, mut zc_moved) = (0u32, 0u32, 0u32, false);
         let mut cur_mon = usize::MAX;
         // Last successfully scaled frame (shared), re-sent on idle so the encoder's
         // ~1s keep-alive still fires for a freshly attached decoder.
@@ -914,9 +951,19 @@ where
                                 } else if ok {
                                     if let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) {
                                         let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        let force_ir = !force_key && NATIVE_FORCE_IR.swap(false, Ordering::Relaxed);
                                         let ts_us = zc_started.elapsed().as_micros() as u64;
                                         let e0 = Instant::now();
-                                        if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
+                                        if let Some(pkt) = enc.encode_texture_ex(comp.output(), force_key, force_ir, ts_us) {
+                                            // Moving content refines itself; arm the burst
+                                            // for when it settles (Timeout branch).
+                                            zc_moved = true;
+                                            if force_key {
+                                                ir_left = 0;
+                                            } else if force_ir {
+                                                ir_left = super::nvenc::INTRA_REFRESH_FRAMES;
+                                            }
+                                            ir_left = ir_left.saturating_sub(1);
                                             ST_CAP_US.store(cap_us, Ordering::Relaxed);
                                             // The composite IS the scale; there is no
                                             // separate CPU resize pass to report.
@@ -950,21 +997,56 @@ where
                             // bytes of skip macroblocks).
                             if let Some((comp, enc)) = zc.as_mut() {
                                 let want_key = NATIVE_FORCE_KEY.load(Ordering::Relaxed);
-                                // The static-screen keep-alive also respects the
-                                // backpressure pause (it would only deepen the backlog);
-                                // a requested IDR still goes out.
+                                let want_ir = NATIVE_FORCE_IR.load(Ordering::Relaxed);
+                                // The screen just settled after motion: sharpen what
+                                // the motion left at motion-grade QP.
+                                if zc_moved {
+                                    zc_moved = false;
+                                    refine_left = refine_left.max(REFINE_FRAMES);
+                                    refine_small = 0;
+                                }
+                                // The static-screen keep-alive (and the refinement
+                                // burst) respect the backpressure pause — they would
+                                // only deepen the backlog; a requested IDR still goes out.
+                                let paused = NATIVE_ENCODE_PAUSED.load(Ordering::Relaxed);
                                 if want_key
-                                    || (!NATIVE_ENCODE_PAUSED.load(Ordering::Relaxed)
-                                        && zc_last_emit.elapsed() >= Duration::from_millis(700))
+                                    || (!paused
+                                        && (want_ir
+                                            || refine_left > 0
+                                            || ir_left > 0
+                                            || zc_last_emit.elapsed() >= Duration::from_millis(700)))
                                 {
                                     if let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) {
                                         let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        let force_ir = !force_key && NATIVE_FORCE_IR.swap(false, Ordering::Relaxed);
                                         let ts_us = zc_started.elapsed().as_micros() as u64;
-                                        if let Some(pkt) = enc.encode_texture(comp.output(), force_key, ts_us) {
-                                            ST_BYTES.store(pkt.len() as u32, Ordering::Relaxed);
+                                        if let Some(pkt) = enc.encode_texture_ex(comp.output(), force_key, force_ir, ts_us) {
+                                            let bytes = pkt.len();
+                                            ST_BYTES.store(bytes as u32, Ordering::Relaxed);
                                             ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
                                             cap_emit(permit.packet(pkt));
                                             zc_last_emit = Instant::now();
+                                            if force_key || force_ir {
+                                                // A fresh IDR / wave starts blurry by design —
+                                                // refine it at frame cadence, not 1.4 fps.
+                                                refine_left = REFINE_FRAMES;
+                                                refine_small = 0;
+                                                ir_left = if force_ir { super::nvenc::INTRA_REFRESH_FRAMES - 1 } else { 0 };
+                                            } else {
+                                                ir_left = ir_left.saturating_sub(1);
+                                                if refine_left > 0 {
+                                                    refine_left -= 1;
+                                                    refine_small = if bytes < REFINE_SMALL_BYTES { refine_small + 1 } else { 0 };
+                                                    // Converged — but never cut an intra-refresh
+                                                    // wave short (its later rows are still owed).
+                                                    if ir_left == 0
+                                                        && (enc.last_avg_qp <= REFINE_QP_DONE
+                                                            || (refine_small >= 3 && enc.last_avg_qp <= REFINE_QP_SETTLED))
+                                                    {
+                                                        refine_left = 0;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

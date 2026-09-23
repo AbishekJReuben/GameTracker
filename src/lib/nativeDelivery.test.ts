@@ -29,11 +29,11 @@ describe("native delivery wire", () => {
     expect(parseNativeFrame(frame(true), 500, 990_000)?.timestamp).toBe(500);
     expect(parseNativeFrame(frame(true), 500, 2_000_000)?.timestamp).toBe(500);
   });
-  it("uses 16KiB only for fast delivery and respects negotiated SCTP limits", () => {
-    expect(videoFragmentSize(false)).toBe(61440);
-    expect(videoFragmentSize(true)).toBe(16384);
+  it("sends 4 KiB fragments in both modes and respects negotiated SCTP limits", () => {
+    expect(videoFragmentSize(false)).toBe(4096);
+    expect(videoFragmentSize(true)).toBe(4096);
     for (const fast of [false, true]) {
-      expect(videoFragmentSize(fast, 8192)).toBe(8192);
+      expect(videoFragmentSize(fast, 2048)).toBe(2048);
       expect(videoFragmentSize(fast, 0)).toBe(videoFragmentSize(fast));
     }
     const payload = new Uint8Array(222_333).map((_, i) => i % 251);

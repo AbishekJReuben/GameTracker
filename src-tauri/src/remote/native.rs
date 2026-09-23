@@ -100,6 +100,9 @@ pub struct NativeEncoder {
     tuning: EncoderTuning,
     /// Microseconds of the last encode (submit → bitstream), for the HUD.
     pub last_encode_us: u32,
+    /// NVENC's average QP of the last frame — drives the still-screen refinement
+    /// burst in capture.rs.
+    pub last_avg_qp: u32,
 }
 
 impl NativeEncoder {
@@ -158,6 +161,7 @@ impl NativeEncoder {
             bitrate: bitrate_bps,
             tuning,
             last_encode_us: 0,
+            last_avg_qp: 0,
         })
     }
 
@@ -250,14 +254,20 @@ impl NativeEncoder {
     /// Zero-copy: encode a texture that is already the exact session size with the
     /// cursor composited. See [`super::gpu::Compositor`].
     pub fn encode_texture(&mut self, tex: &ID3D11Texture2D, force_key: bool, ts_us: u64) -> Option<Vec<u8>> {
+        self.encode_texture_ex(tex, force_key, false, ts_us)
+    }
+
+    /// [`Self::encode_texture`] that can also start an intra-refresh wave.
+    pub fn encode_texture_ex(&mut self, tex: &ID3D11Texture2D, force_key: bool, force_ir: bool, ts_us: u64) -> Option<Vec<u8>> {
         let t0 = Instant::now();
-        let frame = match self.enc.encode(tex, force_key, ts_us) {
+        let frame = match self.enc.encode_ex(tex, force_key, force_ir, ts_us) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[native] encode failed: {e}");
                 return None;
             }
         };
+        self.last_avg_qp = frame.avg_qp;
         let out = wrap(frame.data, frame.key, self.w, self.h);
         self.last_encode_us = t0.elapsed().as_micros() as u32;
         Some(out)

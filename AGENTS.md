@@ -1129,6 +1129,11 @@ never blocks the metadata channel.
 
 ### The Android floating dock (`scripts/android-templates/ClipboardService.java`)
 
+> **3.9.102: the dock's UI is Jetpack Compose now (`NotesDock.kt`, §16).** The
+> service below still owns sync, crypto, classification, previews, voice and
+> actions; the View-building / row-recycling notes further down describe the
+> retired View UI and apply only to the data rules they mention.
+
 A **`specialUse` foreground service** draws a draggable overlay bubble on every
 app (`SYSTEM_ALERT_WINDOW`) and stays connected via a native OkHttp WebSocket even
 when the Activity/webview is destroyed — so history keeps syncing without the app
@@ -1261,6 +1266,10 @@ per-row copy/edit/folder/pin/share/delete.
   All pin geometry now goes through those constants (drag clamp, flip, position).
 
 ### Notes dock: tappable links when preview is off + view recycling (do not regress)
+
+> Superseded in 3.9.102 by the Compose dock (§16): LazyColumn does the recycling,
+> links are `LinkAnnotation`s built from `ClipboardService.UrlSpan`. The link
+> rule survives: a link in a note must be tappable with previews on or off.
 
 - **Links are clickable even when "Preview off"** (`ClipboardService.configureBody`).
   The preview toggle used to gate the ONLY clickable target (`buildLinkCard`, added
@@ -1526,12 +1535,13 @@ reproduction commands live in `docs/STREAMING_EFFICIENCY.md`.
   closes mid-stream latches `pipeBroken` and restarts on the Channel (new generation +
   IDR); a client that stops reading is dropped at 48 MB queued. CSP `connect-src` needs
   `ws://127.0.0.1:*`. Fast-delivery acks ride the pipe too.
-- **Stream colour is labelled.** NVENC's ARGB input path converts with **BT.601** limited
-  range (`colour_matrix_probe`: pure red → Y81 U90 V240). The SPS carried no colour
-  description, so Chromium/Android assumed BT.709 for HD: greens rendered ~15% dark, reds
-  orange-shifted. VUI now says primaries/transfer BT.709, matrix SMPTE 170M (6); ffmpeg
-  round-trip of the fixtures decodes to (253,0,0)/(0,254,0)/(0,0,254). `sps::fixup`
-  preserves it (unit test). Do not drop the colour description, and if the encoder input
+- **Stream colour is labelled** (corrected in 3.9.102). NVENC's ARGB input path takes its
+  RGB→YUV matrix FROM the VUI label, and when there is none it picks by resolution: BT.601
+  at small sizes (256×256: red → Y81 U90 V240), **BT.709 at 1080p** (red → Y63 U102). So the
+  unlabelled 1080p stream was not actually miscoloured; small and odd downscaled sizes were
+  the risk. VUI now says primaries/transfer BT.709, matrix SMPTE 170M (6), and conversion and
+  label agree at every size: `colour_matrix_probe` now runs at **1080p** (red → Y 81 → decodes
+  (253,0,0)). `sps::fixup` preserves it (unit test). Do not drop the colour description, and if the encoder input
   ever becomes NV12 from our own shader, the matrix label must follow what that shader does.
 - **NVENC preset P2 is the default** (supersedes the P1 mentions in §13). `preset_latency_1080p`:
   P1 1.22–1.45 ms vs P2 1.21–1.29 ms median; `encoder_tuning_matrix` (720p, starved 2.5 Mbps,
@@ -1586,3 +1596,113 @@ reproduction commands live in `docs/STREAMING_EFFICIENCY.md`.
   1.33 MB → 0.64 MB (phone). Entry screens stay eager; the rest preload when idle. The
   dev-only mock backend (`lib/mock.ts`, ~360 KB) is a dynamic import in `api.ts` — keep it off
   the static import graph.
+
+---
+
+## 16. Notes dock v2 (Compose) + Quick Settings tile + resume fix (v3.9.102) — do not regress
+
+### Floating Notes dock is Jetpack Compose (`scripts/android-templates/NotesDock.kt`)
+
+- **Split:** `ClipboardService.java` keeps everything that isn't pixels (relay socket,
+  crypto, classifier, span builders, link-preview fetch, voice, note actions) and
+  implements **`NotesDockHost`**. `NotesDock.kt` is the window + UI. Every host call is
+  main-thread and cheap; slow work is a `dockRequest…` that answers later through
+  `refreshPanelIfOpen()` → `NotesDock.invalidate()` (coalesced to one recompose per
+  ~32 ms, so a 300-notice relay replay doesn't recompose 300 times).
+- **Window model:** ONE full-screen `TYPE_APPLICATION_OVERLAY` window, **added on open
+  and removed on close**. Never leave it attached-but-hidden — an invisible full-screen
+  overlay that still takes touches freezes the phone. The *composition* outlives the
+  window (`ViewCompositionStrategy.DisposeOnLifecycleDestroyed` + `OverlayOwner`), so a
+  reopen is `addView` + recompose. `ui.visible` is set BEFORE `addView` so the first
+  frame starts the enter transition from hidden.
+- **Insets:** API 30+ uses `fitInsetsTypes = 0` + `SOFT_INPUT_ADJUST_NOTHING`; Compose
+  pads the sheet with `WindowInsets.safeDrawing` (bars + cutout + **IME**) so the keyboard
+  shrinks the sheet smoothly. API < 30 falls back to `ADJUST_RESIZE`.
+- **Back:** targetSdk 36 routes Back through `OnBackInvokedDispatcher` (predictive back),
+  not `KEYCODE_BACK` — `registerBack` does both. Don't drop either.
+- **No Popups inside the overlay.** The overflow menu and the tag picker are in-sheet
+  (`AnimatedVisibility`), not `DropdownMenu`/`ModalBottomSheet` (those open their own
+  windows off the overlay's token).
+- **Activities open UNDER overlay windows**: share sheet, links, photo picker and "Open
+  app" all `hidePanel()` first (`dockShare`, `dockOpenUrl`, `dockPickImage`,
+  `dockOpenApp`). Feedback goes to the dock's snackbar while it's open (`toast()` routes).
+- **Rows:** pure Compose `LazyColumn` (keys = note ids, `animateItem`). Bodies come from
+  the SAME span builders as before (`dockBody` → `buildProse/buildCode/buildLog/
+  buildCommand`) converted to `AnnotatedString`; links are `ClipboardService.UrlSpan` →
+  `LinkAnnotation.Clickable` routed to `dockOpenUrl` (a Service context can't
+  `startActivity` without NEW_TASK, which Compose's default UriHandler omits). The
+  composer is an `EditText` inside `AndroidView` on purpose: it keeps Gboard image
+  paste (`OnReceiveContentListener`), the floating Select/Copy/Paste toolbar in an
+  overlay, and the mic's append path.
+- **Toolchain:** Compose needs Kotlin 2. `patch-android.mjs` raises the root Kotlin
+  plugin to `KOTLIN_VERSION` (2.1.0), adds the `compose-compiler-gradle-plugin`
+  classpath + `org.jetbrains.kotlin.plugin.compose`, and pins `COMPOSE_BOM` 2025.08.00
+  (Compose 1.9.0). The BOM must match the Compose runtime that **lifecycle 2.10 already
+  forces** (1.9.x): pairing Kotlin 1.9 + an older BOM compiled into "couldn't find inline
+  method `remember`". Change the two constants together.
+
+### Quick Settings tile — the screenshot-free way in
+
+- `NotesTileService` ("Notes" tile) → `NotesDockActivity` (invisible trampoline) →
+  `ClipboardService` `ACTION_SHOW_DOCK`. The trampoline exists because launching an
+  **Activity** is what collapses the shade (a Service PendingIntent opens the dock
+  *under* it). It has `taskAffinity=""` + `excludeFromRecents` + `noHistory`, so
+  finishing it returns you to the app you were in, not to GameTracker.
+- The edge handle is a permanent overlay window, so it lands in every screenshot and
+  screen recording. `PREF_EDGE_HANDLE` (default on) turns it off; **adding the tile
+  flips it off** when the user hasn't chosen yet (`onTileAdded`), and the dock menu's
+  "Edge handle" switch brings it back. The foreground notification now opens the dock
+  too (content intent → trampoline), with an "Open app" action.
+- Locked device: `unlockAndRun` — overlays can't draw over the keyguard.
+
+### Resume from background / PiP no longer pauses the stream (`cloud.ts`, `Control.tsx`)
+
+- Android reports the page **hidden a beat before** the PiP flag lands (enter) and drops
+  the flag **a beat before** the page turns visible (exit). `syncPowerIdle` treated that
+  window as "backgrounded": host encoder paused, decoder gated to the next IDR, Wi-Fi
+  low-latency lock and the 120 Hz display mode released and re-taken — on every PiP
+  transition (measured on the moto g57: `wifi lock released` / `display mode preference
+  released` logged at the instant of *exiting* PiP).
+- Now **going idle is debounced by `POWER_IDLE_GRACE_MS` (1.5 s); waking is immediate.**
+  The decode gate uses the debounced `powerIdle`, not raw `document.hidden`, so frames
+  that arrive during the handoff keep the reference chain alive. `Control.tsx`'s radio /
+  display-mode lock uses the same grace for its release. A real background still stops
+  the encoder ~1.5 s after leaving.
+
+### Streaming changes from the September research (docs/STREAMING_RESEARCH_2026-09.md)
+
+- **DIRECT video goes out in 4 KB data-channel messages** (`VIDEO_FRAGMENT_BYTES`, was 60 KB
+  classic / 16 KB fast). Chromium lab, zero loss: p50 19.7 → 8.5 ms at 6 ms RTT, p90 40 → 15 ms.
+  It does nothing under packet loss — see R5 in the research doc before touching transport.
+- **Still screens refine instead of re-blurring.**
+  1. The periodic safety net (Tune `wcKeyMs`, now **30 s**) asks Rust for an **intra-refresh
+     wave** (`remote_request_refresh` → `NATIVE_FORCE_IR` → `encode_ex(.., force_ir, ..)`),
+     not an IDR.
+  2. The zero-copy loop runs a **refinement burst** at frame cadence after an IDR, an IR wave,
+     or the screen settling, instead of the 700 ms keep-alive. It stops at any of:
+     - average QP ≤ 18;
+     - three tiny frames in a row once QP ≤ 26 (tiny frames right after an IDR are the VBV
+       draining — measured, QP stays at 50 for ~15 frames);
+     - 120 frames.
+  3. **P-frame min QP 12** (`MIN_QP_P`): a converged still costs ~64 B per keep-alive instead
+     of kilobytes.
+
+  Measured on a worst-case 1080p still at 6 Mb/s (`still_screen_refinement`): IDR 17.5 dB →
+  refined 36.8 dB by frame 71; an IR wave dips to ~32 dB and recovers. Before this, every 10 s
+  produced a fresh ~17–25 dB IDR that never sharpened.
+
+  Do not reintroduce periodic IDRs on the native path, and do not stop the burst on small
+  frames alone.
+- **Intra refresh is enabled at session init**: `intraRefreshPeriod` 100 000 (≈ never
+  automatic), `intraRefreshCnt` 30. A wave is P-slices with intra MBs. It strict-decodes
+  cleanly (ffmpeg `-err_detect explode`) and needs no decoder support.
+- Research items **not yet implemented**. Each has measured evidence and a file-level plan in
+  the research doc:
+  - H.264 **High + CABAC** for known-good decoders: −12 to −24 % bits. This phone supports
+    Constrained High.
+  - **RTP "VP8 append carrier"**: the fix for SCTP collapsing under any packet loss.
+  - **Reference-frame invalidation**.
+  - Loss-aware SCTP bitrate ceiling.
+  - HEVC low-bandwidth mode.
+  - SurfaceView vs TextureView A/B.
+  - A 30 Mb/s bitrate cap for this phone's low-latency decoder.

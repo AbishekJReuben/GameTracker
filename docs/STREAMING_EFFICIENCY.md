@@ -1,4 +1,4 @@
-# Streaming efficiency pass (3.9.101)
+# Streaming efficiency pass (3.9.101, colour note corrected in 3.9.102)
 
 Scope: the remote-control stream end to end (PC capture → encode → transport → phone
 receive → decode → present), plus the always-on desktop costs that compete with it.
@@ -13,7 +13,7 @@ from mechanism, and each one ships with a HUD counter that shows it working.
 | Change | Evidence |
 |---|---|
 | NVENC default preset **P1 → P2** | 1080p encode median: P1 1.22–1.45 ms, P2 1.21–1.29 ms (`preset_latency_1080p`, 2 runs). 720p @ 2.5 Mbps desktop-like content: **25.45 → 28.12 dB** PSNR (`encoder_tuning_matrix` + ffmpeg). P3/P4: +0.6–0.8 ms for ~+0.2 dB (Tune knob). |
-| **Colour labelled correctly** (BT.601 matrix in the VUI) | `colour_matrix_probe`: NVENC ARGB input is converted with BT.601 (red → Y81 U90 V240) but the stream was unlabelled, so decoders assumed BT.709 for HD — green decoded ≈(0,216,0), red orange-shifted. Labelled stream decodes to (253,0,0) / (0,254,0) / (0,0,254). |
+| **Colour labelled explicitly** (BT.601 matrix in the VUI) | *Corrected in 3.9.102:* NVENC picks its RGB→YUV matrix from the VUI label, and unlabelled it picks by resolution (BT.601 at 256×256, BT.709 at 1080p), so unlabelled 1080p was already consistent; small/odd sizes were the risk. With the label, conversion and label agree at every size (1080p probe: red → Y 81 → decodes (253,0,0)). The original claim came from a 256×256 probe and overstated the 1080p problem. |
 | **Area downscale filter** (compositor) | vs trilinear, PSNR against a Lanczos3 reference (`area_filter_beats_trilinear`): 1.33× **+5.47 dB**, 1.5× **+5.06**, 1.79× **+3.78**, 2.0× ±0 (4K→1080p unchanged), 2.13× +0.03, 2.18× +0.21, 2.4× +1.39, 2.81× +2.29, 3.0× +1.59. |
 | Surround endpoints fold down to stereo | Centre (dialogue) was dropped; now ITU/Web-Audio fold-down with a soft limiter (unit tests). |
 
