@@ -59,7 +59,9 @@ fn slices_for_height(h: u32) -> u32 {
 /// `cfg.encodeCodecConfig` is a C union; the caller must have just filled it from
 /// an H.264 preset so the `h264Config` arm is the live one.
 unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
-    cfg.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+    // Constrained High for decoders that reported it (the guest's DIRECT opt-in),
+    // Constrained Baseline otherwise. `sps::fixup` sets the "constrained" flags.
+    cfg.profileGUID = if p.high { NV_ENC_H264_PROFILE_HIGH_GUID } else { NV_ENC_H264_PROFILE_BASELINE_GUID };
     // Infinite GOP: keyframes cost bandwidth and the transport is reliable, so we
     // only emit them on demand (guest `vkf`, resolution change, first frame).
     cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
@@ -105,10 +107,16 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     let h264 = &mut cfg.encodeCodecConfig.h264Config;
     h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
     h264.chromaFormatIDC = 1; // yuv420
-    // Baseline forbids CABAC and the 8×8 adaptive transform — CAVLC is also a few
-    // ms cheaper to decode on software paths (Sunshine's `nvenc_h264_cavlc` knob).
-    h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
-    h264.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE;
+    if p.high {
+        // CABAC + the adaptive 8×8 transform are where High's ~10–20 % comes from.
+        h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+        h264.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
+    } else {
+        // Baseline forbids CABAC and the 8×8 adaptive transform — CAVLC is also a few
+        // ms cheaper to decode on software paths (Sunshine's `nvenc_h264_cavlc` knob).
+        h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
+        h264.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE;
+    }
     // DPB of 1: the phone only ever needs the previous frame. Moonlight errata #1 —
     // NVENC's default of 16 makes some Android decoders allocate 16+ buffers.
     h264.maxNumRefFrames = 1;
@@ -278,6 +286,10 @@ pub struct Params {
     pub preset: u8,
     /// Rate-control passes: 0 single, 1 two-pass quarter-res, 2 two-pass full-res.
     pub multipass: u8,
+    /// H.264 **Constrained High** (CABAC + 8×8 transform, no B-frames) instead of
+    /// Constrained Baseline. Only for guests whose decoder reported it
+    /// (research R3: −12…−24 % bits at equal quality, encode time unchanged).
+    pub high: bool,
 }
 
 impl Params {
@@ -289,7 +301,13 @@ impl Params {
             bitrate_bps,
             preset: DEFAULT_PRESET,
             multipass: DEFAULT_MULTIPASS,
+            high: false,
         }
+    }
+
+    pub fn with_high(mut self, high: bool) -> Self {
+        self.high = high;
+        self
     }
 
     pub fn with_tuning(mut self, preset: u8, multipass: u8) -> Self {
@@ -452,8 +470,8 @@ impl Encoder {
         if p.width != self.params.width || p.height != self.params.height {
             return Err("resolution change needs a new session".into());
         }
-        if p.preset != self.params.preset || p.multipass != self.params.multipass {
-            return Err("preset / pass-mode change needs a new session".into());
+        if p.preset != self.params.preset || p.multipass != self.params.multipass || p.high != self.params.high {
+            return Err("preset / pass-mode / profile change needs a new session".into());
         }
         unsafe {
             let mut preset = NV_ENC_PRESET_CONFIG {

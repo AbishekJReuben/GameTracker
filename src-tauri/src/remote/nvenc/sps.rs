@@ -218,6 +218,11 @@ fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
     // already; force it so a driver quirk can't leave us on plain Baseline.
     if profile_idc == 66 {
         w.u(constraints | 0x40, 8); // constraint_set1_flag
+    } else if profile_idc == 100 {
+        // Constrained High = High + constraint_set5 (no B-slices) + constraint_set4
+        // (frame_mbs_only, set below once that field is read): the "reordering is
+        // impossible" promise the Baseline choice made, now at High (research R3).
+        w.u(constraints | 0x04, 8);
     } else {
         w.u(constraints, 8);
     }
@@ -278,6 +283,9 @@ fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
     w.ue(r.ue()?); // pic_height_in_map_units_minus1
     let frame_mbs_only = r.u1()?;
     w.u1(frame_mbs_only);
+    if profile_idc == 100 && frame_mbs_only == 1 {
+        w.d[1] |= 0x08; // constraint_set4_flag (byte 1 is already flushed)
+    }
     if frame_mbs_only == 0 {
         w.u1(r.u1()?); // mb_adaptive_frame_field_flag
     }
@@ -901,5 +909,50 @@ mod tests {
         let out = rewrite_rbsp(&w.d).expect("rewrite");
         assert_eq!(out[0], 66);
         assert_ne!(out[1] & 0x40, 0, "constraint_set1_flag must be set");
+    }
+
+    /// High SPS as NVENC writes it with the High GUID: the rewriter must mark it
+    /// Constrained High (set4 + set5 → `avc1.640C..`) and keep the High-only fields.
+    #[test]
+    fn forces_constrained_high_flags() {
+        let high = |frame_mbs_only: u32| {
+            let mut w = BitWriter::default();
+            w.u(100, 8); // High
+            w.u(0x00, 8);
+            w.u(42, 8); // level 4.2
+            w.ue(0); // sps id
+            w.ue(1); // chroma 4:2:0
+            w.ue(0); // bit depth luma
+            w.ue(0); // bit depth chroma
+            w.u1(0); // qpprime bypass
+            w.u1(0); // no scaling matrix
+            w.ue(0); // log2_max_frame_num
+            w.ue(2); // poc_type 2
+            w.ue(16); // refs
+            w.u1(0);
+            w.ue(119);
+            w.ue(67);
+            w.u1(frame_mbs_only);
+            if frame_mbs_only == 0 {
+                w.u1(0); // mb_adaptive_frame_field
+            }
+            w.u1(1);
+            w.u1(0);
+            w.u1(0);
+            w.trailing();
+            w.d
+        };
+        let out = rewrite_rbsp(&high(1)).expect("rewrite");
+        assert_eq!(out[0], 100);
+        assert_eq!(out[1] & 0x0C, 0x0C, "set4 + set5 = Constrained High");
+        assert_eq!(out[1] & 0x40, 0, "set1 is a Baseline-only promise");
+        let info = summarize(&out).expect("parse");
+        assert_eq!(info.profile_idc, 100);
+        assert_eq!(info.max_num_ref_frames, 1);
+        assert_eq!(info.max_num_reorder_frames, Some(0));
+
+        // Field-coded streams can't claim set4 (it asserts frame_mbs_only == 1).
+        let out = rewrite_rbsp(&high(0)).expect("rewrite");
+        assert_eq!(out[1] & 0x0C, 0x04, "set5 only when not frame-only");
     }
 }

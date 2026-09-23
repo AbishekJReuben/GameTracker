@@ -76,6 +76,13 @@ export type StreamTune = {
    */
   preferNativeDecode: boolean;
   /**
+   * Guest capability opt-in: when this device's decoder lists H.264 High, ask the
+   * PC for Constrained High + CABAC instead of Constrained Baseline — 12–24 % fewer
+   * bits for the same picture (research R3). A High stream that fails to decode
+   * falls back to Baseline for the rest of the app run. OFF = always Baseline.
+   */
+  h264High: boolean;
+  /**
    * PC sound path. ON = DIRECT: Opus (or raw f32) over the high-priority,
    * time-bounded audio channel → adaptive phone worklet (~65ms target). OFF = RTC: WebRTC
    * Opus track (NetEQ + host worklet). Flip OFF if DIRECT crackles on a bad link.
@@ -155,6 +162,7 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   hostNvenc: true,
   nvencFast: false,
   preferNativeDecode: true,
+  h264High: true,
   preferDirectAudio: true,
   audioJbMs: 100,
   audioHostMs: 90,
@@ -225,6 +233,7 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     // Experiments must never turn on for existing installs or malformed prefs.
     nvencFast: r.nvencFast === true,
     preferNativeDecode: r.preferNativeDecode !== false,
+    h264High: r.h264High !== false,
     preferDirectAudio: r.preferDirectAudio !== false,
     abrV2: r.abrV2 !== false,
     audioStudio: r.audioStudio !== false,
@@ -324,6 +333,7 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.hostNvenc !== d.hostNvenc ||
     t.nvencFast !== d.nvencFast ||
     t.preferNativeDecode !== d.preferNativeDecode ||
+    t.h264High !== d.h264High ||
     t.preferDirectAudio !== d.preferDirectAudio ||
     t.audioJbMs !== d.audioJbMs ||
     t.audioHostMs !== d.audioHostMs ||

@@ -27,6 +27,8 @@ import {
   parseOpusRed,
 } from "@/lib/audioWire";
 import audioFeederWorkletUrl from "@/lib/audioFeeder.worklet.js?url";
+import { SeqLossWindow } from "@/lib/lossCeiling";
+import { H264_HIGH_CODEC } from "@/lib/nativeDelivery";
 import {
   dumpNativeDecoderDiag,
   feedNativeDecoder,
@@ -456,6 +458,16 @@ export class CloudConn {
   private wcRetryBackoff = WC_RETRY_MIN_MS;
   /** Host said "my encoder is gone" — respect it until the next peer session. */
   private wcHostRefused = false;
+  /** DEVICE fact (probed with wcSupported): the decoder lists H.264 High. */
+  private wcHighCap = false;
+  /** A High stream failed to decode here — ask for Baseline for the rest of this app run. */
+  private wcHighFailed = false;
+  /** Tune: allow asking the PC for Constrained High (research R3). */
+  private preferH264High = true;
+  /** Native decoder's declared bitrate ceiling (kbps; 0 = unknown) — sent with the opt-in. */
+  private wcMaxKbps = 0;
+  /** Frames the CURRENT WebCodecs decoder has output (0 ⇒ it never decoded anything). */
+  private wcDecodedOut = 0;
   private wcDecoder: VideoDecoder | null = null;
   /**
    * Android APK: decode via MediaCodec → Surface (Moonlight/Chiaki pattern) instead
@@ -554,6 +566,8 @@ export class CloudConn {
   private redPending = new Map<number, Uint8Array>();
   /** Next sequence we owe the decoder. -1 until the first packet lands. */
   private redNextSeq = -1;
+  /** Raw loss on audio2 (primary sequences, before RED repair) — the R6 signal. */
+  private a2Loss = new SeqLossWindow();
   /** Units per packet the host is actually sending — how far back redundancy
    *  reaches, and therefore how long a missing sequence is still recoverable. */
   private redDepth = 1;
@@ -703,6 +717,12 @@ export class CloudConn {
       }
     } else {
       this.preferNativeDecode = wantNative;
+    }
+    const wantHigh = tune.h264High !== false;
+    if (wantHigh !== this.preferH264High) {
+      this.preferH264High = wantHigh;
+      // Live: the host rebuilds its NVENC session and re-announces the codec.
+      if (this.wcActive || this.wcRequestedAt) this.sendControl({ type: "vprofile", high: this.wcWantHigh() });
     }
     // RTC audio playout delay — applies live to the existing receiver, so the
     // slider is audible mid-stream without a reconnect.
@@ -1882,6 +1902,7 @@ export class CloudConn {
     while (this.audioByteWin.length && now - this.audioByteWin[0].at > 2000) this.audioByteWin.shift();
 
     const newest = units[0].seq;
+    this.a2Loss.push(newest, now);
     this.redDepth = Math.max(1, units.length);
     if (this.redNextSeq < 0) this.redNextSeq = newest;
     for (const u of units) {
@@ -2032,7 +2053,37 @@ export class CloudConn {
     }
     if (this.closed || this.denied) return;
     this.wcRequestedAt = Date.now();
-    this.sendControl({ type: "vmode", mode: "wc" });
+    // Decoder facts ride the opt-in (hosts before 3.9.103 ignore them): Constrained
+    // High when this decoder can take it (R3), and its declared bitrate ceiling.
+    this.sendControl({
+      type: "vmode",
+      mode: "wc",
+      high: this.wcWantHigh(),
+      ...(this.wcMaxKbps > 0 ? { maxKbps: this.wcMaxKbps } : {}),
+    });
+  }
+
+  /** Ask the PC for Constrained High? Capability AND Tune AND no failure this run. */
+  private wcWantHigh(): boolean {
+    return this.preferH264High && this.wcHighCap && !this.wcHighFailed;
+  }
+
+  /** The stream is High (by the host's announce). */
+  private wcIsHigh(): boolean {
+    return this.wcCodec.startsWith("avc1.64");
+  }
+
+  /**
+   * A High stream would not decode on this device. Stop asking for it (for the rest
+   * of the app run) and, when still on DIRECT, switch the live stream to Baseline:
+   * the host rebuilds its encoder and re-announces, which rebuilds our decoder.
+   */
+  private wcDropHigh(reason: string) {
+    if (this.wcHighFailed) return;
+    this.wcHighFailed = true;
+    console.warn(`[remote] H.264 High failed here (${reason}) — using Baseline`);
+    hitchNote("high-failed", `H.264 High failed: ${reason}`, {});
+    if (this.wcActive || this.wcRequestedAt) this.sendControl({ type: "vprofile", high: false });
   }
 
   /** Can this device decode ANY codec on the host's ladder? (device fact, cached) */
@@ -2042,8 +2093,11 @@ export class CloudConn {
     if (nativeDecoderPossible() && this.preferNativeDecode) {
       const p = await probeNativeDecoder();
       if (p.available) {
+        this.wcHighCap = p.high === true;
+        this.wcMaxKbps = p.maxBitrateKbps > 0 ? p.maxBitrateKbps : 0;
         console.info(
-          `[remote] native MediaCodec available (${p.name || "hw"}${p.lowLatency ? ", low-latency" : ""})`,
+          `[remote] native MediaCodec available (${p.name || "hw"}${p.lowLatency ? ", low-latency" : ""}` +
+            `${this.wcHighCap ? ", High" : ""}${this.wcMaxKbps ? `, ≤${this.wcMaxKbps}k` : ""})`,
         );
         return true;
       }
@@ -2062,7 +2116,19 @@ export class CloudConn {
               optimizeForLatency: true,
               hardwareAcceleration: hw,
             });
-            if (r.supported) return true;
+            if (r.supported) {
+              try {
+                const hi = await VideoDecoder.isConfigSupported({
+                  codec: H264_HIGH_CODEC,
+                  optimizeForLatency: true,
+                  hardwareAcceleration: hw,
+                });
+                this.wcHighCap = hi.supported === true;
+              } catch {
+                this.wcHighCap = false;
+              }
+              return true;
+            }
           } catch {
             /* try next */
           }
@@ -2082,6 +2148,8 @@ export class CloudConn {
    */
   private wcFallback(reason: string, hard = false) {
     if (!this.wcActive && !this.wcRequestedAt) return;
+    // A decoder that fails on a High stream gets Baseline on the retry (R3).
+    if (this.wcIsHigh() && /decoder|configure|native init/.test(reason)) this.wcDropHigh(reason);
     const wasActive = this.wcActive;
     this.wcBuildGeneration++;
     this.wcActive = false;
@@ -2237,8 +2305,10 @@ export class CloudConn {
     } catch {
       /* ignore */
     }
+    this.wcDecodedOut = 0;
     const dec = new VideoDecoder({
       output: (frame) => {
+        if (this.wcDecoder === dec) this.wcDecodedOut++;
         if (this.wcDecoder !== dec || this.closed || this.powerIdle) frame.close();
         else this.onWcFrameOut(frame);
       },
@@ -2258,6 +2328,13 @@ export class CloudConn {
           /* ignore */
         }
         this.wcAwaitKey = true;
+        // A High stream this decoder never managed a single frame of: switch the
+        // stream to Baseline now instead of burning the whole error budget.
+        if (this.wcIsHigh() && this.wcDecodedOut === 0 && this.wcErrorTimes.length >= 2) {
+          this.wcDropHigh("WebCodecs decoded nothing");
+          this.wcRequestKeyframe();
+          return;
+        }
         // >4 errors inside 20s = the decoder genuinely can't hold this stream —
         // fall back. Sparser errors are transients (artifact recovery after a
         // host backpressure skip): rebuild and resync from the next IDR instead.
@@ -2377,6 +2454,9 @@ export class CloudConn {
               ? `\ncause: the SurfaceView never produced a Surface, so the codec was never configured.`
               : ""),
         );
+        // MediaCodec produced nothing from a High stream: Baseline is what this
+        // path was proven on, so switch the stream before blaming the decoder.
+        if (this.wcIsHigh() && st.frames === 0) this.wcDropHigh("MediaCodec output nothing");
         this.wcBuildWebCodecsDecoder();
         this.wcRequestKeyframe();
         return;
@@ -2752,6 +2832,10 @@ export class CloudConn {
       for (const b of this.wcByteWin) if (now - b.at <= 1000) winBytes += b.bytes;
       const perfNow = performance.now();
       while (this.wcTimes.length && perfNow - this.wcTimes[0] > 1000) this.wcTimes.shift();
+      // R6: raw path loss from the STUDIO audio sequences + the base RTT, so the
+      // host can cap video at what reliable SCTP can actually carry. −1 = no signal.
+      const loss = this.audioStudio ? this.a2Loss.loss(now) : null;
+      const clk = this.bestClock();
       this.sendControl({
         type: "vstat",
         recvKbps: Math.round((winBytes * 8) / 1000),
@@ -2759,6 +2843,9 @@ export class CloudConn {
         owdMinMs: Math.round(this.owdMin),
         fps: this.wcNative ? this.wcNativeFps : this.wcTimes.length,
         queue: this.wcNative ? this.wcNativeQueue : this.wcMeta.size,
+        loss: loss ? Math.round(loss.p * 1e5) / 1e5 : -1,
+        lossN: loss ? loss.lost : 0,
+        rttMs: clk ? Math.round(clk.rtt) : 0,
       });
     }, 250);
   }

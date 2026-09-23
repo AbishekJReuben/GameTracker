@@ -2381,6 +2381,14 @@ pub fn remote_request_refresh() {
     crate::remote::capture::request_refresh();
 }
 
+/// Encode H.264 Constrained High (CABAC + 8×8) instead of Constrained Baseline —
+/// only when the guest's decoder reported it (research R3). Takes effect on the next
+/// frame as a new session with an IDR.
+#[tauri::command]
+pub fn remote_set_h264_high(on: bool) {
+    crate::remote::capture::set_h264_high(on);
+}
+
 /// Backpressure gate for the native H.264 path. While set, captures are skipped
 /// BEFORE NVENC (keyframes still encode), so the reference chain stays intact —
 /// dropping already-encoded P-frames is what corrupted the picture until the

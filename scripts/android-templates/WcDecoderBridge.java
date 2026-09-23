@@ -568,6 +568,53 @@ public final class WcDecoderBridge {
     }
   }
 
+  /**
+   * Upper end of the picked decoder's declared bitrate range, in kbps (0 = unknown).
+   * Pure introspection, like the other probes — never instantiates a codec. The
+   * host caps its encode target to this: e.g. the moto g57's
+   * {@code c2.qti.avc.decoder.low_latency} declares 1–30 Mb/s while the PC's auto
+   * curve can ask for 40 (research: docs/STREAMING_RESEARCH_2026-09.md §2).
+   */
+  public static int probeMaxBitrateKbps() {
+    try {
+      String name = pickDecoderName();
+      if (name == null) return 0;
+      MediaCodecInfo info = findInfo(name);
+      if (info == null) return 0;
+      MediaCodecInfo.VideoCapabilities v = info.getCapabilitiesForType(MIME).getVideoCapabilities();
+      if (v == null) return 0;
+      int upper = v.getBitrateRange().getUpper();
+      return upper > 0 ? Math.max(1, upper / 1000) : 0;
+    } catch (Throwable t) {
+      return 0;
+    }
+  }
+
+  /**
+   * True when the picked decoder lists H.264 High or Constrained High, so the PC may
+   * encode Constrained High + CABAC for it (research R3: 12–24 % fewer bits at equal
+   * quality). Listed profiles are the decoder's own declaration; a stream it then
+   * fails on still falls back to Baseline through the guest's decoder-error path.
+   */
+  public static boolean probeSupportsHigh() {
+    try {
+      String name = pickDecoderName();
+      if (name == null) return false;
+      MediaCodecInfo info = findInfo(name);
+      if (info == null) return false;
+      MediaCodecInfo.CodecProfileLevel[] pls = info.getCapabilitiesForType(MIME).profileLevels;
+      if (pls == null) return false;
+      for (MediaCodecInfo.CodecProfileLevel pl : pls) {
+        // AVCProfileConstrainedHigh (0x80000) is API 27; compare the constant's value.
+        if (pl.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh || pl.profile == 0x80000) {
+          return true;
+        }
+      }
+    } catch (Throwable ignored) {
+    }
+    return false;
+  }
+
   /** Diagnostic — surfaces the reason the probe returned its answer. */
   public static String probeDetail() {
     String d = lastProbeDetail.get();

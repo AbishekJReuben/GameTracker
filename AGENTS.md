@@ -1055,6 +1055,9 @@ not regress):**
   so the phone can parallelise decode. Guest `VideoDecoder.configure` sets
   `optimizeForLatency`, `avc: { format: "annexb" }`, and `codedWidth/Height` from
   the host announce. NVENC announces `avc1.42C028` (not High `640034`).
+  **3.9.103:** Baseline stays the default and the fallback, but a guest whose decoder
+  lists High now gets **Constrained High** + CABAC (set4/set5 in the SPS, still poc 2 /
+  reorder 0 / DPB 1 — errata #8 was about unconstrained High). See §16.
 - **APK native MediaCodec decode (guest).** On the Tauri Android companion, DIRECT
   Annex-B frames skip WebCodecs and feed `WcDecoderBridge` (MediaCodec → SurfaceView
   under the WebView) — Moonlight `MediaCodecHelper` low-latency ladder + Chiaki/ALVR
@@ -1696,13 +1699,60 @@ reproduction commands live in `docs/STREAMING_EFFICIENCY.md`.
 - **Intra refresh is enabled at session init**: `intraRefreshPeriod` 100 000 (≈ never
   automatic), `intraRefreshCnt` 30. A wave is P-slices with intra MBs. It strict-decodes
   cleanly (ffmpeg `-err_detect explode`) and needs no decoder support.
-- Research items **not yet implemented**. Each has measured evidence and a file-level plan in
-  the research doc:
-  - H.264 **High + CABAC** for known-good decoders: −12 to −24 % bits. This phone supports
-    Constrained High.
-  - **RTP "VP8 append carrier"**: the fix for SCTP collapsing under any packet loss.
-  - **Reference-frame invalidation**.
-  - Loss-aware SCTP bitrate ceiling.
-  - HEVC low-bandwidth mode.
-  - SurfaceView vs TextureView A/B.
-  - A 30 Mb/s bitrate cap for this phone's low-latency decoder.
+- Research items **not yet implemented** (3.9.103 shipped R3, R6, the decoder cap and
+  R7's overshoot half — see below). Each has measured evidence and a file-level plan in the
+  research doc:
+  - **RTP "VP8 append carrier"** (R5): the fix for SCTP collapsing under any packet loss.
+    Needs an on-device spike first (does the WebView deliver receiver-transform frames?).
+  - **Reference-frame invalidation** (R4). Deliberately waiting for R5: on SCTP the host
+    never drops an encoded frame except at the 4× "channel dead" limit or a partial send
+    (backpressure pauses the encoder *before* encoding), so there is almost nothing to
+    invalidate — and RFI needs a 2-ref DPB on the phone, which must be tested on-device.
+  - R7's other half: first-fragment delay gradient (GCC trendline) for ABR v2.
+  - HEVC low-bandwidth mode (R8).
+  - SurfaceView vs TextureView A/B (R9).
+
+### 3.9.103 — Constrained High, decoder cap, loss ceiling, overshoot correction
+
+All four are negotiated or measured per session; nothing changes for an older guest or host.
+
+- **Constrained High + CABAC (R3).** The guest's DIRECT opt-in now carries
+  `{type:"vmode", mode:"wc", high, maxKbps}`:
+  - `high` = the decoder lists High: `WcDecoderBridge.probeSupportsHigh()` (MediaCodec
+    `profileLevels`) on the APK, `VideoDecoder.isConfigSupported("avc1.640C2A")` on web/Quest;
+    gated by Tune "H.264 High profile" (default on).
+  - Host → `remote_set_h264_high` → `CAP_H264_HIGH` → `EncoderTuning.high` → a new NVENC
+    session (one IDR) with the High GUID, CABAC and adaptive 8×8.
+  - `sps.rs` marks profile 100 as **Constrained High**: `constraint_set5` always,
+    `constraint_set4` only when `frame_mbs_only`. That keeps the "no reordering" promise the
+    Baseline choice existed for; poc_type 2, reorder 0 and DPB 1 are unchanged.
+  - **The host announces the codec it reads from each keyframe's SPS**
+    (`h264CodecFromAnnexB`; Baseline keeps the historical `avc1.42C028`). A profile switch
+    arrives at the same size, so the announce compares the codec too, and the guest
+    rebuilds its decoder before the IDR.
+  - Fallback: a High stream that never decodes (2 WebCodecs errors with 0 frames out,
+    MediaCodec producing nothing, or a decoder-shaped `wcFallback`) sets `wcHighFailed` for
+    the app run and sends `{type:"vprofile", high:false}`. The Tune toggle sends
+    `vprofile` live.
+  - Measured with `high_vs_baseline` (720p, P2, ffmpeg PSNR, both strict-decode): +1.22 dB
+    with 3.5 % fewer bytes at 6 Mb/s, +0.19 dB at a starved 2.5 Mb/s. Encode time unchanged.
+- **Decoder bitrate cap.** `WcDecoderBridge.probeMaxBitrateKbps()` (the picked decoder's
+  `getBitrateRange().getUpper()`; the Moto g57's `.low_latency` AVC decoder says 30 Mb/s)
+  rides the opt-in as `maxKbps`. `targetKbps()` stays 10 % under it. APK only.
+- **Loss-aware SCTP ceiling (R6, `src/lib/lossCeiling.ts`).**
+  - The guest measures raw path loss from STUDIO `audio2` primary sequences before RED
+    repair (`SeqLossWindow`, 5 s window, unordered-safe, u32-wrap-safe). It sends
+    `loss`, `lossN` and `rttMs` (best clock-ping RTT) in every `vstat`, or `loss: -1` when
+    there's no STUDIO audio.
+  - The host smooths the loss and, with ≥ 2 lost packets in the window, caps the target at
+    `0.6 · 0.85·MSS·8/(RTT·√p)`. The cap is never below the Tune floor and goes stale with the
+    reports.
+  - HUD: `Path loss`, `SCTP cap`, `Dec cap`.
+- **NVENC overshoot correction (R7, `src/lib/overshoot.ts`).**
+  - `rate_overshoot_busy` measured on busy content: 2 → 3.57 Mb/s and 3 → 3.92 Mb/s, but
+    6 → 5.32 and 12 → 11.49.
+  - `OvershootEstimator` samples output ÷ command in 1 s windows where the encoder is binding
+    (≥ 90 % of the command, no keyframe, not paused). Every NVENC command is divided by the
+    factor, clamped to 1…1.8; the factor relaxes toward 1 on light content.
+  - It never goes below 1, so it only acts in the starved range, where overshoot builds a
+    queue. HUD: `Overshoot`.

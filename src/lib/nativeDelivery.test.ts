@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseNativeFrame, videoFragmentSize } from "./nativeDelivery";
+import { H264_BASELINE_CODEC, h264CodecFromAnnexB, parseNativeFrame, videoFragmentSize } from "./nativeDelivery";
 
 function frame(fast: boolean) {
   const bytes = new ArrayBuffer((fast ? 24 : 8) + 5);
@@ -41,5 +41,27 @@ describe("native delivery wire", () => {
     const received = new Uint8Array(payload.length);
     for (let off = 0; off < payload.length; off += size) received.set(payload.subarray(off, off + size), off);
     expect(received).toEqual(payload);
+  });
+});
+
+describe("h264CodecFromAnnexB", () => {
+  const au = (...nals: number[][]) => new Uint8Array(nals.flatMap((n) => [0, 0, 0, 1, ...n]));
+
+  it("names Constrained High from the SPS", () => {
+    expect(h264CodecFromAnnexB(au([0x09, 0xf0], [0x67, 100, 0x0c, 42, 0xac], [0x68, 0xee], [0x65, 0x88])))
+      .toBe("avc1.640C2A");
+  });
+
+  it("keeps the historical Baseline string", () => {
+    expect(h264CodecFromAnnexB(au([0x67, 66, 0xc0, 42, 0xda], [0x65, 0x88]))).toBe(H264_BASELINE_CODEC);
+  });
+
+  it("returns null for access units without an SPS", () => {
+    expect(h264CodecFromAnnexB(au([0x41, 0x9a, 0x00]))).toBeNull();
+    expect(h264CodecFromAnnexB(new Uint8Array(3))).toBeNull();
+  });
+
+  it("works with 3-byte start codes", () => {
+    expect(h264CodecFromAnnexB(new Uint8Array([0, 0, 1, 0x67, 100, 0x0c, 51, 0x00]))).toBe("avc1.640C33");
   });
 });

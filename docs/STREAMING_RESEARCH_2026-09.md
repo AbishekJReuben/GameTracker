@@ -18,14 +18,14 @@ below are the record.
 | R2 | No periodic IDR on still screens; intra-refresh wave + refinement burst | **Shipped 3.9.102** (re-verified: `still_screen_refinement`) |
 | R10 | P-frame min QP 12 | **Shipped 3.9.102** (`MIN_QP_P`) |
 | R8 (colour) | NVENC matrix follows the VUI label; probe at 1080p | **Shipped 3.9.102** (docs corrected) |
-| R3 | H.264 High + CABAC (Constrained High) for known-good decoders | Next — needs guest capability opt-in + fallback |
-| R6 | Loss-aware SCTP ceiling from `audio2` gaps | Next |
+| R3 | H.264 High + CABAC (Constrained High) for known-good decoders | **Shipped 3.9.103** — guest opt-in (`high`), live `vprofile` fallback; `high_vs_baseline`: +1.22 dB / −3.5 % bytes @ 6 Mb/s |
+| R6 | Loss-aware SCTP ceiling from `audio2` gaps | **Shipped 3.9.103** (`lossCeiling.ts`; needs STUDIO audio for the signal) |
+| — | Cap this phone's LL decoder at 30 Mb/s | **Shipped 3.9.103** — generic: decoder's declared max − 10 % (`maxKbps` on the opt-in) |
+| R7 | ABR v2: delay-gradient + overshoot correction | **Overshoot half shipped 3.9.103** (`overshoot.ts`; `rate_overshoot_busy`: 2 → 3.57, 3 → 3.92 Mb/s). Delay gradient still planned |
 | R5 | DIRECT over RTP with a VP8 "append carrier" | Planned — large; needs on-device spike |
-| R4 | Reference-frame invalidation instead of recovery IDRs | Planned — pairs with R5 |
-| R7 | ABR v2: delay-gradient + overshoot correction | Planned (moot on the R5 path) |
-| R8 | HEVC low-bandwidth mode | Planned |
+| R4 | Reference-frame invalidation instead of recovery IDRs | Planned — pairs with R5 (SCTP host drops almost no encoded frames) |
+| R8 | HEVC low-bandwidth mode | Planned (new MediaCodec/WebCodecs path; on-device) |
 | R9 | SurfaceView vs TextureView A/B | Needs per-device A/B |
-| — | Cap this phone's LL decoder at 30 Mb/s | Next (small) |
 
 ---
 

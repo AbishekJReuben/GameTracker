@@ -35,3 +35,32 @@ export function videoFragmentSize(_fast: boolean, negotiatedMax?: number) {
   return Number.isFinite(negotiatedMax) && negotiatedMax! > 0
     ? Math.min(preferred, Math.floor(negotiatedMax!)) : preferred;
 }
+
+/** Constrained Baseline announce — unchanged since 3.9.27, every DIRECT decoder has seen it. */
+export const H264_BASELINE_CODEC = "avc1.42C028";
+/** Constrained High (set4+set5), level 4.2 — what the guest probes before asking for High. */
+export const H264_HIGH_CODEC = "avc1.640C2A";
+
+const hex2 = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
+
+/**
+ * WebCodecs codec string for an Annex-B access unit that carries an SPS, else null.
+ * The host announces what the stream actually IS, so a profile switch (research R3:
+ * Baseline ⇄ Constrained High) re-announces and the guest rebuilds its decoder
+ * before the new IDR. Baseline keeps the historical string. The SPS leads the
+ * access unit (after an optional AUD/SEI), so only the first bytes are scanned.
+ */
+export function h264CodecFromAnnexB(au: Uint8Array, scan = 1024): string | null {
+  const end = Math.min(au.length, scan) - 6;
+  for (let i = 0; i < end; i++) {
+    if (au[i] !== 0 || au[i + 1] !== 0 || au[i + 2] !== 1) continue;
+    if ((au[i + 3] & 0x1f) === 7) {
+      // profile_idc, constraint flags, level_idc — never 00 00, so never escaped.
+      const profile = au[i + 4];
+      if (profile === 66) return H264_BASELINE_CODEC;
+      return `avc1.${hex2(profile)}${hex2(au[i + 5])}${hex2(au[i + 6])}`;
+    }
+    i += 2;
+  }
+  return null;
+}

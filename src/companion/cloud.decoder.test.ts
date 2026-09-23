@@ -139,7 +139,7 @@ describe("phone decoder lifecycle (no visual testing)", () => {
     let resolve!: (v: native.DecoderProbe) => void;
     vi.mocked(native.probeNativeDecoder).mockReturnValue(new Promise((r) => { resolve = r; }));
     c.wcBuildDecoder(); c.wcReset(false);
-    resolve({ available: true, name: "test", lowLatency: true, detail: "" });
+    resolve({ available: true, name: "test", lowLatency: true, detail: "", maxBitrateKbps: 0, high: false });
     await Promise.resolve(); await Promise.resolve();
     expect(native.initNativeDecoder).not.toHaveBeenCalled();
   });

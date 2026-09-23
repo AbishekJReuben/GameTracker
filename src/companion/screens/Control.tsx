@@ -176,6 +176,16 @@ type HostWcStats = {
   abrCeilKbps?: number;
   abrGuestFps?: number;
   abrDecQueue?: number;
+  /** Raw path loss (%) the phone measured on the STUDIO audio channel; −1 = no signal. */
+  lossPct?: number;
+  /** Target cap from that loss (0.6 × what reliable SCTP can carry); 0 = none. */
+  lossCeilKbps?: number;
+  /** Cap from this phone's decoder's declared bitrate range; 0 = none. */
+  decCapKbps?: number;
+  /** PC is encoding Constrained High for this phone. */
+  h264High?: boolean;
+  /** NVENC output ÷ command, measured; the PC divides its command by it (R7). */
+  encOvershoot?: number;
 };
 type HostAudioStats = {
   mode: "pcm" | "rtc";
@@ -3645,6 +3655,9 @@ export function ControlScreen({
               {hostStats?.wc?.native ? (
                 <span className="rounded bg-accent-3/20 px-1 py-0.5 text-[8px] font-800 text-accent-3">NVENC</span>
               ) : null}
+              {hostStats?.wc?.native && wcStats?.codec?.startsWith("avc1.64") ? (
+                <span className="rounded bg-accent-3/20 px-1 py-0.5 text-[8px] font-800 text-accent-3">High</span>
+              ) : null}
               {wcStats?.native ? (
                 <span className="rounded bg-accent/25 px-1 py-0.5 text-[8px] font-800 text-accent">MediaCodec</span>
               ) : null}
@@ -4001,6 +4014,21 @@ export function ControlScreen({
                           <StatCell k="Ceil" v={`${hostStats.wc.abrCeilKbps}k`} />
                         )}
                       </>
+                    )}
+                    {/* The two caps that can hold the target under the Tune value:
+                        link loss (reliable SCTP can't carry more) and the phone's
+                        decoder's declared ceiling. */}
+                    {(hostStats.wc.lossPct ?? -1) >= 0 && (
+                      <StatCell k="Path loss" v={`${hostStats.wc.lossPct}%`} hi={(hostStats.wc.lossPct ?? 0) >= 0.1} />
+                    )}
+                    {(hostStats.wc.lossCeilKbps ?? 0) > 0 && (
+                      <StatCell k="SCTP cap" v={`${hostStats.wc.lossCeilKbps}k`} hi />
+                    )}
+                    {(hostStats.wc.decCapKbps ?? 0) > 0 && (
+                      <StatCell k="Dec cap" v={`${hostStats.wc.decCapKbps}k`} />
+                    )}
+                    {(hostStats.wc.encOvershoot ?? 1) > 1.01 && (
+                      <StatCell k="Overshoot" v={`×${hostStats.wc.encOvershoot}`} />
                     )}
                     {/* Per-session artifact/recovery counters. Pulses red while a
                         recovery is in flight so a healthy stream stays green. */}
@@ -4537,6 +4565,29 @@ export function ControlScreen({
                     under the WebView (lowest decode ms). OFF forces WebCodecs even on the APK. Web and Quest always use
                     WebCodecs — this toggle is a no-op there. The header shows a <b className="text-ink-dim">MediaCodec</b>{" "}
                     badge when native decode is live.
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    H.264 High profile <ScopeTag scope="direct" />
+                  </span>
+                  <button
+                    type="button"
+                    aria-pressed={tune.h264High}
+                    onClick={() => patchTune({ h264High: !tune.h264High })}
+                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
+                      tune.h264High ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                    }`}
+                  >
+                    {tune.h264High ? "ON" : "OFF"}
+                  </button>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    ON asks the PC for Constrained High (CABAC + 8×8) when this device's decoder supports it — about
+                    12–24 % fewer bits for the same picture, same latency. If a High stream won't decode, it drops back
+                    to Baseline by itself. OFF always uses Baseline. Needs DIRECT + PC NVENC; the header shows{" "}
+                    <b className="text-ink-dim">High</b> when it is live.
                   </p>
                 )}
                 <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
@@ -5621,6 +5672,32 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   "Guest err": {
     long: "Phone decode errors",
     info: "Times the phone's decoder reported an error and asked the PC for a keyframe. A climbing count on the WebCodecs path usually means the H.264 stream hit a reference the decoder couldn't reconcile; on the native path it's the bridge's own fault count.",
+  },
+  ABR: {
+    long: "Bitrate controller",
+    info: "v2 = driven by what this phone reports receiving and how much delay the link is adding. v2-idle = selected but no reports yet. v1 = the older send-queue controller (Smart bitrate off, or an older phone build).",
+  },
+  Queue: {
+    long: "Standing link delay",
+    info: "How much delay this stream is adding to the network path (one-way delay minus its own recent minimum). Over ~110 ms the PC lowers the bitrate; under ~45 ms it climbs.",
+  },
+  Recv: { long: "Received rate", info: "Video data this phone reported actually receiving, as the PC saw it. The PC sets the new rate from this when the link overloads." },
+  Ceil: { long: "Remembered ceiling", info: "The last rate that overloaded the link. The PC climbs carefully near it, and forgets it after about 6 clean seconds." },
+  "Path loss": {
+    long: "Network packet loss",
+    info: "Raw network loss this phone measured on the sound channel over the last 5 s, before any repair. Even 0.1 % limits how fast the reliable video channel can go, so the PC caps the bitrate (see SCTP cap). Needs Studio sound.",
+  },
+  "SCTP cap": {
+    long: "Loss ceiling",
+    info: "60 % of what a reliable data channel can carry at this loss and round-trip time (≈ 0.85·MSS·8 / (RTT·√loss)). Asking for more than that only builds delay. It lifts by itself once the loss clears.",
+  },
+  Overshoot: {
+    long: "Encoder overshoot",
+    info: "How much more NVENC really produces than it is asked for on busy content (it over-delivers low targets: 3 Mb/s asked came out as 4.5). The PC divides its request by this so what reaches the phone matches the bitrate controller. Hidden while it is ×1.",
+  },
+  "Dec cap": {
+    long: "Decoder bitrate limit",
+    info: "This phone's hardware decoder declares a maximum bitrate; the PC stays 10 % under it. Only the Android app reports it.",
   },
   Audio: { long: "Audio path", info: "PCM = DIRECT data-channel sound with a ~65ms adaptive target. RTC = classic WebRTC Opus + NetEQ (~150–250ms behind video)." },
   "A-codec": {

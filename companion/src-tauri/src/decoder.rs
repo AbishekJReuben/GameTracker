@@ -20,6 +20,12 @@ pub struct DecoderProbe {
     /// internal state (which decoder was picked, why none was, or which configure
     /// attempt failed) so "MediaCodec unavailable" is diagnosable without logcat.
     pub detail: String,
+    /// Upper end of the picked decoder's declared bitrate range (kbps; 0 = unknown).
+    /// The host caps its encode target to it. Absent on older bridge templates.
+    pub max_bitrate_kbps: u32,
+    /// The picked decoder lists H.264 High / Constrained High, so the host may send
+    /// Constrained High + CABAC. False on older bridge templates.
+    pub high: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,11 +256,31 @@ mod android {
                 let js: JString = detail_obj.into();
                 env.get_string(&js).map(|s| s.into()).unwrap_or_default()
             };
+            // Newer bridges only; an older template simply has no such method.
+            let max_bitrate_kbps = env
+                .call_static_method(&class, "probeMaxBitrateKbps", "()I", &[])
+                .ok()
+                .and_then(|v| v.i().ok())
+                .map(|k| k.max(0) as u32)
+                .unwrap_or(0);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            let high = env
+                .call_static_method(&class, "probeSupportsHigh", "()Z", &[])
+                .ok()
+                .and_then(|v| v.z().ok())
+                .unwrap_or(false);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
             Ok(DecoderProbe {
                 available,
                 name,
                 low_latency,
                 detail,
+                max_bitrate_kbps,
+                high,
             })
         })
     }
@@ -457,6 +483,8 @@ fn decoder_probe_impl() -> Result<DecoderProbe, String> {
         name: String::new(),
         low_latency: false,
         detail: String::new(),
+        max_bitrate_kbps: 0,
+        high: false,
     })
 }
 #[cfg(not(target_os = "android"))]

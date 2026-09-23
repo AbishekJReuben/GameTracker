@@ -19,7 +19,9 @@ import { auxMonitorRoom } from "./remoteConfig";
 import { AUDIO_HDR_BYTES, StreamingAudioResampler, audioPacket, audioRedPacket } from "./audioWire";
 // Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
 import audioFeederWorkletUrl from "./audioFeeder.worklet.js?url";
-import { parseNativeFrame, videoFragmentSize } from "./nativeDelivery";
+import { H264_BASELINE_CODEC, H264_HIGH_CODEC, h264CodecFromAnnexB, parseNativeFrame, videoFragmentSize } from "./nativeDelivery";
+import { lossCeilingKbps, sctpCapacityKbps } from "./lossCeiling";
+import { OvershootEstimator } from "./overshoot";
 import { MediaPipe, type PipeEndpoint } from "./mediaPipe";
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
@@ -655,6 +657,12 @@ export function startHost(opts: HostOptions): () => void {
     fps: number;
     /** Frames waiting in the decoder (a persistent backlog is decoder-bound). */
     queue: number;
+    /** Raw loss (0…1) on the STUDIO audio channel over 5 s; −1 = no signal (R6). */
+    loss?: number;
+    /** Packets missing from that window. */
+    lossN?: number;
+    /** Base RTT (ms): the lowest of the guest's recent clock pings. */
+    rttMs?: number;
   };
   /** True while fresh guest reports are arriving (an old guest sends none). */
   let vsAt = 0;
@@ -677,10 +685,60 @@ export function startHost(opts: HostOptions): () => void {
   const ABR_CEIL_FORGET_MS = 6000;
   /** v2 owns the rate only while the guest is actually reporting. */
   const abrV2Live = () => quality.abrV2 && vsAt > 0 && Date.now() - vsAt < 3000;
+  /**
+   * Upper end of the guest decoder's declared bitrate range (kbps, from its DIRECT
+   * opt-in; 0 = unknown). The Moto g57's low-latency AVC decoder declares 1–30 Mb/s
+   * while the auto curve can ask 40 (research §2).
+   */
+  let guestDecoderMaxKbps = 0;
+  /** Guest asked for Constrained High and its decoder says it can take it (R3). */
+  let guestH264High = false;
+  /**
+   * Loss-aware SCTP ceiling (research R6, lossCeiling.ts): reliable SCTP can't carry
+   * more than ~C_sctp under random loss, and anything above it only queues. 0 = none.
+   */
+  let lossCeilKbps = 0;
+  /** Smoothed raw loss the guest measured on the STUDIO audio channel (−1 = unknown). */
+  let vsLoss = -1;
+  let vsRttMs = 0;
 
-  /** Target ceiling from the Tune panel (or auto curve). */
-  const targetKbps = () =>
-    quality.bitrate > 0 ? quality.bitrate : Math.round(bitrateFor(quality) / 1000);
+  /** Ask Rust for Constrained High (or back to Baseline). A change = new NVENC session + IDR. */
+  const setGuestH264High = (on: boolean, why: string) => {
+    // Native NVENC runs on the primary pipeline only — a pop-out host must never flip it.
+    if (opts.fixedMonitor != null || on === guestH264High) return;
+    guestH264High = on;
+    slog("config", `H.264 ${on ? "Constrained High" : "Constrained Baseline"} (${why})`);
+    try {
+      void api.remoteSetH264High(on);
+    } catch {
+      /* not on desktop */
+    }
+  };
+
+  /** Target ceiling from the Tune panel (or auto curve), capped by the guest's decoder and the link's loss. */
+  const targetKbps = () => {
+    let t = quality.bitrate > 0 ? quality.bitrate : Math.round(bitrateFor(quality) / 1000);
+    // 10 % under the declared maximum: NVENC's 1-frame VBV overshoots low-ish targets.
+    if (guestDecoderMaxKbps > 0) t = Math.min(t, Math.round(guestDecoderMaxKbps * 0.9));
+    // The loss ceiling never undercuts the user's Tune floor, and goes stale with the reports.
+    if (lossCeilKbps > 0 && Date.now() - vsAt < 3000) {
+      t = Math.min(t, Math.max(lossCeilKbps, Math.max(500, quality.minBitrateKbps)));
+    }
+    return t;
+  };
+
+  // ---- R7: NVENC overshoot correction (overshoot.ts) ------------------------
+  // ULL rate control over-delivers low targets on busy content (3 Mb/s asked came
+  // out as 4.5). The ABR decides what should ACTUALLY reach the wire, so every
+  // command to NVENC is divided by the overshoot it measurably has.
+  const overshoot = new OvershootEstimator();
+  const nvencCommandKbps = (kbps: number) => overshoot.command(kbps);
+  const noteEncodedBytes = (n: number, key: boolean, paused: boolean) => {
+    const moved = overshoot.note(n, key, paused, performance.now());
+    if (moved === null) return;
+    slog("abr", `NVENC overshoot ×${moved.toFixed(2)} (cmd ${overshoot.cmdKbps}k for ${adaptKbps}k)`);
+    pushAdaptBitrate(true);
+  };
 
   /** Push the live encode bitrate to Rust (+ WebCodecs) when adapt moved enough. */
   const pushAdaptBitrate = (force = false) => {
@@ -703,7 +761,7 @@ export function startHost(opts: HostOptions): () => void {
         Math.round(adaptFps),
         jpegForRtc(quality.jpeg, quality.jpegCap),
         CONTENT_NUM[quality.mode] ?? 0,
-        kbps,
+        nvencCommandKbps(kbps),
         quality.encPreset,
         quality.encMultipass,
       );
@@ -817,6 +875,29 @@ export function startHost(opts: HostOptions): () => void {
     // smoothing exists precisely so one sample cannot decide anything.
     vsQueueMs = vsSeeded ? vsQueueMs * 0.6 + queueMs * 0.4 : queueMs;
     vsSeeded = true;
+    // R6: loss-aware ceiling. Applies to v1 and v2 alike (it caps the target, not
+    // the controller). Needs ≥2 lost packets in the guest's 5 s window, so one
+    // stray Wi-Fi drop can't cap the stream.
+    if (r.loss != null && r.loss >= 0 && r.rttMs != null && r.rttMs > 0) {
+      vsLoss = vsLoss < 0 ? r.loss : vsLoss * 0.7 + r.loss * 0.3;
+      vsRttMs = r.rttMs;
+      const ceil = (r.lossN ?? 0) >= 2 ? lossCeilingKbps(vsLoss, vsRttMs) : 0;
+      if ((ceil > 0) !== (lossCeilKbps > 0) || (ceil > 0 && Math.abs(ceil - lossCeilKbps) > lossCeilKbps * 0.2)) {
+        slog(
+          "abr",
+          ceil > 0
+            ? `loss ${(vsLoss * 100).toFixed(2)}% rtt ${Math.round(vsRttMs)}ms → SCTP ceiling ${ceil}k (C ${Math.round(sctpCapacityKbps(vsLoss, vsRttMs))}k)`
+            : "loss cleared — SCTP ceiling lifted",
+        );
+      }
+      lossCeilKbps = ceil;
+      // Tightened under the live rate: bring the encoder down now (self-rate-limited).
+      if (ceil > 0 && adaptKbps > targetKbps()) pushAdaptBitrate();
+    } else if (r.loss != null && r.loss < 0) {
+      // Guest has no loss signal (STUDIO audio off / sound muted) — no ceiling.
+      vsLoss = -1;
+      lossCeilKbps = 0;
+    }
     if (!quality.abrV2) return;
     const tgt = targetKbps();
     if (adaptKbps <= 0) adaptKbps = tgt;
@@ -2091,6 +2172,18 @@ export function startHost(opts: HostOptions): () => void {
     teardownPeer(); // reset any prior session
     if (!sig) return;
     slogReset("peer session starting");
+    // Per-guest decoder facts arrive with each DIRECT opt-in; never inherit them.
+    guestDecoderMaxKbps = 0;
+    lossCeilKbps = 0;
+    vsLoss = -1;
+    if (opts.fixedMonitor == null && guestH264High) {
+      guestH264High = false;
+      try {
+        void api.remoteSetH264High(false);
+      } catch {
+        /* not on desktop */
+      }
+    }
     // Access gate: the screen/audio capture and input injection stay off until the
     // guest is authorized (trusted device, correct secret, or user approval).
     let authorized = false;
@@ -2463,6 +2556,8 @@ export function startHost(opts: HostOptions): () => void {
     // watchdog falls back to RTC. The canvas/WebCodecs path announces during
     // configure — the native path never touches the canvas, so we do it here.
     let nativeAnnounced = false;
+    /** Codec string last announced for the native stream (read from keyframe SPS). */
+    let nativeCodec = "";
     let nativeConfigW = 0;
     let nativeConfigH = 0;
     // HARD gate — set ONLY when the decoder truly cannot make progress on a P-frame:
@@ -2708,11 +2803,21 @@ export function startHost(opts: HostOptions): () => void {
     nativeSink = (payload, key, w = 0, h = 0, tsMs = performance.now(), fast = false) => {
       if (!sessionAlive || pc !== myPc) return;
       if (videoCh.readyState !== "open") return;
-      if (!nativeAnnounced || w !== nativeConfigW || h !== nativeConfigH) {
+      // Announce what the stream IS: a keyframe carries the SPS. A profile switch
+      // (R3) arrives as a fresh session's IDR at the same size, so the codec is
+      // compared too — the guest must rebuild its decoder before that IDR.
+      const keyCodec = key ? h264CodecFromAnnexB(payload) : null;
+      if (
+        !nativeAnnounced ||
+        w !== nativeConfigW ||
+        h !== nativeConfigH ||
+        (keyCodec !== null && keyCodec !== nativeCodec)
+      ) {
         nativeAnnounced = true;
         nativeConfigW = w;
         nativeConfigH = h;
-        const codec = "avc1.42C028"; // Constrained Baseline — matches NVENC output
+        const codec = keyCodec ?? (guestH264High ? H264_HIGH_CODEC : H264_BASELINE_CODEC);
+        nativeCodec = codec;
         try {
           videoCh.send(JSON.stringify({ codec, w, h }));
         } catch {
@@ -2721,7 +2826,7 @@ export function startHost(opts: HostOptions): () => void {
         // A decoder configuration/resize genuinely cannot decode a P-frame sent under
         // the old SPS — HARD-gate until the IDR arrives.
         if (!key) setNativeAwaitKey(true, `config/announce ${w}x${h}`);
-        slog("config", `announce ${w}x${h}`);
+        slog("config", `announce ${w}x${h} ${codec}`);
         requestNativeKeyframe("config/announce");
       }
       // Periodic safety net (Tune wcKeyMs), now an intra-refresh WAVE, not an IDR.
@@ -2817,6 +2922,7 @@ export function startHost(opts: HostOptions): () => void {
       // Fast delivery carries the native encode-submission time, converted to
       // this clock on arrival. Classic retains its original arrival timestamp.
       noteFrameBytes(payload.byteLength);
+      noteEncodedBytes(payload.byteLength, key, encodePaused);
       if (!wcSendBytes(payload, key, tsMs, fast)) {
         // Channel threw mid-frame — the guest received a partial access unit, which
         // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
@@ -2870,6 +2976,7 @@ export function startHost(opts: HostOptions): () => void {
       // and the phone sits on "Waking your screen…" again.
       nativeActive = false;
       nativeAnnounced = false;
+      nativeCodec = "";
       nativeConfigW = 0;
       nativeConfigH = 0;
       // Path is stopping — gate any stray frames but don't arm the IDR watchdog
@@ -3000,7 +3107,8 @@ export function startHost(opts: HostOptions): () => void {
           // Announce immediately — native frames may already be in flight, and the
           // guest refuses to build a decoder until it sees a codec string.
           try {
-            videoCh.send(JSON.stringify({ codec: WC_CODECS[0] }));
+            nativeCodec = guestH264High ? H264_HIGH_CODEC : H264_BASELINE_CODEC;
+            videoCh.send(JSON.stringify({ codec: nativeCodec }));
           } catch {
             /* guest picks it up from the first-frame announce in nativeSink */
           }
@@ -3045,7 +3153,8 @@ export function startHost(opts: HostOptions): () => void {
         // webview encoder (we just have no canvas fallback if NVENC later dies).
         if (nativeOk) {
           try {
-            videoCh.send(JSON.stringify({ codec: WC_CODECS[0] }));
+            nativeCodec = guestH264High ? H264_HIGH_CODEC : H264_BASELINE_CODEC;
+            videoCh.send(JSON.stringify({ codec: nativeCodec }));
           } catch {
             /* first-frame announce in nativeSink covers this */
           }
@@ -3259,6 +3368,9 @@ export function startHost(opts: HostOptions): () => void {
               owdMinMs: Math.max(0, Number(msg.owdMinMs) || 0),
               fps: Math.max(0, Number(msg.fps) || 0),
               queue: Math.max(0, Number(msg.queue) || 0),
+              loss: typeof msg.loss === "number" && Number.isFinite(msg.loss) ? Math.min(1, msg.loss) : undefined,
+              lossN: Math.max(0, Number(msg.lossN) || 0),
+              rttMs: Math.max(0, Number(msg.rttMs) || 0),
             });
           }
           return;
@@ -3271,10 +3383,27 @@ export function startHost(opts: HostOptions): () => void {
           // normally already true; an unauthorized ask is simply ignored (the
           // guest's own timeout then reverts it to the track).
           if (msg.mode === "wc") {
-            if (authorized) void wcActivate();
+            if (authorized) {
+              // Decoder facts ride the opt-in: its declared bitrate ceiling, and
+              // whether it can take Constrained High (R3). Older guests send
+              // neither → Baseline, no cap. Set BEFORE activation so the first
+              // NVENC session is already built with the right profile.
+              const maxKbps = Number(msg.maxKbps) || 0;
+              guestDecoderMaxKbps = maxKbps >= 1000 ? Math.round(maxKbps) : 0;
+              setGuestH264High(msg.high === true, "DIRECT opt-in");
+              if (guestDecoderMaxKbps > 0 && adaptKbps > targetKbps()) pushAdaptBitrate(true);
+              void wcActivate();
+            }
           } else {
             wcTeardown(false);
           }
+          return;
+        }
+        // Mid-session profile change: the Tune toggle, or the guest found it can't
+        // decode High after all. A change rebuilds the NVENC session (one IDR) and
+        // the codec re-announce makes the guest rebuild its decoder first.
+        if (msg && msg.type === "vprofile") {
+          if (authorized) setGuestH264High(msg.high === true, "guest vprofile");
           return;
         }
         // Audio-mode: "pcm" = DIRECT float32 over the data channel (lean phone
@@ -3452,8 +3581,8 @@ export function startHost(opts: HostOptions): () => void {
               CONTENT_NUM[quality.mode] ?? 0,
               // The native encoder needs a real bitrate, not a JPEG quality. Prefer
               // the adaptive value (phone-network shed) when it's running; else the
-              // Tune target / auto curve.
-              adaptKbps > 0 ? adaptKbps : quality.bitrate,
+              // Tune target / auto curve. Overshoot-corrected like every command (R7).
+              nvencCommandKbps(adaptKbps > 0 ? adaptKbps : quality.bitrate),
               quality.encPreset,
               quality.encMultipass,
             );
@@ -3751,6 +3880,13 @@ export function startHost(opts: HostOptions): () => void {
                           abrCeilKbps: Math.round(abrCeilKbps),
                           abrGuestFps: Math.round(vsFps),
                           abrDecQueue: vsDecoderQueue,
+                          // R6 / decoder cap: the other two things that can hold the target
+                          // below the Tune value, so the HUD can say which one is.
+                          lossPct: vsLoss >= 0 ? Math.round(vsLoss * 10000) / 100 : -1,
+                          lossCeilKbps: Math.round(lossCeilKbps),
+                          decCapKbps: guestDecoderMaxKbps,
+                          h264High: guestH264High,
+                          encOvershoot: Math.round(overshoot.factor * 100) / 100,
                           // Artifact / recovery telemetry for the HUD. The host is the
                           // single source of truth: it knows every backpressure skip,
                           // every soft-recovery arming, and every clean IDR that closed

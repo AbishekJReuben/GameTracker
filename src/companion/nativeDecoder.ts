@@ -18,6 +18,10 @@ export type DecoderProbe = {
   lowLatency: boolean;
   /** Diagnostic — the bridge's reason for the probe result (e.g. "picked=c2.qti.avc.decoder"). */
   detail: string;
+  /** Upper end of the decoder's declared bitrate range, kbps (0 = unknown). */
+  maxBitrateKbps: number;
+  /** The decoder lists H.264 High / Constrained High (research R3). */
+  high: boolean;
 };
 
 export type DecoderStats = {
@@ -92,11 +96,12 @@ function lifecycleInvoke(cmd: string, args?: Record<string, unknown>) {
 /** Probe once per page load — MediaCodec availability doesn't change. */
 export async function probeNativeDecoder(): Promise<DecoderProbe> {
   if (!nativeDecoderPossible()) {
-    return { available: false, name: "", lowLatency: false, detail: "not Tauri/companion" };
+    return { available: false, name: "", lowLatency: false, detail: "not Tauri/companion", maxBitrateKbps: 0, high: false };
   }
   if (probeCache) return probeCache;
   try {
-    probeCache = await invoke<DecoderProbe>("decoder_probe");
+    const r = await invoke<DecoderProbe>("decoder_probe");
+    probeCache = { ...r, maxBitrateKbps: Number(r.maxBitrateKbps) || 0, high: r.high === true };
   } catch (e) {
     console.warn("[nativeDecoder] probe failed:", e);
     // Keep the whole error (the Rust side now attaches the Java throwable's
@@ -106,6 +111,8 @@ export async function probeNativeDecoder(): Promise<DecoderProbe> {
       available: false,
       name: "",
       lowLatency: false,
+      maxBitrateKbps: 0,
+      high: false,
       detail: `probe threw: ${String(e).slice(0, 2000)}`,
     };
   }

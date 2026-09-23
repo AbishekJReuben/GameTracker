@@ -1249,6 +1249,8 @@ export const api = {
   remoteRequestKeyframe: () => call<void>("remote_request_keyframe"),
   /// Ask for an intra-refresh wave (periodic safety net) instead of an IDR.
   remoteRequestRefresh: () => call<void>("remote_request_refresh"),
+  /** Encode H.264 Constrained High instead of Baseline (guest decoder said it can; R3). */
+  remoteSetH264High: (on: boolean) => call<void>("remote_set_h264_high", { on }),
   /// Reference-safe backpressure: while paused, captures are skipped BEFORE NVENC
   /// (keyframes still encode) so the H.264 reference chain never breaks. Dropping
   /// already-encoded P-frames is what caused visible artifacting until recovery.

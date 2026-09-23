@@ -442,11 +442,22 @@ pub fn set_encoder_tuning(preset: u32, multipass: u32) {
     CAP_MULTIPASS.store(multipass.min(2), Ordering::Relaxed);
 }
 
+/// Encode Constrained High instead of Constrained Baseline. Set by the host from the
+/// guest's DIRECT opt-in (only when its decoder reported High support); a change
+/// rebuilds the session like any tuning change, and the guest resyncs on the IDR.
+static CAP_H264_HIGH: AtomicBool = AtomicBool::new(false);
+
+/// Host: the guest's decoder can (or can no longer) take Constrained High.
+pub fn set_h264_high(on: bool) {
+    CAP_H264_HIGH.store(on, Ordering::Relaxed);
+}
+
 #[cfg(windows)]
 fn encoder_tuning() -> super::native::EncoderTuning {
     super::native::EncoderTuning {
         preset: CAP_PRESET.load(Ordering::Relaxed) as u8,
         multipass: CAP_MULTIPASS.load(Ordering::Relaxed) as u8,
+        high: CAP_H264_HIGH.load(Ordering::Relaxed),
     }
 }
 

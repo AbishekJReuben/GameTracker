@@ -75,6 +75,8 @@ pub struct EncoderTuning {
     pub preset: u8,
     /// 0 single pass, 1 two-pass quarter-res, 2 two-pass full-res.
     pub multipass: u8,
+    /// Constrained High instead of Constrained Baseline (the guest's decoder said so).
+    pub high: bool,
 }
 
 impl Default for EncoderTuning {
@@ -82,6 +84,7 @@ impl Default for EncoderTuning {
         EncoderTuning {
             preset: nvenc::DEFAULT_PRESET,
             multipass: nvenc::DEFAULT_MULTIPASS,
+            high: false,
         }
     }
 }
@@ -148,7 +151,7 @@ impl NativeEncoder {
 
         let enc = nvenc::Encoder::new(
             &device,
-            nvenc::Params::new(w, h, fps.clamp(1, 240), bitrate_bps).with_tuning(tuning.preset, tuning.multipass),
+            nvenc::Params::new(w, h, fps.clamp(1, 240), bitrate_bps).with_tuning(tuning.preset, tuning.multipass).with_high(tuning.high),
         )?;
         Some(NativeEncoder {
             device,
@@ -185,7 +188,7 @@ impl NativeEncoder {
         }
         if fps != self.fps || bitrate_bps != self.bitrate {
             let p = nvenc::Params::new(self.w, self.h, fps.clamp(1, 240), bitrate_bps)
-                .with_tuning(self.tuning.preset, self.tuning.multipass);
+                .with_tuning(self.tuning.preset, self.tuning.multipass).with_high(self.tuning.high);
             match self.enc.reconfigure(p) {
                 Ok(()) => {
                     self.fps = fps;
@@ -385,7 +388,7 @@ mod tests {
         }
         for preset in 1..=4u8 {
             for multipass in [0u8, 1] {
-                let tuning = EncoderTuning { preset, multipass };
+                let tuning = EncoderTuning { preset, multipass, high: false };
                 let mut enc = NativeEncoder::new(None, w, h, fps, bps, tuning).expect("NVENC hardware required");
                 let mut stream = Vec::new();
                 let mut times = Vec::new();
@@ -408,6 +411,113 @@ mod tests {
                     stream.len()
                 );
             }
+        }
+    }
+
+    /// Research R3: Constrained High (CABAC + 8×8) vs the shipped Constrained
+    /// Baseline, same content / bitrate / preset. Asserts the High stream really
+    /// is Constrained High with the low-latency DPB hints, and writes both streams
+    /// (plus `tuning-src.bgra`'s sibling `profile-src.bgra`) for an ffmpeg PSNR
+    /// comparison; prints encode time and payload bytes per profile.
+    ///   `cargo test --release --lib remote::native::tests::high_vs_baseline -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires NVIDIA GPU; writes fixtures under target/perf-validation"]
+    fn high_vs_baseline() {
+        use super::nvenc::sps;
+        use std::io::Write;
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-validation");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let (w, h, frames, fps) = (1280u32, 720u32, 120u32, 60u32);
+        let mut src = std::fs::File::create(out_dir.join("profile-src.bgra")).unwrap();
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let mut all = Vec::with_capacity(frames as usize);
+        for t in 0..frames {
+            synthetic_desktop(w, h, t, &mut px);
+            src.write_all(&px).unwrap();
+            all.push(px.clone());
+        }
+        for (high, bps) in [false, true].into_iter().flat_map(|hi| [(hi, 2_500_000u32), (hi, 6_000_000u32)]) {
+            let tuning = EncoderTuning { high, ..EncoderTuning::default() };
+            let mut enc = NativeEncoder::new(None, w, h, fps, bps, tuning).expect("NVENC hardware required");
+            let mut stream = Vec::new();
+            let mut times = Vec::new();
+            for (i, frame) in all.iter().enumerate() {
+                let pkt = enc.encode_pixels(frame, w, h, i == 0, i as u64 * 16_667).expect("encode");
+                let au = &pkt[NATIVE_HEADER_LEN..];
+                if i == 0 {
+                    let units = sps::nal_units_for_test(au);
+                    let nal = units
+                        .iter()
+                        .map(|&(s, e)| &au[s..e])
+                        .find(|n| !n.is_empty() && n[0] & 0x1f == 7)
+                        .expect("SPS in the first IDR");
+                    let rbsp = sps::unescape_for_test(&nal[1..]);
+                    let info = sps::summarize(&rbsp).expect("parse SPS");
+                    eprintln!("high={high}: SPS {info:?} constraints {:#04x}", rbsp[1]);
+                    if high {
+                        assert_eq!(info.profile_idc, 100, "High GUID must give profile_idc 100");
+                        assert_eq!(rbsp[1] & 0x0C, 0x0C, "must be marked Constrained High (set4+set5)");
+                    } else {
+                        assert_eq!(info.profile_idc, 66);
+                    }
+                    assert_eq!(info.max_num_reorder_frames, Some(0));
+                    assert_eq!(info.max_dec_frame_buffering, Some(1));
+                    assert_eq!(info.poc_type, 2, "no reordering is possible");
+                } else {
+                    times.push(enc.last_encode_us as f64 / 1000.0);
+                }
+                stream.extend_from_slice(au);
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            let name = format!("profile-{}-{}m.h264", if high { "high" } else { "baseline" }, bps as f64 / 1e6);
+            std::fs::write(out_dir.join(&name), &stream).unwrap();
+            eprintln!(
+                "high={high} {bps}: encode median {:.3} ms p95 {:.3} ms, {} bytes → {name}",
+                times[times.len() / 2],
+                times[times.len() * 95 / 100],
+                stream.len()
+            );
+        }
+    }
+
+    /// Research R7: how far NVENC's real output lands from the commanded rate on
+    /// busy content (moving noise over the synthetic desktop) with the shipped
+    /// config — the premise of the host's overshoot correction (`overshoot.ts`).
+    ///   `cargo test --release --lib remote::native::tests::rate_overshoot_busy -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires NVIDIA GPU"]
+    fn rate_overshoot_busy() {
+        let (w, h, frames, fps) = (1280u32, 720u32, 180u32, 60u32);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let mut seed = 0x1234_5678u32;
+        let mut all = Vec::with_capacity(frames as usize);
+        for t in 0..frames {
+            synthetic_desktop(w, h, t, &mut px);
+            // A "video" region of fresh noise every frame: incompressible motion.
+            for y in 0..h / 2 {
+                for x in w / 2..w {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let i = ((y * w + x) * 4) as usize;
+                    px[i..i + 3].copy_from_slice(&seed.to_le_bytes()[..3]);
+                }
+            }
+            all.push(px.clone());
+        }
+        for cmd in [2_000_000u32, 3_000_000, 6_000_000, 12_000_000] {
+            let mut enc = NativeEncoder::new(None, w, h, fps, cmd, EncoderTuning::default()).expect("NVENC hardware required");
+            let mut bytes = 0usize;
+            for (i, frame) in all.iter().enumerate() {
+                let pkt = enc.encode_pixels(frame, w, h, i == 0, i as u64 * 16_667).expect("encode");
+                // Steady state only: skip the IDR and the first second.
+                if i >= fps as usize {
+                    bytes += pkt.len() - NATIVE_HEADER_LEN;
+                }
+            }
+            let secs = (frames - fps) as f64 / fps as f64;
+            let out = bytes as f64 * 8.0 / secs;
+            eprintln!("cmd {:>5.1} Mb/s → out {:>5.2} Mb/s (×{:.2})", cmd as f64 / 1e6, out / 1e6, out / cmd as f64);
         }
     }
 
