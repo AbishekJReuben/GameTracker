@@ -75,6 +75,8 @@ let lifecycle: Promise<unknown> = Promise.resolve();
 function lifecycleInvoke(cmd: string, args?: Record<string, unknown>) {
   const next = lifecycle.then(() => {
     if (cmd === "decoder_init" || cmd === "decoder_teardown") {
+      // Java forgets its desired rect on init; make the next bounds call go out.
+      lastBounds = null;
       nativeFeedSession = (nativeFeedSession + 1) >>> 0;
       binaryPendingKeys.length = 0;
       binaryInFlight = 0;
@@ -132,6 +134,28 @@ export async function initNativeDecoder(width: number, height: number): Promise<
  */
 let boundsSeq = 0;
 
+/**
+ * Last rect actually sent (quantized to ¼ CSS px). Each call is a Tauri IPC → Rust
+ * `spawn_blocking` → JNI → Android UI thread → a layout pass on the video view —
+ * and Control used to send one per animation frame even when only the cursor had
+ * moved. Identical rects are now dropped here (Java also skips unchanged layouts).
+ * Reset whenever the decoder is (re)initialized, because Java forgets its desired
+ * rect then and needs the next call.
+ */
+let lastBounds: { x: number; y: number; w: number; h: number } | null = null;
+const q4 = (v: number) => Math.round(v * 4) / 4;
+
+/** True when this rect equals the last one sent (exported for tests). */
+export function boundsUnchanged(r: { x: number; y: number; w: number; h: number }): boolean {
+  const b = lastBounds;
+  return !!b && b.x === q4(r.x) && b.y === q4(r.y) && b.w === q4(r.w) && b.h === q4(r.h);
+}
+
+/** Test hook: forget the last-sent rect. */
+export function resetBoundsCache() {
+  lastBounds = null;
+}
+
 export async function setNativeDecoderBounds(opts: {
   x: number;
   y: number;
@@ -140,6 +164,8 @@ export async function setNativeDecoderBounds(opts: {
   visible: boolean;
 }): Promise<void> {
   if (!nativeDecoderPossible()) return;
+  if (boundsUnchanged(opts)) return;
+  lastBounds = { x: q4(opts.x), y: q4(opts.y), w: q4(opts.w), h: q4(opts.h) };
   boundsSeq += 1;
   try {
     await invoke("decoder_set_bounds", { ...opts, seq: boundsSeq });

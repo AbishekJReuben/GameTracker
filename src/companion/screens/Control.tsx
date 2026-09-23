@@ -1,4 +1,5 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { mainThreadStats, startMainThreadMonitor } from "../mainThreadMonitor";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence, useReducedMotion } from "motion/react";
@@ -217,6 +218,8 @@ type NetStats = {
   keyFramesDecoded: number;
   framesRendered: number;
   framesDecoded: number;
+  /** Selected ICE path, e.g. "host·udp·wifi" / "relay·tcp" (see describeIcePath). */
+  path: string;
 };
 
 // ---------- tuning constants ----------
@@ -1127,7 +1130,17 @@ export function ControlScreen({
   // View transform: refs drive the hot gesture path, state mirrors it for render.
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [cursor, setCursor] = useState({ x: 0.5, y: 0.5 });
+  // The remote cursor's POSITION is not React state: it moves on every pointer
+  // event (90–120 Hz), and as state each move re-rendered this entire ~4,800-line
+  // screen once per animation frame — on the same WebView main thread that
+  // receives, reassembles and feeds every video frame and audio packet. Its DOM
+  // node is positioned imperatively instead (placeCursorEl); only zoom/pan (rare)
+  // and the cursor's shape remain state.
+  const cursorElRef = useRef<HTMLDivElement | null>(null);
+  const committedView = useRef({ zoom: 1, x: 0, y: 0 });
+  /** Renders of this screen (the HUD shows renders/s — a UI-thread health signal). */
+  const renderCount = useRef(0);
+  renderCount.current++;
   const [zoomOpen, setZoomOpen] = useState(false);
   const zoomRef = useRef(1);
   const panRef = useRef({ x: 0, y: 0 });
@@ -1281,6 +1294,8 @@ export function ControlScreen({
       nvencFast: tune.nvencFast,
       audioHostMs: tune.audioHostMs,
       abrV2: tune.abrV2,
+      encPreset: tune.encPreset,
+      encMultipass: tune.encMultipass,
     }),
     [tune],
   );
@@ -1290,47 +1305,6 @@ export function ControlScreen({
     link.applyStreamTune?.(tune);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);
-
-  // Composite one delta wire-frame (see capture.rs `TileEncoder::encode`) onto the
-  // canvas: only the changed tiles are present, so we draw them over the retained
-  // previous image. A keyframe carries new dimensions → (re)size the canvas.
-  const drawFrame = (buf: Uint8Array) => {
-    if (buf.length < 12 || buf[0] !== 0x47 || buf[1] !== 0x54) return; // "GT"
-    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    const w = dv.getUint16(4, true);
-    const h = dv.getUint16(6, true);
-    const count = dv.getUint16(10, true);
-    const canvas = canvasRef.current;
-    if (!canvas || !w || !h) return;
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w;
-      canvas.height = h;
-      natRef.current = { w, h };
-      setRes(`${w}×${h}`);
-      const l = measure(viewportRef.current, w, h);
-      if (l) layoutRef.current = l;
-      ctxRef.current = canvas.getContext("2d");
-    }
-    if (!ctxRef.current) ctxRef.current = canvas.getContext("2d");
-    const ctx = ctxRef.current;
-    if (!ctx) return;
-    let off = 12;
-    for (let i = 0; i < count && off + 12 <= buf.length; i++) {
-      const tx = dv.getUint16(off, true);
-      const ty = dv.getUint16(off + 2, true);
-      const len = dv.getUint32(off + 8, true);
-      off += 12;
-      const jpg = buf.slice(off, off + len); // copy: buf may be reused before decode resolves
-      off += len;
-      createImageBitmap(new Blob([jpg], { type: "image/jpeg" }), { colorSpaceConversion: "none" })
-        .then((bmp) => {
-          ctx.drawImage(bmp, tx, ty);
-          bmp.close?.();
-          setHasFrame(true);
-        })
-        .catch(() => {});
-    }
-  };
 
   // ----- frame + status lifecycle -----
   useEffect(() => {
@@ -1464,7 +1438,6 @@ export function ControlScreen({
         if (wcNativeRef.current && cs.outW > 0 && cs.outH > 0) {
           const w = cs.outW;
           const h = cs.outH;
-          const grew = natRef.current.w !== w || natRef.current.h !== h;
           natRef.current = { w, h };
           const canvas = canvasRef.current;
           if (canvas && (canvas.width !== w || canvas.height !== h)) {
@@ -1477,17 +1450,13 @@ export function ControlScreen({
           // that positions the Surface won't re-run on its own. Re-sync here or
           // the Surface keeps whatever geometry it was given before the aspect
           // was known — on the native path that's the pre-first-frame fallback.
-          if (grew) syncNativeSurface();
+          // Also re-sync on every tick: bounds calls are de-duplicated (see
+          // nativeDecoder.setNativeDecoderBounds), so this costs one rect read
+          // unless something changed — and it heals the geometry within 500ms
+          // after a decoder re-init (Java forgets its desired rect on init).
+          syncNativeSurface();
         }
       }
-    });
-    // LAN fallback: JPEG tile frames drawn to the canvas.
-    link.onFrame((buf) => {
-      drawFrame(buf);
-      const now = performance.now();
-      const t = frameTimes.current;
-      t.push(now);
-      while (t.length && now - t[0] > 1000) t.shift();
     });
     return () => {
       unsubProgress?.();
@@ -1870,10 +1839,12 @@ export function ControlScreen({
   useEffect(() => {
     if (!connected) return;
     let alive = true;
+    let tick = 0;
     const id = window.setInterval(async () => {
       // Backgrounded: nothing is on screen to read these, and `netStats()` is a
       // full getStats() sweep every tick. Skipping it is most of the idle drain.
       if (document.hidden) return;
+      const sweep = tick++;
       // Direct-video path telemetry (independent of the RTP stats below).
       setWcStats(link.wcStats?.() ?? null);
       const aStats = link.audioStats?.() ?? null;
@@ -1890,6 +1861,10 @@ export function ControlScreen({
         }
         audioUnderrunRef.current = aStats.underruns;
       }
+      // On DIRECT the RTC video track is idle; its getStats() sweep only feeds the
+      // RTT (input-latency pill) and ICE path — every 3s is plenty unless the
+      // stats panel is open. That sweep is real main-thread work on a low-end phone.
+      if (wcActiveRef.current && !showStats && sweep % 3 !== 0) return;
       const s = await link.netStats().catch(() => null);
       if (!alive || !s) return;
       const prev = netRef.current;
@@ -1935,6 +1910,7 @@ export function ControlScreen({
         keyFramesDecoded: s.keyFramesDecoded ?? 0,
         framesRendered: s.framesRendered ?? 0,
         framesDecoded: s.framesDecoded ?? 0,
+        path: s.path ?? "",
       });
     }, showStats ? 500 : 1000);
     return () => {
@@ -1986,6 +1962,26 @@ export function ControlScreen({
   // Sample fps once a second for the stats overlay. Native MediaCodec paints a
   // SurfaceView under the WebView — there is no canvas/rVFC to fill frameTimes,
   // so credit the decode-side wc fps (that IS the displayed picture).
+  // UI-thread health for the HUD: this screen's renders/s and long tasks (10s).
+  const [uiRenders, setUiRenders] = useState(0);
+  const [mainThread, setMainThread] = useState({ count: 0, totalMs: 0, maxMs: 0 });
+  useEffect(() => startMainThreadMonitor(), []);
+  useEffect(() => {
+    let lastRenders = renderCount.current;
+    const id = window.setInterval(() => {
+      if (document.hidden) return;
+      const now = renderCount.current;
+      // Subtract this sampler's own re-render (it sets state below).
+      setUiRenders(Math.max(0, now - lastRenders - 1));
+      lastRenders = now;
+      const mt = mainThreadStats();
+      setMainThread((prev) =>
+        prev.count === mt.count && prev.totalMs === mt.totalMs && prev.maxMs === mt.maxMs ? prev : mt,
+      );
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
   useEffect(() => {
     const id = window.setInterval(() => {
       if (document.hidden) return; // no picture to count while backgrounded
@@ -2021,9 +2017,10 @@ export function ControlScreen({
           zoomRef.current = 1;
           setZoom(1);
         }
+        committedView.current = { zoom: zoomRef.current, x: panRef.current.x, y: panRef.current.y };
       }
-      // Force cursor overlay to re-anchor against the live media box.
-      setCursor((c) => ({ ...c }));
+      // Re-anchor the cursor overlay against the live media box.
+      placeCursorEl();
     };
     const schedule = () => {
       requestAnimationFrame(() => {
@@ -2115,10 +2112,21 @@ export function ControlScreen({
     if (viewRaf.current != null) return;
     viewRaf.current = requestAnimationFrame(() => {
       viewRaf.current = null;
-      setZoom(zoomRef.current);
-      setPan({ ...panRef.current });
-      setCursor({ ...cursorRef.current });
-      syncNativeSurface();
+      const z = zoomRef.current;
+      const p = panRef.current;
+      const c = committedView.current;
+      if (z !== c.zoom || p.x !== c.x || p.y !== c.y) {
+        // The view itself moved: render (transform) + re-place the native surface.
+        committedView.current = { zoom: z, x: p.x, y: p.y };
+        setZoom(z);
+        setPan({ x: p.x, y: p.y });
+        syncNativeSurface();
+        // The post-render layout effect places the cursor against the NEW transform.
+        return;
+      }
+      // Cursor-only move (the common case while driving the trackpad): no React
+      // render and no native-surface IPC at all — just move the cursor's node.
+      placeCursorEl();
     });
   };
 
@@ -2195,6 +2203,16 @@ export function ControlScreen({
     if (v && v.srcObject && v.videoWidth > 0) return v;
     if (c && c.width > 0) return c;
     return v ?? c;
+  };
+
+  /** Position the remote-cursor node from the refs (no React render). */
+  const placeCursorEl = () => {
+    const el = cursorElRef.current;
+    if (!el) return;
+    const s = normToViewport(viewportRef.current, mediaEl(), cursorRef.current.x, cursorRef.current.y);
+    if (!s) return;
+    el.style.left = `${s.x}px`;
+    el.style.top = `${s.y}px`;
   };
 
   /** Keyboard overlap of the screen viewport, in px (0 when the IME resizes the page). */
@@ -3057,9 +3075,14 @@ export function ControlScreen({
   const pinKb = !questBrowser && vvPin != null;
   const bottomReserve = questBrowser || pinKb ? 0 : kbInset;
   const cursorScreen = useMemo(() => {
-    return normToViewport(viewportRef.current, mediaEl(), cursor.x, cursor.y);
+    return normToViewport(viewportRef.current, mediaEl(), cursorRef.current.x, cursorRef.current.y);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor, zoom, pan, hasStream, wcActive, immersive, topCollapsed, dockCollapsed, browserFs, kbInset, vvPin]);
+  }, [zoom, pan, hasStream, wcActive, immersive, topCollapsed, dockCollapsed, browserFs, kbInset, vvPin]);
+  // After every commit the media box may have moved (zoom/pan/chrome/keyboard):
+  // re-place the cursor against the committed DOM, before paint.
+  useLayoutEffect(() => {
+    placeCursorEl();
+  });
   // Trackpad / Quest: hide the OS pointer and draw RemoteCursor (shape mirrors host).
   // Desktop web mouse/pen: live CSS cursor instead (no double-cursor).
   const showRemoteCursor = mode === "trackpad" || questBrowser;
@@ -3447,7 +3470,7 @@ export function ControlScreen({
           }}
         />
         {showRemoteCursor && connected && cursorScreen && !pipView && (
-          <RemoteCursor x={cursorScreen.x} y={cursorScreen.y} kind={cursorKind} dragging={dragging} fx={cursorFx} />
+          <RemoteCursor elRef={cursorElRef} x={cursorScreen.x} y={cursorScreen.y} kind={cursorKind} dragging={dragging} fx={cursorFx} />
         )}
         {/* App-icon placeholder for the ~1s gap before the first frame arrives. */}
         <AnimatePresence>
@@ -3830,6 +3853,13 @@ export function ControlScreen({
               <StatCell k="Clock ±" v={`${wcStats.clockRttMs} ms`} />
               <StatCell k="Buffer" v="0 ms" />
               <StatCell k="JB tgt/min" v="bypassed" />
+              <StatCell k="Path" v={net?.path || "—"} hi={!!net?.path && net.path.startsWith("relay")} />
+              <StatCell
+                k="Long tasks"
+                v={mainThread.count ? `${mainThread.count} · ${mainThread.maxMs}ms` : "0"}
+                hi={mainThread.maxMs > 100}
+              />
+              <StatCell k="UI renders" v={`${uiRenders}/s`} hi={uiRenders > 20} />
             </div>
           ) : (
             <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 sm:grid-cols-3 lg:grid-cols-4">
@@ -3852,6 +3882,13 @@ export function ControlScreen({
               <StatCell k="Pkts ↓" v={net ? `${net.packetsReceived}` : "—"} />
               <StatCell k="Decoded" v={net ? `${net.framesDecoded}` : "—"} />
               <StatCell k="Rendered" v={net ? `${net.framesRendered || "—"}` : "—"} />
+              <StatCell k="Path" v={net?.path || "—"} hi={!!net?.path && net.path.startsWith("relay")} />
+              <StatCell
+                k="Long tasks"
+                v={mainThread.count ? `${mainThread.count} · ${mainThread.maxMs}ms` : "0"}
+                hi={mainThread.maxMs > 100}
+              />
+              <StatCell k="UI renders" v={`${uiRenders}/s`} hi={uiRenders > 20} />
             </div>
           )}
           {hostStats && (
@@ -4334,6 +4371,64 @@ export function ControlScreen({
                     setting the moment the network can take it. <b className="text-ink-dim">OFF</b>: the older controller,
                     which guesses from its own send queue and can ratchet down over a long session until you nudge a
                     slider. The <b className="text-ink-dim">ABR</b> row in the host stats shows which one is live.
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    Encoder preset <ScopeTag scope="host" />
+                  </span>
+                  <div className="flex gap-1">
+                    {[1, 2, 3, 4].map((p) => (
+                      <button
+                        key={p}
+                        type="button"
+                        onClick={() => patchTune({ encPreset: p })}
+                        className={`rounded px-1.5 py-0.5 text-[9px] font-800 ${
+                          tune.encPreset === p ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                        }`}
+                      >
+                        P{p}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    NVENC quality/speed. <b className="text-ink-dim">P2</b> (default) encodes as fast as P1 but gives a
+                    visibly cleaner picture at the same bitrate; <b className="text-ink-dim">P3/P4</b> spend ~0.6–0.8ms
+                    more per frame for a little more. Go back to <b className="text-ink-dim">P1</b> only on an older GPU
+                    whose "H264 enc" time climbs. Changing it restarts the encoder (one keyframe).
+                  </p>
+                )}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
+                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
+                    Encoder passes <ScopeTag scope="host" />
+                  </span>
+                  <div className="flex gap-1">
+                    {[
+                      [0, "1"],
+                      [1, "2·¼"],
+                      [2, "2"],
+                    ].map(([v, label]) => (
+                      <button
+                        key={v}
+                        type="button"
+                        onClick={() => patchTune({ encMultipass: v as number })}
+                        className={`rounded px-1.5 py-0.5 text-[9px] font-800 ${
+                          tune.encMultipass === v ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {tuneHints && (
+                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
+                    <b className="text-ink-dim">1</b> (default): single pass. <b className="text-ink-dim">2·¼</b> /{" "}
+                    <b className="text-ink-dim">2</b>: two-pass rate control (quarter / full resolution) — frame sizes
+                    stick closer to the budget, so the wire is steadier on a tight link, but it spends fewer bits and
+                    looked softer in testing. Try it only if bursts cause hitches.
                   </p>
                 )}
                 <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
@@ -5300,12 +5395,15 @@ const CURSOR_ICONS: Record<string, { Icon: typeof MousePointer2; center?: boolea
 /** The on-screen remote cursor: mirrors the live desktop cursor shape, springs on
  *  every state change, shrinks while dragging, and ripples on click/scroll. */
 function RemoteCursor({
+  elRef,
   x,
   y,
   kind,
   dragging,
   fx,
 }: {
+  /** Positioned imperatively between renders (see placeCursorEl). */
+  elRef?: React.Ref<HTMLDivElement>;
   x: number;
   y: number;
   kind: string;
@@ -5325,7 +5423,7 @@ function RemoteCursor({
   // inline transform, leaving every center cursor mis-anchored by half its size.
   const offset = entry.center ? "translate(-50%,-50%)" : "translate(-2px,-2px)";
   return (
-    <div className="pointer-events-none absolute z-10" style={{ left: x, top: y }}>
+    <div ref={elRef} className="pointer-events-none absolute z-10" style={{ left: x, top: y }}>
       {!hidden && (
         <div style={{ transform: offset }}>
           <motion.div
@@ -5420,6 +5518,18 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   Keyframes: { long: "Keyframes decoded", info: "Full self-contained frames. DIRECT sends these rarely on purpose — long gaps here are correct, not a fault." },
   "Data ↓": { long: "Total downloaded", info: "Video bytes received this session." },
   "Clock ±": { long: "Clock sync quality", info: "Round-trip of the best sync sample. The E2E figure is only as trustworthy as this is small." },
+  Path: {
+    long: "Network path",
+    info: "How this phone reaches the PC. host = direct on the same network (best); srflx/prflx = through a router's NAT; relay = via a TURN server on the internet (adds a lot of latency — red). udp beats tcp.",
+  },
+  "Long tasks": {
+    long: "Phone main-thread stalls (10s)",
+    info: "Count and worst length of >50ms stalls on this phone's WebView main thread. That thread also receives every video/audio packet and sends input, so a stall shows up as a hitch, a crackle and laggy input together.",
+  },
+  "UI renders": {
+    long: "Control screen renders per second",
+    info: "How often this screen re-renders. Moving the cursor no longer re-renders it; a high number while idle means something is churning the UI thread.",
+  },
   // ---- RTC-only
   RTT: { long: "Round-trip time", info: "Network round trip to the PC. Roughly half of it lands in one-way video lag." },
   Jitter: { long: "Arrival jitter", info: "How irregularly packets arrive. High jitter is what forces the buffer — and the lag — up." },

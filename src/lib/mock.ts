@@ -1054,8 +1054,6 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return { ...mockRemote, running: mockRemote.enabled } as T;
     case "remote_status":
       return { ...mockRemote, running: mockRemote.enabled } as T;
-    case "remote_grab_frame":
-      return null as T;
     case "remote_inject":
       return undefined as T;
     case "remote_set_encode_paused":

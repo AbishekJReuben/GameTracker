@@ -122,6 +122,36 @@ function program(gl: WebGLRenderingContext, vs: string, fs: string): WebGLProgra
 
 type ButtonEdges = { trigger: boolean; squeeze: boolean; stick: boolean; a: boolean; b: boolean };
 
+/**
+ * Upload-only-when-new gate for the XR video texture. The XR loop runs at
+ * 72–120 Hz but the stream delivers ≤60 fps (a static desktop far fewer), so
+ * re-uploading the same 1080p frame every XR frame was wasted GPU bandwidth on a
+ * mobile SoC that is also rendering both eyes.
+ *
+ * Keyed off the element's decoded-frame counter (`getVideoPlaybackQuality()
+ * .totalVideoFrames`), NOT `requestVideoFrameCallback`: rVFC is driven by the
+ * window's render loop, which pauses while an immersive session owns rendering.
+ * Until the counter is seen to advance every frame uploads (old behaviour); if it
+ * never advances within 2 s it is treated as unsupported and every frame uploads
+ * forever. A 500 ms safety refresh bounds any staleness if the counter stalls.
+ */
+export type UploadGate = { lastCount: number; lastUploadAt: number; counterWorks: boolean | null; learnSince: number };
+export const newUploadGate = (): UploadGate => ({ lastCount: -1, lastUploadAt: 0, counterWorks: null, learnSince: 0 });
+export function shouldUploadVideoFrame(g: UploadGate, frameCount: number, now: number): boolean {
+  if (g.counterWorks === null) {
+    if (frameCount > 0) {
+      g.counterWorks = true;
+    } else {
+      if (!g.learnSince) g.learnSince = now;
+      if (now - g.learnSince > 2000) g.counterWorks = false;
+    }
+  }
+  if (g.counterWorks === true && frameCount === g.lastCount && now - g.lastUploadAt < 500) return false;
+  g.lastCount = frameCount;
+  g.lastUploadAt = now;
+  return true;
+}
+
 export class ImmersiveSession {
   private session: XRSession | null = null;
   private refSpace: XRReferenceSpace | null = null;
@@ -156,6 +186,8 @@ export class ImmersiveSession {
   private width = SCREEN_WIDTH;
   private height = SCREEN_WIDTH * (9 / 16);
   private aspectSet = false;
+  /** Upload-only-when-new state for the video texture (see shouldUploadVideoFrame). */
+  private uploadGate: UploadGate = newUploadGate();
 
   private edges = new Map<string, ButtonEdges>();
   private dragHand: string | null = null;
@@ -326,6 +358,8 @@ export class ImmersiveSession {
       this.height = this.width * (v.videoHeight / v.videoWidth);
       this.aspectSet = true;
     }
+    const q = (v as HTMLVideoElement & { getVideoPlaybackQuality?: () => VideoPlaybackQuality }).getVideoPlaybackQuality?.();
+    if (!shouldUploadVideoFrame(this.uploadGate, q ? q.totalVideoFrames : -1, performance.now())) return;
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     try {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
@@ -670,6 +704,7 @@ export class ImmersiveSession {
   }
 
   private cleanup() {
+    this.uploadGate = newUploadGate();
     if (this.session) {
       try {
         this.session.cancelAnimationFrame?.(this.frameHandle);

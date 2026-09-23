@@ -78,3 +78,34 @@ describe("binary native decoder feed", () => {
     expect(window.__GT_DECODER__.feed).toHaveBeenCalledExactlyOnceWith(123, true, "AAABBQ==");
   });
 });
+
+describe("native surface bounds", () => {
+  it("drops identical rects and resends after a decoder (re)init", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
+    vi.doMock("@/lib/tauri", () => ({ isTauri: () => true }));
+    (window as unknown as { __GT_COMPANION__?: boolean }).__GT_COMPANION__ = true;
+    try {
+      const nd = await import("./nativeDecoder");
+      const sent = () => invoke.mock.calls.filter((c) => c[0] === "decoder_set_bounds").length;
+      const r = { x: 10, y: 20, w: 300, h: 200, visible: true };
+      await nd.setNativeDecoderBounds(r);
+      await nd.setNativeDecoderBounds({ ...r });
+      await nd.setNativeDecoderBounds({ ...r, x: 10.05 }); // sub-¼px layout jitter
+      expect(sent()).toBe(1);
+      await nd.setNativeDecoderBounds({ ...r, x: 12 });
+      expect(sent()).toBe(2);
+      // Java forgets its desired rect on init — the same rect must go out again.
+      await nd.initNativeDecoder(1920, 1080);
+      await nd.setNativeDecoderBounds({ ...r, x: 12 });
+      expect(sent()).toBe(3);
+      // Sequence numbers stay monotonic across the dedupe (Java drops stale ones).
+      const seqs = invoke.mock.calls.filter((c) => c[0] === "decoder_set_bounds").map((c) => c[1].seq);
+      expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    } finally {
+      delete (window as unknown as { __GT_COMPANION__?: boolean }).__GT_COMPANION__;
+      vi.doUnmock("@tauri-apps/api/core");
+      vi.doUnmock("@/lib/tauri");
+    }
+  });
+});

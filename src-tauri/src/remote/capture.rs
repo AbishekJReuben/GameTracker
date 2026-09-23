@@ -1,12 +1,10 @@
-//! Screen capture → JPEG for the remote screen stream.
+//! Screen capture pipelines for the remote screen stream: the primary pipeline
+//! (`start_capture`: zero-copy DXGI → GPU composite → NVENC, with readback-NVENC and
+//! JPEG fallbacks) and the per-monitor pop-out pipelines (`start_aux_capture`).
 //!
-//! Two encoders share this module:
-//!  - `grab_primary_jpeg` — a whole-frame JPEG (kept for simple callers).
-//!  - `TileEncoder` — a stateful **delta** encoder that only re-sends the screen
-//!    tiles that actually changed since the last frame (plus a periodic keyframe).
-//!    This is the big bandwidth/latency win: a mostly-static desktop sends almost
-//!    nothing, so real changes get through faster. The wire format is documented
-//!    on `TileEncoder::encode`.
+//! (The LAN-era `TileEncoder` / `grab_primary_jpeg` GDI paths served the old
+//! `/screen` WebSocket, which no client has used since the companion went
+//! WebRTC-only; they were removed along with that endpoint.)
 //!
 //! Multi-monitor: `list_monitors` enumerates displays in a stable left-to-right
 //! order; the phone picks one and it's remembered in `SELECTED_MONITOR`, read by
@@ -23,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xcap::image::codecs::jpeg::JpegEncoder;
-use xcap::image::{imageops, imageops::FilterType, RgbImage};
+use xcap::image::imageops::FilterType;
 use xcap::Monitor;
 
 // ---------------------------------------------------------------------------
@@ -35,52 +33,6 @@ use xcap::Monitor;
 // (`fast_image_resize`) and SIMD (AVX2) JPEG (`jpeg-encoder`), an order-of-magnitude
 // faster, so the WebRTC video track is fed at its real target rate.
 // ---------------------------------------------------------------------------
-
-/// Drop the alpha from a tightly-packed 4-byte-per-pixel buffer, yielding RGB.
-/// `swap_rb` converts BGRA (Desktop Duplication) → RGB; RGBA (xcap) passes false.
-fn u8x4_to_rgb(px4: &[u8], w: u32, h: u32, swap_rb: bool) -> Vec<u8> {
-    let n = (w as usize) * (h as usize);
-    let mut out = Vec::with_capacity(n * 3);
-    if swap_rb {
-        for px in px4.chunks_exact(4) {
-            out.push(px[2]);
-            out.push(px[1]);
-            out.push(px[0]);
-        }
-    } else {
-        for px in px4.chunks_exact(4) {
-            out.extend_from_slice(&px[0..3]);
-        }
-    }
-    out
-}
-
-/// Downscale a captured RGBA/BGRA frame to `max_w` (keeping aspect) and return
-/// packed RGB bytes + the output dimensions. `fast` picks nearest-neighbour (the
-/// big fps lever on a 4K downscale) over bilinear; H.264 + the phone screen hide
-/// the aliasing at the lower-quality presets. `swap_rb` handles BGRA sources.
-fn scale_u8x4_to_rgb(px4: &[u8], sw: u32, sh: u32, max_w: u32, fast: bool, swap_rb: bool) -> Option<(Vec<u8>, u32, u32)> {
-    if sw == 0 || sh == 0 {
-        return None;
-    }
-    if sw <= max_w {
-        return Some((u8x4_to_rgb(px4, sw, sh, swap_rb), sw, sh));
-    }
-    let dw = max_w;
-    let dh = (((sh as u64) * (dw as u64)) / (sw as u64)).max(1) as u32;
-    // Borrow the source (so the caller's buffer — e.g. the duplicator's reusable
-    // readback — isn't consumed); the resize is spread across cores via rayon.
-    let src = ImageRef::new(sw, sh, px4, PixelType::U8x4).ok()?;
-    let mut dst = FirImage::new(dw, dh, PixelType::U8x4);
-    let alg = if fast {
-        ResizeAlg::Nearest
-    } else {
-        ResizeAlg::Convolution(FirFilter::Bilinear)
-    };
-    let opts = ResizeOptions::new().resize_alg(alg);
-    Resizer::new().resize(&src, &mut dst, &opts).ok()?;
-    Some((u8x4_to_rgb(dst.buffer(), dw, dh, swap_rb), dw, dh))
-}
 
 /// Downscale a captured 4-byte-per-pixel frame to `max_w` (keeping aspect) and
 /// return it still packed as U8x4 — **no color conversion**. The video-track paths
@@ -130,11 +82,6 @@ fn encode_jpeg_px(px: &[u8], w: u32, h: u32, quality: u8, subsample_420: bool, c
     });
     enc.encode(px, w as u16, h as u16, color).ok()?;
     Some(buf)
-}
-
-/// RGB convenience wrapper (LAN tile path + one-shot grabs).
-fn encode_jpeg_rgb(rgb: &[u8], w: u32, h: u32, quality: u8, subsample_420: bool) -> Option<Vec<u8>> {
-    encode_jpeg_px(rgb, w, h, quality, subsample_420, JpegColor::Rgb)
 }
 
 /// Encode a full RGB frame for the WebRTC video-track feed. At high resolutions a
@@ -330,124 +277,6 @@ pub fn monitor_bounds(index: usize) -> Option<(i32, i32, u32, u32)> {
     Some((m.x().ok()?, m.y().ok()?, m.width().ok()?, m.height().ok()?))
 }
 
-/// Grab the primary monitor, optionally downscale to `max_w`, and JPEG-encode it.
-pub fn grab_primary_jpeg(max_w: u32, quality: u8) -> Option<Vec<u8>> {
-    let mon = primary_monitor()?;
-    let rgba = mon.capture_image().ok()?;
-    let (sw, sh) = (rgba.width(), rgba.height());
-    let raw = rgba.into_raw();
-    let (rgb, w, h) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, false, false)?;
-    encode_jpeg_rgb(&rgb, w, h, quality, false)
-}
-
-/// Pixel size of the primary monitor.
-pub fn primary_size() -> Option<(u32, u32)> {
-    let mon = primary_monitor()?;
-    Some((mon.width().ok()?, mon.height().ok()?))
-}
-
-const TILE: u32 = 256; // tile edge in pixels
-const KEY_INTERVAL: u32 = 120; // force a full keyframe at least this often (loss recovery)
-
-/// Stateful delta encoder. Keep one per stream (per LAN socket, or the shared
-/// static for the cloud command); it remembers the previous frame to diff against.
-pub struct TileEncoder {
-    prev: Option<RgbImage>,
-    frames_since_key: u32,
-    last_monitor: usize,
-}
-
-impl Default for TileEncoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TileEncoder {
-    pub fn new() -> Self {
-        Self { prev: None, frames_since_key: 0, last_monitor: usize::MAX }
-    }
-
-    /// Capture the selected monitor and return a serialized frame, or `None` when
-    /// nothing changed (caller should simply not send anything).
-    ///
-    /// Wire format (little-endian):
-    /// ```text
-    /// "GT"        2 bytes magic
-    /// version     u8  (=1)
-    /// flags       u8  (bit0 = keyframe)
-    /// frame_w     u16
-    /// frame_h     u16
-    /// tile_size   u16
-    /// tile_count  u16
-    /// then tile_count times:
-    ///   x u16, y u16, w u16, h u16, jpeg_len u32, jpeg bytes
-    /// ```
-    pub fn encode(&mut self, monitor: usize, max_w: u32, quality: u8, force_key: bool) -> Option<Vec<u8>> {
-        let mon = monitor_at(monitor)?;
-        let rgba = mon.capture_image().ok()?;
-        let (sw, sh) = (rgba.width(), rgba.height());
-        // SIMD downscale to packed RGB (bilinear keeps tiles crisp for the sharp
-        // LAN path), then wrap as an RgbImage for the tile diff/crop below.
-        let raw = rgba.into_raw();
-        let (rgb, w, h) = scale_u8x4_to_rgb(&raw, sw, sh, max_w, false, false)?;
-        let cur = RgbImage::from_raw(w, h, rgb)?;
-
-        let prev_ok = matches!(&self.prev, Some(p) if p.width() == w && p.height() == h);
-        let keyframe = force_key || !prev_ok || monitor != self.last_monitor || self.frames_since_key >= KEY_INTERVAL;
-
-        let cols = w.div_ceil(TILE);
-        let rows = h.div_ceil(TILE);
-        let mut changed: Vec<(u32, u32, u32, u32)> = Vec::new();
-        for ty in 0..rows {
-            for tx in 0..cols {
-                let x0 = tx * TILE;
-                let y0 = ty * TILE;
-                let tw = TILE.min(w - x0);
-                let th = TILE.min(h - y0);
-                let differs = keyframe || tile_differs(self.prev.as_ref().unwrap(), &cur, x0, y0, tw, th);
-                if differs {
-                    changed.push((x0, y0, tw, th));
-                }
-            }
-        }
-
-        if changed.is_empty() {
-            // Nothing to send, but keep prev current and count toward the next keyframe.
-            self.prev = Some(cur);
-            self.last_monitor = monitor;
-            self.frames_since_key = self.frames_since_key.saturating_add(1);
-            return None;
-        }
-
-        let mut out = Vec::with_capacity(8192);
-        out.extend_from_slice(b"GT");
-        out.push(1);
-        out.push(if keyframe { 1 } else { 0 });
-        out.extend_from_slice(&(w as u16).to_le_bytes());
-        out.extend_from_slice(&(h as u16).to_le_bytes());
-        out.extend_from_slice(&(TILE as u16).to_le_bytes());
-        out.extend_from_slice(&(changed.len() as u16).to_le_bytes());
-        for (x0, y0, tw, th) in &changed {
-            let sub = imageops::crop_imm(&cur, *x0, *y0, *tw, *th).to_image();
-            let Some(jpg) = encode_jpeg_rgb(sub.as_raw(), *tw, *th, quality, false) else {
-                continue;
-            };
-            out.extend_from_slice(&(*x0 as u16).to_le_bytes());
-            out.extend_from_slice(&(*y0 as u16).to_le_bytes());
-            out.extend_from_slice(&(*tw as u16).to_le_bytes());
-            out.extend_from_slice(&(*th as u16).to_le_bytes());
-            out.extend_from_slice(&(jpg.len() as u32).to_le_bytes());
-            out.extend_from_slice(&jpg);
-        }
-
-        self.prev = Some(cur);
-        self.last_monitor = monitor;
-        self.frames_since_key = if keyframe { 0 } else { self.frames_since_key.saturating_add(1) };
-        Some(out)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Streaming capture driver (WebRTC video-track path)
 //
@@ -569,6 +398,25 @@ static CAP_BITRATE_KBPS: AtomicU32 = AtomicU32::new(0);
 /// Live-set the native encoder's bitrate (kbps; 0 = auto).
 pub fn set_capture_bitrate(kbps: u32) {
     CAP_BITRATE_KBPS.store(kbps.min(40_000), Ordering::Relaxed);
+}
+
+/// NVENC preset (1..=4) and rate-control pass mode (0..=2) from the phone's Tune
+/// panel. Changing either rebuilds the session (the guest resyncs on the IDR).
+static CAP_PRESET: AtomicU32 = AtomicU32::new(2); // = nvenc::DEFAULT_PRESET
+static CAP_MULTIPASS: AtomicU32 = AtomicU32::new(0);
+
+/// Live-set the NVENC preset / pass mode (see [`CAP_PRESET`]).
+pub fn set_encoder_tuning(preset: u32, multipass: u32) {
+    CAP_PRESET.store(preset.clamp(1, 4), Ordering::Relaxed);
+    CAP_MULTIPASS.store(multipass.min(2), Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn encoder_tuning() -> super::native::EncoderTuning {
+    super::native::EncoderTuning {
+        preset: CAP_PRESET.load(Ordering::Relaxed) as u8,
+        multipass: CAP_MULTIPASS.load(Ordering::Relaxed) as u8,
+    }
 }
 
 /// Whether the consumer can accept native H.264 frames.
@@ -748,6 +596,8 @@ where
     std::thread::spawn(move || {
         boost_capture_thread();
         let _timer = TimerBoost::new(); // 1ms sleep precision for fps pacing
+        #[cfg(windows)]
+        let _gpu = super::gpusched::ProcessGpuBoost::new();
         let budget_ms = (1000 / fps).clamp(1, 1000);
         let budget = Duration::from_millis(budget_ms as u64);
         // Persistent duplication session for THIS monitor (recreated if lost).
@@ -921,6 +771,9 @@ where
     std::thread::spawn(move || {
         boost_capture_thread();
         let _timer = TimerBoost::new(); // 1ms sleep precision for fps pacing
+        // GPU scheduling class HIGH while this pipeline runs (ref-counted, process-wide).
+        #[cfg(windows)]
+        let _gpu = super::gpusched::ProcessGpuBoost::new();
         #[cfg(windows)]
         let mut dup: Option<super::dxdupe::Duplicator> = None;
         // ---- zero-copy state (Windows + NVIDIA + Desktop Duplication) ----
@@ -994,21 +847,31 @@ where
                 // and the CPU downscale + cursor paint that follow it.
                 if !zc_off && CAP_NATIVE_OK.load(Ordering::Relaxed) && dup.is_some() {
                     let d = dup.as_mut().unwrap();
+                    let tuning = encoder_tuning();
+                    // The compositor's area filter reads mip level floor(log2 ratio),
+                    // so the chain is only needed at >= 2x downscale (4K -> 1080p);
+                    // below that it samples level 0 directly. The previous frame's
+                    // native size decides (the first frame of a session builds them).
+                    let (lnw, lnh) = d.native_size();
+                    let want_mips = lnw == 0 || native_out_size(lnw, lnh, max_w).0 * 2 <= lnw;
                     let g0 = Instant::now();
-                    match d.grab_gpu(budget_ms) {
+                    match d.grab_gpu(budget_ms, want_mips) {
                         super::dxdupe::Grab::Frame { native_w, native_h, .. } => {
                             let cap_us = g0.elapsed().as_micros() as u32;
                             let (ow, oh) = native_out_size(native_w, native_h, max_w);
-                            // (Re)build on first use or a resolution change. NVENC must
-                            // sit on the DUPLICATOR's device to register its textures.
+                            // (Re)build on first use, a resolution change, or a new
+                            // preset / pass mode. NVENC must sit on the DUPLICATOR's
+                            // device to register its textures.
                             let fresh = match &zc {
-                                Some((c, _)) => c.size() != (ow, oh),
+                                Some((c, e)) => c.size() != (ow, oh) || e.tuning() != tuning,
                                 None => true,
                             };
                             if fresh {
+                                // Release the old NVENC session before opening a new one.
+                                drop(zc.take());
                                 zc = super::gpu::Compositor::new(d.device(), d.context(), ow, oh).and_then(|c| {
                                     let bps = native_bitrate_bps(ow, oh, fps, quality);
-                                    super::native::NativeEncoder::new(Some(d.device()), ow, oh, fps, bps)
+                                    super::native::NativeEncoder::new(Some(d.device()), ow, oh, fps, bps, tuning)
                                         .map(|e| (c, e))
                                 });
                                 if zc.is_none() {
@@ -1027,11 +890,16 @@ where
                             }
                             if let Some((comp, enc)) = zc.as_mut() {
                                 let bps = native_bitrate_bps(ow, oh, fps, quality);
-                                enc.accepts(ow, oh, fps, bps);
+                                enc.accepts(ow, oh, fps, bps, tuning);
                                 let srv = d.frame_srv();
-                                let img = d.cursor_image();
+                                // Levels > 0 may be sampled only when the chain was rebuilt
+                                // from the current pixels (gpu::downscale_params falls back
+                                // to level 0 otherwise).
+                                let src_mips = d.mips_current();
+                                let seq = d.cursor_seq();
+                                let img = d.cursor_image_cached();
                                 let ok = match &srv {
-                                    Some(s) => comp.render(s, native_w, native_h, img.as_ref().map(|i| (i, d.cursor_seq()))),
+                                    Some(s) => comp.render(s, native_w, native_h, src_mips, img.map(|i| (i, seq))),
                                     None => false,
                                 };
                                 // Channel backpressure: skip BEFORE the encoder so the
@@ -1303,12 +1171,14 @@ where
                 let want_bps = native_bitrate_bps(frame.w, frame.h, fps, quality as u32);
                 // (Re)build on first use or a resolution change. NVENC rounds to even
                 // dimensions, so ask the session what it settled on.
+                let tuning = encoder_tuning();
                 let usable = match native.as_mut() {
-                    Some(n) => n.accepts(frame.w, frame.h, fps, want_bps),
+                    Some(n) => n.accepts(frame.w, frame.h, fps, want_bps, tuning),
                     None => false,
                 };
                 if !usable {
-                    native = super::native::NativeEncoder::new(None, frame.w, frame.h, fps, want_bps);
+                    drop(native.take()); // one NVENC session at a time
+                    native = super::native::NativeEncoder::new(None, frame.w, frame.h, fps, want_bps, tuning);
                     if native.is_none() {
                         // No NVENC on this machine (or it refused this shape). Say so
                         // once, then stop paying for the attempt every frame.
@@ -1401,20 +1271,4 @@ where
 fn mailbox_wake(mail: &Arc<(PlMutex<Option<RawFrame>>, Condvar)>) {
     let (_lock, cv) = &**mail;
     cv.notify_all();
-}
-
-/// True if any pixel in the tile region changed between `prev` and `cur`
-/// (both are the same dimensions — guaranteed by the caller).
-fn tile_differs(prev: &RgbImage, cur: &RgbImage, x0: u32, y0: u32, tw: u32, th: u32) -> bool {
-    let stride = (cur.width() * 3) as usize;
-    let pb = prev.as_raw();
-    let cb = cur.as_raw();
-    let row_bytes = (tw * 3) as usize;
-    for row in y0..y0 + th {
-        let start = row as usize * stride + x0 as usize * 3;
-        if pb[start..start + row_bytes] != cb[start..start + row_bytes] {
-            return true;
-        }
-    }
-    false
 }

@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "gametracker"
-version = "3.9.100"
+version = "3.9.101"
 dependencies = [
  "anyhow",
  "axum",
@@ -1844,6 +1844,7 @@ dependencies = [
  "dirs 5.0.1",
  "enigo",
  "fast_image_resize",
+ "futures-util",
  "image",
  "jpeg-encoder",
  "local-ip-address",
@@ -1867,6 +1868,7 @@ dependencies = [
  "tauri-plugin-updater",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tower-http",
  "ureq",
  "url",

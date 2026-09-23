@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tauri::{AppHandle, Emitter};
 
 const TICK_SECS: u64 = 2;
@@ -165,6 +165,17 @@ pub fn spawn(
         .ok();
 }
 
+/// Stage 1 of the per-tick scan: list every process with its exe path only
+/// (resolved once per PID).
+fn tracker_list_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::new().with_exe(UpdateKind::OnlyIfNotSet)
+}
+
+/// Stage 2: CPU + memory, for the matched (tracked) processes only.
+fn tracker_usage_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::new().with_cpu().with_memory()
+}
+
 fn run_loop(
     app: AppHandle,
     pool: DbPool,
@@ -245,11 +256,13 @@ fn run_loop(
             (settings::get_i64(&pool, "idle_minutes", 5).unwrap_or(5)).max(0) as u64 * 60;
         let is_idle = idle_threshold > 0 && idle::idle_seconds() >= idle_threshold;
 
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::everything(),
-        );
+        // Two-stage scan. Stage 1 lists every process with only its exe path
+        // (resolved once per PID — it never changes). Stage 2 samples CPU + memory
+        // for just the processes that matched a tracked entry. Sampling them for all
+        // ~480 processes (what `everything()` did every 2s) doubled the scan: measured
+        // 18.3 ms vs 8.9 ms per tick on the dev PC (`refresh_cost`), in an always-on
+        // tray app that shares the machine with games and the remote stream.
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, tracker_list_kind());
 
         let cache_by_id: HashMap<String, MatchGame> = games_cache
             .iter()
@@ -267,6 +280,8 @@ fn run_loop(
 
         let mut running: HashMap<String, RunGame> = HashMap::new();
         let mut usage: HashMap<String, AppAccum> = HashMap::new();
+        // (pid, entry id) of every process that belongs to a tracked entry.
+        let mut matched: Vec<(Pid, String)> = Vec::new();
         for proc_ in sys.processes().values() {
             if let Some(exe) = proc_.exe() {
                 let path = exe.to_string_lossy();
@@ -278,15 +293,23 @@ fn run_loop(
                         accent: g.accent_color.clone(),
                         kind: g.kind.clone(),
                     });
-                    if sample_usage {
-                        let acc = usage.entry(g.id.clone()).or_default();
-                        // cpu_usage() is per single core; normalize to total-system %.
-                        acc.cpu += proc_.cpu_usage() as f64 / ncpu;
-                        acc.ram_mb += proc_.memory() as f64 / 1_048_576.0;
-                        if gpu_meter.is_some() {
-                            acc.gpu += gpu_map.get(&proc_.pid().as_u32()).copied().unwrap_or(0.0);
-                        }
-                    }
+                    matched.push((proc_.pid(), g.id.clone()));
+                }
+            }
+        }
+        if sample_usage && !matched.is_empty() {
+            let pids: Vec<Pid> = matched.iter().map(|(p, _)| *p).collect();
+            // Every matched PID is sampled every tick, so sysinfo's per-process CPU
+            // delta stays valid (a brand-new PID reads 0 on its first tick, as before).
+            sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), false, tracker_usage_kind());
+            for (pid, gid) in &matched {
+                let Some(proc_) = sys.process(*pid) else { continue };
+                let acc = usage.entry(gid.clone()).or_default();
+                // cpu_usage() is per single core; normalize to total-system %.
+                acc.cpu += proc_.cpu_usage() as f64 / ncpu;
+                acc.ram_mb += proc_.memory() as f64 / 1_048_576.0;
+                if gpu_meter.is_some() {
+                    acc.gpu += gpu_map.get(&pid.as_u32()).copied().unwrap_or(0.0);
                 }
             }
         }
@@ -799,6 +822,74 @@ fn emit_session(app: &AppHandle, kind: &str, name: &str, icon: &Option<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-tick refresh must read only what the loop uses — never the
+    /// command line / environment / cwd / disk counters of every process.
+    #[test]
+    fn per_tick_refresh_reads_only_what_the_loop_uses() {
+        let list = tracker_list_kind();
+        assert_eq!(list.exe(), UpdateKind::OnlyIfNotSet);
+        assert!(!list.cpu() && !list.memory(), "usage is sampled for matched PIDs only");
+        for k in [list, tracker_usage_kind()] {
+            assert_eq!(k.cmd(), UpdateKind::Never);
+            assert_eq!(k.environ(), UpdateKind::Never);
+            assert_eq!(k.cwd(), UpdateKind::Never);
+            assert_eq!(k.root(), UpdateKind::Never);
+            assert_eq!(k.user(), UpdateKind::Never);
+            assert!(!k.disk_usage());
+        }
+        let usage = tracker_usage_kind();
+        assert!(usage.cpu() && usage.memory());
+    }
+
+    /// The two-stage scan must report the same CPU numbers as a full sample for
+    /// the processes it samples: this very test process, sampled across two ticks.
+    #[test]
+    fn subset_sampling_measures_cpu_for_matched_pids() {
+        let me = Pid::from_u32(std::process::id());
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, tracker_list_kind());
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[me]), false, tracker_usage_kind());
+        // Burn some CPU so the second sample has a non-zero delta.
+        let t0 = Instant::now();
+        let mut x = 0u64;
+        while t0.elapsed() < Duration::from_millis(250) {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        }
+        std::hint::black_box(x);
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, tracker_list_kind());
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[me]), false, tracker_usage_kind());
+        let p = sys.process(me).expect("self process listed");
+        assert!(p.exe().is_some(), "exe resolved by the list stage");
+        assert!(p.memory() > 0, "memory sampled");
+        assert!(p.cpu_usage() > 1.0, "cpu sampled: {}", p.cpu_usage());
+    }
+
+    /// Cost comparison on the real machine (steady state, after the first scan).
+    ///   `cargo test --release --lib tracking::tracker::tests::refresh_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing measurement on the local machine"]
+    fn refresh_cost() {
+        let time = |kind: ProcessRefreshKind| {
+            let mut sys = System::new();
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+            let mut samples = Vec::new();
+            for _ in 0..10 {
+                let t0 = Instant::now();
+                sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+                samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(|a, b| a.total_cmp(b));
+            (samples[samples.len() / 2], sys.processes().len())
+        };
+        let (full, n) = time(ProcessRefreshKind::everything());
+        let (lean, _) = time(tracker_list_kind().with_cpu().with_memory());
+        let (exe_only, _) = time(ProcessRefreshKind::new().with_exe(UpdateKind::OnlyIfNotSet));
+        let (list_only, _) = time(ProcessRefreshKind::new());
+        eprintln!(
+            "{n} processes: everything() {full:.2} ms, exe+cpu+mem {lean:.2} ms, exe-only {exe_only:.2} ms, list-only {list_only:.2} ms"
+        );
+    }
 
     fn game() -> MatchGame {
         MatchGame {

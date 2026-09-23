@@ -51,12 +51,33 @@ pub struct SensorReading {
 }
 
 impl SensorReading {
-    /// Only trust live sample fields when the sidecar reported recently.
+    /// Only trust live sample fields when the sidecar reported recently. The window
+    /// follows the sidecar's current sampling interval (2 s while someone views
+    /// system stats, 10 s otherwise), never shorter than `SENSOR_STALE_SECS`.
     fn fresh(&self) -> bool {
-        self.last_update
-            .map(|t| t.elapsed() < Duration::from_secs(SENSOR_STALE_SECS))
-            .unwrap_or(false)
+        let window = sensor::stale_after().max(Duration::from_secs(SENSOR_STALE_SECS));
+        self.last_update.map(|t| t.elapsed() < window).unwrap_or(false)
     }
+}
+
+/// When a UI (desktop System page, or the phone's System screen via the remote
+/// API) last read live system stats. Drives the sidecar's fast/slow cadence.
+static LAST_DEMAND: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// Keep sampling fast this long after the last read (the page polls every 2–8 s).
+const DEMAND_HOLD: Duration = Duration::from_secs(20);
+
+/// Record that live system stats are being viewed; switches the sidecar to its
+/// fast cadence immediately instead of on the next monitor tick.
+pub fn note_demand() {
+    let was_idle = !demand_active();
+    *LAST_DEMAND.lock() = Some(std::time::Instant::now());
+    if was_idle {
+        sensor::set_interval(sensor::FAST_INTERVAL_MS);
+    }
+}
+
+fn demand_active() -> bool {
+    LAST_DEMAND.lock().is_some_and(|t| t.elapsed() < DEMAND_HOLD)
 }
 
 /// One tick's per-app resource samples (all sharing a timestamp). Kept in a live
@@ -340,6 +361,8 @@ fn run_loop(pool: DbPool, shared: Arc<SystemShared>) {
         if tick % DISKS_EVERY == 0 {
             disks.refresh();
         }
+        // Sidecar cadence follows demand (a no-op write unless it changed).
+        sensor::set_interval(if demand_active() { sensor::FAST_INTERVAL_MS } else { sensor::SLOW_INTERVAL_MS });
 
         let sensor = shared.sensor.lock().clone();
         let fresh = sensor.fresh();
@@ -478,10 +501,12 @@ fn prune(pool: &DbPool) -> AppResult<()> {
 // ---------- command-facing reads ----------
 
 pub fn specs(shared: &SystemShared) -> SystemSpecs {
+    note_demand();
     shared.specs.lock().clone().unwrap_or_default()
 }
 
 pub fn live(shared: &SystemShared) -> SystemLive {
+    note_demand();
     SystemLive {
         specs: shared.specs.lock().clone().unwrap_or_default(),
         samples: shared.live.lock().iter().cloned().collect(),
@@ -489,6 +514,7 @@ pub fn live(shared: &SystemShared) -> SystemLive {
 }
 
 pub fn history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppResult<SystemHistory> {
+    note_demand();
     let minutes = minutes.clamp(5, 60 * 24 * PRUNE_DAYS);
     let from = (Utc::now() - ChronoDuration::minutes(minutes)).to_rfc3339();
 

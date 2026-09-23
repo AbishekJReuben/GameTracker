@@ -4,7 +4,6 @@
  *   - request(path)   : id-correlated stats request over the "data" channel
  *   - onStream(cb)    : the inbound screen video track (WebRTC media, hardware-decoded)
  *   - onEvent(cb)     : unsolicited host events (e.g. PC text-field focus)
- *   - onFrame(cb)     : legacy base64 JPEG frames (LAN fallback only)
  *   - sendControl(m)  : input events over the "control" channel
  *
  * The connection is **self-healing**: once it has connected at least once, any drop
@@ -193,8 +192,36 @@ export type RtcInboundVideoStats = {
   keyFramesDecoded: number;
   /** Frames rendered (if reported). */
   framesRendered: number;
+  /**
+   * The ICE path actually in use, e.g. "host·udp·wifi" (direct on the LAN),
+   * "srflx·udp" (through the router's NAT) or "relay·tcp" (via a TURN server —
+   * far slower). Empty when unknown. See `describeIcePath`.
+   */
+  path: string;
   at: number;
 };
+
+/** Monotonic epoch-ms clock. Clock sync and one-way-delay maths must not use
+ *  `Date.now()`: a wall-clock step (NTP / network time on the phone) would shift
+ *  every OWD sample, and ABR v2 reads `owd − min(owd)` as the standing queue — so a
+ *  step looked exactly like congestion and cut the bitrate for nothing. */
+export const monoNow = () => performance.timeOrigin + performance.now();
+
+type IceCandidateStat = { candidateType?: string; protocol?: string; networkType?: string; relayProtocol?: string };
+
+/** Compact, human-readable description of the selected ICE candidate pair. */
+export function describeIcePath(local?: IceCandidateStat | null, remote?: IceCandidateStat | null): string {
+  if (!local && !remote) return "";
+  const lt = local?.candidateType ?? "?";
+  const rt = remote?.candidateType ?? "?";
+  // Either side relayed ⇒ the media hairpins through a TURN server.
+  const kind = lt === "relay" || rt === "relay" ? "relay" : lt === rt ? lt : `${lt}/${rt}`;
+  const parts = [kind];
+  const proto = lt === "relay" && local?.relayProtocol ? local.relayProtocol : local?.protocol ?? remote?.protocol;
+  if (proto) parts.push(proto);
+  if (local?.networkType && local.networkType !== "unknown") parts.push(local.networkType);
+  return parts.join("·");
+}
 
 /** Live telemetry for the DIRECT audio path (PCM over data channel). */
 export type AudioStats = {
@@ -314,7 +341,6 @@ const clampNum = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo
 export class CloudConn {
   private sig: Signaling | null = null;
   private pc: RTCPeerConnection | null = null;
-  private chScreen?: RTCDataChannel;
   private chControl?: RTCDataChannel;
   /** Unordered / no-retransmit channel for high-rate pointer moves (see rtcHost). */
   private chMove?: RTCDataChannel;
@@ -322,7 +348,6 @@ export class CloudConn {
   private reqId = 1;
   private pending = new Map<number, Pending>();
   private chunks = new Map<number, { parts: string[]; got: number; n: number }>();
-  private frameCb: ((b64: string) => void) | null = null;
   /** Multi-subscriber: Control + Quest VR both need the same stream without clobbering. */
   private streamCbs = new Set<(s: MediaStream) => void>();
   /** Multi-subscriber: Control + ImmersiveScreen both need cursor/focus events. */
@@ -757,7 +782,7 @@ export class CloudConn {
     this.lastPong = Date.now();
     if (this.chData?.readyState === "open") {
       try {
-        this.chData.send(JSON.stringify({ ping: Date.now() }));
+        this.chData.send(JSON.stringify({ ping: monoNow() }));
       } catch {
         /* ignore */
       }
@@ -1124,7 +1149,9 @@ export class CloudConn {
     this.redDepth = 1;
     this.chAudio = undefined;
     this.chAudioRed = undefined;
-    const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 4 });
+    // One pre-gathered pool is enough for a fast ICE restart; four pools meant up to
+    // four sets of TURN allocations on a public relay for every session.
+    const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 1 });
     this.pc = pc;
     pipeIce(pc, this.sig!, sid);
     // Guard every handler against firing for a superseded connection. The peer
@@ -1192,10 +1219,7 @@ export class CloudConn {
     this.pc.ondatachannel = (e) => {
       if (this.pc !== pc) return; // superseded before channels arrived
       const ch = e.channel;
-      if (ch.label === "screen") {
-        this.chScreen = ch;
-        ch.onmessage = (ev) => this.frameCb?.(ev.data as string);
-      } else if (ch.label === "control") {
+      if (ch.label === "control") {
         this.chControl = ch;
         // Send the auth handshake as soon as the guest→host channel is open.
         if (ch.readyState === "open") this.sendAuth();
@@ -1243,9 +1267,16 @@ export class CloudConn {
   private startHeartbeat() {
     this.stopHeartbeat();
     this.lastPong = Date.now();
-    // Immediate first ping: seeds the clock-sync samples so the wc path's
-    // end-to-end latency reading is meaningful within a second of connecting.
+    // Immediate first ping, then a short burst: the clock offset is taken from the
+    // LOWEST-RTT sample of the last eight, and one sample at connect time (often
+    // taken while ICE/DTLS is still settling) made the first ~40s of E2E and ABR v2
+    // delay readings noisy. Five samples in the first second fix that for free.
     this.sendHeartbeatPing();
+    for (const ms of [200, 400, 700, 1000]) {
+      window.setTimeout(() => {
+        if (!this.closed) this.sendHeartbeatPing();
+      }, ms);
+    }
     this.hbTimer = window.setInterval(() => {
       if (this.closed) return;
       // Backgrounded: timers are throttled and pongs may sit unprocessed, so a
@@ -1275,7 +1306,7 @@ export class CloudConn {
   private sendHeartbeatPing() {
     if (this.chData?.readyState !== "open") return;
     try {
-      this.chData.send(JSON.stringify({ ping: Date.now() }));
+      this.chData.send(JSON.stringify({ ping: monoNow() }));
     } catch {
       /* channel is being replaced */
     }
@@ -2443,7 +2474,7 @@ export class CloudConn {
       const clk = this.bestClock();
       if (clk) {
         const capturedAtGuest = head.tsMs - clk.off;
-        const net = now - capturedAtGuest;
+        const net = monoNow() - capturedAtGuest;
         this.wcNetMs = this.smoothLatency(this.wcNetMs, net);
         this.noteOwd(net);
         if (this.wcDecMs > 0) {
@@ -2484,7 +2515,7 @@ export class CloudConn {
     }
     if (head.key) this.wcAwaitKey = false;
     const tsUs = Math.round(head.tsMs * 1000);
-    this.wcMeta.set(tsUs, { arrivedAt: now, submittedAt: perfNow, tsMs: head.tsMs, bytes: head.len });
+    this.wcMeta.set(tsUs, { arrivedAt: monoNow(), submittedAt: perfNow, tsMs: head.tsMs, bytes: head.len });
     try {
       // These bytes belong exclusively to this AU. Chrome 120+ can adopt their
       // buffer; older WebCodecs implementations ignore the optional dictionary
@@ -2504,7 +2535,8 @@ export class CloudConn {
 
   /** Decoded frame out: update latency stats and deliver to the render sink. */
   private onWcFrameOut(frame: VideoFrame) {
-    const now = Date.now();
+    // Monotonic: compared with clock-synced capture times and pacing deadlines.
+    const now = monoNow();
     const meta = this.wcMeta.get(frame.timestamp);
     let capturedAtGuest = 0;
     if (meta) {
@@ -2593,7 +2625,7 @@ export class CloudConn {
       window.clearTimeout(this.wcPlayTimer);
       this.wcPlayTimer = null;
     }
-    const now = Date.now();
+    const now = monoNow();
     let newest: VideoFrame | null = null;
     while (this.wcPlayQ.length && this.wcPlayQ[0].showAt <= now) {
       newest?.close();
@@ -2601,7 +2633,7 @@ export class CloudConn {
     }
     if (newest) this.wcDeliver(newest);
     if (this.wcPlayQ.length) {
-      this.wcPlayTimer = window.setTimeout(this.wcPlayDrain, Math.max(1, this.wcPlayQ[0].showAt - Date.now()));
+      this.wcPlayTimer = window.setTimeout(this.wcPlayDrain, Math.max(1, this.wcPlayQ[0].showAt - monoNow()));
     }
   };
 
@@ -2813,7 +2845,10 @@ export class CloudConn {
   private startJitterHold() {
     this.stopJitterHold();
     this.jitterHoldTimer = window.setInterval(() => {
-      if (this.closed || !this.videoReceiver) return;
+      // On DIRECT the RTC track carries nothing, so re-asserting its jitter-buffer
+      // hint 4×/s was pure overhead (each write posts to the WebRTC worker thread).
+      // Falling back to RTC re-applies it on the very next tick.
+      if (this.closed || !this.videoReceiver || this.wcActive) return;
       this.applyJitter();
     }, 250);
   }
@@ -2953,6 +2988,10 @@ export class CloudConn {
       // user is on the Home/Library tab, not Control), which used to trigger a
       // spurious rebuild every ~10s → the connect→reconnect loop. Genuinely dead
       // links are caught by the data-channel heartbeat and ICE-"failed" instead.
+      // Everything below adapts / self-heals the RTC video track. On DIRECT that
+      // track is idle, so skip the getStats() sweep entirely (the HUD polls its own
+      // RTT/path at a relaxed cadence).
+      if (this.wcActive) return;
       const st = await this.videoStats().catch(() => null);
       if (!st) return;
       if (st.framesDecoded > this.lastDecoded) this.lastDecoded = st.framesDecoded;
@@ -3060,8 +3099,9 @@ export class CloudConn {
       return;
     }
     if (typeof msg.pong === "number") {
-      const now = Date.now();
-      this.lastPong = now;
+      this.lastPong = Date.now();
+      // Same monotonic clock the ping was stamped with (see monoNow).
+      const now = monoNow();
       // A pong may have been queued on the previous candidate pair. It proves
       // the data channel was recently alive, but must not cancel protection for
       // a replacement route that is still in ICE checking.
@@ -3227,9 +3267,6 @@ export class CloudConn {
     });
   }
 
-  onFrame(cb: (b64: string) => void) {
-    this.frameCb = cb;
-  }
   private emitStream() {
     if (!this.stream) return;
     for (const cb of this.streamCbs) {
@@ -3325,14 +3362,25 @@ export class CloudConn {
     }
     let inbound: any = null;
     let rtt = 0;
+    let selectedPairId = "";
+    let nominatedPair: any = null;
+    const byId = new Map<string, any>();
     report.forEach((s: any) => {
+      byId.set(s.id, s);
       if (s.type === "inbound-rtp" && s.kind === "video") inbound = s;
+      if (s.type === "transport" && s.selectedCandidatePairId) selectedPairId = s.selectedCandidatePairId;
       // RTT of the nominated (active) candidate pair — the network leg of latency.
       if (s.type === "candidate-pair" && s.nominated && typeof s.currentRoundTripTime === "number") {
         rtt = s.currentRoundTripTime;
+        if (!nominatedPair || s.state === "succeeded") nominatedPair = s;
       }
     });
-    if (!inbound) return null;
+    const pair = (selectedPairId && byId.get(selectedPairId)) || nominatedPair;
+    if (pair && typeof pair.currentRoundTripTime === "number") rtt = pair.currentRoundTripTime;
+    const path = pair ? describeIcePath(byId.get(pair.localCandidateId), byId.get(pair.remoteCandidateId)) : "";
+    // DIRECT: the RTC video track may carry no RTP at all. Still report RTT + path
+    // (the HUD's input-latency and path cells need them) with zeroed video counters.
+    inbound ??= {};
     return {
       framesPerSecond: inbound.framesPerSecond ?? 0,
       framesDecoded: inbound.framesDecoded ?? 0,
@@ -3358,6 +3406,7 @@ export class CloudConn {
       firCount: inbound.firCount ?? 0,
       keyFramesDecoded: inbound.keyFramesDecoded ?? 0,
       framesRendered: inbound.framesRendered ?? 0,
+      path,
       at: Date.now(),
     };
   }

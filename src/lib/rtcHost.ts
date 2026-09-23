@@ -3,8 +3,9 @@
  * alive even when minimized to tray). When cloud mode is on it waits in a signaling
  * room for the phone (guest) to join, establishes a peer connection, and then serves
  * three data channels directly over the P2P link:
- *   - "screen"  : pushes base64 JPEG frames (from the `remote_grab_frame` command)
- *   - "control" : receives input events → `remote_inject`
+ *   - "control" / "move" : receive input events → the injector (loopback media
+ *     pipe when available, else `remote_inject`)
+ *   - "video" / "audio" / "audio2" : DIRECT H.264 + Opus (see below)
  *   - "data"    : answers stats requests (id-correlated JSON)
  *
  * The screen/input pixels come from Rust; the WebRTC transport is entirely browser
@@ -19,6 +20,7 @@ import { AUDIO_HDR_BYTES, StreamingAudioResampler, audioPacket, audioRedPacket }
 // Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
 import audioFeederWorkletUrl from "./audioFeeder.worklet.js?url";
 import { parseNativeFrame, videoFragmentSize } from "./nativeDelivery";
+import { MediaPipe, type PipeEndpoint } from "./mediaPipe";
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
 export interface HostLiveStats {
@@ -570,6 +572,11 @@ export function startHost(opts: HostOptions): () => void {
     // the long-standing JPEG→canvas→WebCodecs path.
     hostNvenc: true,
     nvencFast: false,
+    // NVENC preset (1..4 = P1..P4) and rate-control passes (0 single, 1 two-pass
+    // quarter-res, 2 two-pass full-res). P2 is the measured sweet spot: same ~1.2ms
+    // 1080p encode as P1, +2.7dB at the same bitrate (see nvenc::DEFAULT_PRESET).
+    encPreset: 2,
+    encMultipass: 0,
     // Drive the DIRECT bitrate from the guest's own link reports (see ABR v2
     // below) instead of from our send-queue depth alone.
     abrV2: true,
@@ -694,6 +701,8 @@ export function startHost(opts: HostOptions): () => void {
         jpegForRtc(quality.jpeg, quality.jpegCap),
         CONTENT_NUM[quality.mode] ?? 0,
         kbps,
+        quality.encPreset,
+        quality.encMultipass,
       );
     } catch {
       /* not on desktop */
@@ -1151,36 +1160,84 @@ export function startHost(opts: HostOptions): () => void {
     }
   };
 
+  // ---- loopback media pipe (see mediaPipe.ts / src-tauri/src/remote/pipe.rs) ----
+  // Frames, audio and input ride a 127.0.0.1 WebSocket instead of Tauri's
+  // UI-thread IPC. Strictly an optimisation: any failure keeps the Channel/invoke
+  // paths, and a pipe that dies mid-stream latches `pipeBroken` so this host
+  // stays on the Channel instead of flapping between transports.
+  let pipeEndpoint: PipeEndpoint | null | undefined; // undefined = not asked yet
+  let pipeBroken = false;
+  let videoPipe: MediaPipe | null = null;
+  let audioPipe: MediaPipe | null = null;
+  const pipeEndpointOnce = async (): Promise<PipeEndpoint | null> => {
+    if (pipeBroken) return null;
+    if (pipeEndpoint === undefined) {
+      try {
+        pipeEndpoint = await api.remotePipeInfo();
+      } catch {
+        pipeEndpoint = null; // not on desktop / older backend
+      }
+    }
+    return pipeBroken ? null : pipeEndpoint ?? null;
+  };
+  const closePipes = () => {
+    videoPipe?.close();
+    videoPipe = null;
+    audioPipe?.close();
+    audioPipe = null;
+  };
+  /** Forward one authorized guest input message (raw JSON text) to the injector. */
+  const injectInput = (raw: string, msg: Record<string, unknown>) => {
+    const p = videoPipe;
+    const sent =
+      !!p &&
+      (opts.fixedMonitor != null ? p.injectOnRaw(opts.fixedMonitor, raw) : p.injectRaw(raw));
+    if (sent) return;
+    if (opts.fixedMonitor != null) api.remoteInjectOn(opts.fixedMonitor, msg);
+    else api.remoteInject(msg);
+  };
+
+  /** Push focus + cursor changes to the guest (one backend call per poll). */
+  const pollFocusAndCursor = async (reassertFocus: boolean) => {
+    if (!dataCh || dataCh.readyState !== "open") return;
+    const st = await api.remotePollState();
+    if (!dataCh || dataCh.readyState !== "open") return;
+    if (st.textField !== lastTextField) {
+      lastTextField = st.textField;
+      dataCh.send(JSON.stringify({ event: "focus", textField: st.textField }));
+    } else if (reassertFocus && st.textField) {
+      // Re-assert true so a guest that missed the edge still locks on.
+      dataCh.send(JSON.stringify({ event: "focus", textField: true }));
+    }
+    const kind = st.cursorKind;
+    const pos = st.cursorPos;
+    if (kind !== lastCursorKind || (pos && (!lastCursorPos || Math.abs(pos[0] - lastCursorPos[0]) > 0.0005 || Math.abs(pos[1] - lastCursorPos[1]) > 0.0005))) {
+      lastCursorKind = kind;
+      lastCursorPos = pos;
+      const source = Date.now() - lastRemotePointerAt < 700 ? "remote" : "desktop";
+      dataCh.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1], source }));
+    }
+  };
+
   // Rapid focus re-checks right after a click, so the guest can latch its
   // Surface Keyboard / IME during the same user-gesture window. Quest caret
-  // detection can lag, so we probe longer/faster than a single poll.
+  // detection can lag, so we probe longer/faster than a single poll. Coalesced:
+  // a burst of clicks restarts one probe instead of stacking one per click.
+  let pokeTimer: number | null = null;
+  let pokeLeft = 0;
   const pokeFocus = () => {
-    let n = 0;
+    pokeLeft = 10;
+    if (pokeTimer !== null) return;
     const tick = async () => {
-      if (!dataCh || dataCh.readyState !== "open") return;
+      pokeTimer = null;
       try {
-        const active = await api.remoteTextfieldActive();
-        if (active !== lastTextField) {
-          lastTextField = active;
-          dataCh.send(JSON.stringify({ event: "focus", textField: active }));
-        } else if (active) {
-          // Re-assert true so a guest that missed the edge still locks on.
-          dataCh.send(JSON.stringify({ event: "focus", textField: true }));
-        }
-        const kind = await api.remoteCursorKind();
-        const pos = await api.remoteCursorPosition();
-        if (kind !== lastCursorKind || (pos && (!lastCursorPos || Math.abs(pos[0] - lastCursorPos[0]) > 0.0005 || Math.abs(pos[1] - lastCursorPos[1]) > 0.0005))) {
-          lastCursorKind = kind;
-          lastCursorPos = pos;
-          const source = Date.now() - lastRemotePointerAt < 700 ? "remote" : "desktop";
-          dataCh.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1], source }));
-        }
+        await pollFocusAndCursor(true);
       } catch {
         /* ignore */
       }
-      if (++n < 10) window.setTimeout(tick, 80);
+      if (--pokeLeft > 0) pokeTimer = window.setTimeout(tick, 80);
     };
-    window.setTimeout(tick, 16);
+    pokeTimer = window.setTimeout(tick, 16);
   };
 
   const stopAudio = () => {
@@ -1215,6 +1272,11 @@ export function startHost(opts: HostOptions): () => void {
     runSessionCleanups();
     stopCapture();
     stopAudio();
+    closePipes();
+    if (pokeTimer !== null) {
+      window.clearTimeout(pokeTimer);
+      pokeTimer = null;
+    }
     videoWriter?.close().catch(() => {});
     videoWriter = null;
     videoTrack?.stop();
@@ -1378,9 +1440,8 @@ export function startHost(opts: HostOptions): () => void {
     };
 
     const ch = new Channel<ArrayBuffer>();
-    ch.onmessage = (buf) => {
+    const onFrameBytes = (bytes: ArrayBuffer) => {
       if (feedEpoch !== captureEpoch) return;
-      const bytes = buf as unknown as ArrayBuffer;
       // Native container ('G' 'N' | flags | rsv | w u16 | h u16 | Annex-B): Rust
       // encoded this with NVENC, so there is nothing to do but forward it. This is
       // the whole point of the native path — no JPEG decode, no canvas, no
@@ -1402,7 +1463,9 @@ export function startHost(opts: HostOptions): () => void {
           // Credit is returned only AFTER the frame reached the send/gate logic.
           // Never wait for ACK on the main thread. Stale generations are ignored
           // by Rust; a missing ACK automatically falls back to classic delivery.
-          if (frame.fast) void api.remoteAckNativeFrame(frame.generation, frame.sequence).catch(() => {});
+          if (frame.fast && !videoPipe?.ack(frame.generation, frame.sequence)) {
+            void api.remoteAckNativeFrame(frame.generation, frame.sequence).catch(() => {});
+          }
         }
         return;
       }
@@ -1413,6 +1476,7 @@ export function startHost(opts: HostOptions): () => void {
       }
       pump(bytes);
     };
+    ch.onmessage = (buf) => onFrameBytes(buf as unknown as ArrayBuffer);
     // Generator path: frames are pushed explicitly, so delivery tracks the Rust
     // capture thread exactly. Fallback captureStream() with no fps arg does the
     // same via draw-sampling (encoder fps ceiling is set via setParameters).
@@ -1437,13 +1501,39 @@ export function startHost(opts: HostOptions): () => void {
     // source, so the OS "Choose what to share" picker popped up on the host every
     // connection. The Rust DXGI pipeline (persistent duplication + GPU downscale +
     // parallel encode) needs no picker and is already heavily optimized.
-    const start = async () => {
+    const start = async (): Promise<void> => {
       const startedEpoch = ++captureEpoch;
       feedEpoch = startedEpoch;
+      // Reuse a live pipe across capture restarts; open one if we have none.
+      if (videoPipe && !videoPipe.open) videoPipe = null;
+      if (!videoPipe) {
+        const ep = await pipeEndpointOnce();
+        if (ep) {
+          const pipe = await MediaPipe.open(ep, (buf) => {
+            if (videoPipe === pipe) onFrameBytes(buf);
+          });
+          if (startedEpoch !== captureEpoch) {
+            pipe?.close();
+            return;
+          }
+          if (pipe) {
+            videoPipe = pipe;
+            pipe.onClose(() => {
+              if (videoPipe !== pipe) return;
+              videoPipe = null;
+              pipeBroken = true;
+              slog("pipe", "media pipe closed mid-stream — restarting capture on the Tauri channel");
+              // Only if this capture is still the live one (not torn down/replaced).
+              if (!stopped && feedEpoch === captureEpoch) void start().catch(() => {});
+            });
+          }
+        }
+      }
+      const pipeId = videoPipe?.id;
       if (opts.fixedMonitor != null) {
-        await api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap));
+        await api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap), pipeId);
       } else {
-        const generation = await api.remoteStartCapture(ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap));
+        const generation = await api.remoteStartCapture(ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap), pipeId);
         if (startedEpoch !== captureEpoch) return;
         feedGeneration = generation;
         // Restart resets Rust to JPEG. Restore the negotiated DIRECT/fast mode
@@ -1893,8 +1983,7 @@ export function startHost(opts: HostOptions): () => void {
 
     // DIRECT → data channel (Opus, or a raw copy); RTC → worklet (transfer).
     const ch = new Channel<ArrayBuffer>();
-    ch.onmessage = (buf) => {
-      const ab = buf as unknown as ArrayBuffer;
+    const onPcm = (ab: ArrayBuffer) => {
       if (directSink && directSink.readyState === "open") {
         if (audioCodec === "opus") {
           // sendOpusChunk() ships the packets from the encoder's output callback.
@@ -1910,6 +1999,9 @@ export function startHost(opts: HostOptions): () => void {
         /* node torn down */
       }
     };
+    ch.onmessage = (buf) => onPcm(buf as unknown as ArrayBuffer);
+    /** Bumped per start(); a stale pipe-close restart checks it. */
+    let audioStartSeq = 0;
 
     const track = dest.stream.getAudioTracks()[0] ?? null;
     if (!track) return null;
@@ -1917,8 +2009,32 @@ export function startHost(opts: HostOptions): () => void {
     // graph is built eagerly at 48k stereo for the offer; once capture starts we
     // tell the worklet the REAL mix format (WASAPI loopback runs at the render
     // endpoint's rate — often 44.1k or 96/192k) and it re-primes if it differs.
-    const start = async () => {
-      const fmt = await api.remoteStartAudio(ch);
+    const start = async (): Promise<void> => {
+      const mySeq = ++audioStartSeq;
+      if (audioPipe && !audioPipe.open) audioPipe = null;
+      if (!audioPipe) {
+        const ep = await pipeEndpointOnce();
+        if (ep) {
+          const pipe = await MediaPipe.open(ep, (buf) => {
+            if (audioPipe === pipe) onPcm(buf);
+          });
+          if (mySeq !== audioStartSeq || audioNode !== node) {
+            pipe?.close();
+            return;
+          }
+          if (pipe) {
+            audioPipe = pipe;
+            pipe.onClose(() => {
+              if (audioPipe !== pipe) return;
+              audioPipe = null;
+              pipeBroken = true;
+              slog("pipe", "audio pipe closed — restarting desktop audio on the Tauri channel");
+              if (!stopped && audioNode === node && mySeq === audioStartSeq) void start().catch(() => {});
+            });
+          }
+        }
+      }
+      const fmt = await api.remoteStartAudio(ch, audioPipe?.id);
       const channels = fmt ? Math.max(1, Math.min(2, fmt.channels)) : 2;
       const captureRate =
         fmt && fmt.sampleRate > 8000 && fmt.sampleRate <= 384000 ? fmt.sampleRate : ctx.sampleRate;
@@ -2119,7 +2235,9 @@ export function startHost(opts: HostOptions): () => void {
 
     // Pre-gather a small candidate pool so a reconnect/ICE-restart has paths ready
     // to try immediately instead of waiting on a fresh gathering round.
-    pc = new RTCPeerConnection({ iceServers: defaultIceServers(opts.iceServers), iceCandidatePoolSize: 4 });
+    // One pre-gathered pool is enough for a fast ICE restart; four pools meant up to
+    // four sets of TURN allocations on a public relay for every session.
+    pc = new RTCPeerConnection({ iceServers: defaultIceServers(opts.iceServers), iceCandidatePoolSize: 1 });
     // Capture this session's connection so async handlers (auth/approval) can tell
     // whether they're still the live session after an await. A superseded session's
     // late-resolving approval must NOT send its verdict over the *current* session's
@@ -2920,17 +3038,13 @@ export function startHost(opts: HostOptions): () => void {
       }
       wcCodec = picked;
       wcHw = pickedHw;
-      // Tell the guest the codec NOW. On the NVENC path the canvas never paints, so
-      // wcEncodeFrame's configure-time announce never runs — without this the phone
-      // drops every frame and shows "Waking your screen…" until the opt-in timeout.
-      if (nativeOk) {
-        try {
-          videoCh.send(JSON.stringify({ codec: picked }));
-          nativeAnnounced = true;
-        } catch {
-          /* nativeSink's first-frame announce is the backup */
-        }
-      }
+      // NVENC live: do NOT announce `picked` here. `picked` is the WEBVIEW encoder's
+      // codec (often High/Main when it rejects Baseline at the 4K probe), while the
+      // stream on the wire is NVENC's Constrained Baseline. nativeSink announces that
+      // codec *with the picture size* on the first native frame; a second, different
+      // announce made the guest tear down and rebuild its decoder (MediaCodec
+      // teardown + init + a fresh IDR wait) right at session start. The canvas
+      // encoder announces its own codec at configure time if it ever takes over.
       wcEncoder = new VideoEncoder({
         output: (chunk) => {
           const ms = performance.now() - chunk.timestamp / 1000;
@@ -3240,6 +3354,8 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.wcKeyMs === "number") quality.wcKeyMs = clamp(msg.wcKeyMs, 1000, 30000);
           if (typeof msg.wcBufKB === "number") quality.wcBufKB = clamp(msg.wcBufKB, 64, 1024);
           if (typeof msg.wcQueueMax === "number") quality.wcQueueMax = clamp(msg.wcQueueMax, 1, 6);
+          if (typeof msg.encPreset === "number") quality.encPreset = clamp(Math.round(msg.encPreset), 1, 4);
+          if (typeof msg.encMultipass === "number") quality.encMultipass = clamp(Math.round(msg.encMultipass), 0, 2);
           if (typeof msg.abrV2 === "boolean" && msg.abrV2 !== quality.abrV2) {
             quality.abrV2 = msg.abrV2;
             // Switching controllers mid-stream must not inherit the other one's
@@ -3318,6 +3434,8 @@ export function startHost(opts: HostOptions): () => void {
               // the adaptive value (phone-network shed) when it's running; else the
               // Tune target / auto curve.
               adaptKbps > 0 ? adaptKbps : quality.bitrate,
+              quality.encPreset,
+              quality.encMultipass,
             );
           } catch {
             /* ignore */
@@ -3357,8 +3475,7 @@ export function startHost(opts: HostOptions): () => void {
             (Number.isFinite(msg.x) || Number.isFinite(msg.y))))) {
           lastRemotePointerAt = Date.now();
         }
-        if (opts.fixedMonitor != null) api.remoteInjectOn(opts.fixedMonitor, msg);
-        else api.remoteInject(msg);
+        injectInput(e.data as string, msg);
         // A click can move focus into (or out of) a PC text field. Poll focus a few
         // times right after so the phone learns to pop its keyboard with minimal
         // lag — while the tap's user-activation is still fresh on the phone.
@@ -3501,28 +3618,15 @@ export function startHost(opts: HostOptions): () => void {
       // start that lost a race would sit there re-setting the live session's
       // bitrate every 500ms. `focusTimer` is a single slot, so it cannot reach
       // an orphan — the cleanup registry can.
+      // Last outbound RTP read; reused on the ticks DIRECT skips (see below).
+      let lastLink: Awaited<ReturnType<typeof readSendStats>> | null = null;
       const myFocusTimer = window.setInterval(async () => {
         if (!sessionAlive) return;
+        // Focus (auto-keyboard) + the live desktop cursor shape/position, so the
+        // phone's cursor follows the PC (hand over links, I-beam over text…).
+        // One backend call per tick — this used to be three sequential invokes.
         try {
-          const active = await api.remoteTextfieldActive();
-          if (active !== lastTextField) {
-            lastTextField = active;
-            if (data.readyState === "open") data.send(JSON.stringify({ event: "focus", textField: active }));
-          }
-        } catch {
-          /* ignore */
-        }
-        // Mirror the live desktop cursor shape so the phone's on-screen cursor
-        // follows the PC (hand over links, I-beam over text, resize arrows…).
-        try {
-          const kind = await api.remoteCursorKind();
-          const pos = await api.remoteCursorPosition();
-          if (kind !== lastCursorKind || (pos && (!lastCursorPos || Math.abs(pos[0] - lastCursorPos[0]) > 0.0005 || Math.abs(pos[1] - lastCursorPos[1]) > 0.0005))) {
-            lastCursorKind = kind;
-            lastCursorPos = pos;
-            const source = Date.now() - lastRemotePointerAt < 700 ? "remote" : "desktop";
-            if (data.readyState === "open") data.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1], source }));
-          }
+          await pollFocusAndCursor(false);
         } catch {
           /* ignore */
         }
@@ -3541,13 +3645,20 @@ export function startHost(opts: HostOptions): () => void {
               /* ignore */
             }
           }
-          // Primary hosts always read the outbound link stats — the encoder-stall
+          // Primary hosts read the outbound link stats — the encoder-stall
           // watchdog needs them even when no desktop UI is subscribed. One read
           // feeds the phone HUD, the stall watchdog, and the desktop panel.
+          // On DIRECT the RTC video track is idle (frames ride the data channel)
+          // and the stall watchdog is off, so a full getStats() sweep every 500ms
+          // bought nothing: refresh it every ~2s there and reuse the last read.
+          const directLive = !!(wcSink || nativeActive);
+          const wantLink = opts.fixedMonitor == null || !!opts.onStats;
           const link =
-            opts.fixedMonitor == null || opts.onStats
-              ? await readSendStats()
-              : {
+            wantLink && (!directLive || !lastLink || statsTick % 8 === 0)
+              ? (lastLink = await readSendStats())
+              : wantLink && lastLink
+                ? lastLink
+                : {
                   kbps: 0,
                   fps: 0,
                   rtt: 0,

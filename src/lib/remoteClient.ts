@@ -109,8 +109,3 @@ export function remoteMediaUrl(absPath: string | null | undefined): string | nul
   return `${base}/media?path=${encodeURIComponent(absPath)}`;
 }
 
-/** ws:// URL for a channel (live | screen | control), token in the query. */
-export function remoteWsUrl(path: "/ws" | "/screen" | "/control"): string {
-  const wsBase = base.replace(/^http/i, "ws");
-  return `${wsBase}${path}?token=${encodeURIComponent(token)}`;
-}

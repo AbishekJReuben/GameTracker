@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazyRoute, preloadWhenIdle } from "@/lib/lazyRoute";
 import { invoke } from "@tauri-apps/api/core";
 import { motion } from "motion/react";
 import {
@@ -30,17 +31,36 @@ import { CloudConn, type ConnectSnapshot } from "./cloud";
 import { deviceId, deviceName } from "./device";
 import { getCompanionRuntime } from "./runtime";
 import { ConnectionProgress } from "./ConnectionProgress";
-import { DashboardScreen } from "./screens/Dashboard";
-import { LibraryScreen } from "./screens/Library";
-import { TimelineScreen } from "./screens/Timeline";
-import { CollectionsScreen } from "./screens/Collections";
-import { MusicScreen } from "./screens/MusicView";
+// Control (the screen a remote session lives on) stays eager; the stats screens
+// are separate chunks warmed in the background after startup (see lazyRoute.ts).
+// On a low-end phone that is several hundred KB less JS to parse before the
+// pairing screen or the stream can show anything.
 import { ControlScreen } from "./screens/Control";
-import { SystemScreen } from "./screens/System";
-import { SettingsScreen } from "./screens/Settings";
-import ClipboardScreen from "./screens/Clipboard";
+const DashboardScreen = lazyRoute(() => import("./screens/Dashboard").then((m) => ({ default: m.DashboardScreen })));
+const LibraryScreen = lazyRoute(() => import("./screens/Library").then((m) => ({ default: m.LibraryScreen })));
+const TimelineScreen = lazyRoute(() => import("./screens/Timeline").then((m) => ({ default: m.TimelineScreen })));
+const CollectionsScreen = lazyRoute(() =>
+  import("./screens/Collections").then((m) => ({ default: m.CollectionsScreen })),
+);
+const MusicScreen = lazyRoute(() => import("./screens/MusicView").then((m) => ({ default: m.MusicScreen })));
+const SystemScreen = lazyRoute(() => import("./screens/System").then((m) => ({ default: m.SystemScreen })));
+const SettingsScreen = lazyRoute(() => import("./screens/Settings").then((m) => ({ default: m.SettingsScreen })));
+const ClipboardScreen = lazyRoute(() => import("./screens/Clipboard"));
+const GameDetailScreen = lazyRoute(() =>
+  import("./screens/GameDetail").then((m) => ({ default: m.GameDetailScreen })),
+);
+const SCREEN_CHUNKS = [
+  DashboardScreen,
+  SettingsScreen,
+  ClipboardScreen,
+  LibraryScreen,
+  GameDetailScreen,
+  SystemScreen,
+  TimelineScreen,
+  CollectionsScreen,
+  MusicScreen,
+];
 import { useCompanionClip } from "./clipboardCompanion";
-import { GameDetailScreen } from "./screens/GameDetail";
 import { useOpenGame, closeGame } from "./ui";
 import { ScreenErrorBoundary } from "./ErrorBoundary";
 import { PageTransitionFX } from "./PageTransitionFX";
@@ -81,6 +101,8 @@ const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
 ];
 
 export function CompanionApp() {
+  // Warm the lazily-split screens once startup has settled.
+  useEffect(() => preloadWhenIdle(SCREEN_CHUNKS), []);
   useEffect(() => {
     void useCompanionClip.getState().initializeBackground();
   }, []);
@@ -294,7 +316,9 @@ export function CompanionApp() {
     <PageTransitionFX triggerKey={tab} />
     {detailId && (
       <ScreenErrorBoundary key={detailId} label="game-detail">
-        <GameDetailScreen id={detailId} onClose={closeGame} />
+        <Suspense fallback={null}>
+          <GameDetailScreen id={detailId} onClose={closeGame} />
+        </Suspense>
       </ScreenErrorBoundary>
     )}
     <div className={`flex h-[100dvh] flex-col text-ink ${isControlTab ? "bg-black" : "bg-bg-base"}`}>
@@ -320,6 +344,7 @@ export function CompanionApp() {
         {/* Keyed by tab so a crash in one screen is isolated and cleared when you
             switch tabs — a screen error shows a retry card instead of a blank app. */}
         <ScreenErrorBoundary key={tab} label={tab}>
+          <Suspense fallback={null}>
           {tab === "stats" && <DashboardScreen />}
           {tab === "library" && <LibraryScreen />}
           {tab === "timeline" && <TimelineScreen />}
@@ -339,6 +364,7 @@ export function CompanionApp() {
               remoteOnly={remoteOnly}
             />
           )}
+          </Suspense>
         </ScreenErrorBoundary>
       </main>
 

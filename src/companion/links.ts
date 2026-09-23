@@ -4,7 +4,6 @@
  * WebRTC data channel.
  */
 
-import { remoteWsUrl } from "@/lib/remoteClient";
 import type { CloudConn, ConnectSnapshot, RtcInboundVideoStats, WcStats } from "./cloud";
 
 export type ControlMsg =
@@ -85,11 +84,13 @@ export type QualitySettings = {
    *  encoder. Prime/max are derived from it. No effect on DIRECT audio, which
    *  bypasses the host worklet entirely. */
   audioHostMs?: number;
+  /** Host/NVENC: encoder preset 1..4 (P1..P4). A change rebuilds the session. */
+  encPreset?: number;
+  /** Host/NVENC: 0 single pass, 1 two-pass quarter-res, 2 two-pass full-res. */
+  encMultipass?: number;
 };
 
 export interface RemoteLink {
-  /** Deliver a raw tile wire-frame (LAN fallback; see capture.rs `TileEncoder`). */
-  onFrame(cb: (frame: Uint8Array) => void): void;
   /** Deliver the inbound screen as a WebRTC media stream (cloud video-track path). */
   onStream(cb: (stream: MediaStream) => void): void | (() => void);
   /** Desktop audio only — never merged into the video stream (A/V sync lag). */
@@ -138,105 +139,8 @@ export interface RemoteLink {
   close(): void;
 }
 
-/** LAN transport: /screen (JPEG frames) + /control WebSockets, with auto-reconnect. */
-export function makeWsLink(): RemoteLink {
-  let screenWs: WebSocket | null = null;
-  let controlWs: WebSocket | null = null;
-  let frameCb: ((b: Uint8Array) => void) | null = null;
-  let statusCb: ((c: boolean) => void) | null = null;
-  let alive = true;
-  let connected = false;
-  let quality: QualitySettings | null = null;
-  let retry: number | undefined;
-
-  const setConnected = (c: boolean) => {
-    connected = c;
-    statusCb?.(c);
-  };
-
-  const connectScreen = () => {
-    if (!alive) return;
-    const ws = new WebSocket(remoteWsUrl("/screen"));
-    ws.binaryType = "arraybuffer";
-    screenWs = ws;
-    ws.onopen = () => {
-      setConnected(true);
-      // Re-apply the chosen quality on every (re)connect.
-      if (quality) ws.send(JSON.stringify({ type: "quality", ...quality }));
-    };
-    ws.onmessage = (ev) => {
-      if (ev.data instanceof ArrayBuffer) frameCb?.(new Uint8Array(ev.data));
-    };
-    ws.onclose = () => {
-      setConnected(false);
-      if (alive) retry = window.setTimeout(connectScreen, 1500);
-    };
-    ws.onerror = () => ws.close();
-  };
-  const connectControl = () => {
-    if (!alive) return;
-    const ws = new WebSocket(remoteWsUrl("/control"));
-    controlWs = ws;
-    ws.onclose = () => {
-      if (alive) window.setTimeout(connectControl, 1500);
-    };
-    ws.onerror = () => ws.close();
-  };
-
-  connectScreen();
-  connectControl();
-
-  return {
-    onFrame(cb) {
-      frameCb = cb;
-    },
-    onStream() {
-      /* LAN uses JPEG frames over onFrame, not a media stream. */
-    },
-    onEvent() {
-      /* LAN has no focus events. */
-    },
-    onStatus(cb) {
-      statusCb = cb;
-      cb(connected); // Report current state immediately (socket may already be open).
-    },
-    send(msg) {
-      if (controlWs?.readyState === WebSocket.OPEN) {
-        controlWs.send(JSON.stringify(msg));
-        return true;
-      }
-      return false;
-    },
-    setQuality(q) {
-      quality = q;
-      if (screenWs?.readyState === WebSocket.OPEN) screenWs.send(JSON.stringify({ type: "quality", ...q }));
-    },
-    async netStats() {
-      return null; // LAN path has no WebRTC media stats.
-    },
-    close() {
-      alive = false;
-      if (retry) window.clearTimeout(retry);
-      screenWs?.close();
-      controlWs?.close();
-    },
-  };
-}
-
-function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
-  const bin = atob(b64);
-  const buf = new ArrayBuffer(bin.length);
-  const arr = new Uint8Array(buf);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-}
-
 /** Cloud transport: video stream + control over an established WebRTC connection. */
 export function makeRtcLink(conn: CloudConn): RemoteLink {
-  let frameCb: ((b: Uint8Array) => void) | null = null;
-  conn.onFrame((b64) => {
-    if (frameCb) frameCb(base64ToBytes(b64));
-  });
   // Last absolute move sent via the LOSSY channel and not yet re-anchored. Button
   // events are position-dependent, so before any click/down/up we re-send that
   // move on the RELIABLE control channel — same-stream ordering then guarantees
@@ -244,9 +148,6 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
   // even if every lossy packet in between was dropped.
   let unanchoredMove: ControlMsg | null = null;
   return {
-    onFrame(cb) {
-      frameCb = cb;
-    },
     onStream(cb) {
       return conn.onStream(cb);
     },

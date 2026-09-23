@@ -115,6 +115,20 @@ export type StreamTune = {
    * wire. No effect while PC sound is on the RTC track.
    */
   audioStudio: boolean;
+  /**
+   * Host/NVENC: encoder preset 1..4 (P1..P4). Measured on an RTX 4070 Ti at 1080p:
+   * P2 encodes as fast as P1 (~1.2ms) with ~+2.7dB PSNR at the same bitrate, so it
+   * is the default; P3/P4 add ~0.6–0.8ms for a further ~0.2dB. A change rebuilds
+   * the encoder session (one fresh keyframe).
+   */
+  encPreset: number;
+  /**
+   * Host/NVENC: rate-control passes. 0 = single pass (default), 1 = two-pass at
+   * quarter resolution, 2 = two-pass at full resolution. Two-pass holds frame sizes
+   * tighter to the budget (steadier wire, fewer bursts) but measured lower PSNR at
+   * equal bitrate on desktop content because it under-spends — opt-in.
+   */
+  encMultipass: number;
 };
 
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
@@ -146,6 +160,8 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   audioHostMs: 90,
   abrV2: true,
   audioStudio: true,
+  encPreset: 2,
+  encMultipass: 0,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -215,6 +231,11 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     // 0 means "auto" (don't touch NetEQ). Finite test — like `pace`.
     audioJbMs: clamp(Number.isFinite(Number(r.audioJbMs)) ? Number(r.audioJbMs) : d.audioJbMs, 0, 400),
     audioHostMs,
+    encPreset: Math.round(clamp(Number(r.encPreset) || d.encPreset, 1, 4)),
+    // 0 is meaningful (single pass) — finite test, like `pace`.
+    encMultipass: Math.round(
+      clamp(Number.isFinite(Number(r.encMultipass)) ? Number(r.encMultipass) : d.encMultipass, 0, 2),
+    ),
   };
 }
 
@@ -307,6 +328,8 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.audioJbMs !== d.audioJbMs ||
     t.audioHostMs !== d.audioHostMs ||
     t.abrV2 !== d.abrV2 ||
-    t.audioStudio !== d.audioStudio
+    t.audioStudio !== d.audioStudio ||
+    t.encPreset !== d.encPreset ||
+    t.encMultipass !== d.encMultipass
   );
 }

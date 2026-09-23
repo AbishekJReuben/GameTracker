@@ -13,7 +13,7 @@
 //! finished ~30 KB Annex-B frame and forwards it to the data channel.
 //!
 //! ## Latency-shaped on purpose
-//! Preset **P1 + ULTRA_LOW_LATENCY**, CBR (avg) with a 1.25× peak and **2-frame VBV**
+//! Preset **P2 + ULTRA_LOW_LATENCY** (P1..P4 selectable; see [`DEFAULT_PRESET`]), CBR (avg) with a 1.25× peak and **2-frame VBV**
 //! (Sunshine-style `nvenc_vbv_increase` — pure single-frame VBV starves webcam/busy
 //! tiles into macroblocks), spatial AQ on, `frameIntervalP = 1` (no B-frames),
 //! `zeroReorderDelay`, no lookahead, infinite GOP with IDRs only on demand, and
@@ -90,7 +90,14 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     // Spatial AQ: spend more bits on complex tiles (webcam, text) and fewer on
     // flat desktop regions. Zero latency cost; big quality win under CBR.
     rc.set_enable_aq(true);
-    rc.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+    // Two-pass (quarter-res first pass) makes each frame's size track the VBV budget
+    // more tightly — fewer oversized frames queueing on the wire and fewer starved
+    // ones. Opt-in from Tune; single pass stays the default.
+    rc.multiPass = match p.multipass {
+        1 => NV_ENC_TWO_PASS_QUARTER_RESOLUTION,
+        2 => NV_ENC_TWO_PASS_FULL_RESOLUTION,
+        _ => NV_ENC_MULTI_PASS_DISABLED,
+    };
     rc.lookaheadDepth = 0;
 
     let h264 = &mut cfg.encodeCodecConfig.h264Config;
@@ -117,7 +124,27 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     h264.h264VUIParameters.bitstreamRestrictionFlag = 1;
     h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
     h264.h264VUIParameters.videoFullRangeFlag = 0;
+    // Say which matrix NVENC actually used. Its ARGB input path converts with
+    // BT.601 limited range (measured by `colour_matrix_probe`: pure red → Y81 U90
+    // V240; BT.709 would be Y63 U102). Without a colour description, Chromium and
+    // Android both assume BT.709 for HD, so greens came out ~15% dark and reds
+    // orange-shifted. Desktop pixels are sRGB, whose primaries are BT.709's.
+    h264.h264VUIParameters.videoFormat = VUI_VIDEO_FORMAT_UNSPECIFIED;
+    h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
+    h264.h264VUIParameters.colourPrimaries = VUI_COLOUR_PRIMARIES_BT709;
+    h264.h264VUIParameters.transferCharacteristics = VUI_TRANSFER_BT709;
+    h264.h264VUIParameters.colourMatrix = VUI_MATRIX_SMPTE170M;
 }
+
+/// H.264 VUI `video_format` = 5 (unspecified).
+const VUI_VIDEO_FORMAT_UNSPECIFIED: u32 = 5;
+/// `colour_primaries` = 1 (BT.709 / sRGB primaries).
+const VUI_COLOUR_PRIMARIES_BT709: u32 = 1;
+/// `transfer_characteristics` = 1 (BT.709). Kept at the value decoders already
+/// assume for unlabelled HD, so tone rendering does not shift — only the matrix fix.
+const VUI_TRANSFER_BT709: u32 = 1;
+/// `matrix_coefficients` = 6 (SMPTE 170M, i.e. BT.601 — what NVENC's CSC applies).
+pub(crate) const VUI_MATRIX_SMPTE170M: u32 = 6;
 
 /// `NvEncodeAPICreateInstance` / `NvEncodeAPIGetMaxSupportedVersion` from the driver DLL.
 struct Api {
@@ -204,13 +231,56 @@ pub struct Frame<'a> {
     pub key: bool,
 }
 
-/// Tuning knobs the phone can change mid-stream without a session rebuild.
+/// Default NVENC preset: **P2**. Measured on an RTX 4070 Ti (`preset_latency_1080p`,
+/// `encoder_tuning_matrix`): P2 encodes a 1080p frame as fast as P1 (~1.2 ms median,
+/// same p95) yet scores +2.7 dB PSNR at the same bitrate on desktop-like content —
+/// roughly a third fewer bits for the same picture. P3/P4 add ~0.6–0.8 ms for a
+/// further ~0.2 dB, so they stay opt-in (Tune → Encoder preset).
+pub const DEFAULT_PRESET: u8 = 2;
+/// Default rate-control pass mode: 0 = single pass, 1 = two-pass at quarter
+/// resolution, 2 = two-pass at full resolution.
+pub const DEFAULT_MULTIPASS: u8 = 0;
+
+/// Encoder shape + rate. Bitrate/fps change in place; size, preset and pass mode
+/// need a fresh session (see `NativeEncoder::accepts`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Params {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub bitrate_bps: u32,
+    /// NVENC preset P1..=P4 (clamped). Higher = better quality per bit, slower encode.
+    pub preset: u8,
+    /// Rate-control passes: 0 single, 1 two-pass quarter-res, 2 two-pass full-res.
+    pub multipass: u8,
+}
+
+impl Params {
+    pub fn new(width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Self {
+        Params {
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            preset: DEFAULT_PRESET,
+            multipass: DEFAULT_MULTIPASS,
+        }
+    }
+
+    pub fn with_tuning(mut self, preset: u8, multipass: u8) -> Self {
+        self.preset = preset.clamp(1, 4);
+        self.multipass = multipass.min(2);
+        self
+    }
+}
+
+fn preset_guid(preset: u8) -> windows::core::GUID {
+    match preset {
+        2 => NV_ENC_PRESET_P2_GUID,
+        3 => NV_ENC_PRESET_P3_GUID,
+        4 => NV_ENC_PRESET_P4_GUID,
+        _ => NV_ENC_PRESET_P1_GUID,
+    }
 }
 
 /// A live NVENC session bound to one D3D11 device.
@@ -281,7 +351,7 @@ impl Encoder {
             .ok_or("no GetEncodePresetConfigEx")?)(
             self.enc,
             NV_ENC_CODEC_H264_GUID,
-            NV_ENC_PRESET_P1_GUID,
+            preset_guid(p.preset),
             NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
             &mut preset,
         );
@@ -297,7 +367,7 @@ impl Encoder {
         let mut init = NV_ENC_INITIALIZE_PARAMS {
             version: NV_ENC_INITIALIZE_PARAMS_VER,
             encodeGUID: NV_ENC_CODEC_H264_GUID,
-            presetGUID: NV_ENC_PRESET_P1_GUID,
+            presetGUID: preset_guid(p.preset),
             encodeWidth: p.width,
             encodeHeight: p.height,
             darWidth: p.width,
@@ -357,6 +427,9 @@ impl Encoder {
         if p.width != self.params.width || p.height != self.params.height {
             return Err("resolution change needs a new session".into());
         }
+        if p.preset != self.params.preset || p.multipass != self.params.multipass {
+            return Err("preset / pass-mode change needs a new session".into());
+        }
         unsafe {
             let mut preset = NV_ENC_PRESET_CONFIG {
                 version: NV_ENC_PRESET_CONFIG_VER,
@@ -366,7 +439,7 @@ impl Encoder {
             let st = (self.funcs.nvEncGetEncodePresetConfigEx.ok_or("no preset")?)(
                 self.enc,
                 NV_ENC_CODEC_H264_GUID,
-                NV_ENC_PRESET_P1_GUID,
+                preset_guid(p.preset),
                 NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 &mut preset,
             );
@@ -385,7 +458,7 @@ impl Encoder {
             re.reInitEncodeParams = NV_ENC_INITIALIZE_PARAMS {
                 version: NV_ENC_INITIALIZE_PARAMS_VER,
                 encodeGUID: NV_ENC_CODEC_H264_GUID,
-                presetGUID: NV_ENC_PRESET_P1_GUID,
+                presetGUID: preset_guid(p.preset),
                 encodeWidth: p.width,
                 encodeHeight: p.height,
                 darWidth: p.width,
@@ -499,12 +572,20 @@ impl Encoder {
             let src = std::slice::from_raw_parts(lock.bitstreamBufferPtr as *const u8, lock.bitstreamSizeInBytes as usize);
             let key = lock.pictureType == NV_ENC_PIC_TYPE_IDR || lock.pictureType == NV_ENC_PIC_TYPE_I;
 
-            self.out.clear();
-            let rewrote = sps::fixup_into(src, &mut self.out);
-            if key && !self.sps_logged {
-                self.sps_logged = true;
-                sps::log_summary(src);
-            }
+            // Only keyframes carry an SPS (repeatSPSPPS + OUTPUT_SPSPPS ride the IDR),
+            // so P-frames skip the NAL scan entirely and are copied through as-is.
+            let rewrote = if key {
+                let r = sps::fixup_into(src, &mut self.out);
+                if !self.sps_logged {
+                    self.sps_logged = true;
+                    sps::log_summary(src);
+                }
+                r
+            } else {
+                self.out.clear();
+                self.out.extend_from_slice(src);
+                false
+            };
 
             if let Some(f) = self.funcs.nvEncUnlockBitstream {
                 let _ = f(self.enc, self.bitstream);
@@ -604,15 +685,7 @@ mod tests {
             device.CreateTexture2D(&desc, None, Some(&mut tex)).expect("texture");
             let tex = tex.expect("texture");
 
-            let mut enc = Encoder::new(
-                &device,
-                Params {
-                    width: w,
-                    height: h,
-                    fps: 60,
-                    bitrate_bps: 12_000_000,
-                },
-            )
+            let mut enc = Encoder::new(&device, Params::new(w, h, 60, 12_000_000))
             .expect("NVENC session — if this fails with an NVIDIA GPU present, suspect the FFI layout");
 
             // First frame is an IDR and carries the SPS/PPS we care about.
@@ -637,6 +710,11 @@ mod tests {
                     assert_eq!(info.max_num_ref_frames, 1, "DPB must be pinned to 1");
                     assert_eq!(info.max_num_reorder_frames, Some(0), "must declare zero reordering");
                     assert_eq!(info.max_dec_frame_buffering, Some(1), "must declare a 1-frame DPB");
+                    assert_eq!(
+                        info.colour,
+                        Some((1, 1, VUI_MATRIX_SMPTE170M)),
+                        "must label the BT.601 matrix NVENC's CSC actually uses"
+                    );
                 } else {
                     times.push(ms);
                 }
@@ -653,6 +731,75 @@ mod tests {
             // The WebCodecs path this replaces measured ~35 ms (27 ms of it fixed
             // overhead). Anything near that means we didn't actually escape it.
             assert!(median < 10.0, "expected single-digit ms encode, got {median:.2}");
+        }
+    }
+
+    /// Writes one short H.264 clip per solid colour so the RGB→YUV matrix NVENC uses
+    /// can be read back with ffmpeg (`-f rawvideo -pix_fmt yuv420p`). Pure-red Y is
+    /// the tell: BT.601 limited = 81, BT.709 limited = 63.
+    ///   `cargo test --lib remote::nvenc::tests::colour_matrix_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs an NVIDIA GPU; writes fixtures under target/perf-validation"]
+    fn colour_matrix_probe() {
+        if !available() {
+            eprintln!("no NVENC on this machine — skipping");
+            return;
+        }
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-validation");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        unsafe {
+            let mut device = None;
+            D3D11CreateDevice(
+                None::<&windows::Win32::Graphics::Dxgi::IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .expect("create d3d11 device");
+            let device = device.expect("device");
+            let (w, h) = (256u32, 256u32);
+            // BGRA byte order (what Desktop Duplication hands the encoder).
+            for (name, bgra) in [
+                ("red", [0u8, 0, 255, 255]),
+                ("green", [0, 255, 0, 255]),
+                ("blue", [255, 0, 0, 255]),
+                ("white", [255, 255, 255, 255]),
+                ("grey", [128, 128, 128, 255]),
+            ] {
+                let px: Vec<u8> = bgra.iter().copied().cycle().take((w * h * 4) as usize).collect();
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                    ..Default::default()
+                };
+                let init = windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA {
+                    pSysMem: px.as_ptr() as *const _,
+                    SysMemPitch: w * 4,
+                    SysMemSlicePitch: 0,
+                };
+                let mut tex = None;
+                device.CreateTexture2D(&desc, Some(&init), Some(&mut tex)).expect("texture");
+                let tex = tex.expect("texture");
+                let mut enc = Encoder::new(&device, Params::new(w, h, 30, 8_000_000)).expect("NVENC session");
+                let mut stream = Vec::new();
+                for i in 0..4 {
+                    let f = enc.encode(&tex, i == 0, i as u64 * 33_333).expect("encode");
+                    stream.extend_from_slice(f.data);
+                }
+                std::fs::write(out_dir.join(format!("colour-{name}.h264")), stream).unwrap();
+            }
+            eprintln!("colour fixtures written to {}", out_dir.display());
         }
     }
 }

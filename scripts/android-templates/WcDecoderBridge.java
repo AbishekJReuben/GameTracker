@@ -719,6 +719,7 @@ public final class WcDecoderBridge {
             ix += webLoc[0] - parentLoc[0];
             iy += webLoc[1] - parentLoc[1];
           }
+          boolean sameDesired = desiredX == ix && desiredY == iy && desiredW == iw && desiredH == ih;
           desiredX = ix;
           desiredY = iy;
           desiredW = iw;
@@ -736,16 +737,31 @@ public final class WcDecoderBridge {
           int vh = Math.max(1, Math.min(ph, iy + ih) - vy);
           FrameLayout.LayoutParams lp =
               (FrameLayout.LayoutParams) sv.getLayoutParams();
-          if (lp == null) {
-            lp = new FrameLayout.LayoutParams(vw, vh);
+          boolean sameLayout =
+              lp != null
+                  && lp.width == vw
+                  && lp.height == vh
+                  && lp.leftMargin == vx
+                  && lp.topMargin == vy
+                  && lp.gravity == (Gravity.TOP | Gravity.START);
+          // setLayoutParams ALWAYS requests a layout pass of the parent (which also
+          // holds the WebView) on the UI thread that composites this TextureView —
+          // never do that for an unchanged rect. Zoom/pan that only moves the
+          // desired rect inside the same clamped view is a pure setTransform.
+          if (!sameLayout) {
+            if (lp == null) {
+              lp = new FrameLayout.LayoutParams(vw, vh);
+            }
+            lp.width = vw;
+            lp.height = vh;
+            lp.leftMargin = vx;
+            lp.topMargin = vy;
+            lp.gravity = Gravity.TOP | Gravity.START;
+            sv.setLayoutParams(lp);
           }
-          lp.width = vw;
-          lp.height = vh;
-          lp.leftMargin = vx;
-          lp.topMargin = vy;
-          lp.gravity = Gravity.TOP | Gravity.START;
-          sv.setLayoutParams(lp);
-          applyContentTransform(sv, vx, vy, vw, vh);
+          if (!sameLayout || !sameDesired) {
+            applyContentTransform(sv, vx, vy, vw, vh);
+          }
           // NOT sv.setVisibility(visible ? ...) — see the javadoc above.
           applyVisibility(sv);
         });
@@ -865,8 +881,55 @@ public final class WcDecoderBridge {
               }
             } catch (Throwable ignored) {
             }
+            applyStreamRefreshRate(act, active);
           });
     }
+  }
+
+  /**
+   * While a stream is on screen, ask for the display's highest refresh rate at the
+   * current resolution (0 = give the choice back to the system when it ends).
+   * The decoded picture reaches the glass through the TextureView, i.e. on the
+   * APP's frame clock: at 60 Hz a finished frame waits up to 16.7 ms (avg ~8) for
+   * the next vsync, at 120 Hz half that. Many phones run apps at 60 Hz unless one
+   * asks. Held only while the stream is visible (see Control.tsx), so background
+   * and idle battery are untouched. Must run on the UI thread.
+   */
+  private static void applyStreamRefreshRate(Activity act, boolean active) {
+    try {
+      android.view.Window w = act.getWindow();
+      android.view.WindowManager.LayoutParams lp = w.getAttributes();
+      int want = active ? bestRefreshModeId(act) : 0;
+      if (lp.preferredDisplayModeId != want) {
+        lp.preferredDisplayModeId = want;
+        w.setAttributes(lp);
+        jlog("display mode preference " + (want == 0 ? "released" : "→ mode " + want));
+      }
+    } catch (Throwable t) {
+      jlog("display mode preference failed: " + t);
+    }
+  }
+
+  /** Highest-refresh mode with the current physical resolution (0 = unknown). */
+  @SuppressWarnings("deprecation")
+  private static int bestRefreshModeId(Activity act) {
+    android.view.Display d;
+    if (Build.VERSION.SDK_INT >= 30) {
+      d = act.getDisplay();
+    } else {
+      d = act.getWindowManager().getDefaultDisplay();
+    }
+    if (d == null) return 0;
+    android.view.Display.Mode cur = d.getMode();
+    android.view.Display.Mode best = cur;
+    for (android.view.Display.Mode m : d.getSupportedModes()) {
+      if (m.getPhysicalWidth() == cur.getPhysicalWidth()
+          && m.getPhysicalHeight() == cur.getPhysicalHeight()
+          && m.getRefreshRate() > best.getRefreshRate() + 0.5f) {
+        best = m;
+      }
+    }
+    return best.getModeId();
   }
 
   public static void teardown() {

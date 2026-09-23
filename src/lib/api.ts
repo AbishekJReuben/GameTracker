@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc, type Channel } from "@tauri-apps/api/core";
-import { mockInvoke } from "./mock";
 import { isTauri } from "./tauri";
 import { isCompanion, remoteMediaUrl } from "./remoteClient";
 
@@ -181,6 +180,10 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   if (isTauri()) {
     return invoke<T>(cmd, args);
   }
+  // Plain-browser dev preview only. Loaded on demand: the mock backend is ~360 KB
+  // of sample data that the desktop app, the APK and the discovery web/Quest
+  // clients never call — it used to be parsed at every startup.
+  const { mockInvoke } = await import("./mock");
   return mockInvoke<T>(cmd, args);
 }
 
@@ -1210,30 +1213,38 @@ export const api = {
   // USB direct-install via adb.
   remoteAdbDevices: () => call<string[]>("remote_adb_devices"),
   remoteAdbInstall: () => call<string>("remote_adb_install"),
-  remoteGrabFrame: (maxW?: number, quality?: number) =>
-    call<string | null>("remote_grab_frame", { maxW, quality }),
-  remoteGrabDelta: (maxW?: number, quality?: number, key?: boolean) =>
-    call<string | null>("remote_grab_delta", { maxW, quality, key }),
   // Streaming capture for the cloud WebRTC video-track path (frames arrive as
   // ArrayBuffer JPEGs over the channel; no per-frame invoke round-trip).
-  remoteStartCapture: (onFrame: Channel<ArrayBuffer>, maxW: number, fps: number, quality: number) =>
-    call<number>("remote_start_capture", { onFrame, maxW, fps, quality }),
+  // `pipeId`: a connected loopback media-pipe socket — every frame of this capture
+  // generation then arrives there instead of on `onFrame` (never a mix).
+  remoteStartCapture: (onFrame: Channel<ArrayBuffer>, maxW: number, fps: number, quality: number, pipeId?: number) =>
+    call<number>("remote_start_capture", { onFrame, maxW, fps, quality, pipeId }),
   remoteStartAuxCapture: (
     monitor: number,
     onFrame: Channel<ArrayBuffer>,
     maxW: number,
     fps: number,
     quality: number,
-  ) => call<void>("remote_start_aux_capture", { monitor, onFrame, maxW, fps, quality }),
+    pipeId?: number,
+  ) => call<void>("remote_start_aux_capture", { monitor, onFrame, maxW, fps, quality, pipeId }),
+  /// Loopback media pipe (127.0.0.1 WebSocket): frames/audio in, input + acks out,
+  /// all off Tauri's UI-thread IPC. Null when it could not start.
+  remotePipeInfo: () => call<RemotePipeInfo | null>("remote_pipe_info"),
+  /// Focus + cursor state in one call (was three invokes per 250ms tick).
+  remotePollState: () => call<RemotePollState>("remote_poll_state"),
   // `bitrateKbps` drives the NATIVE H.264 encoder (0/omitted = derive from
   // resolution × fps × quality). It does nothing on the JPEG fallback.
+  // `preset` 1..4 = NVENC P1..P4, `multipass` 0 single / 1 quarter-res / 2 full-res
+  // two-pass; both omitted = unchanged (a change rebuilds the NVENC session).
   remoteSetCaptureQuality: (
     maxW: number,
     fps: number,
     quality: number,
     content?: number,
     bitrateKbps?: number,
-  ) => call<void>("remote_set_capture_quality", { maxW, fps, quality, content, bitrateKbps }),
+    preset?: number,
+    multipass?: number,
+  ) => call<void>("remote_set_capture_quality", { maxW, fps, quality, content, bitrateKbps, preset, multipass }),
   /// Ask the native encoder for a keyframe (infinite GOP, so a fresh decoder needs one).
   remoteRequestKeyframe: () => call<void>("remote_request_keyframe"),
   /// Reference-safe backpressure: while paused, captures are skipped BEFORE NVENC
@@ -1250,8 +1261,8 @@ export const api = {
   remoteStopAuxCapture: (monitor?: number) => call<void>("remote_stop_aux_capture", { monitor }),
   // Desktop-audio (WASAPI loopback) for the WebRTC audio track. PCM float32 frames
   // arrive as ArrayBuffers; returns the mix format to decode them with.
-  remoteStartAudio: (onPcm: Channel<ArrayBuffer>) =>
-    call<RemoteAudioFormat | null>("remote_start_audio", { onPcm }),
+  remoteStartAudio: (onPcm: Channel<ArrayBuffer>, pipeId?: number) =>
+    call<RemoteAudioFormat | null>("remote_start_audio", { onPcm, pipeId }),
   remoteStopAudio: () => call<void>("remote_stop_audio"),
   remoteTextfieldActive: () => call<boolean>("remote_textfield_active"),
   remoteCursorKind: () => call<string>("remote_cursor_kind"),
@@ -1288,6 +1299,19 @@ export interface RemoteMonitor {
 }
 
 /** Desktop-audio loopback PCM format (see remote_start_audio). */
+/** Loopback media pipe endpoint (Rust `remote::pipe::PipeInfo`). */
+export interface RemotePipeInfo {
+  port: number;
+  token: string;
+}
+
+/** Rust `RemotePollState`: PC focus + cursor, polled by the host page. */
+export interface RemotePollState {
+  textField: boolean;
+  cursorKind: string;
+  cursorPos: [number, number] | null;
+}
+
 export interface RemoteAudioFormat {
   sampleRate: number;
   channels: number;

@@ -7,10 +7,41 @@
 use super::SystemShared;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Sampling interval while something is viewing system stats (desktop System page
+/// or the phone's System screen).
+pub const FAST_INTERVAL_MS: u64 = 2_000;
+/// Sampling interval otherwise. Every sidecar sample polls every sensor chip
+/// (SuperIO over port I/O, SMBus for DIMM temps, SMART for drives) — work worth
+/// avoiding on a machine that is busy gaming or streaming when nobody is looking.
+/// The persisted history keeps its cadence (it reuses the latest reading, whose
+/// freshness window scales with this interval — see `stale_after`).
+pub const SLOW_INTERVAL_MS: u64 = 10_000;
+
+static INTERVAL_MS: AtomicU64 = AtomicU64::new(FAST_INTERVAL_MS);
+static STDIN: parking_lot::Mutex<Option<ChildStdin>> = parking_lot::Mutex::new(None);
+
+/// Change the sidecar's sampling interval live (no-op if unchanged).
+pub fn set_interval(ms: u64) {
+    if INTERVAL_MS.swap(ms, Ordering::Relaxed) == ms {
+        return;
+    }
+    if let Some(stdin) = STDIN.lock().as_mut() {
+        let _ = writeln!(stdin, "interval {ms}").and_then(|_| stdin.flush());
+    }
+}
+
+/// How old a sidecar reading may be and still count as live: 2.5 intervals,
+/// never under 8 s (the long-standing threshold at the 2 s cadence).
+pub fn stale_after() -> Duration {
+    Duration::from_millis((INTERVAL_MS.load(Ordering::Relaxed) * 5 / 2).max(8_000))
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -66,7 +97,8 @@ fn reader_loop(shared: Arc<SystemShared>, explicit: Option<PathBuf>) {
         shared.sensor.lock().sidecar_present = true;
 
         let mut cmd = Command::new(&path);
-        cmd.arg("--interval=2000")
+        cmd.arg(format!("--interval={}", INTERVAL_MS.load(Ordering::Relaxed)))
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         #[cfg(windows)]
@@ -81,6 +113,7 @@ fn reader_loop(shared: Arc<SystemShared>, explicit: Option<PathBuf>) {
                 // it can never outlive the app and lock files during a reinstall.
                 #[cfg(windows)]
                 job::assign(&child);
+                *STDIN.lock() = child.stdin.take();
                 if let Some(out) = child.stdout.take() {
                     let reader = BufReader::new(out);
                     for line in reader.lines().map_while(Result::ok) {
@@ -96,6 +129,7 @@ fn reader_loop(shared: Arc<SystemShared>, explicit: Option<PathBuf>) {
         }
 
         // Sidecar exited — mark readings stale and retry shortly.
+        *STDIN.lock() = None;
         shared.sensor.lock().last_update = None;
         std::thread::sleep(Duration::from_secs(10));
     }
@@ -191,5 +225,24 @@ fn parse_line(shared: &Arc<SystemShared>, line: &str) {
             s.last_update = Some(Instant::now());
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The freshness window scales with the sampling interval (so slow mode keeps
+    /// temperatures in the persisted history) but never drops below 8 s.
+    #[test]
+    fn stale_window_follows_the_interval() {
+        set_interval(FAST_INTERVAL_MS);
+        assert_eq!(stale_after(), Duration::from_secs(8));
+        set_interval(SLOW_INTERVAL_MS);
+        assert_eq!(stale_after(), Duration::from_millis(25_000));
+        // Re-setting the same interval is a no-op (no stdin write, no change).
+        set_interval(SLOW_INTERVAL_MS);
+        assert_eq!(stale_after(), Duration::from_millis(25_000));
+        set_interval(FAST_INTERVAL_MS);
     }
 }

@@ -76,6 +76,13 @@ pub enum Grab {
     Lost,
 }
 
+/// Can a `grab_gpu` reuse the texture it already holds? Only when DXGI says the
+/// desktop image did not change (`LastPresentTime == 0`, i.e. a cursor-only update)
+/// AND level 0 really holds the last presented image.
+fn cursor_only_reuse(has_new_pixels: bool, level0_valid: bool) -> bool {
+    !has_new_pixels && level0_valid
+}
+
 pub struct Duplicator {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -90,6 +97,19 @@ pub struct Duplicator {
     mip_srv: Option<ID3D11ShaderResourceView>,
     mip_w: u32,
     mip_h: u32,
+    /// `mip_tex` level 0 holds the most recently presented desktop image. A
+    /// cursor-only update (DXGI `LastPresentTime == 0`) then needs no copy at all —
+    /// the pixels didn't change, only the composited pointer does.
+    mip_valid: bool,
+    /// The mip chain below level 0 was regenerated from the current level 0.
+    /// Mips are only built when the stream actually downscales; when the output is
+    /// the native size nothing samples them, and a full-chain `GenerateMips` of a
+    /// 4K frame is ~45 MB of GPU memory traffic for nothing.
+    mips_fresh: bool,
+    /// Decoded cursor shape for the GPU compositor, rebuilt only when `ptr_seq`
+    /// changes (the pointer moves far more often than it morphs).
+    cursor_cache: Option<CursorImage>,
+    cursor_cache_seq: u64,
     /// Whether BGRA supports GPU mip auto-generation on this device (checked once).
     /// When false we fall back to a full-resolution readback + CPU downscale.
     gpu_scale: bool,
@@ -182,6 +202,9 @@ impl Duplicator {
             let context = context?;
 
             let dup = output1.DuplicateOutput(&device).ok()?;
+            // This device does the whole per-frame GPU job (copy, composite, NVENC);
+            // let it jump ahead of a GPU-bound game's queue. Best-effort.
+            super::gpusched::raise_device(&device);
 
             // GPU downscale needs the swap-chain format (BGRA8) to support mip
             // auto-generation; if a driver doesn't, we quietly use the full-res path.
@@ -201,6 +224,10 @@ impl Duplicator {
                 mip_srv: None,
                 mip_w: 0,
                 mip_h: 0,
+                mip_valid: false,
+                mips_fresh: false,
+                cursor_cache: None,
+                cursor_cache_seq: u64::MAX,
                 gpu_scale,
                 readback: Vec::new(),
                 origin,
@@ -270,6 +297,9 @@ impl Duplicator {
         self.mip_tex = Some(tex);
         self.mip_w = w;
         self.mip_h = h;
+        // A brand-new texture holds nothing yet.
+        self.mip_valid = false;
+        self.mips_fresh = false;
         Some(())
     }
 
@@ -362,8 +392,11 @@ impl Duplicator {
                         let mip_res: ID3D11Resource = mip.cast().ok()?;
                         // Full frame -> mip 0, then generate the chain on the GPU.
                         self.context.CopySubresourceRegion(&mip_res, 0, 0, 0, 0, &src, 0, None);
+                        self.mip_valid = true;
+                        self.mips_fresh = false;
                         if let Some(srv) = self.mip_srv.clone() {
                             self.context.GenerateMips(&srv);
+                            self.mips_fresh = true;
                         }
                         let (mw, mh) = ((nw >> level).max(1), (nh >> level).max(1));
                         self.ensure_staging(mw, mh)?;
@@ -400,12 +433,19 @@ impl Duplicator {
     ///
     /// Same acquisition and cursor bookkeeping as [`Duplicator::grab`], but instead of
     /// staging + `Map`ping the pixels back to system RAM it copies the frame into the
-    /// mip texture and generates the chain, so a downscaling sampler gets a properly
-    /// filtered read. Use [`Duplicator::frame_srv`] to sample the result.
+    /// mip texture (and, only when `want_mips`, generates the chain so a downscaling
+    /// sampler gets a properly filtered read). Use [`Duplicator::frame_srv`] to sample
+    /// the result and [`Duplicator::mips_current`] to know whether levels > 0 are valid.
+    ///
+    /// Work skipped on purpose (the frame is still returned, because the composited
+    /// cursor still has to move):
+    /// * cursor-only updates (`LastPresentTime == 0`) reuse level 0 as-is — the
+    ///   desktop pixels did not change, so the full-frame copy would be a no-op;
+    /// * the mip chain is not rebuilt when the stream is not being downscaled.
     ///
     /// Returns `Grab::Frame` with the NATIVE dimensions (there's no readback size —
     /// the consumer picks the output size when it samples).
-    pub fn grab_gpu(&mut self, timeout_ms: u32) -> Grab {
+    pub fn grab_gpu(&mut self, timeout_ms: u32, want_mips: bool) -> Grab {
         unsafe {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
@@ -428,16 +468,22 @@ impl Duplicator {
                 tex.GetDesc(&mut td);
                 let (nw, nh) = (td.Width, td.Height);
                 self.last_native = (nw, nh);
-                let src: ID3D11Resource = tex.cast().ok()?;
                 // Without mip support we still hand back a sampleable copy; the
                 // compositor's bilinear sampler just does a plain downscale.
                 self.ensure_mip(nw, nh)?;
-                let mip = self.mip_tex.clone()?;
-                let mip_res: ID3D11Resource = mip.cast().ok()?;
-                self.context.CopySubresourceRegion(&mip_res, 0, 0, 0, 0, &src, 0, None);
-                if self.gpu_scale {
+                let reuse = cursor_only_reuse(has_new, self.mip_valid);
+                if !reuse {
+                    let src: ID3D11Resource = tex.cast().ok()?;
+                    let mip = self.mip_tex.clone()?;
+                    let mip_res: ID3D11Resource = mip.cast().ok()?;
+                    self.context.CopySubresourceRegion(&mip_res, 0, 0, 0, 0, &src, 0, None);
+                    self.mip_valid = true;
+                    self.mips_fresh = false;
+                }
+                if want_mips && self.gpu_scale && !self.mips_fresh {
                     if let Some(srv) = self.mip_srv.clone() {
                         self.context.GenerateMips(&srv);
+                        self.mips_fresh = true;
                     }
                 }
                 Some(Grab::Frame { w: nw, h: nh, native_w: nw, native_h: nh })
@@ -449,9 +495,16 @@ impl Duplicator {
         }
     }
 
-    /// SRV over the last [`Duplicator::grab_gpu`] frame (full native resolution, mipped).
+    /// SRV over the last [`Duplicator::grab_gpu`] frame (full native resolution).
+    /// Levels above 0 are only meaningful while [`Duplicator::mips_current`] is true.
     pub fn frame_srv(&self) -> Option<ID3D11ShaderResourceView> {
         self.mip_srv.clone()
+    }
+
+    /// True when the mip chain was regenerated from the current level 0, i.e. a
+    /// trilinear (downscaling) sample of [`Duplicator::frame_srv`] is correct.
+    pub fn mips_current(&self) -> bool {
+        self.mip_valid && self.mips_fresh
     }
 
     /// Mirror the hardware-cursor metadata from an acquired frame. Position/visibility
@@ -496,6 +549,24 @@ impl Duplicator {
 
     pub fn native_size(&self) -> (u32, u32) {
         self.last_native
+    }
+
+    /// The current cursor for the GPU compositor: the decoded shape is cached per
+    /// `ptr_seq` and only its position is refreshed per frame, so a pointer that
+    /// moves (but keeps its shape) costs no decode and no allocation.
+    pub fn cursor_image_cached(&mut self) -> Option<&CursorImage> {
+        if !self.cursor_visible() {
+            return None;
+        }
+        if self.cursor_cache_seq != self.ptr_seq || self.cursor_cache.is_none() {
+            self.cursor_cache = self.cursor_image();
+            self.cursor_cache_seq = self.ptr_seq;
+        }
+        let (x, y) = (self.ptr_x, self.ptr_y);
+        let img = self.cursor_cache.as_mut()?;
+        img.x = x;
+        img.y = y;
+        Some(img)
     }
 
     /// Decode the current shape into a normalized BGRA image + op for the GPU
@@ -667,5 +738,21 @@ impl Duplicator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_only_reuse;
+
+    #[test]
+    fn only_a_cursor_update_over_valid_pixels_skips_the_copy() {
+        // New desktop pixels always copy.
+        assert!(!cursor_only_reuse(true, true));
+        assert!(!cursor_only_reuse(true, false));
+        // Cursor-only update: reuse only if level 0 already holds the desktop.
+        assert!(cursor_only_reuse(false, true));
+        // Fresh texture (monitor switch / session rebuild) must still be filled.
+        assert!(!cursor_only_reuse(false, false));
     }
 }

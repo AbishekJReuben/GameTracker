@@ -2255,20 +2255,6 @@ pub async fn remote_adb_install() -> AppResult<String> {
 
 use base64::Engine as _;
 
-/// Capture the primary monitor as a JPEG and return it base64-encoded, for
-/// sending over a WebRTC data channel. Runs off the main thread.
-#[tauri::command]
-pub async fn remote_grab_frame(max_w: Option<u32>, quality: Option<u8>) -> Option<String> {
-    let w = max_w.unwrap_or(1280).clamp(320, 3840);
-    let q = quality.unwrap_or(60).clamp(20, 95);
-    run_blocking(move || {
-        Ok(crate::remote::capture::grab_primary_jpeg(w, q)
-            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
-    })
-    .await
-    .unwrap_or(None)
-}
-
 /// Inject one remote input event (mouse/keyboard) received over the data channel.
 #[tauri::command]
 pub fn remote_inject(event: crate::remote::input::ControlEvent) {
@@ -2289,55 +2275,63 @@ pub fn remote_gamepad_available() -> bool {
     crate::remote::gamepad::available()
 }
 
-/// Process-wide delta encoder for the cloud (WebRTC) screen path. There is at most
-/// one cloud viewer, so a single shared encoder is enough.
-static CLOUD_ENC: once_cell::sync::Lazy<parking_lot::Mutex<crate::remote::capture::TileEncoder>> =
-    once_cell::sync::Lazy::new(|| {
-        parking_lot::Mutex::new(crate::remote::capture::TileEncoder::new())
-    });
-
-/// Capture the selected monitor as a **delta** frame (only changed tiles, plus a
-/// periodic keyframe) and return it base64-encoded for the WebRTC screen channel.
-/// Returns `None` when nothing changed, so the host can skip sending. Pass
-/// `key=true` to force a full keyframe (e.g. right after a viewer connects).
-#[tauri::command]
-pub async fn remote_grab_delta(
-    max_w: Option<u32>,
-    quality: Option<u8>,
-    key: Option<bool>,
-) -> Option<String> {
-    let w = max_w.unwrap_or(1280).clamp(320, 3840);
-    let q = quality.unwrap_or(60).clamp(20, 95);
-    let force = key.unwrap_or(false);
-    run_blocking(move || {
-        let mon = crate::remote::capture::selected_monitor();
-        let mut enc = CLOUD_ENC.lock();
-        Ok(enc
-            .encode(mon, w, q, force)
-            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
-    })
-    .await
-    .unwrap_or(None)
-}
-
 /// Start the streaming screen capture for the cloud (WebRTC video-track) path.
 /// A dedicated thread pushes full-frame JPEGs to the webview over a binary
 /// channel; the host draws them to a canvas and feeds `captureStream()` into a
 /// real WebRTC video track (hardware H.264/VP9). Frames arrive as raw bytes
 /// (`InvokeResponseBody::Raw`), i.e. `ArrayBuffer` on the JS side — no base64.
+///
+/// `pipe_id`: a connected loopback media-pipe socket (see `remote::pipe`). When
+/// given, EVERY frame of this capture generation goes over that socket instead of
+/// the channel — never a mix, so frames can't reorder across transports. If the
+/// socket drops, frames are dropped and the page restarts capture on the channel.
 #[tauri::command]
 pub fn remote_start_capture(
     on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
     max_w: Option<u32>,
     fps: Option<u32>,
     quality: Option<u32>,
+    pipe_id: Option<u64>,
 ) -> u32 {
     let w = max_w.unwrap_or(1600);
     let f = fps.unwrap_or(30);
     let q = quality.unwrap_or(70);
-    crate::remote::capture::start_capture(w, f, q, move |jpg| {
-        let _ = on_frame.send(tauri::ipc::InvokeResponseBody::Raw(jpg));
+    let pipe_id = pipe_id.filter(|id| crate::remote::pipe::is_connected(*id));
+    crate::remote::capture::start_capture(w, f, q, move |jpg| match pipe_id {
+        Some(id) => {
+            let _ = crate::remote::pipe::send_binary(id, jpg);
+        }
+        None => {
+            let _ = on_frame.send(tauri::ipc::InvokeResponseBody::Raw(jpg));
+        }
     })
+}
+
+/// Port + token of the loopback media pipe (starting it on first call). `None` if
+/// it could not bind — the page then keeps the Tauri channel/invoke paths.
+#[tauri::command]
+pub fn remote_pipe_info() -> Option<crate::remote::pipe::PipeInfo> {
+    crate::remote::pipe::ensure_started()
+}
+
+/// Everything the host page polls about the PC's focus + cursor, in ONE call
+/// (it used to be three sequential invokes every 250 ms, plus ten more bursts of
+/// three after every click). Async so it runs on a worker, not the UI thread.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePollState {
+    pub text_field: bool,
+    pub cursor_kind: String,
+    pub cursor_pos: Option<[f32; 2]>,
+}
+
+#[tauri::command]
+pub async fn remote_poll_state() -> RemotePollState {
+    RemotePollState {
+        text_field: crate::remote::focus::foreground_text_field_active(),
+        cursor_kind: crate::remote::focus::foreground_cursor_kind().to_string(),
+        cursor_pos: crate::remote::focus::foreground_cursor_position(),
+    }
 }
 
 /// Live-retune the streaming capture (resolution / fps / JPEG quality, and the
@@ -2346,6 +2340,9 @@ pub fn remote_start_capture(
 /// `bitrate_kbps` targets the **native** H.264 encoder (0/omitted = derive it from
 /// resolution × fps × quality); it has no effect on the JPEG fallback, where `quality`
 /// is the only lever.
+///
+/// `preset` (1..=4 → NVENC P1..P4) and `multipass` (0 single, 1 two-pass quarter-res,
+/// 2 two-pass full-res) are the phone's encoder-quality knobs; omitted = unchanged.
 #[tauri::command]
 pub fn remote_set_capture_quality(
     max_w: u32,
@@ -2353,12 +2350,17 @@ pub fn remote_set_capture_quality(
     quality: u32,
     content: Option<u32>,
     bitrate_kbps: Option<u32>,
+    preset: Option<u32>,
+    multipass: Option<u32>,
 ) {
     crate::remote::capture::set_capture_quality(max_w, fps, quality);
     if let Some(c) = content {
         crate::remote::capture::set_capture_content(c);
     }
     crate::remote::capture::set_capture_bitrate(bitrate_kbps.unwrap_or(0));
+    if let (Some(p), Some(m)) = (preset, multipass) {
+        crate::remote::capture::set_encoder_tuning(p, m);
+    }
 }
 
 /// Ask the native encoder to emit a keyframe on the next frame.
@@ -2422,12 +2424,19 @@ pub fn remote_start_aux_capture(
     max_w: Option<u32>,
     fps: Option<u32>,
     quality: Option<u32>,
+    pipe_id: Option<u64>,
 ) {
     let w = max_w.unwrap_or(1600);
     let f = fps.unwrap_or(30);
     let q = quality.unwrap_or(70);
-    crate::remote::capture::start_aux_capture(monitor, w, f, q, move |jpg| {
-        let _ = on_frame.send(tauri::ipc::InvokeResponseBody::Raw(jpg));
+    let pipe_id = pipe_id.filter(|id| crate::remote::pipe::is_connected(*id));
+    crate::remote::capture::start_aux_capture(monitor, w, f, q, move |jpg| match pipe_id {
+        Some(id) => {
+            let _ = crate::remote::pipe::send_binary(id, jpg);
+        }
+        None => {
+            let _ = on_frame.send(tauri::ipc::InvokeResponseBody::Raw(jpg));
+        }
     });
 }
 
@@ -2444,9 +2453,16 @@ pub fn remote_stop_aux_capture(monitor: Option<usize>) {
 #[tauri::command]
 pub fn remote_start_audio(
     on_pcm: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+    pipe_id: Option<u64>,
 ) -> Option<crate::remote::audio::AudioFormat> {
-    crate::remote::audio::start_audio(move |pcm| {
-        let _ = on_pcm.send(tauri::ipc::InvokeResponseBody::Raw(pcm));
+    let pipe_id = pipe_id.filter(|id| crate::remote::pipe::is_connected(*id));
+    crate::remote::audio::start_audio(move |pcm| match pipe_id {
+        Some(id) => {
+            let _ = crate::remote::pipe::send_binary(id, pcm);
+        }
+        None => {
+            let _ = on_pcm.send(tauri::ipc::InvokeResponseBody::Raw(pcm));
+        }
     })
 }
 

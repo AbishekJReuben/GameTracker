@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.9.100"
+version = "3.9.101"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -46,6 +46,8 @@ url = "2"
 
 # Remote-access server (companion phone app over Tailscale/LAN).
 axum = { version = "0.7", features = ["ws"] }
+# Split WebSocket read/write halves for the loopback media pipe (remote/pipe.rs).
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tower-http = { version = "0.6", features = ["cors"] }
 local-ip-address = "0.6"
 xcap = "0.9.6"
@@ -102,6 +104,10 @@ winreg = "0.52"
 # streams its state; we replay it as a real XInput device). Needs the ViGEmBus
 # driver installed at runtime; pure-Rust client, Windows-only.
 vigem-client = "0.1"
+
+[dev-dependencies]
+# WebSocket client for the loopback media-pipe tests (same version axum already uses).
+tokio-tungstenite = "0.24"
 
 [profile.release]
 panic = "abort"

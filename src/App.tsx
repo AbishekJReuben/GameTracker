@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { Suspense, useEffect, useRef } from "react";
 import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "motion/react";
 import { Sidebar } from "./components/Sidebar";
@@ -19,21 +19,40 @@ import { useTauriBridge } from "./lib/bridge";
 import { useSettings, useRemoteOnly } from "./lib/queries";
 import { routeAllowed } from "./lib/setupMode";
 import { useApp } from "./store/app";
+// The landing screen stays eager; every other screen is its own chunk, warmed in
+// the background once the app is idle (see lazyRoute.ts).
 import Dashboard from "./routes/Dashboard";
-import LibraryPage from "./routes/Library";
-import AppsPage from "./routes/Apps";
-import SystemsPage from "./routes/Systems";
-import GameDetail from "./routes/GameDetail";
-import TimelinePage from "./routes/Timeline";
-import MusicPage from "./routes/Music";
-import RemotePage from "./routes/Remote";
-import CollectionPage from "./routes/Collection";
-import TagsPage from "./routes/Tags";
-import SuggestedPage from "./routes/Suggested";
-import SettingsPage from "./routes/Settings";
-import ClipboardPage from "./routes/Clipboard";
-import SharePage from "./routes/Share";
-import ClipboardOverlay from "./features/clipboard/ClipboardOverlay";
+import { lazyRoute, preloadWhenIdle } from "./lib/lazyRoute";
+const LibraryPage = lazyRoute(() => import("./routes/Library"));
+const AppsPage = lazyRoute(() => import("./routes/Apps"));
+const SystemsPage = lazyRoute(() => import("./routes/Systems"));
+const GameDetail = lazyRoute(() => import("./routes/GameDetail"));
+const TimelinePage = lazyRoute(() => import("./routes/Timeline"));
+const MusicPage = lazyRoute(() => import("./routes/Music"));
+const RemotePage = lazyRoute(() => import("./routes/Remote"));
+const CollectionPage = lazyRoute(() => import("./routes/Collection"));
+const TagsPage = lazyRoute(() => import("./routes/Tags"));
+const SuggestedPage = lazyRoute(() => import("./routes/Suggested"));
+const SettingsPage = lazyRoute(() => import("./routes/Settings"));
+const ClipboardPage = lazyRoute(() => import("./routes/Clipboard"));
+const SharePage = lazyRoute(() => import("./routes/Share"));
+// Its own window: loading it lazily keeps that window from parsing the whole app.
+const ClipboardOverlay = lazyRoute(() => import("./features/clipboard/ClipboardOverlay"));
+const ROUTE_CHUNKS = [
+  RemotePage,
+  LibraryPage,
+  GameDetail,
+  TimelinePage,
+  SystemsPage,
+  SettingsPage,
+  ClipboardPage,
+  CollectionPage,
+  MusicPage,
+  AppsPage,
+  TagsPage,
+  SuggestedPage,
+  SharePage,
+];
 import { ClipSyncEngine } from "./features/clipboard/ClipSyncEngine";
 import { ShareHostManager } from "./components/ShareHostManager";
 
@@ -59,6 +78,9 @@ function AppShell() {
       navigate(landing, { replace: true });
     }
   }, [landing, location.pathname, navigate, remoteOnly, settings]);
+
+  // Warm the other screens' chunks once startup has settled.
+  useEffect(() => preloadWhenIdle(ROUTE_CHUNKS), []);
 
   // Hiding nav isn't enough on its own: a stale landing pref, an in-app link, or
   // a route left behind when the mode flips would still render a hidden page.
@@ -125,7 +147,14 @@ export default function App() {
   return (
     <Routes>
       {/* Bare, transparent floating overlay window — no app shell. */}
-      <Route path="/clip-overlay" element={<ClipboardOverlay />} />
+      <Route
+        path="/clip-overlay"
+        element={
+          <Suspense fallback={null}>
+            <ClipboardOverlay />
+          </Suspense>
+        }
+      />
       <Route element={<AppShell />}>
         <Route path="/" element={<Dashboard />} />
         <Route path="/library" element={<LibraryPage />} />

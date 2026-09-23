@@ -10,19 +10,46 @@ using LibreHardwareMonitor.Hardware;
 //   {"type":"sample", ...}     emitted every interval (default 2000ms)
 //   {"type":"error","message"} on fatal init failure
 //
+// Control (stdin, one command per line):
+//   interval <ms>   change the sampling interval live (>= 500). The app runs us at
+//                   2s only while something is actually viewing system stats and
+//                   at 10s otherwise: each sample polls every sensor chip (SuperIO,
+//                   SMBus, SMART), which is not free on a machine that is gaming or
+//                   streaming.
+//
 // Numeric sensor fields are null when the sensor is unavailable on this
 // machine / privilege level, so the UI can show "—" gracefully.
 // ---------------------------------------------------------------------------
 
 CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
 var stdout = Console.Out;
-int intervalMs = 2000;
 foreach (var a in args)
 {
     if (a.StartsWith("--interval=", StringComparison.OrdinalIgnoreCase) &&
         int.TryParse(a.Substring("--interval=".Length), out var ms) && ms >= 500)
-        intervalMs = ms;
+        Cfg.IntervalMs = ms;
 }
+
+// Live interval changes from the parent (see the protocol above). Wakes the
+// sampling loop immediately so a newly opened System page gets fresh data now.
+new Thread(() =>
+{
+    try
+    {
+        string? line;
+        while ((line = Console.In.ReadLine()) != null)
+        {
+            var parts = line.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 2 && parts[0] == "interval" &&
+                int.TryParse(parts[1], out var ms) && ms >= 500)
+            {
+                Cfg.IntervalMs = ms;
+                Cfg.Wake.Set();
+            }
+        }
+    }
+    catch { /* stdin gone — keep sampling at the last interval */ }
+}) { IsBackground = true, Name = "stdin-control" }.Start();
 
 var computer = new Computer
 {
@@ -70,7 +97,7 @@ while (true)
 
     // Stop if stdout is gone (parent exited).
     if (Console.Out.GetType() == typeof(TextWriter) /* never true */) break;
-    Thread.Sleep(intervalMs);
+    Cfg.Wake.WaitOne(Cfg.IntervalMs);
 }
 
 void WriteLine(string s)
@@ -259,6 +286,12 @@ static double? FindMemoryTemp(IEnumerable<IHardware> hardwares)
 }
 
 // Updates every hardware node (and sub-hardware) before reading sensors.
+static class Cfg
+{
+    public static volatile int IntervalMs = 2000;
+    public static readonly AutoResetEvent Wake = new(false);
+}
+
 sealed class UpdateVisitor : IVisitor
 {
     public void VisitComputer(IComputer computer) => computer.Traverse(this);

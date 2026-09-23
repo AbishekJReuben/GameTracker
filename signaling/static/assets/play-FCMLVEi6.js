@@ -1,0 +1,1 @@
+import{c}from"./index-BUrF0R1e.js";const o=[["circle",{cx:"8",cy:"18",r:"4",key:"1fc0mg"}],["path",{d:"M12 18V2l7 4",key:"g04rme"}]],s=c("music-2",o);const e=[["path",{d:"M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z",key:"10ikf1"}]],t=c("play",e);export{s as M,t as P};

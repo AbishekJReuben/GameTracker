@@ -533,6 +533,8 @@ pub struct SpsInfo {
     pub bitstream_restriction: bool,
     pub max_num_reorder_frames: Option<u32>,
     pub max_dec_frame_buffering: Option<u32>,
+    /// VUI colour description (primaries, transfer, matrix), when present.
+    pub colour: Option<(u32, u32, u32)>,
 }
 
 /// Read-only parse of an SPS RBSP, for diagnostics and tests.
@@ -604,6 +606,7 @@ pub fn summarize(rbsp: &[u8]) -> Option<SpsInfo> {
             bitstream_restriction: false,
             max_num_reorder_frames: None,
             max_dec_frame_buffering: None,
+            colour: None,
         };
         if !vui_present {
             return Ok(out);
@@ -622,9 +625,10 @@ pub fn summarize(rbsp: &[u8]) -> Option<SpsInfo> {
             r.u(3)?;
             r.u1()?;
             if r.u1()? == 1 {
-                r.u(8)?;
-                r.u(8)?;
-                r.u(8)?;
+                let primaries = r.u(8)?;
+                let transfer = r.u(8)?;
+                let matrix = r.u(8)?;
+                out.colour = Some((primaries, transfer, matrix));
             }
         }
         if r.u1()? == 1 {
@@ -718,6 +722,49 @@ mod tests {
         assert_eq!(after.profile_idc, before.profile_idc);
         assert_eq!(after.level_idc, before.level_idc);
         assert_eq!(after.poc_type, before.poc_type, "poc_type is deliberately preserved");
+    }
+
+    /// The colour description we now ask NVENC for (BT.601 matrix — what its ARGB
+    /// CSC really applies) must survive the DPB rewrite untouched, or the phone goes
+    /// back to guessing BT.709 and greens render dark.
+    #[test]
+    fn keeps_the_colour_description_through_the_rewrite() {
+        let mut w = BitWriter::default();
+        w.u(66, 8); // Baseline
+        w.u(0xC0, 8);
+        w.u(40, 8);
+        w.ue(0);
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(2); // poc_type 2
+        w.ue(1); // refs
+        w.u1(0);
+        w.ue(119);
+        w.ue(67);
+        w.u1(1);
+        w.u1(1);
+        w.u1(0);
+        w.u1(1); // vui present
+        w.u1(0); // aspect
+        w.u1(0); // overscan
+        w.u1(1); // video_signal_type_present
+        w.u(5, 3); // video_format unspecified
+        w.u1(0); // limited range
+        w.u1(1); // colour_description_present
+        w.u(1, 8); // primaries BT.709
+        w.u(1, 8); // transfer BT.709
+        w.u(6, 8); // matrix SMPTE 170M (BT.601)
+        w.u1(0); // chroma_loc
+        w.u1(0); // timing
+        w.u1(0); // nal_hrd
+        w.u1(0); // vcl_hrd
+        w.u1(0); // pic_struct
+        w.u1(0); // no restriction yet
+        w.trailing();
+        let fixed = rewrite_rbsp(&w.d).expect("rewrite");
+        let info = summarize(&fixed).expect("parse");
+        assert_eq!(info.colour, Some((1, 1, 6)));
+        assert_eq!(info.max_dec_frame_buffering, Some(1));
+        assert_eq!(info.profile_idc, 66);
     }
 
     #[test]

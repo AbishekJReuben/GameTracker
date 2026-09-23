@@ -433,10 +433,12 @@ cursor-composite shader), `native.rs` (D3D11 plumbing + the Rust→webview frame
 embedded **axum** HTTP+WS server on **port 47800** (`remote_port`), bound `0.0.0.0`, permissive
 CORS. Pairing: a 6-digit **PIN** (shown on `/remote`) → `POST /pair` returns a bearer token; every
 `/api/*` needs it. WS channels carry the token as a `?token=` query (browsers can't set WS headers).
-Endpoints reuse the exact `db::*` functions via `spawn_blocking`. `/screen` streams delta JPEG tiles
-(**xcap** capture); `/control` injects mouse/keyboard (**enigo**, on its own OS thread since `Enigo`
-isn't `Send`); `/media?path=<abs>` serves artwork (path-checked under `media_dir`). `best_host_ip()`
-prefers a Tailscale 100.64/10 address, else LAN.
+Endpoints reuse the exact `db::*` functions via `spawn_blocking`. Input is injected by **enigo**
+(on its own OS thread since `Enigo` isn't `Send`); `/media?path=<abs>` serves artwork (path-checked
+under `media_dir`). `best_host_ip()` prefers a Tailscale 100.64/10 address, else LAN. (The LAN-era
+`/screen` JPEG-tile socket and `/control` input socket were **removed in 3.9.101** — the companion
+has been WebRTC-only for a long time, and `/control` was an input-injection endpoint on `0.0.0.0`
+that nothing used. The loopback media pipe in §15 is a different, 127.0.0.1-only, token-gated thing.)
 
 **Screen-capture pipeline (`capture.rs` + `dxdupe.rs`) — the fps-critical path.**
 
@@ -1505,3 +1507,82 @@ stay FIFO: after any loss, gate until IDR. Only decoded pictures can be coalesce
 WebCodecs pending-work limits include submitted inputs awaiting output, not just
 `decodeQueueSize`. Close superseded frames and ignore retired-decoder callbacks.
 
+
+---
+
+## 15. Streaming efficiency pass (v3.9.101) — do not regress
+
+Measured, not guessed: every item below has a test or a benchmark. Full numbers and
+reproduction commands live in `docs/STREAMING_EFFICIENCY.md`.
+
+**Host (PC)**
+- **Loopback media pipe (`remote/pipe.rs`, `src/lib/mediaPipe.ts`).** Frames, desktop audio
+  and phone input no longer cross Tauri IPC. A Tauri 2 `Channel` message ≥ 1 KB is an
+  `eval` + `ipc://` fetch serviced on the app's **main UI thread**, and every
+  `remote_inject` invoke landed there too (unordered). Now: capture thread → tokio →
+  `127.0.0.1` WebSocket (random per-process token, `tcp_nodelay`) → page, and page →
+  pipe → injector in order. Rules: a capture/audio generation started with a `pipeId`
+  sends ONLY to that socket (never mix transports — frames would reorder); a pipe that
+  closes mid-stream latches `pipeBroken` and restarts on the Channel (new generation +
+  IDR); a client that stops reading is dropped at 48 MB queued. CSP `connect-src` needs
+  `ws://127.0.0.1:*`. Fast-delivery acks ride the pipe too.
+- **Stream colour is labelled.** NVENC's ARGB input path converts with **BT.601** limited
+  range (`colour_matrix_probe`: pure red → Y81 U90 V240). The SPS carried no colour
+  description, so Chromium/Android assumed BT.709 for HD: greens rendered ~15% dark, reds
+  orange-shifted. VUI now says primaries/transfer BT.709, matrix SMPTE 170M (6); ffmpeg
+  round-trip of the fixtures decodes to (253,0,0)/(0,254,0)/(0,0,254). `sps::fixup`
+  preserves it (unit test). Do not drop the colour description, and if the encoder input
+  ever becomes NV12 from our own shader, the matrix label must follow what that shader does.
+- **NVENC preset P2 is the default** (supersedes the P1 mentions in §13). `preset_latency_1080p`:
+  P1 1.22–1.45 ms vs P2 1.21–1.29 ms median; `encoder_tuning_matrix` (720p, starved 2.5 Mbps,
+  desktop-like content): P1 25.45 dB → P2 28.12 dB PSNR at the same bitrate. P3/P4 cost
+  +0.6–0.8 ms. Two-pass under-spends the budget (lower PSNR here) → opt-in. Both are Tune
+  knobs (`encPreset`, `encMultipass`) riding the `quality` message → `set_encoder_tuning`;
+  a change rebuilds the session (one IDR). One NVENC session at a time: the old session is
+  dropped BEFORE the new one opens.
+- **Zero-copy capture does less GPU work.** `grab_gpu` skips the full-frame copy on
+  cursor-only updates (`LastPresentTime == 0` and level 0 still valid) and builds the mip
+  chain only at ≥ 2× downscale. The cursor image is decoded once per shape (`cursor_image_cached`).
+- **Area downscale filter (`gpu.rs downscale_params`).** Four bilinear taps from mip level
+  floor(log2 r), half-spread (rr−1)/2 below 2× and min((rr−0.5)/2, 1.5(rr−1)) above.
+  `area_filter_beats_trilinear` (Lanczos3 reference, text-like card): +5.5/+5.1/+3.8 dB at
+  1.33×/1.5×/1.79×, identical at 2.0× (4K→1080p unchanged), +0.03…+2.3 dB above. The test is
+  a gate: never worse than trilinear at any listed ratio.
+- **GPU scheduling priority** while streaming (`gpusched.rs`): `SetGPUThreadPriority(7)` on
+  the duplication device + process class HIGH (ref-counted over capture threads; restored
+  to NORMAL when the last one stops). HIGH, not REALTIME. Best-effort.
+- **Surround audio folds down** (ITU/Web-Audio gains from the WASAPI channel mask) with a
+  soft limiter; the old code kept only channels 0–1 and dropped the centre (dialogue).
+- **Tracker scan is two-stage** (exe for all PIDs, CPU/memory only for matched PIDs):
+  measured 18.3 → 8.9 ms per 2 s tick with ~480 processes (`refresh_cost`).
+- **Sensor sidecar cadence follows demand**: 2 s while `system::live/specs/history` is being
+  called (desktop System page or the phone's System screen), 10 s otherwise, via
+  `interval <ms>` on the sidecar's stdin (wakes immediately). Sensor freshness scales with
+  the interval so persisted history keeps temperatures. Rebuild + copy the sidecar after
+  editing `Program.cs` (see the systems-tab memory).
+- **One `remote_poll_state` call** replaces three sequential invokes per 250 ms tick (and
+  per click burst); on DIRECT the RTP `getStats` sweep runs every ~2 s, not every 500 ms.
+- `wcActivate` no longer announces the webview encoder's codec over a native stream
+  (it could differ from NVENC's Baseline and made the guest rebuild its decoder at start).
+- ICE `iceCandidatePoolSize` 4 → 1 on both peers (fewer public-TURN allocations per session).
+
+**Phone / web / Quest**
+- **Cursor movement no longer re-renders `ControlScreen`.** Position is imperative
+  (`placeCursorEl`), `commitView` only commits React state when zoom/pan change, and a
+  layout effect re-places the cursor after each commit. Do not put the cursor position
+  back into React state. HUD shows **UI renders/s** and **Long tasks** (10 s window).
+- **Native-surface geometry is sent only on change** (`setNativeDecoderBounds` dedupe,
+  reset on decoder init/teardown) and re-synced every 500 ms on the native path so a
+  re-init heals; Java `setBounds` skips `setLayoutParams` for an unchanged rect.
+- While a stream is visible the APK asks for the display's **highest refresh mode** at the
+  current resolution (TextureView presents on the app's vsync); released when hidden.
+- Clock sync / OWD maths use a **monotonic** clock (`monoNow`) — a wall-clock step looked
+  like congestion to ABR v2. Five pings in the first second seed the offset.
+- On DIRECT: no RTC jitter-buffer re-asserts, no watchdog `getStats`; the HUD polls RTT/path
+  every 3 s (500 ms with the panel open). HUD shows the ICE **Path** (host/srflx/relay).
+- Quest immersive uploads the video texture only when the decoded-frame counter advances
+  (NOT rVFC — it pauses under immersive WebXR), with a 500 ms safety refresh.
+- **Code splitting** (`lib/lazyRoute.ts`): startup JS 2.0 MB → 1.1 MB (desktop) and
+  1.33 MB → 0.64 MB (phone). Entry screens stay eager; the rest preload when idle. The
+  dev-only mock backend (`lib/mock.ts`, ~360 KB) is a dynamic import in `api.ts` — keep it off
+  the static import graph.

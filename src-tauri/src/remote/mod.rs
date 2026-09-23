@@ -23,6 +23,9 @@ pub(crate) mod focus;
 /// GPU scale + cursor compositing for the zero-copy capture path.
 #[cfg(windows)]
 pub(crate) mod gpu;
+/// GPU scheduling priority for the capture device / process while streaming.
+#[cfg(windows)]
+pub(crate) mod gpusched;
 /// Native H.264 encode path for the screen stream: D3D11 plumbing + the wire
 /// container (Windows + NVIDIA only; JPEG→WebCodecs stays as the fallback).
 #[cfg(windows)]
@@ -32,6 +35,9 @@ pub(crate) mod native;
 pub(crate) mod nvenc;
 pub(crate) mod gamepad;
 pub(crate) mod input;
+/// Loopback WebSocket carrying frames/audio to the host page and input back,
+/// off Tauri's UI-thread IPC.
+pub(crate) mod pipe;
 pub(crate) mod uac;
 
 use crate::db::{games, media as mediadb, music, playlists, screenshots, sessions, settings, stats, DbPool};
@@ -247,8 +253,6 @@ fn build_router(state: ApiState) -> Router {
         .route("/ping", get(ping))
         .route("/pair", post(pair))
         .route("/ws", get(ws_handler))
-        .route("/screen", get(screen_ws))
-        .route("/control", get(control_ws))
         .route("/media", get(media_file));
 
     public.merge(protected).layer(cors).with_state(state)
@@ -918,120 +922,6 @@ async fn live_socket(mut socket: WebSocket, s: ApiState) {
         }
     }
     s.remote.clients.fetch_sub(1, Ordering::SeqCst);
-}
-
-// ---------- screen streaming ----------
-
-async fn screen_ws(State(s): State<ApiState>, Query(q): Query<WsQuery>, ws: WebSocketUpgrade) -> Response {
-    if !ws_authorized(&s, &q) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
-    ws.on_upgrade(screen_socket)
-}
-
-/// Runtime stream-quality config the phone can push over the screen socket to
-/// trade sharpness (resolution + JPEG quality) against bandwidth and frame rate.
-#[derive(Deserialize, Clone, Copy)]
-struct QualityCfg {
-    #[serde(rename = "maxW")]
-    max_w: u32,
-    quality: u8,
-    fps: u32,
-}
-
-impl QualityCfg {
-    fn clamped(self) -> Self {
-        Self {
-            max_w: self.max_w.clamp(320, 3840),
-            quality: self.quality.clamp(20, 95),
-            fps: self.fps.clamp(1, 60),
-        }
-    }
-    fn frame_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_millis((1000 / self.fps.max(1)) as u64)
-    }
-}
-
-impl Default for QualityCfg {
-    fn default() -> Self {
-        Self { max_w: 1280, quality: 60, fps: 12 }
-    }
-}
-
-/// Stream the primary monitor as JPEG frames. The phone may send a `QualityCfg`
-/// JSON text message at any time to re-tune resolution/quality/fps live. Capture +
-/// encode run on a blocking worker so the async runtime is never stalled.
-async fn screen_socket(mut socket: WebSocket) {
-    let mut cfg = QualityCfg::default();
-    let mut ticker = tokio::time::interval(cfg.frame_interval());
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Stateful delta encoder for this connection (only changed tiles are sent).
-    let mut enc = capture::TileEncoder::new();
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                let (w, q) = (cfg.max_w, cfg.quality);
-                let mon = capture::selected_monitor();
-                // The encoder holds the previous frame, so hand it into the blocking
-                // task and take it back out (it's Send, but not borrowable across await).
-                let mut taken = std::mem::replace(&mut enc, capture::TileEncoder::new());
-                let (frame, back) = tokio::task::spawn_blocking(move || {
-                    let f = taken.encode(mon, w, q, false);
-                    (f, taken)
-                })
-                .await
-                .unwrap_or_else(|_| (None, capture::TileEncoder::new()));
-                enc = back;
-                let Some(bytes) = frame else { continue }; // None = nothing changed
-                if socket.send(Message::Binary(bytes.into())).await.is_err() {
-                    break;
-                }
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Text(t))) => {
-                        if let Ok(next) = serde_json::from_str::<QualityCfg>(&t) {
-                            let next = next.clamped();
-                            if next.fps != cfg.fps {
-                                ticker = tokio::time::interval(next.frame_interval());
-                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                            }
-                            cfg = next;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-
-// ---------- input control ----------
-
-async fn control_ws(State(s): State<ApiState>, Query(q): Query<WsQuery>, ws: WebSocketUpgrade) -> Response {
-    if !ws_authorized(&s, &q) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
-    ws.on_upgrade(control_socket)
-}
-
-/// Receive control events and forward them to the input-injection thread. The
-/// `Enigo` backend lives on its own OS thread (it isn't `Send`), fed via a channel.
-async fn control_socket(mut socket: WebSocket) {
-    let tx = input::spawn_controller();
-    if tx.is_none() {
-        let _ = socket
-            .send(Message::Text("{\"error\":\"input unavailable\"}".to_string().into()))
-            .await;
-    }
-    while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Text(t) = msg {
-            if let (Ok(ev), Some(tx)) = (serde_json::from_str::<input::ControlEvent>(&t), tx.as_ref()) {
-                let _ = tx.send(ev);
-            }
-        }
-    }
 }
 
 fn ws_authorized(s: &ApiState, q: &WsQuery) -> bool {
