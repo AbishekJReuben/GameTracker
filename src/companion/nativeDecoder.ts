@@ -22,6 +22,8 @@ export type DecoderProbe = {
   maxBitrateKbps: number;
   /** The decoder lists H.264 High / Constrained High (research R3). */
   high: boolean;
+  /** A hardware HEVC Main decoder exists (research R8). False on older bridges. */
+  hevc?: boolean;
 };
 
 export type DecoderStats = {
@@ -101,7 +103,7 @@ export async function probeNativeDecoder(): Promise<DecoderProbe> {
   if (probeCache) return probeCache;
   try {
     const r = await invoke<DecoderProbe>("decoder_probe");
-    probeCache = { ...r, maxBitrateKbps: Number(r.maxBitrateKbps) || 0, high: r.high === true };
+    probeCache = { ...r, maxBitrateKbps: Number(r.maxBitrateKbps) || 0, high: r.high === true, hevc: r.hevc === true };
   } catch (e) {
     console.warn("[nativeDecoder] probe failed:", e);
     // Keep the whole error (the Rust side now attaches the Java throwable's
@@ -120,10 +122,15 @@ export async function probeNativeDecoder(): Promise<DecoderProbe> {
 }
 
 /** Returns null on success, or the full error string on failure. */
-export async function initNativeDecoder(width: number, height: number): Promise<string | null> {
+export async function initNativeDecoder(
+  width: number,
+  height: number,
+  codec: "avc" | "hevc" = "avc",
+  layer: "texture" | "surface" = "texture",
+): Promise<string | null> {
   if (!nativeDecoderPossible()) return "not Tauri/companion";
   try {
-    await lifecycleInvoke("decoder_init", { width, height });
+    await lifecycleInvoke("decoder_init", { width, height, codec, layer });
     return null;
   } catch (e) {
     console.warn("[nativeDecoder] init failed:", e);

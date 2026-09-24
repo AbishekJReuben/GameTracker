@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { H264_BASELINE_CODEC, h264CodecFromAnnexB, parseNativeFrame, videoFragmentSize } from "./nativeDelivery";
+import {
+  H264_BASELINE_CODEC,
+  h264CodecFromAnnexB,
+  hevcCodecFromAnnexB,
+  isHevcCodec,
+  parseNativeFrame,
+  videoFragmentSize,
+} from "./nativeDelivery";
+
+const hex = (s: string) => Uint8Array.from(s.match(/../g)!.map((b) => parseInt(b, 16)));
 
 function frame(fast: boolean) {
   const bytes = new ArrayBuffer((fast ? 24 : 8) + 5);
@@ -21,6 +30,34 @@ describe("native delivery wire", () => {
     expect(f).toMatchObject({ generation: 123, sequence: 7, timestamp: 490, hostAgeMs: 10 });
     expect(f.payload.buffer).toBe(bytes);
     expect([...f.payload]).toEqual([0, 0, 0, 1, 0x65]);
+  });
+  it("names an HEVC stream from its SPS, escapes and all (R8)", () => {
+    // VPS + SPS + PPS exactly as NVENC emitted them for 1280x720@60 (codec-hevc-6m).
+    const au = hex(
+      "0000000140010c01ffff016000000300900000030000030078ac09" +
+        "00000001420101016000000300900000030000030078a00280802e1f1396b4a421192e3016a02020c0800000" +
+        "000000014401c0f7c0cc90" +
+        "000000012601af19",
+    );
+    expect(hevcCodecFromAnnexB(au)).toBe("hev1.1.6.L120.90");
+    expect(isHevcCodec("hev1.1.6.L120.90")).toBe(true);
+    expect(isHevcCodec(H264_BASELINE_CODEC)).toBe(false);
+    // A delta frame (no SPS) and an H.264 AU are not HEVC keyframes.
+    expect(hevcCodecFromAnnexB(hex("000000010201d0"))).toBeNull();
+    expect(hevcCodecFromAnnexB(hex("0000000167428028da01e0089f960000000168ce3c80"))).toBeNull();
+  });
+  it("encodes tier, profile space and non-zero constraint bytes (R8)", () => {
+    // Main 10 (idc 2, compat flag 2), High tier, level 5.1, two constraint bytes.
+    const sps = hex("000001" + "4201" + "01" + "22" + "20000000" + "b00400000000" + "99");
+    expect(hevcCodecFromAnnexB(sps)).toBe("hev1.2.4.H153.B0.04");
+  });
+  it("reads the RFI clean flag and the 6-bit frame id from the flags byte (R4)", () => {
+    const bytes = frame(false);
+    new Uint8Array(bytes)[2] = (45 << 2) | 2;
+    const f = parseNativeFrame(bytes)!;
+    expect(f).toMatchObject({ key: false, rfiClean: true, frameId: 45 });
+    new Uint8Array(bytes)[2] = 1;
+    expect(parseNativeFrame(bytes)).toMatchObject({ key: true, rfiClean: false, frameId: 0 });
   });
   it("rejects truncated/unknown headers and tolerates host clock adjustments", () => {
     expect(parseNativeFrame(frame(true).slice(0, 20))).toBeNull();

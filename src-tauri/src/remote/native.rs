@@ -19,6 +19,7 @@
 
 #![cfg(windows)]
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use windows::core::Interface;
@@ -35,16 +36,102 @@ use super::nvenc;
 /// Magic for the native-H.264 container on the Rust→webview channel. The webview
 /// checks these two bytes to tell a native frame from a JPEG / "GS" strip container.
 pub const NATIVE_MAGIC: [u8; 2] = [b'G', b'N'];
-/// `'G' 'N' | flags u8 (bit0 = keyframe) | reserved u8 | w u16 | h u16` then Annex-B.
+/// `'G' 'N' | flags u8 | reserved u8 | w u16 | h u16` then Annex-B.
+///
+/// flags: bit0 = keyframe; bit1 = first frame encoded after a reference-frame
+/// invalidation ("clean": it predicts only from frames the guest has); bits 2..7 =
+/// the frame's 6-bit id, which is what the webview names when it asks Rust to
+/// invalidate a frame it had to drop (research R4, [`NativeEncoder::invalidate_from`]).
 pub const NATIVE_HEADER_LEN: usize = 8;
 
+/// GN flags byte for a frame (see [`NATIVE_HEADER_LEN`]).
+fn frame_flags(key: bool, clean: bool, id: u8) -> u8 {
+    (key as u8) | ((clean as u8) << 1) | ((id & 63) << 2)
+}
+
+/// Frames remembered for reference-frame invalidation. Much more than the DPB: an
+/// id older than the DPB can't be recovered, but it must still be *recognised* so
+/// it gets an IDR rather than being mistaken for a newer frame with the same id.
+const RFI_HISTORY: usize = 32;
+
+/// One encoded frame, as reference-frame invalidation sees it.
+#[derive(Clone, Copy, Debug)]
+struct Sent {
+    id: u8,
+    /// The `inputTimeStamp` NVENC was given — what invalidation names a frame by.
+    ts: u64,
+    /// Still usable as a reference (not invalidated).
+    valid: bool,
+}
+
+/// Frame ids, timestamps and validity since the last keyframe (research R4).
+#[derive(Default, Debug)]
+struct RfiState {
+    next_id: u8,
+    history: VecDeque<Sent>,
+    /// The next frame out is the first one after an invalidation.
+    clean_next: bool,
+    last_ts: u64,
+}
+
+impl RfiState {
+    /// NVENC identifies frames by `inputTimeStamp`, so each must be unique — a
+    /// keep-alive re-encode can otherwise share its source frame's timestamp.
+    fn unique_ts(&mut self, ts: u64) -> u64 {
+        let t = ts.max(self.last_ts.wrapping_add(1));
+        self.last_ts = t;
+        t
+    }
+
+    /// Remember the frame just encoded and return its GN flags byte.
+    fn note(&mut self, key: bool, ts: u64) -> u8 {
+        let id = self.next_id;
+        self.next_id = (id + 1) & 63;
+        if key {
+            // Nothing before an IDR can be referenced again.
+            self.history.clear();
+        }
+        if self.history.len() >= RFI_HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(Sent { id, ts, valid: true });
+        frame_flags(key, std::mem::take(&mut self.clean_next), id)
+    }
+
+    /// Timestamps to invalidate so that frame `id` and everything encoded after it
+    /// stop being references, or `None` when that can't be done safely and the
+    /// caller must send an IDR: the id is unknown, or no valid frame precedes it,
+    /// or that frame may no longer be in the guest's DPB. The guest never sees the
+    /// dropped frames, so its decoder fills the frame_num gap with "non-existing"
+    /// frames that take sliding-window slots exactly as the real ones did in
+    /// NVENC's DPB — so the frame to predict from must be among the last `refs`.
+    fn plan(&self, id: u8, refs: usize) -> Option<Vec<u64>> {
+        let pos = self.history.iter().rposition(|s| s.id == id)?;
+        let prior = self.history.iter().take(pos).rposition(|s| s.valid)?;
+        if self.history.len() - 1 - prior >= refs {
+            return None;
+        }
+        Some(self.history.iter().skip(pos).filter(|s| s.valid).map(|s| s.ts).collect())
+    }
+
+    /// The frames from `id` on were invalidated; the next frame out is clean.
+    fn invalidated_from(&mut self, id: u8) {
+        if let Some(pos) = self.history.iter().rposition(|s| s.id == id) {
+            for s in self.history.iter_mut().skip(pos) {
+                s.valid = false;
+            }
+        }
+        self.clean_next = true;
+    }
+}
+
 /// Wrap an Annex-B frame in the container the webview expects.
-fn wrap(annexb: &[u8], key: bool, w: u32, h: u32) -> Vec<u8> {
+fn wrap(annexb: &[u8], flags: u8, w: u32, h: u32) -> Vec<u8> {
     // Spare bytes for opt-in delivery timing/credit header; avoids a second
     // allocation when that header is inserted. Classic wire length is unchanged.
     let mut out = Vec::with_capacity(NATIVE_HEADER_LEN + 16 + annexb.len());
     out.extend_from_slice(&NATIVE_MAGIC);
-    out.push(if key { 1 } else { 0 });
+    out.push(flags);
     out.push(0);
     out.extend_from_slice(&(w.min(u16::MAX as u32) as u16).to_le_bytes());
     out.extend_from_slice(&(h.min(u16::MAX as u32) as u16).to_le_bytes());
@@ -77,6 +164,10 @@ pub struct EncoderTuning {
     pub multipass: u8,
     /// Constrained High instead of Constrained Baseline (the guest's decoder said so).
     pub high: bool,
+    /// A DPB deep enough for reference-frame invalidation (the guest opted in).
+    pub rfi: bool,
+    /// HEVC Main instead of H.264 — the host's low-bandwidth mode (research R8).
+    pub hevc: bool,
 }
 
 impl Default for EncoderTuning {
@@ -85,6 +176,8 @@ impl Default for EncoderTuning {
             preset: nvenc::DEFAULT_PRESET,
             multipass: nvenc::DEFAULT_MULTIPASS,
             high: false,
+            rfi: false,
+            hevc: false,
         }
     }
 }
@@ -106,6 +199,8 @@ pub struct NativeEncoder {
     /// NVENC's average QP of the last frame — drives the still-screen refinement
     /// burst in capture.rs.
     pub last_avg_qp: u32,
+    /// Frame ids / timestamps for reference-frame invalidation.
+    rfi: RfiState,
 }
 
 impl NativeEncoder {
@@ -151,7 +246,11 @@ impl NativeEncoder {
 
         let enc = nvenc::Encoder::new(
             &device,
-            nvenc::Params::new(w, h, fps.clamp(1, 240), bitrate_bps).with_tuning(tuning.preset, tuning.multipass).with_high(tuning.high),
+            nvenc::Params::new(w, h, fps.clamp(1, 240), bitrate_bps)
+                .with_tuning(tuning.preset, tuning.multipass)
+                .with_high(tuning.high)
+                .with_rfi(tuning.rfi)
+                .with_hevc(tuning.hevc),
         )?;
         Some(NativeEncoder {
             device,
@@ -165,6 +264,7 @@ impl NativeEncoder {
             tuning,
             last_encode_us: 0,
             last_avg_qp: 0,
+            rfi: RfiState::default(),
         })
     }
 
@@ -188,7 +288,10 @@ impl NativeEncoder {
         }
         if fps != self.fps || bitrate_bps != self.bitrate {
             let p = nvenc::Params::new(self.w, self.h, fps.clamp(1, 240), bitrate_bps)
-                .with_tuning(self.tuning.preset, self.tuning.multipass).with_high(self.tuning.high);
+                .with_tuning(self.tuning.preset, self.tuning.multipass)
+                .with_high(self.tuning.high)
+                .with_rfi(self.tuning.rfi)
+                .with_hevc(self.tuning.hevc);
             match self.enc.reconfigure(p) {
                 Ok(()) => {
                     self.fps = fps;
@@ -242,14 +345,16 @@ impl NativeEncoder {
             self.context
                 .UpdateSubresource(&res, 0, None, px.as_ptr() as *const _, w * 4, 0);
         }
-        let frame = match self.enc.encode(&tex, force_key, ts_us) {
+        let ts = self.rfi.unique_ts(ts_us);
+        let frame = match self.enc.encode(&tex, force_key, ts) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[native] encode failed: {e}");
                 return None;
             }
         };
-        let out = wrap(frame.data, frame.key, self.w, self.h);
+        let flags = self.rfi.note(frame.key, ts);
+        let out = wrap(frame.data, flags, self.w, self.h);
         self.last_encode_us = t0.elapsed().as_micros() as u32;
         Some(out)
     }
@@ -263,7 +368,8 @@ impl NativeEncoder {
     /// [`Self::encode_texture`] that can also start an intra-refresh wave.
     pub fn encode_texture_ex(&mut self, tex: &ID3D11Texture2D, force_key: bool, force_ir: bool, ts_us: u64) -> Option<Vec<u8>> {
         let t0 = Instant::now();
-        let frame = match self.enc.encode_ex(tex, force_key, force_ir, ts_us) {
+        let ts = self.rfi.unique_ts(ts_us);
+        let frame = match self.enc.encode_ex(tex, force_key, force_ir, ts) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[native] encode failed: {e}");
@@ -271,9 +377,34 @@ impl NativeEncoder {
             }
         };
         self.last_avg_qp = frame.avg_qp;
-        let out = wrap(frame.data, frame.key, self.w, self.h);
+        let flags = self.rfi.note(frame.key, ts);
+        let out = wrap(frame.data, flags, self.w, self.h);
         self.last_encode_us = t0.elapsed().as_micros() as u32;
         Some(out)
+    }
+
+    /// Reference-frame invalidation (research R4): the frame with wire id `id` and
+    /// every frame encoded after it will never reach the guest, so stop predicting
+    /// from them. True = done; the next frame goes out flagged clean. False = not
+    /// possible here (session without the deeper DPB, unknown/too-old id, or NVENC
+    /// refused) and the caller must send an IDR instead.
+    pub fn invalidate_from(&mut self, id: u8) -> bool {
+        // HEVC sessions keep the 1-frame DPB (nvenc::Params::refs).
+        if !self.tuning.rfi || self.tuning.hevc {
+            return false;
+        }
+        let id = id & 63;
+        let Some(stamps) = self.rfi.plan(id, nvenc::sps::DPB_RFI as usize) else {
+            return false;
+        };
+        for ts in stamps {
+            if let Err(e) = self.enc.invalidate(ts) {
+                eprintln!("[native] RFI #{id}: {e}");
+                return false;
+            }
+        }
+        self.rfi.invalidated_from(id);
+        true
     }
 }
 
@@ -283,15 +414,60 @@ mod tests {
 
     #[test]
     fn wraps_frames_with_a_parseable_header() {
-        let out = wrap(&[0, 0, 0, 1, 0x65, 0xAA], true, 1920, 1080);
+        let out = wrap(&[0, 0, 0, 1, 0x65, 0xAA], frame_flags(true, false, 5), 1920, 1080);
         assert_eq!(&out[..2], &NATIVE_MAGIC);
         assert_eq!(out[2] & 1, 1, "keyframe flag");
+        assert_eq!(out[2] >> 2, 5, "frame id");
         assert_eq!(u16::from_le_bytes([out[4], out[5]]), 1920);
         assert_eq!(u16::from_le_bytes([out[6], out[7]]), 1080);
         assert_eq!(&out[NATIVE_HEADER_LEN..], &[0, 0, 0, 1, 0x65, 0xAA]);
 
-        let delta = wrap(&[9], false, 2, 2);
+        let delta = wrap(&[9], frame_flags(false, true, 63), 2, 2);
         assert_eq!(delta[2] & 1, 0, "delta frames must not claim keyframe");
+        assert_eq!(delta[2] & 2, 2, "clean flag");
+        assert_eq!(delta[2] >> 2, 63, "frame id");
+    }
+
+    #[test]
+    fn rfi_plans_only_what_the_guest_dpb_can_recover() {
+        let mut st = RfiState::default();
+        let ids: Vec<u8> = (0..6).map(|i| st.note(i == 0, 100 + i as u64) >> 2).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+        // Frame 4 dropped (5 already encoded): invalidate 4 and 5, predict from 3.
+        assert_eq!(st.plan(4, 4), Some(vec![104, 105]));
+        // The IDR itself can't be skipped over.
+        assert_eq!(st.plan(0, 4), None);
+        // Frame 1 dropped with 2..5 encoded since: 0 would sit behind 5 frames.
+        assert_eq!(st.plan(1, 4), None);
+        assert_eq!(st.plan(42, 4), None, "unknown id");
+        st.invalidated_from(4);
+        let flags = st.note(false, 106);
+        assert_eq!(flags & 2, 2, "first frame after an invalidation is clean");
+        assert_eq!(st.note(false, 107) & 2, 0, "only the first");
+        // Frame 6 (the clean one) is dropped too: the frame to predict from is 3,
+        // and 4, 5, 6 still take DPB slots on the guest as gap frames.
+        assert_eq!(st.plan(6, 4), None, "3 would sit behind 4 frames");
+        assert_eq!(st.plan(7, 4), Some(vec![107]), "7 predicts from the clean frame 6");
+        // A keyframe resets the history.
+        st.note(true, 108);
+        assert_eq!(st.plan(6, 4), None);
+        st.note(false, 109);
+        assert_eq!(st.plan(9, 4), Some(vec![109]), "predict from the IDR");
+    }
+
+    #[test]
+    fn rfi_ids_wrap_and_timestamps_stay_unique() {
+        let mut st = RfiState::default();
+        assert_eq!(st.unique_ts(50), 50);
+        assert_eq!(st.unique_ts(50), 51, "a keep-alive may reuse its source's timestamp");
+        assert_eq!(st.unique_ts(40), 52);
+        for i in 0..70u64 {
+            st.note(i == 0, 1000 + i);
+        }
+        assert_eq!(st.history.len(), RFI_HISTORY);
+        let last = st.history.back().unwrap();
+        assert_eq!(last.id, (69 % 64) as u8);
+        assert_eq!(st.plan(last.id, 4), Some(vec![1069]));
     }
 
     #[test]
@@ -388,7 +564,7 @@ mod tests {
         }
         for preset in 1..=4u8 {
             for multipass in [0u8, 1] {
-                let tuning = EncoderTuning { preset, multipass, high: false };
+                let tuning = EncoderTuning { preset, multipass, ..EncoderTuning::default() };
                 let mut enc = NativeEncoder::new(None, w, h, fps, bps, tuning).expect("NVENC hardware required");
                 let mut stream = Vec::new();
                 let mut times = Vec::new();
@@ -411,6 +587,174 @@ mod tests {
                     stream.len()
                 );
             }
+        }
+    }
+
+    /// Research R4: reference-frame invalidation on real NVENC. Encodes a moving
+    /// desktop with the 4-frame DPB, drops frames the way the host webview does at
+    /// the 4× backpressure ceiling (the first one plus the ones already encoded
+    /// before the request reaches Rust), invalidates them, and writes what the guest
+    /// would receive. Drops of 1–3 frames must recover with a clean P-frame, a
+    /// 4-frame drop must fall back to an IDR. A control stream drops the same frames
+    /// with no invalidation (the pre-R4 behaviour minus its recovery IDR).
+    ///
+    /// Fixtures for the strict-decode + PSNR check: `rfi-src.bgra` (every source
+    /// frame), `rfi-recv.h264` / `rfi-broken.h264` and `rfi-kept.txt` (source frame
+    /// index of each frame in the received streams).
+    ///   `cargo test --release --lib remote::native::tests::rfi_recovers_dropped_frames_without_an_idr -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires NVIDIA GPU; writes fixtures under target/perf-validation"]
+    fn rfi_recovers_dropped_frames_without_an_idr() {
+        use std::io::Write;
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-validation");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let (w, h, fps, bps, frames) = (960u32, 544u32, 60u32, 5_000_000u32, 100u32);
+        // (first dropped frame, frames dropped, expect recovery by invalidation)
+        let drops = [(20u32, 1u32, true), (40, 2, true), (60, 3, true), (80, 4, false)];
+        let dropped = |t: u32| drops.iter().find(|&&(s, n, _)| t >= s && t < s + n).copied();
+
+        let mut src = std::fs::File::create(out_dir.join("rfi-src.bgra")).unwrap();
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let mut all = Vec::with_capacity(frames as usize);
+        for t in 0..frames {
+            synthetic_desktop(w, h, t, &mut px);
+            src.write_all(&px).unwrap();
+            all.push(px.clone());
+        }
+
+        for rfi in [true, false] {
+            let tuning = EncoderTuning { rfi, ..EncoderTuning::default() };
+            let mut enc = NativeEncoder::new(None, w, h, fps, bps, tuning).expect("NVENC hardware required");
+            let mut recv = Vec::new();
+            let mut kept = Vec::new();
+            let mut first_dropped: Option<(u8, bool)> = None;
+            let mut idr_bytes = 0usize;
+            let mut p_bytes = Vec::new();
+            for t in 0..frames {
+                let mut force_key = t == 0;
+                let mut recovering = None;
+                if dropped(t).is_none() {
+                    if let Some((id, expect)) = first_dropped.take() {
+                        let ok = enc.invalidate_from(id);
+                        if rfi {
+                            assert_eq!(ok, expect, "frame {t}: invalidation of #{id}");
+                            force_key = !ok;
+                        } else {
+                            assert!(!ok, "a session without the deeper DPB never invalidates");
+                        }
+                        recovering = Some(ok);
+                    }
+                }
+                let pkt = enc.encode_pixels(&all[t as usize], w, h, force_key, t as u64 * 16_667).expect("encode");
+                let (key, clean, id) = (pkt[2] & 1 == 1, pkt[2] & 2 == 2, pkt[2] >> 2);
+                assert_eq!(id as u32, t % 64, "wire ids count frames");
+                if let Some((_, _, expect)) = dropped(t) {
+                    if first_dropped.is_none() {
+                        first_dropped = Some((id, expect));
+                    }
+                    continue;
+                }
+                let bytes = pkt.len() - NATIVE_HEADER_LEN;
+                match recovering {
+                    Some(true) => {
+                        assert!(clean && !key, "frame {t}: recovered by a clean P-frame");
+                        eprintln!("rfi={rfi} frame {t}: clean P-frame {bytes} B (IDR was {idr_bytes} B)");
+                    }
+                    Some(false) if rfi => {
+                        assert!(key, "frame {t}: too deep to invalidate → IDR");
+                        eprintln!("rfi={rfi} frame {t}: IDR fallback {bytes} B");
+                    }
+                    _ => assert!(!clean, "frame {t}: only the frame after an invalidation is clean"),
+                }
+                if t == 0 {
+                    idr_bytes = bytes;
+                } else if !key {
+                    p_bytes.push(bytes);
+                }
+                recv.extend_from_slice(&pkt[NATIVE_HEADER_LEN..]);
+                kept.push(t);
+            }
+            p_bytes.sort_unstable();
+            eprintln!(
+                "rfi={rfi}: {} frames kept, IDR {idr_bytes} B, P median {} B",
+                kept.len(),
+                p_bytes[p_bytes.len() / 2]
+            );
+            let name = if rfi { "rfi-recv.h264" } else { "rfi-broken.h264" };
+            std::fs::write(out_dir.join(name), &recv).unwrap();
+            let list: Vec<String> = kept.iter().map(|t| t.to_string()).collect();
+            std::fs::write(out_dir.join("rfi-kept.txt"), list.join("\n")).unwrap();
+        }
+    }
+
+    /// Research R8: HEVC Main vs the shipped H.264 Baseline, same content / bitrate /
+    /// preset. Asserts every HEVC IDR carries VPS/SPS/PPS and that an HEVC session
+    /// never claims to invalidate; writes `codec-src.bgra` plus one stream per
+    /// codec/bitrate for the ffmpeg strict-decode + PSNR check; prints encode time.
+    ///   `cargo test --release --lib remote::native::tests::hevc_vs_h264 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires NVIDIA GPU; writes fixtures under target/perf-validation"]
+    fn hevc_vs_h264() {
+        use std::io::Write;
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-validation");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let (w, h, frames, fps) = (1280u32, 720u32, 120u32, 60u32);
+        let mut src = std::fs::File::create(out_dir.join("codec-src.bgra")).unwrap();
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let mut all = Vec::with_capacity(frames as usize);
+        for t in 0..frames {
+            synthetic_desktop(w, h, t, &mut px);
+            src.write_all(&px).unwrap();
+            all.push(px.clone());
+        }
+        // HEVC NAL type from the 2-byte header.
+        let hevc_types = |au: &[u8]| -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i + 4 < au.len() {
+                if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+                    out.push((au[i + 3] >> 1) & 0x3f);
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        };
+        for (hevc, bps) in [false, true].into_iter().flat_map(|c| [(c, 2_500_000u32), (c, 6_000_000u32)]) {
+            let tuning = EncoderTuning { hevc, rfi: true, ..EncoderTuning::default() };
+            let mut enc = NativeEncoder::new(None, w, h, fps, bps, tuning).expect("NVENC hardware required");
+            let mut stream = Vec::new();
+            let mut times = Vec::new();
+            for (i, frame) in all.iter().enumerate() {
+                let pkt = enc.encode_pixels(frame, w, h, i == 0 || i == 60, i as u64 * 16_667).expect("encode");
+                let key = pkt[2] & 1 == 1;
+                let au = &pkt[NATIVE_HEADER_LEN..];
+                assert_eq!(key, i == 0 || i == 60, "frame {i}: keyframes only on demand");
+                if hevc && key {
+                    let types = hevc_types(au);
+                    for t in [32u8, 33, 34] {
+                        assert!(types.contains(&t), "IDR {i} carries NAL type {t} (VPS/SPS/PPS): {types:?}");
+                    }
+                    assert!(types.iter().any(|&t| t == 19 || t == 20), "IDR slice present: {types:?}");
+                }
+                if i > 0 {
+                    times.push(enc.last_encode_us as f64 / 1000.0);
+                }
+                stream.extend_from_slice(au);
+            }
+            if hevc {
+                assert!(!enc.invalidate_from(5), "HEVC keeps the 1-frame DPB: no invalidation");
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            let name = format!("codec-{}-{}m.{}", if hevc { "hevc" } else { "h264" }, bps as f64 / 1e6, if hevc { "h265" } else { "h264" });
+            std::fs::write(out_dir.join(&name), &stream).unwrap();
+            eprintln!(
+                "hevc={hevc} {bps}: encode median {:.3} ms p95 {:.3} ms, {} bytes → {name}",
+                times[times.len() / 2],
+                times[times.len() * 95 / 100],
+                stream.len()
+            );
         }
     }
 

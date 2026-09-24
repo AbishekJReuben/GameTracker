@@ -3,11 +3,20 @@
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include "nvEncodeAPI.h"
 
 #define SZ(t)      printf("size  %-46s %zu\n", #t, sizeof(t))
 #define OF(t, f)   printf("off   %-46s %zu\n", #t "." #f, offsetof(t, f))
 #define VAL(n, v)  printf("const %-46s 0x%08X\n", n, (unsigned)(v))
+/* Bit position of a 1-bit (or the low bit of a wider) bitfield inside the u32 at
+   byte offset `word`: set it on a zeroed struct and find the bit that moved. */
+#define BIT(t, f, word) do { t x_; uint32_t w_; int b_ = 0; memset(&x_, 0, sizeof x_); x_.f = 1; \
+    memcpy(&w_, (char *)&x_ + (word), 4); while (b_ < 32 && !(w_ >> b_ & 1)) b_++; \
+    printf("bit   %-46s %d\n", #t "." #f, b_); } while (0)
+#define GUIDV(n, g) printf("guid  %-46s %08lX-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X\n", n, \
+    (unsigned long)(g).Data1, (g).Data2, (g).Data3, (g).Data4[0], (g).Data4[1], (g).Data4[2], \
+    (g).Data4[3], (g).Data4[4], (g).Data4[5], (g).Data4[6], (g).Data4[7])
 
 int main(void) {
     printf("--- api version\n");
@@ -208,5 +217,51 @@ int main(void) {
     OF(NV_ENCODE_API_FUNCTION_LIST, nvEncOpenEncodeSessionEx);
     OF(NV_ENCODE_API_FUNCTION_LIST, nvEncReconfigureEncoder);
     OF(NV_ENCODE_API_FUNCTION_LIST, nvEncGetLastErrorString);
+    OF(NV_ENCODE_API_FUNCTION_LIST, nvEncInvalidateRefFrames);
+
+    /* HEVC (research R8) */
+    printf("--- NV_ENC_CONFIG_HEVC\n");
+    SZ(NV_ENC_CONFIG_HEVC_VUI_PARAMETERS);
+    OF(NV_ENC_CONFIG_HEVC, level);
+    OF(NV_ENC_CONFIG_HEVC, tier);
+    OF(NV_ENC_CONFIG_HEVC, minCUSize);
+    OF(NV_ENC_CONFIG_HEVC, maxCUSize);
+    OF(NV_ENC_CONFIG_HEVC, idrPeriod);
+    OF(NV_ENC_CONFIG_HEVC, intraRefreshPeriod);
+    OF(NV_ENC_CONFIG_HEVC, intraRefreshCnt);
+    OF(NV_ENC_CONFIG_HEVC, maxNumRefFramesInDPB);
+    OF(NV_ENC_CONFIG_HEVC, ltrNumFrames);
+    OF(NV_ENC_CONFIG_HEVC, vpsId);
+    OF(NV_ENC_CONFIG_HEVC, spsId);
+    OF(NV_ENC_CONFIG_HEVC, ppsId);
+    OF(NV_ENC_CONFIG_HEVC, sliceMode);
+    OF(NV_ENC_CONFIG_HEVC, sliceModeData);
+    OF(NV_ENC_CONFIG_HEVC, maxTemporalLayersMinus1);
+    OF(NV_ENC_CONFIG_HEVC, hevcVUIParameters);
+    OF(NV_ENC_CONFIG_HEVC, ltrTrustMode);
+    OF(NV_ENC_CONFIG_HEVC, useBFramesAsRef);
+    OF(NV_ENC_CONFIG_HEVC, numRefL0);
+    OF(NV_ENC_CONFIG_HEVC, numRefL1);
+    OF(NV_ENC_CONFIG_HEVC, reserved1);
+    OF(NV_ENC_CONFIG_HEVC, reserved2);
+    BIT(NV_ENC_CONFIG_HEVC, outputAUD, 16);
+    BIT(NV_ENC_CONFIG_HEVC, disableSPSPPS, 16);
+    BIT(NV_ENC_CONFIG_HEVC, repeatSPSPPS, 16);
+    BIT(NV_ENC_CONFIG_HEVC, enableIntraRefresh, 16);
+    BIT(NV_ENC_CONFIG_HEVC, chromaFormatIDC, 16);
+    BIT(NV_ENC_CONFIG_HEVC, pixelBitDepthMinus8, 16);
+    printf("--- NV_ENC_PIC_PARAMS_HEVC\n");
+    SZ(NV_ENC_PIC_PARAMS_HEVC);
+    OF(NV_ENC_PIC_PARAMS_HEVC, displayPOCSyntax);
+    OF(NV_ENC_PIC_PARAMS_HEVC, refPicFlag);
+    OF(NV_ENC_PIC_PARAMS_HEVC, temporalId);
+    OF(NV_ENC_PIC_PARAMS_HEVC, forceIntraRefreshWithFrameCnt);
+    printf("--- HEVC constants\n");
+    GUIDV("NV_ENC_CODEC_HEVC_GUID", NV_ENC_CODEC_HEVC_GUID);
+    GUIDV("NV_ENC_HEVC_PROFILE_MAIN_GUID", NV_ENC_HEVC_PROFILE_MAIN_GUID);
+    GUIDV("NV_ENC_CODEC_H264_GUID", NV_ENC_CODEC_H264_GUID);
+    VAL("NV_ENC_LEVEL_AUTOSELECT", NV_ENC_LEVEL_AUTOSELECT);
+    VAL("NV_ENC_TIER_HEVC_MAIN", NV_ENC_TIER_HEVC_MAIN);
+    VAL("NV_ENC_HEVC_CUSIZE_AUTOSELECT", NV_ENC_HEVC_CUSIZE_AUTOSELECT);
     return 0;
 }

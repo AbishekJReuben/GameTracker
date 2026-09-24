@@ -145,6 +145,11 @@ pub const NV_ENC_H264_PROFILE_MAIN_GUID: GUID =
     GUID::from_values(0x60B5_C1D4, 0x67FE, 0x4790, [0x94, 0xD5, 0xC4, 0x72, 0x6D, 0x7B, 0x6E, 0x6D]);
 pub const NV_ENC_H264_PROFILE_BASELINE_GUID: GUID =
     GUID::from_values(0x0727_BCAA, 0x78C4, 0x4C83, [0x8C, 0x2F, 0xEF, 0x3D, 0xFF, 0x26, 0x7C, 0x6A]);
+/// HEVC (research R8), probed like the rest.
+pub const NV_ENC_CODEC_HEVC_GUID: GUID =
+    GUID::from_values(0x790C_DC88, 0x4522, 0x4D7B, [0x94, 0x25, 0xBD, 0xA9, 0x97, 0x5F, 0x76, 0x03]);
+pub const NV_ENC_HEVC_PROFILE_MAIN_GUID: GUID =
+    GUID::from_values(0xB514_C39A, 0xB55B, 0x40FA, [0x87, 0x8F, 0xF1, 0x25, 0x3B, 0x4D, 0xFD, 0xEC]);
 /// P1 = fastest. Paired with ULTRA_LOW_LATENCY tuning this is the Moonlight/Sunshine
 /// style config: no B-frames, no lookahead, minimum encode latency.
 pub const NV_ENC_PRESET_P1_GUID: GUID =
@@ -364,6 +369,67 @@ impl NV_ENC_CONFIG_H264 {
     }
 }
 
+/// `NV_ENC_CONFIG_HEVC` (research R8). The VUI block is the same C typedef as H.264's.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NV_ENC_CONFIG_HEVC {
+    pub level: u32,
+    pub tier: u32,
+    pub minCUSize: u32,
+    pub maxCUSize: u32,
+    /// LSB-first (probed): 0 useConstrainedIntraPred, 1 disableDeblockAcrossSliceBoundary,
+    /// 2 outputBufferingPeriodSEI, 3 outputPictureTimingSEI, 4 outputAUD, 5 enableLTR,
+    /// 6 disableSPSPPS, 7 repeatSPSPPS, 8 enableIntraRefresh, 9..10 chromaFormatIDC,
+    /// 11..13 pixelBitDepthMinus8, 14 enableFillerDataInsertion, 15 enableConstrainedEncoding,
+    /// 16 enableAlphaLayerEncoding, 17 singleSliceIntraRefresh, 18 outputRecoveryPointSEI,
+    /// 19 outputTimeCodeSEI, 20..31 reserved.
+    pub bitfields: u32,
+    pub idrPeriod: u32,
+    pub intraRefreshPeriod: u32,
+    pub intraRefreshCnt: u32,
+    pub maxNumRefFramesInDPB: u32,
+    pub ltrNumFrames: u32,
+    pub vpsId: u32,
+    pub spsId: u32,
+    pub ppsId: u32,
+    pub sliceMode: u32,
+    pub sliceModeData: u32,
+    pub maxTemporalLayersMinus1: u32,
+    pub hevcVUIParameters: NV_ENC_CONFIG_H264_VUI_PARAMETERS,
+    pub ltrTrustMode: u32,
+    pub useBFramesAsRef: u32,
+    pub numRefL0: u32,
+    pub numRefL1: u32,
+    pub reserved1: [u32; 214],
+    pub reserved2: [*mut c_void; 64],
+}
+const _: () = assert!(size_of::<NV_ENC_CONFIG_HEVC>() == 1560);
+
+impl NV_ENC_CONFIG_HEVC {
+    pub fn set_output_aud(&mut self, on: bool) {
+        self.set_bits(4, 1, on as u32);
+    }
+    pub fn set_disable_sps_pps(&mut self, on: bool) {
+        self.set_bits(6, 1, on as u32);
+    }
+    pub fn set_repeat_sps_pps(&mut self, on: bool) {
+        self.set_bits(7, 1, on as u32);
+    }
+    pub fn set_enable_intra_refresh(&mut self, on: bool) {
+        self.set_bits(8, 1, on as u32);
+    }
+    pub fn set_chroma_format_idc(&mut self, v: u32) {
+        self.set_bits(9, 2, v);
+    }
+    pub fn set_pixel_bit_depth_minus8(&mut self, v: u32) {
+        self.set_bits(11, 3, v);
+    }
+    fn set_bits(&mut self, at: u32, width: u32, v: u32) {
+        let mask = ((1u32 << width) - 1) << at;
+        self.bitfields = (self.bitfields & !mask) | ((v << at) & mask);
+    }
+}
+
 /// `NV_ENC_CODEC_CONFIG`. Sized by its **largest** member (`h264Config`, 1792) — the
 /// `reserved[320]` filler in the header is only 1280 bytes, so sizing off that would
 /// hand NVENC a short struct.
@@ -371,6 +437,7 @@ impl NV_ENC_CONFIG_H264 {
 #[derive(Clone, Copy)]
 pub union NV_ENC_CODEC_CONFIG {
     pub h264Config: NV_ENC_CONFIG_H264,
+    pub hevcConfig: NV_ENC_CONFIG_HEVC,
     pub raw: [u32; 448],
 }
 const _: () = assert!(size_of::<NV_ENC_CODEC_CONFIG>() == 1792);
@@ -531,11 +598,25 @@ pub struct NV_ENC_PIC_PARAMS_H264 {
 }
 const _: () = assert!(size_of::<NV_ENC_PIC_PARAMS_H264>() == 1536);
 
+/// Head of `NV_ENC_PIC_PARAMS_HEVC` (research R8); the rest is opaque padding kept at
+/// the probed total of 1536 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NV_ENC_PIC_PARAMS_HEVC {
+    pub displayPOCSyntax: u32,
+    pub refPicFlag: u32,
+    pub temporalId: u32,
+    pub forceIntraRefreshWithFrameCnt: u32,
+    pub tail: [u8; 1520],
+}
+const _: () = assert!(size_of::<NV_ENC_PIC_PARAMS_HEVC>() == 1536);
+
 /// Sized by its largest member (HEVC/AV1 pic params at 12.0), not by `h264PicParams`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union NV_ENC_CODEC_PIC_PARAMS {
     pub h264PicParams: NV_ENC_PIC_PARAMS_H264,
+    pub hevcPicParams: NV_ENC_PIC_PARAMS_HEVC,
     pub raw: [u8; 1552],
 }
 const _: () = assert!(size_of::<NV_ENC_CODEC_PIC_PARAMS>() == 1552);
@@ -722,6 +803,8 @@ pub type PEncUnregisterResource = unsafe extern "C" fn(*mut c_void, *mut c_void)
 pub type PEncMapInputResource = unsafe extern "C" fn(*mut c_void, *mut NV_ENC_MAP_INPUT_RESOURCE) -> u32;
 pub type PEncUnmapInputResource = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
 pub type PEncDestroyEncoder = unsafe extern "C" fn(*mut c_void) -> u32;
+/// `nvEncInvalidateRefFrames(encoder, invalidRefFrameTimeStamp)` — research R4.
+pub type PEncInvalidateRefFrames = unsafe extern "C" fn(*mut c_void, u64) -> u32;
 pub type PEncGetLastErrorString = unsafe extern "C" fn(*mut c_void) -> *const std::ffi::c_char;
 
 /// Unused entry-point slot. Must be a bare pointer, **not** `Option<*mut c_void>`:
@@ -763,7 +846,7 @@ pub struct NV_ENCODE_API_FUNCTION_LIST {
     pub nvEncMapInputResource: Option<PEncMapInputResource>,
     pub nvEncUnmapInputResource: Option<PEncUnmapInputResource>,
     pub nvEncDestroyEncoder: Option<PEncDestroyEncoder>,
-    pub nvEncInvalidateRefFrames: Slot,
+    pub nvEncInvalidateRefFrames: Option<PEncInvalidateRefFrames>,
     pub nvEncOpenEncodeSessionEx: Option<PEncOpenEncodeSessionEx>,
     pub nvEncRegisterResource: Option<PEncRegisterResource>,
     pub nvEncUnregisterResource: Option<PEncUnregisterResource>,
@@ -804,6 +887,34 @@ const _: () = {
     assert!(offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncMapInputResource) == 208);
     assert!(offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncUnmapInputResource) == 216);
     assert!(offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncDestroyEncoder) == 224);
+    assert!(offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncInvalidateRefFrames) == 232);
+    // HEVC (research R8), from the probe.
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, level) == 0);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, tier) == 4);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, minCUSize) == 8);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, maxCUSize) == 12);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, idrPeriod) == 20);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, intraRefreshPeriod) == 24);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, intraRefreshCnt) == 28);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, maxNumRefFramesInDPB) == 32);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, ltrNumFrames) == 36);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, vpsId) == 40);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, spsId) == 44);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, ppsId) == 48);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, sliceMode) == 52);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, sliceModeData) == 56);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, maxTemporalLayersMinus1) == 60);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, hevcVUIParameters) == 64);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, ltrTrustMode) == 176);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, useBFramesAsRef) == 180);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, numRefL0) == 184);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, numRefL1) == 188);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, reserved1) == 192);
+    assert!(offset_of!(NV_ENC_CONFIG_HEVC, reserved2) == 1048);
+    assert!(offset_of!(NV_ENC_PIC_PARAMS_HEVC, displayPOCSyntax) == 0);
+    assert!(offset_of!(NV_ENC_PIC_PARAMS_HEVC, refPicFlag) == 4);
+    assert!(offset_of!(NV_ENC_PIC_PARAMS_HEVC, temporalId) == 8);
+    assert!(offset_of!(NV_ENC_PIC_PARAMS_HEVC, forceIntraRefreshWithFrameCnt) == 12);
     assert!(offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncOpenEncodeSessionEx) == 240);
     assert!(offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncRegisterResource) == 248);
     assert!(offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncUnregisterResource) == 256);

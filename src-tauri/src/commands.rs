@@ -2389,6 +2389,29 @@ pub fn remote_set_h264_high(on: bool) {
     crate::remote::capture::set_h264_high(on);
 }
 
+/// Keep a 4-frame DPB so frames the host drops can be invalidated instead of
+/// answered with an IDR (research R4). Only for guests whose decoder opted in; a
+/// change is a new session with an IDR, like the profile.
+#[tauri::command]
+pub fn remote_set_rfi(on: bool) {
+    crate::remote::capture::set_rfi(on);
+}
+
+/// The host webview dropped the frame with this wire id (GN flags bits 2..7):
+/// invalidate it and everything after it before the next encode, or send an IDR
+/// when that can't be done (see `capture::NATIVE_RFI`).
+#[tauri::command]
+pub fn remote_request_rfi(frame_id: u32) {
+    crate::remote::capture::request_rfi((frame_id & 63) as u8);
+}
+
+/// HEVC Main instead of H.264 — the low-bandwidth mode (research R8). Only for
+/// guests whose decoder reported HEVC; a change is a new session with an IDR.
+#[tauri::command]
+pub fn remote_set_hevc(on: bool) {
+    crate::remote::capture::set_hevc(on);
+}
+
 /// Backpressure gate for the native H.264 path. While set, captures are skipped
 /// BEFORE NVENC (keyframes still encode), so the reference chain stays intact —
 /// dropping already-encoded P-frames is what corrupted the picture until the

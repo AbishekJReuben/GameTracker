@@ -80,6 +80,10 @@ export type QualitySettings = {
   /** Host/DIRECT: drive the encode bitrate from the guest's link reports
    *  (measured receive rate + delay gradient) instead of send-queue depth. */
   abrV2?: boolean;
+  /** Host/DIRECT: also act on the guest's delay-gradient overuse (R7). */
+  abrGradient?: boolean;
+  /** Host/DIRECT: native codec policy (R8). */
+  codec?: "auto" | "h264" | "hevc";
   /** Host/RTC audio: the PC's playout buffer target (ms) feeding the Opus
    *  encoder. Prime/max are derived from it. No effect on DIRECT audio, which
    *  bypasses the host worklet entirely. */
@@ -88,6 +92,8 @@ export type QualitySettings = {
   encPreset?: number;
   /** Host/NVENC: 0 single pass, 1 two-pass quarter-res, 2 two-pass full-res. */
   encMultipass?: number;
+  /** Host: DIRECT transport — "auto" | "sctp" | "rtp" (lib/carrier.ts). */
+  videoTransport?: "auto" | "sctp" | "rtp";
 };
 
 export interface RemoteLink {

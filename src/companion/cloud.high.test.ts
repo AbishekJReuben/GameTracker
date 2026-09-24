@@ -55,6 +55,70 @@ beforeEach(() => {
 });
 afterEach(() => { conn.close(); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
+describe("reference-frame invalidation opt-in (R4)", () => {
+  const probe = (name: string) => {
+    vi.mocked(native.nativeDecoderPossible).mockReturnValue(true);
+    vi.mocked(native.probeNativeDecoder).mockResolvedValue({
+      available: true, name, lowLatency: true, detail: "", maxBitrateKbps: 0, high: false,
+    });
+    vi.spyOn(c, "wcEligible").mockReturnValue(true);
+  };
+  const vmode = () => sent.find((m) => m.type === "vmode");
+
+  it("auto: only Qualcomm decoders take the 4-frame DPB", async () => {
+    probe("c2.qti.avc.decoder");
+    await c.maybeStartWc();
+    expect(vmode()?.rfi).toBe(true);
+  });
+
+  it("auto: other decoders keep the 1-frame DPB", async () => {
+    probe("c2.mtk.avc.decoder");
+    await c.maybeStartWc();
+    expect(vmode()?.rfi).toBe(false);
+  });
+
+  it("the Tune override wins both ways, live", async () => {
+    probe("c2.exynos.h264.decoder");
+    conn.applyStreamTune({ ...STREAM_TUNE_DEFAULTS, rfi: "on" });
+    await c.maybeStartWc();
+    expect(vmode()?.rfi).toBe(true);
+    conn.applyStreamTune({ ...STREAM_TUNE_DEFAULTS, rfi: "off" });
+    expect(sent).toContainEqual({ type: "vprofile", high: false, rfi: false, hevc: false });
+  });
+});
+
+describe("HEVC opt-in (R8)", () => {
+  it("offers HEVC when MediaCodec has a hardware HEVC decoder", async () => {
+    vi.mocked(native.nativeDecoderPossible).mockReturnValue(true);
+    vi.mocked(native.probeNativeDecoder).mockResolvedValue({
+      available: true, name: "c2.qti.avc.decoder", lowLatency: true, detail: "",
+      maxBitrateKbps: 0, high: false, hevc: true,
+    });
+    vi.spyOn(c, "wcEligible").mockReturnValue(true);
+    await c.maybeStartWc();
+    expect(sent.find((m) => m.type === "vmode")?.hevc).toBe(true);
+  });
+
+  it("uses WebCodecs isConfigSupported for HEVC off the APK", async () => {
+    supported = new Set(["avc1.42C028", "hev1.1.6.L123.90"]);
+    vi.spyOn(c, "wcEligible").mockReturnValue(true);
+    await c.maybeStartWc();
+    expect(sent.find((m) => m.type === "vmode")?.hevc).toBe(true);
+  });
+
+  it("an HEVC stream that never decodes withdraws the capability live", async () => {
+    supported = new Set(["avc1.42C028", "hev1.1.6.L123.90"]);
+    expect(await c.wcProbeDecoder()).toBe(true);
+    c.wcActive = true;
+    c.wcCodec = "hev1.1.6.L120.90";
+    expect(c.wcBuildWebCodecsDecoder()).toBe(true);
+    Decoder.all[0].init.error(new DOMException("bad"));
+    expect(c.wcBuildWebCodecsDecoder()).toBe(true);
+    Decoder.all[1].init.error(new DOMException("bad"));
+    expect(sent).toContainEqual({ type: "vprofile", high: false, rfi: false, hevc: false });
+  });
+});
+
 describe("H.264 High opt-in (R3)", () => {
   it("asks for High + the decoder cap when MediaCodec lists High", async () => {
     vi.mocked(native.nativeDecoderPossible).mockReturnValue(true);
@@ -64,13 +128,13 @@ describe("H.264 High opt-in (R3)", () => {
     });
     vi.spyOn(c, "wcEligible").mockReturnValue(true);
     await c.maybeStartWc();
-    expect(sent).toContainEqual({ type: "vmode", mode: "wc", high: true, maxKbps: 30000 });
+    expect(sent).toContainEqual({ type: "vmode", mode: "wc", high: true, rfi: true, hevc: false, maxKbps: 30000, carrier: false });
   });
 
   it("stays on Baseline (and sends no cap) when the decoder lacks High", async () => {
     vi.spyOn(c, "wcEligible").mockReturnValue(true);
     await c.maybeStartWc();
-    expect(sent).toContainEqual({ type: "vmode", mode: "wc", high: false });
+    expect(sent).toContainEqual({ type: "vmode", mode: "wc", high: false, rfi: false, hevc: false, carrier: false });
   });
 
   it("uses WebCodecs isConfigSupported for High off the APK", async () => {
@@ -97,7 +161,7 @@ describe("H.264 High opt-in (R3)", () => {
     c.wcBuildWebCodecsDecoder();
     Decoder.all[1].init.error(new DOMException("bad"));
     expect(c.wcHighFailed).toBe(true);
-    expect(sent).toContainEqual({ type: "vprofile", high: false });
+    expect(sent).toContainEqual({ type: "vprofile", high: false, rfi: false, hevc: false });
     expect(c.wcWantHigh()).toBe(false);
   });
 

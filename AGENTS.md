@@ -1749,18 +1749,9 @@ reproduction commands live in `docs/STREAMING_EFFICIENCY.md`.
 - **Intra refresh is enabled at session init**: `intraRefreshPeriod` 100 000 (≈ never
   automatic), `intraRefreshCnt` 30. A wave is P-slices with intra MBs. It strict-decodes
   cleanly (ffmpeg `-err_detect explode`) and needs no decoder support.
-- Research items **not yet implemented** (3.9.103 shipped R3, R6, the decoder cap and
-  R7's overshoot half — see below). Each has measured evidence and a file-level plan in the
-  research doc:
-  - **RTP "VP8 append carrier"** (R5): the fix for SCTP collapsing under any packet loss.
-    Needs an on-device spike first (does the WebView deliver receiver-transform frames?).
-  - **Reference-frame invalidation** (R4). Deliberately waiting for R5: on SCTP the host
-    never drops an encoded frame except at the 4× "channel dead" limit or a partial send
-    (backpressure pauses the encoder *before* encoding), so there is almost nothing to
-    invalidate — and RFI needs a 2-ref DPB on the phone, which must be tested on-device.
-  - R7's other half: first-fragment delay gradient (GCC trendline) for ABR v2.
-  - HEVC low-bandwidth mode (R8).
-  - SurfaceView vs TextureView A/B (R9).
+- Every September research item is now implemented: 3.9.103 shipped R3, R6, the decoder cap
+  and R7's overshoot half (below); 3.9.105 shipped R5, R4, R7's delay gradient, R8 and the R9
+  A/B (§17).
 
 ### 3.9.103 — Constrained High, decoder cap, loss ceiling, overshoot correction
 
@@ -1806,3 +1797,115 @@ All four are negotiated or measured per session; nothing changes for an older gu
     factor, clamped to 1…1.8; the factor relaxes toward 1 on light content.
   - It never goes below 1, so it only acts in the starved range, where overshoot builds a
     queue. HUD: `Overshoot`.
+
+---
+
+## 17. 3.9.105 — RTP carrier, RFI, delay gradient, HEVC, SurfaceView A/B, Tune sheet (do not regress)
+
+Every item is negotiated per session and falls back to 3.9.104 behaviour for an older peer.
+
+### RTP "append carrier" (R5) — `src/lib/carrier.ts`, `carrier.worker.ts`
+- **Why:** SCTP turns any packet loss into hundreds of ms of stall (per-association,
+  loss-based congestion control; research R5 table). The browser's RTP stack recovers loss
+  with NACK/RTX and paces with GCC.
+- **How:** the host adds a send-only VP8 transceiver fed by a 64×64 grey
+  `MediaStreamTrackGenerator`. An `RTCRtpScriptTransform` worker appends queued DIRECT
+  access units to each tiny VP8 frame as records `[len u32][flags u8][seq u32][tsMs f64]`
+  plus a 16-byte trailer ending in `"GTAU"`. The guest's receive transform cuts the records off
+  **before the jitter buffer** and restores the VP8 frame, so libwebrtc never sees garbage.
+- Negotiated by renegotiation after DIRECT opt-in (`vmode … carrier: true` → host sends
+  `{event:"carrier", mid}` then an offer), so an old guest never mistakes the carrier for the
+  screen. The guest classifies tracks by mid.
+- **Both transports share `wcSeq`**; the guest merges them with `SeqOrderer` (holds a gap up
+  to 250 ms, then declares a loss → await key + `vkf`).
+- **Policy (Tune "Video transport", default Auto):** SCTP while clean (≈5–10 ms faster), RTP as
+  soon as the R6 loss ceiling engages or RTCP reports > 5 % loss; back to SCTP after 20 s clean.
+  On RTP the target follows GCC: `availableOutgoingBitrate × 0.9 − 300 kb/s`, and the SCTP loss
+  ceiling doesn't apply. `boostCarrierSdp` sets `x-google-start/min/max-bitrate` on the
+  carrier — without them GCC starts at 300 kb/s and the spike measured 1.3 s latency.
+- **Spike on the Moto g57 (WebView 151):** receive transforms work; 340/341 frames intact at
+  57 fps, p50 16 ms / p90 24 ms. Config JSON rides the carrier too (`REC_CONFIG`) while on RTP.
+- Immersive VR is excluded (`carrierCapable()`); the carrier needs a Worker.
+
+### Reference-frame invalidation (R4)
+- Guest opt-in `rfi` on `vmode` / `vprofile`: Tune "Drop recovery" (Auto/On/Off). **Auto =
+  Codec2 Qualcomm decoders only** (`c2.qti.`, like Moonlight; the old low-end Snapdragons
+  that Moonlight excludes are on OMX). Host → `remote_set_rfi` → `CAP_RFI` →
+  `EncoderTuning.rfi` → new session.
+- **The DPB is 4 only for opted-in guests** (`sps::DPB_RFI`; `DPB_LOW_LATENCY` = 1 otherwise).
+  NVENC `maxNumRefFrames` and the SPS rewrite (refs, `max_dec_frame_buffering`) always agree,
+  and the rewrite sets `gaps_in_frame_num_value_allowed_flag` so the frame_num jump over the
+  dropped frames is a legal gap, not an error. Reorder stays 0.
+- **GN flags byte:** bit0 key, bit1 "clean" (first frame after an invalidation), bits 2..7 a
+  6-bit frame id (`native.rs frame_flags`). `RfiState` keeps 32 frames of (id, unique ts,
+  valid). `plan()` refuses — and the caller sends an IDR — when the id is unknown, nothing
+  valid precedes it, or the frame to predict from is ≥ 4 frames back (the guest's gap frames
+  take sliding-window slots just like NVENC's real ones).
+- **Host flow:** a P-frame dropped at the 4× ceiling → `remote_request_rfi(id)` →
+  `NATIVE_RFI` → `take_rfi` before the next encode (all three encode sites; a pending RFI also
+  wakes a still screen's Timeout branch). The page drops in-flight frames until the clean
+  one (`rfiGateAt`), then sends it; an IDR answers it too; after 1.5 s it falls back to the
+  hard gate + IDR. HUD: `RFI healed/asked · N IDR`.
+- **Measured** (`rfi_recovers_dropped_frames_without_an_idr`, ffmpeg decode + PSNR vs source):
+  after 1-, 2- and 3-frame drops the stream stays at 27–35 dB; the same drops without
+  invalidation collapse to 8–11 dB and never recover; the 4-frame drop falls back to an IDR
+  (18.7 dB — the blur RFI avoids).
+- HEVC sessions keep the 1-frame DPB (`Params::refs`); RFI is H.264 only.
+
+### Delay-gradient ABR (R7, second half) — `src/lib/trendline.ts`
+- A port of libwebrtc's TrendlineEstimator + adaptive-threshold overuse detector, fed per
+  data-channel frame with (host timestamp, guest arrival of the 20-byte GV header). The header
+  is its own SCTP message, so its arrival measures the queue *in front of* the frame; the
+  clock offset cancels in the deltas. Reported in `vstat` as `bw`/`trend`/`thr`.
+- **The host acts on overuse only with a real standing queue (> 30 ms, `ABR_GRAD_QUEUE_MS`).**
+  Without SCTP pacing, one big frame's burst reads as overuse; the floor removes that (0 false
+  cuts in 120 s of simulated clean link with 6× frames) while a capacity drop to 0.8× is caught
+  in 500 ms vs 1000 ms, 0.6× in 250 vs 500 ms. `underuse` holds the rate while the queue drains.
+- Tune "Early congestion detection" (default on, needs Smart bitrate). HUD `Gradient`.
+
+### HEVC low-bandwidth mode (R8)
+- NVENC HEVC Main bindings are probe-verified: `scripts/nvenc-abi-probe.c` now prints the HEVC
+  config/pic-param layouts, bitfield positions and GUIDs (header: FFmpeg nv-codec-headers
+  n12.0.16.1 = API 12.0; all 63 `ffi.rs` asserts match). Same config shape as H.264 (no B,
+  infinite GOP, IR waves, slices, repeated VPS/SPS/PPS, colour labelled); no SPS rewrite —
+  HEVC says "no reordering" in the SPS proper.
+- Measured (`hevc_vs_h264`, 720p60 dense content, ffmpeg strict decode): +1.2 dB at 2.5 Mb/s,
+  +2.5 dB at 6 Mb/s; encode 1.75 vs 1.37 ms.
+- Guest capability: `probeHevc()` (hardware decoder listing HEVC Main) on the APK,
+  `isConfigSupported("hev1.1.6.L123.90", prefer-hardware)` on web/Quest → `hevc` on
+  `vmode`/`vprofile`. The host announces the codec parsed from the SPS
+  (`hevcCodecFromAnnexB`, e.g. `hev1.1.6.L120.90`); the guest rebuilds its decoder;
+  MediaCodec gets `video/hevc` + VPS/SPS/PPS as CSD (`setCodec` before `init`).
+- **Policy (Tune "Codec", default Auto):** HEVC once the rate the encoder is held to stays
+  < 8 Mb/s for 5 s; back to H.264 > 12 Mb/s for 10 s; ≥ 20 s between switches (each is a new
+  session + IDR). A stream that won't decode withdraws the capability (`wcDropHevc`).
+
+### Lighter picture-in-picture stream
+`tune.pipLite` (default on): while `pipView`, the quality message caps width 960, 30 fps and a
+manual bitrate at 4 Mb/s (`PIP_MAX_*`, `streamTune.ts`). Full stream on exit.
+
+### SurfaceView A/B (R9) — experimental, default TextureView
+- Tune "Video layer" (APK, needs MediaCodec). `setViewKind` before `init`; a change stops the
+  codec, drops the old view, and init builds the other kind. `videoView()` is the one
+  accessor every lifecycle rule uses (visibility, bounds, watchdog, reseat, compositing).
+- SurfaceView specifics: the holder owns the Surface (never release it), `setFixedSize` to the
+  codec size, the view is laid out as the contain-fit box (`layoutHole`; no `setTransform`),
+  and `surfaceDestroyed` waits ≤ 500 ms for the codec to stop — the one UI-thread wait.
+- It brings back the translucent window that caused the Android 16 WebView burn-in; that's
+  why it's opt-in. Compare on each device.
+
+### Tune sheet — `src/companion/screens/TuneSheet.tsx`
+- Replaces the inline HUD panel: a full-height sheet (portal), six tabs by function (Picture,
+  Bitrate, PC encoder, Connection, Phone, Sound), one scroll area, 44 px targets, sliders with
+  28 px thumbs + −/+ steppers (`.tune-range`, `touch-action: pan-y`), per-tab and full reset.
+- **Knobs are data** (`TUNE_GROUPS`): kind, keys, hint, scope and a **gate**. Hard gates lock the
+  control and offer the one change that fixes it ("Turn on Smart bitrate"); soft gates mark
+  fallback-path knobs "not in use right now" but keep them adjustable.
+- **A new Tune field must be added to `TUNE_GROUPS` and to the coverage list in
+  `TuneSheet.test.tsx`** — the test fails otherwise, and so does "nothing locked by default".
+
+### Process notes
+- Scripted file edits write to `<file>.tmp` and rename. An interrupted in-place write left
+  `WcDecoderBridge.java` at 0 bytes once (restored from git + replayed patches).
+- The companion embeds `dist/` at compile time and has **no** `beforeBuildCommand`: run
+  `npm run build` before any local APK build, or it ships stale JS.

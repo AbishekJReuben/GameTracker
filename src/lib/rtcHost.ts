@@ -19,12 +19,33 @@ import { auxMonitorRoom } from "./remoteConfig";
 import { AUDIO_HDR_BYTES, StreamingAudioResampler, audioPacket, audioRedPacket } from "./audioWire";
 // Bundled as a same-origin asset (CSP default-src 'self' blocks blob:/data: modules).
 import audioFeederWorkletUrl from "./audioFeeder.worklet.js?url";
-import { H264_BASELINE_CODEC, H264_HIGH_CODEC, h264CodecFromAnnexB, parseNativeFrame, videoFragmentSize } from "./nativeDelivery";
+import {
+  H264_BASELINE_CODEC,
+  H264_HIGH_CODEC,
+  HEVC_MAIN_CODEC,
+  h264CodecFromAnnexB,
+  hevcCodecFromAnnexB,
+  parseNativeFrame,
+  videoFragmentSize,
+} from "./nativeDelivery";
 import { lossCeilingKbps, sctpCapacityKbps } from "./lossCeiling";
 import { OvershootEstimator } from "./overshoot";
+import { REC_CONFIG, REC_KEY, boostCarrierSdp } from "./carrier";
 import { MediaPipe, type PipeEndpoint } from "./mediaPipe";
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
+/**
+ * Device-test hook for reference-frame invalidation (R4): `window.__gtTestDrop = n` in the PC
+ * page's devtools sends the next n P-frames down the 4× "channel dead" drop path, exactly as
+ * a backed-up link would. The app never sets it.
+ */
+function takeTestDrop(): boolean {
+  const w = window as { __gtTestDrop?: number };
+  if (!w.__gtTestDrop || w.__gtTestDrop <= 0) return false;
+  w.__gtTestDrop--;
+  return true;
+}
+
 export interface HostLiveStats {
   /** Rust capture-pipeline stats (produced fps, capture/scale/encode ms, bytes…). */
   capture: RemoteCaptureStats | null;
@@ -471,6 +492,11 @@ export function startHost(opts: HostOptions): () => void {
   let sig: Signaling | null = null;
   let pc: RTCPeerConnection | null = null;
   let dataCh: RTCDataChannel | null = null;
+  /** The RTP carrier's m-section mid once negotiated (carrier.ts): the answer
+   *  handler puts the VP8 bitrate hints on it (boostCarrierSdp). */
+  let carrierMid: string | null = null;
+  /** Session hook: a (re)negotiation answer was applied. */
+  let onAnswerApplied: (() => void) | null = null;
   let videoTrack: MediaStreamTrack | null = null;
   let videoWriter: WritableStreamDefaultWriter<VideoFrame> | null = null;
   let videoSender: RTCRtpSender | null = null;
@@ -585,6 +611,13 @@ export function startHost(opts: HostOptions): () => void {
     // Drive the DIRECT bitrate from the guest's own link reports (see ABR v2
     // below) instead of from our send-queue depth alone.
     abrV2: true,
+    // R7: also act on the guest's delay-gradient overuse (with a 30 ms queue floor).
+    abrGradient: true,
+    // R8: native codec — "auto" = HEVC only while link-limited (pickCodec).
+    codec: "auto" as "auto" | "h264" | "hevc",
+    // DIRECT transport (carrier.ts): "auto" = the SCTP video channel while the link
+    // is clean, the RTP carrier as soon as it loses packets; or force either.
+    videoTransport: "auto" as "auto" | "sctp" | "rtp",
     // RTC audio: this worklet's playout target (ms) before the Opus encoder.
     // DIRECT audio diverts upstream of the worklet, so this only shapes the
     // classic track. Prime/max are derived (see audioEnvelope).
@@ -663,11 +696,18 @@ export function startHost(opts: HostOptions): () => void {
     lossN?: number;
     /** Base RTT (ms): the lowest of the guest's recent clock pings. */
     rttMs?: number;
+    /** R7: the guest's delay-gradient state (GCC trendline) and its trend/threshold. */
+    bw?: "normal" | "overuse" | "underuse";
+    trend?: number;
+    thr?: number;
   };
   /** True while fresh guest reports are arriving (an old guest sends none). */
   let vsAt = 0;
   let vsRecvKbps = 0;
   let vsQueueMs = 0;
+  let vsBw = "";
+  let vsTrend = 0;
+  let vsThr = 0;
   /** The queue EWMA holds a real value (0 is a legitimate reading). */
   let vsSeeded = false;
   let vsFps = 0;
@@ -681,6 +721,14 @@ export function startHost(opts: HostOptions): () => void {
   const ABR_QUEUE_HIGH_MS = 110;
   /** ...and below which it is provably clean and we may probe upward. */
   const ABR_QUEUE_LOW_MS = 45;
+  /**
+   * R7: a delay-gradient overuse (the queue is GROWING) is acted on once there is
+   * also this much standing queue. The gradient alone flags the transient queue a
+   * big frame makes on a clean link; with this floor, simulated capacity drops are
+   * caught in 0.25–0.5 s instead of 0.5–1 s, with no false cuts on a clean link
+   * with 6× frames (src/lib/trendline.test.ts).
+   */
+  const ABR_GRAD_QUEUE_MS = 30;
   /** A clean stretch this long retires the remembered ceiling entirely. */
   const ABR_CEIL_FORGET_MS = 6000;
   /** v2 owns the rate only while the guest is actually reporting. */
@@ -693,6 +741,16 @@ export function startHost(opts: HostOptions): () => void {
   let guestDecoderMaxKbps = 0;
   /** Guest asked for Constrained High and its decoder says it can take it (R3). */
   let guestH264High = false;
+  /** Research R4: the guest's decoder takes a 4-frame DPB, so frames the host drops
+   *  are invalidated instead of answered with an IDR. Per guest, from its opt-in. */
+  let guestRfi = false;
+  /** Research R8: the guest's decoder takes HEVC Main (from its opt-in / vprofile). */
+  let guestHevcCap = false;
+  /** The native encoder is on HEVC right now (the low-bandwidth mode). */
+  let guestHevc = false;
+  let codecLowSince = 0;
+  let codecHighSince = 0;
+  let codecSwitchAt = 0;
   /**
    * Loss-aware SCTP ceiling (research R6, lossCeiling.ts): reliable SCTP can't carry
    * more than ~C_sctp under random loss, and anything above it only queues. 0 = none.
@@ -701,6 +759,11 @@ export function startHost(opts: HostOptions): () => void {
   /** Smoothed raw loss the guest measured on the STUDIO audio channel (−1 = unknown). */
   let vsLoss = -1;
   let vsRttMs = 0;
+  /** DIRECT frames currently ride the RTP carrier (carrier.ts), not the SCTP channel.
+   *  RTP has its own loss recovery and GCC, so the SCTP loss ceiling doesn't apply
+   *  and the target follows GCC's estimate instead (`rtpCapKbps`, 0 = unknown). */
+  let onRtpTransport = false;
+  let rtpCapKbps = 0;
 
   /** Ask Rust for Constrained High (or back to Baseline). A change = new NVENC session + IDR. */
   const setGuestH264High = (on: boolean, why: string) => {
@@ -715,11 +778,80 @@ export function startHost(opts: HostOptions): () => void {
     }
   };
 
+  /** Ask Rust for the 4-frame DPB (R4) or back to 1. A change = new NVENC session + IDR. */
+  const setGuestRfi = (on: boolean, why: string) => {
+    if (opts.fixedMonitor != null || on === guestRfi) return;
+    guestRfi = on;
+    slog("config", `reference-frame invalidation ${on ? "on (4-frame DPB)" : "off"} (${why})`);
+    try {
+      void api.remoteSetRfi(on);
+    } catch {
+      /* not on desktop */
+    }
+  };
+
+  const setGuestHevc = (on: boolean, why: string) => {
+    if (opts.fixedMonitor != null || on === guestHevc) return;
+    guestHevc = on;
+    codecSwitchAt = Date.now();
+    slog("config", `codec ${on ? "HEVC (low-bandwidth mode)" : "H.264"} (${why})`);
+    try {
+      void api.remoteSetHevc(on);
+    } catch {
+      /* not on desktop */
+    }
+  };
+
+  /**
+   * R8 low-bandwidth mode. HEVC costs ~0.4 ms more encode and ~4 ms more decode on
+   * the reference phone but needs 27–54 % fewer bits for the same picture, so it
+   * wins only when bits are what's short: "auto" switches to it once the rate the
+   * encoder is held to stays under HEVC_BELOW_KBPS, and back to H.264 once it stays
+   * over H264_ABOVE_KBPS. Each switch is a new NVENC session + IDR + a decoder
+   * rebuild on the guest, so it is hysteretic and at most one per CODEC_MIN_GAP_MS.
+   * "h264" / "hevc" force it (HEVC only if the guest's decoder has it).
+   */
+  const HEVC_BELOW_KBPS = 8000;
+  const H264_ABOVE_KBPS = 12000;
+  const HEVC_ENTER_MS = 5000;
+  const HEVC_LEAVE_MS = 10000;
+  const CODEC_MIN_GAP_MS = 20000;
+  const pickCodec = (why: string) => {
+    if (opts.fixedMonitor != null) return;
+    if (!guestHevcCap || quality.codec === "h264") return setGuestHevc(false, why);
+    if (quality.codec === "hevc") return setGuestHevc(true, why);
+    const now = Date.now();
+    const tgt = targetKbps();
+    const rate = adaptKbps > 0 ? Math.min(adaptKbps, tgt) : tgt;
+    if (rate < HEVC_BELOW_KBPS) {
+      codecHighSince = 0;
+      if (!codecLowSince) codecLowSince = now;
+    } else if (rate > H264_ABOVE_KBPS) {
+      codecLowSince = 0;
+      if (!codecHighSince) codecHighSince = now;
+    } else {
+      codecLowSince = 0;
+      codecHighSince = 0;
+    }
+    if (now - codecSwitchAt < CODEC_MIN_GAP_MS) return;
+    if (!guestHevc && codecLowSince && now - codecLowSince >= HEVC_ENTER_MS) {
+      setGuestHevc(true, `auto: ${Math.round(rate)}k < ${HEVC_BELOW_KBPS}k for ${HEVC_ENTER_MS / 1000}s`);
+    } else if (guestHevc && codecHighSince && now - codecHighSince >= HEVC_LEAVE_MS) {
+      setGuestHevc(false, `auto: ${Math.round(rate)}k > ${H264_ABOVE_KBPS}k for ${HEVC_LEAVE_MS / 1000}s`);
+    }
+  };
+
   /** Target ceiling from the Tune panel (or auto curve), capped by the guest's decoder and the link's loss. */
   const targetKbps = () => {
     let t = quality.bitrate > 0 ? quality.bitrate : Math.round(bitrateFor(quality) / 1000);
     // 10 % under the declared maximum: NVENC's 1-frame VBV overshoots low-ish targets.
     if (guestDecoderMaxKbps > 0) t = Math.min(t, Math.round(guestDecoderMaxKbps * 0.9));
+    if (onRtpTransport) {
+      // RTP carrier: GCC owns congestion control; stay a little under its estimate
+      // so the pacer never queues (its queue is latency). No SCTP loss ceiling here.
+      if (rtpCapKbps > 0) t = Math.min(t, Math.max(rtpCapKbps, Math.max(500, quality.minBitrateKbps)));
+      return t;
+    }
     // The loss ceiling never undercuts the user's Tune floor, and goes stale with the reports.
     if (lossCeilKbps > 0 && Date.now() - vsAt < 3000) {
       t = Math.min(t, Math.max(lossCeilKbps, Math.max(500, quality.minBitrateKbps)));
@@ -875,6 +1007,9 @@ export function startHost(opts: HostOptions): () => void {
     // smoothing exists precisely so one sample cannot decide anything.
     vsQueueMs = vsSeeded ? vsQueueMs * 0.6 + queueMs * 0.4 : queueMs;
     vsSeeded = true;
+    vsBw = r.bw ?? "";
+    vsTrend = r.trend ?? 0;
+    vsThr = r.thr ?? 0;
     // R6: loss-aware ceiling. Applies to v1 and v2 alike (it caps the target, not
     // the controller). Needs ≥2 lost packets in the guest's 5 s window, so one
     // stray Wi-Fi drop can't cap the stream.
@@ -910,7 +1045,8 @@ export function startHost(opts: HostOptions): () => void {
     // encoder a reconfigure.
     if (now - abrLastMoveAt < 400) return;
 
-    if (vsQueueMs > ABR_QUEUE_HIGH_MS) {
+    const gradOveruse = quality.abrGradient && r.bw === "overuse" && vsQueueMs > ABR_GRAD_QUEUE_MS;
+    if (vsQueueMs > ABR_QUEUE_HIGH_MS || gradOveruse) {
       abrLastMoveAt = now;
       abrCleanSince = 0;
       // GCC's decrease: the new rate comes from what the receiver MEASURED, not
@@ -930,7 +1066,7 @@ export function startHost(opts: HostOptions): () => void {
         abrCeilKbps = adaptKbps;
         slog(
           "abr",
-          `overuse: queue ${Math.round(vsQueueMs)}ms → ${adaptKbps}k to ${next}k (recv ${Math.round(vsRecvKbps)}k, ceil ${adaptKbps}k)`,
+          `overuse (${vsQueueMs > ABR_QUEUE_HIGH_MS ? "queue" : `gradient ${r.trend}>${r.thr}`}): queue ${Math.round(vsQueueMs)}ms → ${adaptKbps}k to ${next}k (recv ${Math.round(vsRecvKbps)}k, ceil ${adaptKbps}k)`,
         );
         adaptKbps = next;
         pushAdaptBitrate(true);
@@ -938,6 +1074,12 @@ export function startHost(opts: HostOptions): () => void {
       return;
     }
 
+    // R7: the queue is draining. GCC's rate controller holds here — climbing now
+    // would refill the queue it is emptying.
+    if (quality.abrGradient && r.bw === "underuse") {
+      abrCleanSince = 0;
+      return;
+    }
     if (vsQueueMs > ABR_QUEUE_LOW_MS) {
       // In between: neither proof of congestion nor proof of headroom. Hold —
       // the single most valuable thing a delay controller does is NOT move here.
@@ -1159,7 +1301,9 @@ export function startHost(opts: HostOptions): () => void {
    * the JPEG decode and the WebCodecs encoder are all bypassed. Null ⇒ Rust must send
    * JPEG (the RTC track needs real pixels to composite).
    */
-  let nativeSink: ((payload: Uint8Array<ArrayBuffer>, key: boolean, w?: number, h?: number, tsMs?: number, fast?: boolean) => void) | null = null;
+  let nativeSink:
+    | ((payload: Uint8Array<ArrayBuffer>, key: boolean, w?: number, h?: number, tsMs?: number, fast?: boolean, frameId?: number, rfiClean?: boolean) => void)
+    | null = null;
   /** True once Rust has told us (via the frame container) that it's encoding natively. */
   let nativeActive = false;
   let nativeDeliveryMs = 0;
@@ -1542,7 +1686,7 @@ export function startHost(opts: HostOptions): () => void {
         if (frame.fast && frame.generation !== feedGeneration) return;
         nativeDeliveryMs = frame.hostAgeMs;
         try {
-          nativeSink?.(frame.payload, frame.key, frame.w, frame.h, frame.timestamp, frame.fast);
+          nativeSink?.(frame.payload, frame.key, frame.w, frame.h, frame.timestamp, frame.fast, frame.frameId, frame.rfiClean);
         } finally {
           // Credit is returned only AFTER the frame reached the send/gate logic.
           // Never wait for ACK on the main thread. Stale generations are ignored
@@ -2184,6 +2328,26 @@ export function startHost(opts: HostOptions): () => void {
         /* not on desktop */
       }
     }
+    if (opts.fixedMonitor == null && guestRfi) {
+      guestRfi = false;
+      try {
+        void api.remoteSetRfi(false);
+      } catch {
+        /* not on desktop */
+      }
+    }
+    guestHevcCap = false;
+    codecLowSince = 0;
+    codecHighSince = 0;
+    codecSwitchAt = 0;
+    if (opts.fixedMonitor == null && guestHevc) {
+      guestHevc = false;
+      try {
+        void api.remoteSetHevc(false);
+      } catch {
+        /* not on desktop */
+      }
+    }
     // Access gate: the screen/audio capture and input injection stay off until the
     // guest is authorized (trusted device, correct secret, or user approval).
     let authorized = false;
@@ -2503,11 +2667,222 @@ export function startHost(opts: HostOptions): () => void {
 
     const wcTargetBps = () => (quality.bitrate > 0 ? quality.bitrate * 1000 : bitrateFor(quality));
 
+    // ---- DIRECT over RTP: the "append carrier" (carrier.ts, research R5) -------
+    // Reliable SCTP turns any packet loss into hundreds of ms of stall; RTP (NACK,
+    // pacer, GCC) doesn't. The carrier is a VP8 transceiver of 64×64 dummy frames
+    // whose encoded frames carry our access units (carrier.worker.ts). It is added
+    // by RENEGOTIATION only once the guest says it can take it — an older guest
+    // would mistake a second video track for the screen. Frames then take whichever
+    // transport `pickTransport` chose; both share wcSeq, so the guest merges them in
+    // order and a switch needs no keyframe.
+    type CarrierState = {
+      tx: RTCRtpTransceiver;
+      writer: WritableStreamDefaultWriter<VideoFrame>;
+      worker: Worker;
+      ready: boolean;
+      lastTs: number;
+    };
+    let carrier: CarrierState | null = null;
+    let carrierFailed = false;
+    let transport: "sctp" | "rtp" = "sctp";
+    let transportCleanSince = 0;
+    let carrierFrames = 0;
+    let carrierBytes = 0;
+    let carrierLossPct = -1;
+    let lastCarrierPoll = 0;
+    /** After this long without any measured loss, auto mode returns to SCTP (it is
+     *  ~5–10 ms faster on a clean link). */
+    const TRANSPORT_CLEAN_MS = 20_000;
+    /** 64×64 grey I420 — the cheapest frame VP8 will encode; one per carried frame. */
+    const dummyI420 = new Uint8Array((64 * 64 * 3) / 2).fill(128);
+    const carrierPossible = () =>
+      typeof (window as unknown as { RTCRtpScriptTransform?: unknown }).RTCRtpScriptTransform === "function" &&
+      typeof (window as unknown as { MediaStreamTrackGenerator?: unknown }).MediaStreamTrackGenerator === "function" &&
+      typeof VideoFrame === "function";
+    sessionCleanups.add(() => {
+      carrierMid = null;
+      onAnswerApplied = null;
+      onRtpTransport = false;
+      rtpCapKbps = 0;
+    });
+
+    const setTransport = (next: "sctp" | "rtp", why: string) => {
+      if (next === transport) return;
+      transport = next;
+      onRtpTransport = next === "rtp";
+      transportCleanSince = 0;
+      slog("transport", `${next === "rtp" ? "RTP carrier" : "SCTP video channel"} (${why})`);
+      try {
+        data.send(JSON.stringify({ event: "vtransport", mode: next }));
+      } catch {
+        /* HUD only */
+      }
+      pushAdaptBitrate(true);
+    };
+
+    /** Auto: RTP as soon as the link loses packets (reliable SCTP would stall on
+     *  them), back to SCTP after a clean stretch. Tune can force either. */
+    const pickTransport = () => {
+      if (!carrier?.ready) {
+        setTransport("sctp", "carrier not negotiated");
+        return;
+      }
+      if (quality.videoTransport === "rtp") return setTransport("rtp", "Tune: RTP");
+      if (quality.videoTransport === "sctp") return setTransport("sctp", "Tune: data channel");
+      const lossy = lossCeilKbps > 0 || carrierLossPct > 0.05;
+      if (lossy) {
+        transportCleanSince = 0;
+        setTransport("rtp", `loss ${vsLoss >= 0 ? (vsLoss * 100).toFixed(2) : "?"}% (audio) / ${carrierLossPct.toFixed(2)}% (RTP)`);
+        return;
+      }
+      if (transport === "rtp") {
+        const now = Date.now();
+        if (!transportCleanSince) transportCleanSince = now;
+        else if (now - transportCleanSince > TRANSPORT_CLEAN_MS) setTransport("sctp", "link clean for 20 s");
+      }
+    };
+
+    /** GCC's estimate (the RTP bitrate cap) and the carrier's RTCP-reported loss. */
+    const pollCarrier = async () => {
+      const c = carrier;
+      if (!c?.ready || pc !== myPc) return;
+      try {
+        const stats = await c.tx.sender.getStats();
+        let avail = 0;
+        let lossFrac = -1;
+        stats.forEach((r: Record<string, unknown>) => {
+          if (r.type === "candidate-pair" && r.nominated && typeof r.availableOutgoingBitrate === "number") {
+            avail = r.availableOutgoingBitrate;
+          }
+          if (r.type === "remote-inbound-rtp" && typeof r.fractionLost === "number") lossFrac = r.fractionLost;
+        });
+        // Leave room for audio (STUDIO ~260 kb/s) and the RTCP/RTX overhead.
+        rtpCapKbps = avail > 0 ? Math.max(0, Math.round((avail * 0.9) / 1000) - 300) : 0;
+        carrierLossPct = lossFrac >= 0 ? lossFrac * 100 : -1;
+      } catch {
+        /* keep the last values */
+      }
+    };
+
+    const setupCarrier = async () => {
+      const s = sig;
+      if (carrier || carrierFailed || !carrierPossible() || !s || pc !== myPc) return;
+      if (myPc.signalingState !== "stable") {
+        // An ICE-restart offer is in flight; try again once it settles.
+        window.setTimeout(() => void setupCarrier(), 1000);
+        return;
+      }
+      try {
+        const Gen = (window as unknown as {
+          MediaStreamTrackGenerator: new (init: { kind: "video" }) => MediaStreamTrack & { writable: WritableStream<VideoFrame> };
+        }).MediaStreamTrackGenerator;
+        const gen = new Gen({ kind: "video" });
+        const tx = myPc.addTransceiver(gen, { direction: "sendonly", sendEncodings: [{ maxBitrate: 60_000_000 }] });
+        const codecs = RTCRtpSender.getCapabilities("video")?.codecs ?? [];
+        const vp8 = codecs.filter((c) => /VP8/i.test(c.mimeType));
+        if (!vp8.length) throw new Error("no VP8 encoder");
+        tx.setCodecPreferences([...vp8, ...codecs.filter((c) => /rtx/i.test(c.mimeType))]);
+        const worker = new Worker(new URL("./carrier.worker.ts", import.meta.url), { type: "module", name: "gt-carrier-send" });
+        const Transform = (window as unknown as { RTCRtpScriptTransform: new (w: Worker, o: unknown) => unknown }).RTCRtpScriptTransform;
+        (tx.sender as unknown as { transform: unknown }).transform = new Transform(worker, { side: "send" });
+        const writer = gen.writable.getWriter();
+        const st: CarrierState = { tx, writer, worker, ready: false, lastTs: 0 };
+        carrier = st;
+        sessionCleanups.add(() => {
+          try {
+            worker.terminate();
+          } catch {
+            /* gone */
+          }
+          writer.close().catch(() => {});
+          gen.stop();
+          if (carrier === st) carrier = null;
+        });
+        try {
+          const p = tx.sender.getParameters() as RTCRtpSendParameters & { degradationPreference?: string };
+          p.degradationPreference = "maintain-framerate";
+          await tx.sender.setParameters(p);
+        } catch {
+          /* optional */
+        }
+        const offer = await myPc.createOffer();
+        if (pc !== myPc) return;
+        await myPc.setLocalDescription(offer);
+        carrierMid = tx.mid;
+        onAnswerApplied = () => {
+          if (carrier === st && !st.ready && st.tx.currentDirection === "sendonly") {
+            st.ready = true;
+            slog("transport", `RTP carrier negotiated (mid ${st.tx.mid})`);
+            pickTransport();
+          }
+        };
+        try {
+          data.send(JSON.stringify({ event: "carrier", mid: tx.mid }));
+        } catch {
+          /* the guest also identifies it as the non-primary video m-line */
+        }
+        s.send({ type: "offer", sdp: await gatheredLocalSdp(myPc), sid: sessionId });
+        slog("transport", `RTP carrier offered (mid ${tx.mid})`);
+      } catch (e) {
+        carrierFailed = true;
+        console.warn("[remote] RTP carrier unavailable — DIRECT stays on the data channel:", e);
+      }
+    };
+
+    /** One access unit (or a config JSON) onto the carrier: queue it in the send
+     *  worker, then push one dummy frame for VP8 to encode it into. */
+    const carrierSend = (payload: Uint8Array, key: boolean, tsMs: number, config = false): boolean => {
+      const c = carrier;
+      if (!c?.ready) return false;
+      // Own buffer: the payload may be a view into a larger pipe buffer, and the
+      // worker takes it by transfer.
+      const copy = payload.slice();
+      const seq = config ? 0 : wcSeq++ >>> 0;
+      try {
+        c.worker.postMessage(
+          { type: "rec", flags: (key ? REC_KEY : 0) | (config ? REC_CONFIG : 0), seq, tsMs, data: copy.buffer },
+          [copy.buffer],
+        );
+        const ts = Math.max(c.lastTs + 1, Math.round(performance.now() * 1000));
+        c.lastTs = ts;
+        c.writer.write(new VideoFrame(dummyI420, { format: "I420", codedWidth: 64, codedHeight: 64, timestamp: ts })).catch(() => {});
+      } catch {
+        return false;
+      }
+      if (!config) {
+        carrierFrames++;
+        carrierBytes += payload.byteLength;
+      }
+      return true;
+    };
+
+    /** Codec announces go on the video channel always, and on the carrier too while
+     *  it carries the frames — a keyframe must never overtake its own announce. */
+    const sendVideoConfig = (cfg: Record<string, unknown>) => {
+      const json = JSON.stringify(cfg);
+      try {
+        videoCh.send(json);
+      } catch {
+        /* the next announce / keyframe resyncs the guest */
+      }
+      if (transport === "rtp" && carrier?.ready) carrierSend(new TextEncoder().encode(json), false, performance.now(), true);
+    };
+
     /** Ship one encoded frame: 20-byte header, then bounded fragments. The payload is
      *  a view (not a copy) so the native path can forward Rust's bytes as-is. */
     // `Uint8Array<ArrayBuffer>` (not the default `ArrayBufferLike`): RTCDataChannel.send
     // won't take a possibly-SharedArrayBuffer-backed view.
     const wcSendBytes = (payload: Uint8Array<ArrayBuffer>, key: boolean, tsMs: number, fast = false): boolean => {
+      if (transport === "rtp" && carrier?.ready) {
+        if (!carrierSend(payload, key, tsMs)) return false;
+        wcFrames++;
+        wcBytes += payload.byteLength;
+        if (key) {
+          wcKeys++;
+          wcLastKeyAt = performance.now();
+        }
+        return true;
+      }
       if (videoCh.readyState !== "open") return false;
       const head = new ArrayBuffer(20);
       const dv = new DataView(head);
@@ -2580,6 +2955,18 @@ export function startHost(opts: HostOptions): () => void {
     let nativeKeyRequestAt = 0;
     let nativeArtifactEvents = 0; // count of soft-recovery armings (HUD "artifacts")
     let nativeRecoveredEvents = 0; // count of clean IDRs that closed a recovery
+    // Research R4 — reference-frame invalidation. When a P-frame has to be dropped at
+    // the 4x ceiling and the guest opted in, Rust invalidates it (and the frames
+    // already encoded after it) and the next frame predicts from the last one the
+    // guest got. Until that "clean" frame arrives, frames still in flight reference
+    // the dropped one and are held back; no IDR, no blur, no hard gate. An
+    // invalidation Rust can't do (too deep, old session) comes back as an IDR, and
+    // one that never comes back falls through to the hard gate after RFI_GATE_MAX_MS.
+    let rfiGateAt = 0;
+    let rfiRequests = 0;
+    let rfiRecovered = 0;
+    let rfiFallbacks = 0;
+    const RFI_GATE_MAX_MS = 1500;
     /** P-frames dropped by backpressure since the last on-wire IDR. */
     let skipsSinceKey = 0;
     /** Last time a soft-recovery IDR was armed — cooldown stops the skip→IDR sawtooth. */
@@ -2800,13 +3187,14 @@ export function startHost(opts: HostOptions): () => void {
       if (skipsSinceKey < SKIP_RECOVER_AT) return;
       if (armNativeRecovery(true)) skipsSinceKey = 0;
     };
-    nativeSink = (payload, key, w = 0, h = 0, tsMs = performance.now(), fast = false) => {
+    nativeSink = (payload, key, w = 0, h = 0, tsMs = performance.now(), fast = false, frameId = -1, rfiClean = false) => {
       if (!sessionAlive || pc !== myPc) return;
       if (videoCh.readyState !== "open") return;
       // Announce what the stream IS: a keyframe carries the SPS. A profile switch
       // (R3) arrives as a fresh session's IDR at the same size, so the codec is
       // compared too — the guest must rebuild its decoder before that IDR.
-      const keyCodec = key ? h264CodecFromAnnexB(payload) : null;
+      // HEVC and H.264 parameter-set NAL headers can't be mistaken for each other.
+      const keyCodec = key ? (hevcCodecFromAnnexB(payload) ?? h264CodecFromAnnexB(payload)) : null;
       if (
         !nativeAnnounced ||
         w !== nativeConfigW ||
@@ -2816,10 +3204,10 @@ export function startHost(opts: HostOptions): () => void {
         nativeAnnounced = true;
         nativeConfigW = w;
         nativeConfigH = h;
-        const codec = keyCodec ?? (guestH264High ? H264_HIGH_CODEC : H264_BASELINE_CODEC);
+        const codec = keyCodec ?? (guestHevc ? HEVC_MAIN_CODEC : guestH264High ? H264_HIGH_CODEC : H264_BASELINE_CODEC);
         nativeCodec = codec;
         try {
-          videoCh.send(JSON.stringify({ codec, w, h }));
+          sendVideoConfig({ codec, w, h });
         } catch {
           /* guest resyncs from the next announce / keyframe */
         }
@@ -2851,6 +3239,8 @@ export function startHost(opts: HostOptions): () => void {
       }
       const maxBuffered = wcBufBudget();
       const buffered = videoCh.bufferedAmount;
+      // The 4× "channel dead" ceiling (or the device-test hook standing in for it).
+      const channelDead = buffered > maxBuffered * 4 || (!key && takeTestDrop());
       // HARD gate: only set on a true reference-chain break (config/resize/partial AU).
       if (nativeAwaitKey && !key) {
         // Gated frames never reach the send path below, so a deferred recovery
@@ -2863,6 +3253,31 @@ export function startHost(opts: HostOptions): () => void {
         }
         return;
       }
+      // R4 gate: waiting for the first frame encoded after an invalidation.
+      if (rfiGateAt > 0) {
+        const waited = Math.round(performance.now() - rfiGateAt);
+        if (key) {
+          rfiGateAt = 0;
+          slog("rfi", `answered by an IDR after ${waited} ms (invalidation not possible)`);
+        } else if (rfiClean) {
+          rfiGateAt = 0;
+          rfiRecovered++;
+          slog("rfi", `recovered by clean P-frame #${frameId} after ${waited} ms (no IDR)`);
+        } else if (waited > RFI_GATE_MAX_MS) {
+          rfiGateAt = 0;
+          rfiFallbacks++;
+          wcSkipped++;
+          slog("rfi", `no clean frame after ${waited} ms — falling back to an IDR`);
+          setNativeAwaitKey(true, "RFI unanswered");
+          armNativeRecovery(false, true);
+          return;
+        } else {
+          // Encoded before the invalidation reached Rust: it predicts from a frame
+          // the guest never got. Rust invalidated it too; just don't send it.
+          wcSkipped++;
+          return;
+        }
+      }
       // Reference-safe backpressure: NEVER latest-wins an already-encoded frame —
       // every encoded P-frame is a reference for the ones after it, and each
       // post-encode drop was a visible artifact until the next recovery IDR.
@@ -2873,7 +3288,24 @@ export function startHost(opts: HostOptions): () => void {
       // 4× was ~32KB — smaller than a typical IDR — so recovery keys were shed,
       // the guest stayed gated for seconds, then the stall watchdog tore the
       // whole DIRECT session down ("stream drops then reconnects").
-      if (!key && buffered > maxBuffered * 4) {
+      if (!key && channelDead && guestRfi && frameId >= 0) {
+        wcSkipped++;
+        rfiRequests++;
+        rfiGateAt = performance.now();
+        slog(
+          "rfi",
+          `P-frame #${frameId} dropped — channel dead (buffered=${Math.round(buffered / 1024)}KB, 4× budget); invalidating it instead of an IDR`,
+        );
+        setEncoderPaused(true, buffered, maxBuffered);
+        try {
+          void api.remoteRequestRfi(frameId);
+        } catch {
+          /* not on desktop */
+        }
+        adaptFromBuffer(buffered, maxBuffered, true);
+        return;
+      }
+      if (!key && channelDead) {
         wcSkipped++;
         skipsSinceKey++;
         slog(
@@ -2979,6 +3411,7 @@ export function startHost(opts: HostOptions): () => void {
       nativeCodec = "";
       nativeConfigW = 0;
       nativeConfigH = 0;
+      rfiGateAt = 0;
       // Path is stopping — gate any stray frames but don't arm the IDR watchdog
       // (nothing will encode until DIRECT is re-opted in).
       clearAwaitKeyWatchdog();
@@ -3056,7 +3489,7 @@ export function startHost(opts: HostOptions): () => void {
         wcFps = Math.round(adaptFps);
         wcForceKey = true;
         try {
-          videoCh.send(JSON.stringify({ codec: wcCodec, w, h }));
+          sendVideoConfig({ codec: wcCodec, w, h });
         } catch {
           /* guest resyncs from the next keyframe's in-band SPS/PPS */
         }
@@ -3108,7 +3541,7 @@ export function startHost(opts: HostOptions): () => void {
           // guest refuses to build a decoder until it sees a codec string.
           try {
             nativeCodec = guestH264High ? H264_HIGH_CODEC : H264_BASELINE_CODEC;
-            videoCh.send(JSON.stringify({ codec: nativeCodec }));
+            sendVideoConfig({ codec: nativeCodec });
           } catch {
             /* guest picks it up from the first-frame announce in nativeSink */
           }
@@ -3154,7 +3587,7 @@ export function startHost(opts: HostOptions): () => void {
         if (nativeOk) {
           try {
             nativeCodec = guestH264High ? H264_HIGH_CODEC : H264_BASELINE_CODEC;
-            videoCh.send(JSON.stringify({ codec: nativeCodec }));
+            sendVideoConfig({ codec: nativeCodec });
           } catch {
             /* first-frame announce in nativeSink covers this */
           }
@@ -3371,7 +3804,20 @@ export function startHost(opts: HostOptions): () => void {
               loss: typeof msg.loss === "number" && Number.isFinite(msg.loss) ? Math.min(1, msg.loss) : undefined,
               lossN: Math.max(0, Number(msg.lossN) || 0),
               rttMs: Math.max(0, Number(msg.rttMs) || 0),
+              bw: msg.bw === "overuse" || msg.bw === "underuse" || msg.bw === "normal" ? msg.bw : undefined,
+              trend: Number.isFinite(Number(msg.trend)) ? Number(msg.trend) : 0,
+              thr: Number.isFinite(Number(msg.thr)) ? Number(msg.thr) : 0,
             });
+            pickCodec("rate");
+            // Transport choice rides the same 4 Hz tick (it keys off the loss above).
+            if (carrier?.ready) {
+              const now = Date.now();
+              if (now - lastCarrierPoll > 1000) {
+                lastCarrierPoll = now;
+                void pollCarrier();
+              }
+              pickTransport();
+            }
           }
           return;
         }
@@ -3391,6 +3837,13 @@ export function startHost(opts: HostOptions): () => void {
               const maxKbps = Number(msg.maxKbps) || 0;
               guestDecoderMaxKbps = maxKbps >= 1000 ? Math.round(maxKbps) : 0;
               setGuestH264High(msg.high === true, "DIRECT opt-in");
+              setGuestRfi(msg.rfi === true, "DIRECT opt-in");
+              // R8: HEVC capability. Starts on H.264 unless forced; auto decides later.
+              guestHevcCap = msg.hevc === true;
+              pickCodec("DIRECT opt-in");
+              // The guest can take DIRECT over RTP too: negotiate the carrier now
+              // (once per session); pickTransport decides when to use it.
+              if (msg.carrier === true) void setupCarrier();
               if (guestDecoderMaxKbps > 0 && adaptKbps > targetKbps()) pushAdaptBitrate(true);
               void wcActivate();
             }
@@ -3403,7 +3856,16 @@ export function startHost(opts: HostOptions): () => void {
         // decode High after all. A change rebuilds the NVENC session (one IDR) and
         // the codec re-announce makes the guest rebuild its decoder first.
         if (msg && msg.type === "vprofile") {
-          if (authorized) setGuestH264High(msg.high === true, "guest vprofile");
+          if (authorized) {
+            setGuestH264High(msg.high === true, "guest vprofile");
+            // Guests before 3.9.105 send only `high`.
+            if (typeof msg.rfi === "boolean") setGuestRfi(msg.rfi, "guest vprofile");
+            // R8: capability (false after HEVC failed to decode there).
+            if (typeof msg.hevc === "boolean") {
+              guestHevcCap = msg.hevc;
+              pickCodec("guest vprofile");
+            }
+          }
           return;
         }
         // Audio-mode: "pcm" = DIRECT float32 over the data channel (lean phone
@@ -3505,6 +3967,14 @@ export function startHost(opts: HostOptions): () => void {
           if (typeof msg.wcQueueMax === "number") quality.wcQueueMax = clamp(msg.wcQueueMax, 1, 6);
           if (typeof msg.encPreset === "number") quality.encPreset = clamp(Math.round(msg.encPreset), 1, 4);
           if (typeof msg.encMultipass === "number") quality.encMultipass = clamp(Math.round(msg.encMultipass), 0, 2);
+          if (msg.videoTransport === "auto" || msg.videoTransport === "sctp" || msg.videoTransport === "rtp") {
+            quality.videoTransport = msg.videoTransport;
+          }
+          if ((msg.codec === "auto" || msg.codec === "h264" || msg.codec === "hevc") && msg.codec !== quality.codec) {
+            quality.codec = msg.codec;
+            pickCodec(`tune: ${msg.codec}`);
+          }
+          if (typeof msg.abrGradient === "boolean") quality.abrGradient = msg.abrGradient;
           if (typeof msg.abrV2 === "boolean" && msg.abrV2 !== quality.abrV2) {
             quality.abrV2 = msg.abrV2;
             // Switching controllers mid-stream must not inherit the other one's
@@ -3876,6 +4346,9 @@ export function startHost(opts: HostOptions): () => void {
                           // queue it measured, and any ceiling it is respecting.
                           abr: abrV2Live() ? "v2" : quality.abrV2 ? "v2-idle" : "v1",
                           abrQueueMs: Math.round(vsQueueMs),
+                          abrBw: vsBw,
+                          abrTrend: vsTrend,
+                          abrThr: vsThr,
                           abrRecvKbps: Math.round(vsRecvKbps),
                           abrCeilKbps: Math.round(abrCeilKbps),
                           abrGuestFps: Math.round(vsFps),
@@ -3886,7 +4359,23 @@ export function startHost(opts: HostOptions): () => void {
                           lossCeilKbps: Math.round(lossCeilKbps),
                           decCapKbps: guestDecoderMaxKbps,
                           h264High: guestH264High,
+                          // R4: invalidations asked / healed by a clean P-frame / fell back to an IDR.
+                          rfi: guestRfi,
+                          // R8: HEVC capability of this guest and whether it is live.
+                          hevcCap: guestHevcCap,
+                          hevc: guestHevc,
+                          rfiRequests,
+                          rfiRecovered,
+                          rfiFallbacks,
                           encOvershoot: Math.round(overshoot.factor * 100) / 100,
+                          // DIRECT transport (carrier.ts): which one carries the frames now,
+                          // whether the RTP carrier is negotiated, GCC's cap and RTCP loss.
+                          transport: carrier?.ready ? transport : "sctp",
+                          carrierReady: !!carrier?.ready,
+                          carrierFrames,
+                          carrierKB: Math.round(carrierBytes / 1024),
+                          rtpCapKbps: onRtpTransport ? rtpCapKbps : 0,
+                          carrierLossPct: carrierLossPct >= 0 ? Math.round(carrierLossPct * 100) / 100 : -1,
                           // Artifact / recovery telemetry for the HUD. The host is the
                           // single source of truth: it knows every backpressure skip,
                           // every soft-recovery arming, and every clean IDR that closed
@@ -4081,10 +4570,13 @@ export function startHost(opts: HostOptions): () => void {
         if (m.sid && activeSessionId && m.sid !== activeSessionId) return;
         // Munge the guest's answer so the video encoder starts near its working
         // bitrate instead of ramping up from Chromium's ~300kbps default.
-        await pc.setRemoteDescription({
-          type: "answer",
-          sdp: boostStartBitrate(m.sdp, quality.startBitrateKbps, Math.min(quality.minBitrateKbps, 4000)),
-        });
+        let answerSdp = boostStartBitrate(m.sdp, quality.startBitrateKbps, Math.min(quality.minBitrateKbps, 4000));
+        // The carrier's VP8 has no fmtp line for boostStartBitrate to extend; without
+        // its own hint it starts at ~300 kb/s and queues every appended frame.
+        if (carrierMid) {
+          answerSdp = boostCarrierSdp(answerSdp, carrierMid, Math.max(quality.startBitrateKbps, 6000), Math.min(quality.minBitrateKbps, 4000), 60000);
+        }
+        await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
         const pending = pendingGuestCandidates;
         pendingGuestCandidates = [];
         for (const item of pending) {
@@ -4095,6 +4587,7 @@ export function startHost(opts: HostOptions): () => void {
             /* stale/malformed candidate; do not poison the next negotiation */
           }
         }
+        onAnswerApplied?.();
       } else if (m.type === "candidate") {
         const item = { candidate: m.candidate, sid: m.sid };
         if (

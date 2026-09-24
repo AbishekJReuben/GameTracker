@@ -1251,6 +1251,12 @@ export const api = {
   remoteRequestRefresh: () => call<void>("remote_request_refresh"),
   /** Encode H.264 Constrained High instead of Baseline (guest decoder said it can; R3). */
   remoteSetH264High: (on: boolean) => call<void>("remote_set_h264_high", { on }),
+  /** Research R4: 4-frame DPB so dropped frames can be invalidated (guest opt-in). */
+  remoteSetRfi: (on: boolean) => call<void>("remote_set_rfi", { on }),
+  /** Research R4: the host dropped the GN frame with this 6-bit id — invalidate from it. */
+  remoteRequestRfi: (frameId: number) => call<void>("remote_request_rfi", { frameId }),
+  /** Research R8: HEVC Main instead of H.264 (low-bandwidth mode, guest opt-in). */
+  remoteSetHevc: (on: boolean) => call<void>("remote_set_hevc", { on }),
   /// Reference-safe backpressure: while paused, captures are skipped BEFORE NVENC
   /// (keyframes still encode) so the H.264 reference chain never breaks. Dropping
   /// already-encoded P-frames is what caused visible artifacting until recovery.

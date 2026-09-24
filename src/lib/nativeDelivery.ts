@@ -12,6 +12,9 @@ export function parseNativeFrame(bytes: ArrayBuffer, now = performance.now(), wa
   const hostAgeMs = Number.isFinite(age) && age >= 0 && age < 10_000 ? age : 0;
   return {
     payload: u8.subarray(fast ? 24 : 8), key: (u8[2] & 1) === 1,
+    // Research R4: bit1 = first frame after a reference-frame invalidation (it only
+    // predicts from frames the guest has), bits 2..7 = the frame's 6-bit id.
+    rfiClean: (u8[2] & 2) === 2, frameId: u8[2] >> 2,
     w: dv.getUint16(4, true), h: dv.getUint16(6, true), fast,
     generation: fast ? dv.getUint32(8, true) : 0,
     sequence: fast ? dv.getUint32(12, true) : 0,
@@ -40,6 +43,61 @@ export function videoFragmentSize(_fast: boolean, negotiatedMax?: number) {
 export const H264_BASELINE_CODEC = "avc1.42C028";
 /** Constrained High (set4+set5), level 4.2 — what the guest probes before asking for High. */
 export const H264_HIGH_CODEC = "avc1.640C2A";
+/**
+ * HEVC Main, level 4.1, progressive + frame-only (research R8) — what the guest
+ * probes, and the host's announce before the first SPS. The real stream announces
+ * its own string (`hevcCodecFromAnnexB`), e.g. NVENC's 720p60 is hev1.1.6.L120.90.
+ */
+export const HEVC_MAIN_CODEC = "hev1.1.6.L123.90";
+
+/** True for an HEVC codec string (hev1/hvc1). */
+export const isHevcCodec = (codec: string) => codec.startsWith("hev1") || codec.startsWith("hvc1");
+
+/** Up to `count` RBSP bytes from `start`, emulation-prevention bytes removed. */
+function rbspBytes(au: Uint8Array, start: number, count: number): number[] {
+  const out: number[] = [];
+  let zeros = 0;
+  for (let i = start; i < au.length && out.length < count; i++) {
+    const b = au[i];
+    if (zeros >= 2 && b === 3) {
+      zeros = 0;
+      continue;
+    }
+    zeros = b === 0 ? zeros + 1 : 0;
+    out.push(b);
+  }
+  return out;
+}
+
+/**
+ * WebCodecs codec string for an HEVC Annex-B access unit that carries an SPS
+ * (NAL type 33), else null — ISO/IEC 14496-15 Annex E: profile space + idc, the
+ * compatibility flags bit-reversed in hex, tier + level, then the constraint bytes
+ * with trailing zero bytes dropped. Reads only the SPS's leading profile_tier_level.
+ */
+export function hevcCodecFromAnnexB(au: Uint8Array, scan = 1024): string | null {
+  const end = Math.min(au.length, scan) - 5;
+  for (let i = 0; i < end; i++) {
+    if (au[i] !== 0 || au[i + 1] !== 0 || au[i + 2] !== 1) continue;
+    if (((au[i + 3] >> 1) & 0x3f) !== 33) continue;
+    // 2-byte NAL header, then vps_id/max_sub_layers/nesting (1 byte), then the PTL.
+    const r = rbspBytes(au, i + 5, 13);
+    if (r.length < 13) return null;
+    const space = r[1] >> 6;
+    const tier = (r[1] >> 5) & 1;
+    const idc = r[1] & 0x1f;
+    const compat = ((r[2] << 24) | (r[3] << 16) | (r[4] << 8) | r[5]) >>> 0;
+    let rev = 0;
+    for (let b = 0; b < 32; b++) if (compat & (1 << b)) rev |= 1 << (31 - b);
+    const cons = r.slice(6, 12);
+    let n = cons.length;
+    while (n > 0 && cons[n - 1] === 0) n--;
+    const spaceTag = ["", "A", "B", "C"][space];
+    const tail = cons.slice(0, n).map((b) => "." + hex2(b)).join("");
+    return `hev1.${spaceTag}${idc}.${(rev >>> 0).toString(16).toUpperCase()}.${tier ? "H" : "L"}${r[12]}${tail}`;
+  }
+  return null;
+}
 
 const hex2 = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
 

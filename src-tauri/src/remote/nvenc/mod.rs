@@ -17,7 +17,8 @@
 //! (Sunshine-style `nvenc_vbv_increase` — pure single-frame VBV starves webcam/busy
 //! tiles into macroblocks), spatial AQ on, `frameIntervalP = 1` (no B-frames),
 //! `zeroReorderDelay`, no lookahead, infinite GOP with IDRs only on demand, and
-//! `maxNumRefFrames = 1`. The last one matters off-host: NVENC defaults the DPB to 16,
+//! `maxNumRefFrames = 1` (4 for guests that opted into reference-frame invalidation,
+//! [`Encoder::invalidate`]). The last one matters off-host: NVENC defaults the DPB to 16,
 //! which makes some Android decoders allocate 16+ buffers (Moonlight decoder-errata #1).
 //!
 //! Profile is **Constrained Baseline + CAVLC** (not High+CABAC): Moonlight errata #8 —
@@ -52,16 +53,22 @@ fn slices_for_height(h: u32) -> u32 {
     ((h + 539) / 540).clamp(1, 8)
 }
 
-/// Apply the phone-friendly H.264 knobs onto a fresh preset config. Shared by
-/// `open_session` and `reconfigure` so they can never drift apart.
+/// Apply the phone-friendly knobs for p's codec onto a fresh preset config. Shared
+/// by `init` and `reconfigure` so they can never drift apart.
 ///
 /// # Safety
-/// `cfg.encodeCodecConfig` is a C union; the caller must have just filled it from
-/// an H.264 preset so the `h264Config` arm is the live one.
-unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
-    // Constrained High for decoders that reported it (the guest's DIRECT opt-in),
-    // Constrained Baseline otherwise. `sps::fixup` sets the "constrained" flags.
-    cfg.profileGUID = if p.high { NV_ENC_H264_PROFILE_HIGH_GUID } else { NV_ENC_H264_PROFILE_BASELINE_GUID };
+/// `cfg.encodeCodecConfig` is a C union; the caller must have just filled it from a
+/// preset for p's codec so the matching arm is the live one.
+unsafe fn apply_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
+    if p.hevc {
+        apply_hevc_guest_friendly(cfg, p)
+    } else {
+        apply_h264_guest_friendly(cfg, p)
+    }
+}
+
+/// Rate control and GOP shape: identical for both codecs.
+fn apply_common(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     // Infinite GOP: keyframes cost bandwidth and the transport is reliable, so we
     // only emit them on demand (guest `vkf`, resolution change, first frame).
     cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
@@ -103,6 +110,56 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
         _ => NV_ENC_MULTI_PASS_DISABLED,
     };
     rc.lookaheadDepth = 0;
+}
+
+/// Label the colour the way NVENC's ARGB input path converts it (see the H.264 VUI
+/// notes below) — HEVC reads the matrix from the same label.
+fn label_colour(vui: &mut NV_ENC_CONFIG_H264_VUI_PARAMETERS) {
+    vui.videoSignalTypePresentFlag = 1;
+    vui.videoFullRangeFlag = 0;
+    vui.videoFormat = VUI_VIDEO_FORMAT_UNSPECIFIED;
+    vui.colourDescriptionPresentFlag = 1;
+    vui.colourPrimaries = VUI_COLOUR_PRIMARIES_BT709;
+    vui.transferCharacteristics = VUI_TRANSFER_BT709;
+    vui.colourMatrix = VUI_MATRIX_SMPTE170M;
+}
+
+/// HEVC Main (research R8): same shape as the H.264 path — no B-frames, infinite
+/// GOP, on-demand IDRs and intra-refresh waves, multi-slice, VPS/SPS/PPS repeated
+/// with every IDR, colour labelled. HEVC signals "no reordering" in the SPS proper
+/// (sps_max_num_reorder_pics, which NVENC sets to 0 with frameIntervalP = 1), so
+/// there is no VUI rewrite to do.
+///
+/// # Safety
+/// See [`apply_guest_friendly`]: the `hevcConfig` arm must be the live one.
+unsafe fn apply_hevc_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
+    cfg.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+    apply_common(cfg, p);
+    let hevc = &mut cfg.encodeCodecConfig.hevcConfig;
+    hevc.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+    hevc.set_chroma_format_idc(1); // 4:2:0
+    hevc.set_pixel_bit_depth_minus8(0); // Main = 8-bit
+    hevc.maxNumRefFramesInDPB = 1;
+    hevc.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
+    hevc.sliceMode = NV_ENC_H264_SLICE_MODE_NUM_SLICES; // same value (3) for HEVC
+    hevc.sliceModeData = slices_for_height(p.height);
+    hevc.set_repeat_sps_pps(true);
+    hevc.set_output_aud(false);
+    hevc.set_enable_intra_refresh(true);
+    hevc.intraRefreshPeriod = 100_000;
+    hevc.intraRefreshCnt = INTRA_REFRESH_FRAMES;
+    label_colour(&mut hevc.hevcVUIParameters);
+}
+
+/// Apply the phone-friendly H.264 knobs onto a fresh preset config.
+///
+/// # Safety
+/// The `h264Config` arm must be the live one (an H.264 preset was just loaded).
+unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
+    // Constrained High for decoders that reported it (the guest's DIRECT opt-in),
+    // Constrained Baseline otherwise. `sps::fixup` sets the "constrained" flags.
+    cfg.profileGUID = if p.high { NV_ENC_H264_PROFILE_HIGH_GUID } else { NV_ENC_H264_PROFILE_BASELINE_GUID };
+    apply_common(cfg, p);
 
     let h264 = &mut cfg.encodeCodecConfig.h264Config;
     h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
@@ -118,8 +175,12 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
         h264.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE;
     }
     // DPB of 1: the phone only ever needs the previous frame. Moonlight errata #1 —
-    // NVENC's default of 16 makes some Android decoders allocate 16+ buffers.
-    h264.maxNumRefFrames = 1;
+    // NVENC's default of 16 makes some Android decoders allocate 16+ buffers. A
+    // guest that opted into reference-frame invalidation gets sps::DPB_RFI instead
+    // (research R4, Encoder::invalidate). Either way one reference is searched per
+    // frame (numRefL0 = 1), so encode cost is unchanged; sps::fixup writes the same
+    // depth into every SPS.
+    h264.maxNumRefFrames = p.refs();
     h264.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
     // Multi-slice: wall-clock decode on the phone scales with cores, not with
     // frame size. Same knob Sunshine sets from the client's `slicesPerFrame`.
@@ -138,8 +199,6 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     // Ask for the VUI bitstream-restriction block; `sps::fixup` then corrects the
     // reorder/buffering values inside it (NVENC exposes no field for them).
     h264.h264VUIParameters.bitstreamRestrictionFlag = 1;
-    h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
-    h264.h264VUIParameters.videoFullRangeFlag = 0;
     // Label the matrix explicitly — NVENC's ARGB input path picks its RGB→YUV
     // matrix FROM this label, and when there is none it picks by resolution:
     // BT.601 at small sizes (256×256: red → Y81 U90 V240) but BT.709 at 1080p
@@ -147,11 +206,7 @@ unsafe fn apply_h264_guest_friendly(cfg: &mut NV_ENC_CONFIG, p: &Params) {
     // set here the conversion and the label agree at every size, including the
     // odd downscaled sizes the phone asks for. Any new codec must set its own label.
     // Desktop pixels are sRGB, whose primaries are BT.709's.
-    h264.h264VUIParameters.videoFormat = VUI_VIDEO_FORMAT_UNSPECIFIED;
-    h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
-    h264.h264VUIParameters.colourPrimaries = VUI_COLOUR_PRIMARIES_BT709;
-    h264.h264VUIParameters.transferCharacteristics = VUI_TRANSFER_BT709;
-    h264.h264VUIParameters.colourMatrix = VUI_MATRIX_SMPTE170M;
+    label_colour(&mut h264.h264VUIParameters);
 }
 
 /// H.264 VUI `video_format` = 5 (unspecified).
@@ -290,6 +345,13 @@ pub struct Params {
     /// Constrained Baseline. Only for guests whose decoder reported it
     /// (research R3: −12…−24 % bits at equal quality, encode time unchanged).
     pub high: bool,
+    /// Keep a DPB of [`sps::DPB_RFI`] frames so a dropped frame can be invalidated
+    /// instead of answered with an IDR (research R4). Only for guests that opted in.
+    /// H.264 only: an HEVC session keeps the 1-frame DPB.
+    pub rfi: bool,
+    /// HEVC Main instead of H.264 (research R8: −27…−54 % bits on motion, ~+4 ms
+    /// decode on the reference phone). The host's low-bandwidth mode; guest opt-in.
+    pub hevc: bool,
 }
 
 impl Params {
@@ -302,6 +364,36 @@ impl Params {
             preset: DEFAULT_PRESET,
             multipass: DEFAULT_MULTIPASS,
             high: false,
+            rfi: false,
+            hevc: false,
+        }
+    }
+
+    /// Reference-frame depth for this session (encoder config and SPS agree on it).
+    pub fn refs(&self) -> u32 {
+        if self.rfi && !self.hevc {
+            sps::DPB_RFI
+        } else {
+            sps::DPB_LOW_LATENCY
+        }
+    }
+
+    pub fn with_rfi(mut self, rfi: bool) -> Self {
+        self.rfi = rfi;
+        self
+    }
+
+    pub fn with_hevc(mut self, hevc: bool) -> Self {
+        self.hevc = hevc;
+        self
+    }
+
+    /// NVENC codec GUID for this session.
+    pub fn codec_guid(&self) -> windows::core::GUID {
+        if self.hevc {
+            NV_ENC_CODEC_HEVC_GUID
+        } else {
+            NV_ENC_CODEC_H264_GUID
         }
     }
 
@@ -393,7 +485,7 @@ impl Encoder {
             .nvEncGetEncodePresetConfigEx
             .ok_or("no GetEncodePresetConfigEx")?)(
             self.enc,
-            NV_ENC_CODEC_H264_GUID,
+            p.codec_guid(),
             preset_guid(p.preset),
             NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
             &mut preset,
@@ -404,12 +496,12 @@ impl Encoder {
 
         let mut cfg = preset.presetCfg;
         cfg.version = NV_ENC_CONFIG_VER;
-        // SAFETY: presetCfg was filled by GetEncodePresetConfigEx for H.264.
-        unsafe { apply_h264_guest_friendly(&mut cfg, &p) };
+        // SAFETY: presetCfg was filled by GetEncodePresetConfigEx for p's codec.
+        unsafe { apply_guest_friendly(&mut cfg, &p) };
 
         let mut init = NV_ENC_INITIALIZE_PARAMS {
             version: NV_ENC_INITIALIZE_PARAMS_VER,
-            encodeGUID: NV_ENC_CODEC_H264_GUID,
+            encodeGUID: p.codec_guid(),
             presetGUID: preset_guid(p.preset),
             encodeWidth: p.width,
             encodeHeight: p.height,
@@ -470,8 +562,13 @@ impl Encoder {
         if p.width != self.params.width || p.height != self.params.height {
             return Err("resolution change needs a new session".into());
         }
-        if p.preset != self.params.preset || p.multipass != self.params.multipass || p.high != self.params.high {
-            return Err("preset / pass-mode / profile change needs a new session".into());
+        if p.preset != self.params.preset
+            || p.multipass != self.params.multipass
+            || p.high != self.params.high
+            || p.rfi != self.params.rfi
+            || p.hevc != self.params.hevc
+        {
+            return Err("preset / pass-mode / profile / codec change needs a new session".into());
         }
         unsafe {
             let mut preset = NV_ENC_PRESET_CONFIG {
@@ -481,7 +578,7 @@ impl Encoder {
             preset.presetCfg.version = NV_ENC_CONFIG_VER;
             let st = (self.funcs.nvEncGetEncodePresetConfigEx.ok_or("no preset")?)(
                 self.enc,
-                NV_ENC_CODEC_H264_GUID,
+                p.codec_guid(),
                 preset_guid(p.preset),
                 NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 &mut preset,
@@ -491,8 +588,8 @@ impl Encoder {
             }
             let mut cfg = preset.presetCfg;
             cfg.version = NV_ENC_CONFIG_VER;
-            // SAFETY: presetCfg was filled by GetEncodePresetConfigEx for H.264.
-            unsafe { apply_h264_guest_friendly(&mut cfg, &p) };
+            // SAFETY: presetCfg was filled by GetEncodePresetConfigEx for p's codec.
+            unsafe { apply_guest_friendly(&mut cfg, &p) };
 
             let mut re = NV_ENC_RECONFIGURE_PARAMS {
                 version: NV_ENC_RECONFIGURE_PARAMS_VER,
@@ -500,7 +597,7 @@ impl Encoder {
             };
             re.reInitEncodeParams = NV_ENC_INITIALIZE_PARAMS {
                 version: NV_ENC_INITIALIZE_PARAMS_VER,
-                encodeGUID: NV_ENC_CODEC_H264_GUID,
+                encodeGUID: p.codec_guid(),
                 presetGUID: preset_guid(p.preset),
                 encodeWidth: p.width,
                 encodeHeight: p.height,
@@ -595,7 +692,11 @@ impl Encoder {
                 ..Default::default()
             };
             if force_ir && !force_key {
-                pic.codecPicParams.h264PicParams.forceIntraRefreshWithFrameCnt = INTRA_REFRESH_FRAMES;
+                if self.params.hevc {
+                    pic.codecPicParams.hevcPicParams.forceIntraRefreshWithFrameCnt = INTRA_REFRESH_FRAMES;
+                } else {
+                    pic.codecPicParams.h264PicParams.forceIntraRefreshWithFrameCnt = INTRA_REFRESH_FRAMES;
+                }
             }
             let st = (self.funcs.nvEncEncodePicture.ok_or("no EncodePicture")?)(self.enc, &mut pic);
             // Unmap before bailing on an error — a leaked mapping wedges the session.
@@ -627,11 +728,11 @@ impl Encoder {
 
             // Only keyframes carry an SPS (repeatSPSPPS + OUTPUT_SPSPPS ride the IDR),
             // so P-frames skip the NAL scan entirely and are copied through as-is.
-            let rewrote = if key {
-                let r = sps::fixup_into(src, &mut self.out);
+            let rewrote = if key && !self.params.hevc {
+                let r = sps::fixup_into(src, &mut self.out, self.params.refs());
                 if !self.sps_logged {
                     self.sps_logged = true;
-                    sps::log_summary(src);
+                    sps::log_summary(src, self.params.refs());
                 }
                 r
             } else {
@@ -651,6 +752,21 @@ impl Encoder {
                 avg_qp,
             })
         }
+    }
+}
+
+impl Encoder {
+    /// Reference-frame invalidation (research R4): NVENC stops using the frame it
+    /// encoded with `inputTimeStamp == ts_us` (and anything predicted from it) as a
+    /// reference; the next frame predicts from an older valid one, or is intra-coded
+    /// when none is left. Only meaningful with [`Params::rfi`] (a deeper DPB).
+    pub fn invalidate(&mut self, ts_us: u64) -> Result<(), String> {
+        let f = self.funcs.nvEncInvalidateRefFrames.ok_or("no InvalidateRefFrames")?;
+        let st = unsafe { f(self.enc, ts_us) };
+        if st != NV_ENC_SUCCESS {
+            return Err(format!("InvalidateRefFrames: {st} ({})", self.last_error()));
+        }
+        Ok(())
     }
 }
 
@@ -761,9 +877,9 @@ mod tests {
                         .expect("SPS present in the IDR");
                     let info = sps::summarize(&sps::unescape_for_test(&sps_nal[1..])).expect("parse shipped SPS");
                     eprintln!("shipped SPS: {info:?}");
-                    assert_eq!(info.max_num_ref_frames, 1, "DPB must be pinned to 1");
+                    assert_eq!(info.max_num_ref_frames, sps::DPB_LOW_LATENCY, "DPB must be pinned to 1");
                     assert_eq!(info.max_num_reorder_frames, Some(0), "must declare zero reordering");
-                    assert_eq!(info.max_dec_frame_buffering, Some(1), "must declare a 1-frame DPB");
+                    assert_eq!(info.max_dec_frame_buffering, Some(sps::DPB_LOW_LATENCY), "must declare a 1-frame DPB");
                     assert_eq!(
                         info.colour,
                         Some((1, 1, VUI_MATRIX_SMPTE170M)),

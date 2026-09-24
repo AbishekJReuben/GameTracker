@@ -1,6 +1,13 @@
 /** Ordered DIRECT wire. Retain a single fragment without copying; allocate only
  * when an access unit actually spans messages. Never decode a truncated unit. */
-export type VideoHeader = { key: boolean; seq: number; tsMs: number; len: number };
+export type VideoHeader = {
+  key: boolean;
+  seq: number;
+  tsMs: number;
+  len: number;
+  /** Guest clock when the header arrived — the R7 delay gradient's receive side. */
+  firstAt?: number;
+};
 export const MAX_VIDEO_BYTES = 16_000_000;
 
 export class VideoAssembler {
@@ -18,7 +25,7 @@ export class VideoAssembler {
     this.sequence = null;
   }
 
-  push(data: ArrayBuffer): { head: VideoHeader; bytes: Uint8Array<ArrayBuffer> } | null {
+  push(data: ArrayBuffer, at = 0): { head: VideoHeader; bytes: Uint8Array<ArrayBuffer> } | null {
     // A sender can fail after the header or halfway through the payload. A new
     // header must discard that partial AU, not become 20 bytes of H.264 garbage.
     if (data.byteLength === 20) {
@@ -36,7 +43,7 @@ export class VideoAssembler {
         }
         const seq = v.getUint32(4, true);
         if (this.sequence !== null && seq !== ((this.sequence + 1) >>> 0)) this.discontinuity();
-        this.head = { key: (v.getUint8(2) & 1) !== 0, seq, tsMs, len };
+        this.head = { key: (v.getUint8(2) & 1) !== 0, seq, tsMs, len, ...(at > 0 ? { firstAt: at } : {}) };
         return null;
       }
     }

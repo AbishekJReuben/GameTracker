@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { isHevcCodec } from "@/lib/nativeDelivery";
 import { mainThreadStats, startMainThreadMonitor } from "../mainThreadMonitor";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -9,6 +10,7 @@ import {
   Pointer,
   ChevronUp,
   ChevronDown,
+  ChevronRight,
   ChevronsUpDown,
   ChevronsLeftRight,
   CornerDownLeft,
@@ -84,7 +86,8 @@ import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { tabAllowed } from "@/lib/setupMode";
 import { isTauri } from "@/lib/tauri";
-import { setNativeDecoderBounds, setStreamPowerActive } from "../nativeDecoder";
+import { nativeDecoderPossible, setNativeDecoderBounds, setStreamPowerActive } from "../nativeDecoder";
+import { TuneSheet } from "./TuneSheet";
 import {
   hitchFormat,
   hitchNote,
@@ -101,6 +104,9 @@ import {
   streamTuneIsCustom,
   STREAM_TUNE_DEFAULTS,
   type StreamTune,
+  PIP_MAX_FPS,
+  PIP_MAX_KBPS,
+  PIP_MAX_W,
 } from "../streamTune";
 import {
   GAME_KEY_WIRES,
@@ -170,6 +176,10 @@ type HostWcStats = {
   abr?: string;
   /** Standing delay this stream is adding to the link (ms) — the v2 signal. */
   abrQueueMs?: number;
+  /** R7: this phone's delay-gradient state and GCC's modified trend / threshold. */
+  abrBw?: string;
+  abrTrend?: number;
+  abrThr?: number;
   /** What the phone reported actually receiving (kbps). */
   abrRecvKbps?: number;
   /** Rate last proven to overuse the link; 0 once a clean stretch retires it. */
@@ -184,8 +194,25 @@ type HostWcStats = {
   decCapKbps?: number;
   /** PC is encoding Constrained High for this phone. */
   h264High?: boolean;
+  /** Reference-frame invalidation (R4): on for this phone, and what it has done. */
+  rfi?: boolean;
+  /** R8: this phone can take HEVC / the PC is sending HEVC now. */
+  hevcCap?: boolean;
+  hevc?: boolean;
+  rfiRequests?: number;
+  rfiRecovered?: number;
+  rfiFallbacks?: number;
   /** NVENC output ÷ command, measured; the PC divides its command by it (R7). */
   encOvershoot?: number;
+  /** DIRECT transport on the PC side (lib/carrier.ts) and the RTP carrier's state. */
+  transport?: "sctp" | "rtp";
+  carrierReady?: boolean;
+  carrierFrames?: number;
+  carrierKB?: number;
+  /** GCC's estimate the PC stays under while on RTP (kbps); 0 = not on RTP. */
+  rtpCapKbps?: number;
+  /** Loss the phone reported for the carrier over RTCP (%); −1 = none yet. */
+  carrierLossPct?: number;
 };
 type HostAudioStats = {
   mode: "pcm" | "rtc";
@@ -1305,10 +1332,23 @@ export function ControlScreen({
       nvencFast: tune.nvencFast,
       audioHostMs: tune.audioHostMs,
       abrV2: tune.abrV2,
+      abrGradient: tune.abrGradient,
+      codec: tune.codec,
       encPreset: tune.encPreset,
       encMultipass: tune.encMultipass,
+      videoTransport: tune.videoTransport,
+      // Picture-in-picture: the window is a few hundred px wide, so ask for a light
+      // stream instead of decoding (and sending) 1080p60 into it. Resolution and
+      // fps changes rebuild the PC encoder and our decoder (one keyframe each way).
+      ...(pipView && tune.pipLite
+        ? {
+            maxW: Math.min(tune.maxW, PIP_MAX_W),
+            fps: Math.min(tune.fps, PIP_MAX_FPS),
+            bitrate: tune.bitrateKbps > 0 ? Math.min(tune.bitrateKbps, PIP_MAX_KBPS) : tune.bitrateKbps,
+          }
+        : {}),
     }),
-    [tune],
+    [tune, pipView],
   );
 
   // Push guest-side JB / preferDirect as soon as the link is up.
@@ -3647,7 +3687,7 @@ export function ControlScreen({
             <span className="flex flex-wrap items-center gap-1 text-[10px] font-800 text-white">
               <Gauge className="h-3 w-3 text-accent-3" /> Stream stats
               <span className={`rounded px-1 py-0.5 text-[8px] font-800 ${wcStats ? "bg-green/20 text-green" : "bg-white/[0.08] text-ink-soft"}`}>
-                {wcStats ? "DIRECT" : hasStream ? "RTC" : "LAN"}
+                {wcStats ? (wcStats.transport === "rtp" ? "DIRECT·RTP" : "DIRECT") : hasStream ? "RTC" : "LAN"}
               </span>
               {/* The PC is encoding H.264 itself (NVENC) instead of shipping JPEGs for
                   the webview to re-encode — worth surfacing, it's the difference
@@ -3657,6 +3697,9 @@ export function ControlScreen({
               ) : null}
               {hostStats?.wc?.native && wcStats?.codec?.startsWith("avc1.64") ? (
                 <span className="rounded bg-accent-3/20 px-1 py-0.5 text-[8px] font-800 text-accent-3">High</span>
+              ) : null}
+              {hostStats?.wc?.native && wcStats?.codec && isHevcCodec(wcStats.codec) ? (
+                <span className="rounded bg-accent-3/20 px-1 py-0.5 text-[8px] font-800 text-accent-3">HEVC</span>
               ) : null}
               {wcStats?.native ? (
                 <span className="rounded bg-accent/25 px-1 py-0.5 text-[8px] font-800 text-accent">MediaCodec</span>
@@ -4009,6 +4052,13 @@ export function ControlScreen({
                           v={`${hostStats.wc.abrQueueMs ?? 0} ms`}
                           hi={(hostStats.wc.abrQueueMs ?? 0) > 110}
                         />
+                        {hostStats.wc.abrBw && (
+                          <StatCell
+                            k="Gradient"
+                            v={`${hostStats.wc.abrBw} ${hostStats.wc.abrTrend ?? 0}/${hostStats.wc.abrThr ?? 0}`}
+                            hi={hostStats.wc.abrBw === "overuse"}
+                          />
+                        )}
                         <StatCell k="Recv" v={`${hostStats.wc.abrRecvKbps ?? 0}k`} />
                         {(hostStats.wc.abrCeilKbps ?? 0) > 0 && (
                           <StatCell k="Ceil" v={`${hostStats.wc.abrCeilKbps}k`} />
@@ -4026,6 +4076,24 @@ export function ControlScreen({
                     )}
                     {(hostStats.wc.decCapKbps ?? 0) > 0 && (
                       <StatCell k="Dec cap" v={`${hostStats.wc.decCapKbps}k`} />
+                    )}
+                    {hostStats.wc.rfi && (
+                      <StatCell
+                        k="RFI"
+                        v={`${hostStats.wc.rfiRecovered ?? 0}/${hostStats.wc.rfiRequests ?? 0}${
+                          (hostStats.wc.rfiFallbacks ?? 0) > 0 ? ` · ${hostStats.wc.rfiFallbacks} IDR` : ""
+                        }`}
+                      />
+                    )}
+                    {hostStats.wc.carrierReady && (
+                      <StatCell
+                        k="Transport"
+                        v={`${hostStats.wc.transport === "rtp" ? "RTP" : "Data"} · ${hostStats.wc.carrierFrames ?? 0} fr`}
+                      />
+                    )}
+                    {(hostStats.wc.rtpCapKbps ?? 0) > 0 && <StatCell k="RTP cap" v={`${hostStats.wc.rtpCapKbps}k`} />}
+                    {(hostStats.wc.carrierLossPct ?? -1) >= 0 && hostStats.wc.transport === "rtp" && (
+                      <StatCell k="RTP loss" v={`${hostStats.wc.carrierLossPct}%`} hi={(hostStats.wc.carrierLossPct ?? 0) > 1} />
                     )}
                     {(hostStats.wc.encOvershoot ?? 1) > 1.01 && (
                       <StatCell k="Overshoot" v={`×${hostStats.wc.encOvershoot}`} />
@@ -4106,553 +4174,38 @@ export function ControlScreen({
               consulted deliberately instead of covering the video. */}
           <HitchSection />
 
-          {/* Collapsible soft-spot tuner — every streaming knob editable for A/B tests. */}
+          {/* Stream tuning lives in its own sheet (TuneSheet): tabs by function, big
+              controls, dependencies wired, one scroll area. */}
           <div className="mt-1.5 border-t border-white/[0.08] pt-1.5">
             <button
               type="button"
-              onClick={() => setTuneOpen((o) => !o)}
-              className="flex w-full items-center justify-between gap-1 rounded-md px-1 py-0.5 text-[10px] font-800 text-white"
+              onClick={() => setTuneOpen(true)}
+              className="flex h-10 w-full items-center justify-between gap-2 rounded-lg bg-white/[0.06] px-3 text-xs font-800 text-white active:bg-white/[0.12]"
             >
-              <span className="flex items-center gap-1">
-                <SlidersHorizontal className="h-3 w-3 text-accent-3" /> Tune
+              <span className="flex items-center gap-2">
+                <SlidersHorizontal className="h-4 w-4 text-accent-3" /> Tune stream
                 {streamTuneIsCustom(tune) && (
-                  <span className="rounded bg-amber/20 px-1 py-0.5 text-[8px] text-amber">custom</span>
+                  <span className="rounded bg-amber/20 px-1.5 py-0.5 text-[10px] text-amber">custom</span>
                 )}
               </span>
-              {tuneOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+              <ChevronRight className="h-4 w-4" />
             </button>
-            {tuneOpen && (
-              <div className="mt-1 max-h-[42vh] space-y-1.5 overflow-y-auto pr-0.5" style={{ scrollbarWidth: "thin" }}>
-                <div className="flex items-start justify-between gap-1.5 px-0.5">
-                  <p className="text-[8px] leading-snug text-ink-faint">
-                    Drag to hunt the soft spot. Changes apply live. Reset restores shipped defaults.
-                    Tags show which leg each knob acts on.
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => setTuneHints((h) => !h)}
-                    className={`shrink-0 rounded px-1.5 py-0.5 text-[8px] font-800 ${
-                      tuneHints ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tuneHints ? "Hide info" : "Info"}
-                  </button>
-                </div>
-                <TuneSection label="Capture — what the PC grabs and ships" />
-                <TuneRow
-                  label="Res"
-                  scope="host"
-                  showHint={tuneHints}
-                  hint="Capture width before encode. The single biggest cost lever: everything downstream scales with pixel count. Right = sharper + heavier."
-                  value={tune.maxW}
-                  min={480}
-                  max={3840}
-                  step={80}
-                  fmt={(v) => `${v}px`}
-                  onChange={(v) => patchTune({ maxW: v })}
-                />
-                <TuneRow
-                  label="JPEG q"
-                  scope="host"
-                  showHint={tuneHints}
-                  hint="Quality of the intermediate JPEG the PC sends its own webview (both paths re-encode it to H.264 after). Raising it burns host CPU/IPC for a win H.264 mostly discards."
-                  value={tune.jpeg}
-                  min={20}
-                  max={95}
-                  step={1}
-                  fmt={(v) => `${v}`}
-                  onChange={(v) => patchTune({ jpeg: v })}
-                />
-                <TuneRow
-                  label="JPEG cap"
-                  scope="host"
-                  showHint={tuneHints}
-                  hint="Hard ceiling on the above, applied even if JPEG q is dragged higher. Exists because ~400KB frames were burning host IPC for no visible gain."
-                  value={tune.jpegCap}
-                  min={40}
-                  max={95}
-                  step={1}
-                  fmt={(v) => `${v}`}
-                  onChange={(v) => patchTune({ jpegCap: v })}
-                />
-                <TuneRow
-                  label="FPS"
-                  scope="host"
-                  showHint={tuneHints}
-                  hint="Capture target. The PC only produces frames when the screen changes, so a static desktop reads far below this in the stats — that's normal, not a fault."
-                  value={tune.fps}
-                  min={10}
-                  max={60}
-                  step={1}
-                  fmt={(v) => `${v}`}
-                  onChange={(v) => patchTune({ fps: v })}
-                />
-                <TuneSection label="Bitrate" />
-                <TuneRow
-                  label="Bitrate"
-                  scope="both"
-                  showHint={tuneHints}
-                  hint="Steady-state encoder target. Both paths use it: RTC as the sender cap, DIRECT as the WebCodecs bitrate."
-                  value={tune.bitrateKbps}
-                  min={1000}
-                  max={40000}
-                  step={500}
-                  fmt={(v) => `${(v / 1000).toFixed(1)}M`}
-                  onChange={(v) => patchTune({ bitrateKbps: v })}
-                />
-                <TuneRow
-                  label="Headroom"
-                  scope="rtc"
-                  showHint={tuneHints}
-                  hint="Sender cap = bitrate × this. Slack for keyframe spikes to clear the pacer instead of queueing a ~1s hitch. Below ~1.2× that hitch comes back."
-                  value={Math.round(tune.bitrateHeadroom * 100)}
-                  min={100}
-                  max={250}
-                  step={5}
-                  fmt={(v) => `${(v / 100).toFixed(2)}×`}
-                  onChange={(v) => patchTune({ bitrateHeadroom: v / 100 })}
-                />
-                <TuneRow
-                  label="Min bitrate"
-                  scope="rtc"
-                  showHint={tuneHints}
-                  hint="Floor for the bandwidth estimator, so screen share can't collapse to a blurry ~200kbps and stay there."
-                  value={tune.minBitrateKbps}
-                  min={500}
-                  max={8000}
-                  step={100}
-                  fmt={(v) => `${v}k`}
-                  onChange={(v) => patchTune({ minBitrateKbps: v })}
-                />
-                <TuneRow
-                  label="Start bitrate"
-                  scope="rtc"
-                  showHint={tuneHints}
-                  hint="Opening bandwidth guess, so the first seconds aren't a blurry ramp-up. Applied to the SDP at connect — takes effect on the NEXT connection, not now."
-                  value={tune.startBitrateKbps}
-                  min={1000}
-                  max={20000}
-                  step={500}
-                  fmt={(v) => `${(v / 1000).toFixed(1)}M`}
-                  onChange={(v) => patchTune({ startBitrateKbps: v })}
-                />
-                <TuneSection label="DIRECT path — H.264 over the data channel" />
-                <TuneRow
-                  label="Refresh every"
-                  scope="direct"
-                  showHint={tuneHints}
-                  hint="Safety-net cadence. With the PC’s NVENC encoder this is an intra-refresh wave (no blurry keyframe on a still screen); otherwise a keyframe. The channel is reliable and real breaks request their own keyframe, so long is good. Short costs bandwidth."
-                  value={tune.wcKeyMs}
-                  min={1000}
-                  max={30000}
-                  step={1000}
-                  fmt={(v) => `${(v / 1000).toFixed(0)}s`}
-                  onChange={(v) => patchTune({ wcKeyMs: v })}
-                />
-                <TuneRow
-                  label="Channel buf cap"
-                  scope="direct"
-                  showHint={tuneHints}
-                  hint="Byte ceiling for unsent DIRECT frames (fast links). Standing latency is hard-capped at ~50 ms of the live encode bitrate on the PC — this KB slider only matters above that. Low = drop stale frames; high = more headroom before skip. Feel widens both."
-                  value={tune.wcBufKB}
-                  min={64}
-                  max={1024}
-                  step={32}
-                  fmt={(v) => `${v}KB`}
-                  onChange={(v) => patchTune({ wcBufKB: v })}
-                />
-                <TuneRow
-                  label="Enc queue cap"
-                  scope="direct"
-                  showHint={tuneHints}
-                  hint="Frames allowed to pile up inside the PC's encoder before it starts skipping. Same trade as above, one stage earlier."
-                  value={tune.wcQueueMax}
-                  min={1}
-                  max={6}
-                  step={1}
-                  fmt={(v) => `${v}`}
-                  onChange={(v) => patchTune({ wcQueueMax: v })}
-                />
-                <TuneRow
-                  label="Direct retry"
-                  scope="direct"
-                  showHint={tuneHints}
-                  hint="How soon to re-attempt DIRECT after it drops to RTC. Doubles on repeat failures up to 2min; a clean spell resets it. Lower = recover faster, more retry chatter."
-                  value={tune.directRetrySec}
-                  min={5}
-                  max={120}
-                  step={5}
-                  fmt={(v) => `${v}s`}
-                  onChange={(v) => patchTune({ directRetrySec: v })}
-                />
-                <TuneSection label="RTC path — jitter buffer (bypassed on DIRECT)" />
-                <TuneRow
-                  label="JB base"
-                  scope="rtc"
-                  showHint={tuneHints}
-                  hint="Resting playout delay the phone asks for. Note it's a MINIMUM — the browser pads above it on its own and often ignores a low ask. This is the delay DIRECT exists to skip."
-                  value={tune.jbBase}
-                  min={20}
-                  max={200}
-                  step={5}
-                  fmt={(v) => `${v}ms`}
-                  onChange={(v) => patchTune({ jbBase: v, jbMin: Math.min(tune.jbMin, v) })}
-                />
-                <TuneRow
-                  label="JB min"
-                  scope="rtc"
-                  showHint={tuneHints}
-                  hint="Floor the buffer eases back down to on a clean link. Never force 0 — that trades this delay for stutter."
-                  value={tune.jbMin}
-                  min={20}
-                  max={200}
-                  step={5}
-                  fmt={(v) => `${v}ms`}
-                  onChange={(v) => patchTune({ jbMin: Math.min(v, tune.jbBase) })}
-                />
-                <TuneRow
-                  label="JB max"
-                  scope="rtc"
-                  showHint={tuneHints}
-                  hint="Ceiling the buffer may grow to when frames are genuinely arriving late."
-                  value={tune.jbMax}
-                  min={40}
-                  max={400}
-                  step={10}
-                  fmt={(v) => `${v}ms`}
-                  onChange={(v) => patchTune({ jbMax: Math.max(v, tune.jbBase) })}
-                />
-                <TuneRow
-                  label="JB grow at"
-                  scope="rtc"
-                  showHint={tuneHints}
-                  hint="Dropped-frame share that makes the buffer grow. Low = react early and add delay; high = tolerate drops to stay responsive."
-                  value={tune.jbGrowAt}
-                  min={5}
-                  max={40}
-                  step={1}
-                  fmt={(v) => `${v}%`}
-                  onChange={(v) => patchTune({ jbGrowAt: v })}
-                />
-                <TuneSection label="RTC audio — the classic Opus track (bypassed on DIRECT)" />
-                <TuneRow
-                  label="RTC aud delay"
-                  scope="rtc"
-                  showHint={tuneHints}
-                  hint="Playout delay the phone asks NetEQ for. Default 100ms is a stable floor under video congestion; 0 = browser auto (~150–250ms). Like the video JB it's a MINIMUM — too low and NetEQ pays with choppy concealment. Only affects the RTC path."
-                  value={tune.audioJbMs}
-                  min={0}
-                  max={400}
-                  step={10}
-                  fmt={(v) => (v === 0 ? "auto" : `${v}ms`)}
-                  onChange={(v) => patchTune({ audioJbMs: v })}
-                />
-                <TuneRow
-                  label="RTC aud buf"
-                  scope="host"
-                  showHint={tuneHints}
-                  hint="The PC's own sound buffer before it encodes Opus (adds to NetEQ). Default 90ms absorbs Tauri IPC + game-load jitter; 55ms underran into audible chop. Lower trims lag; too low crackles when a game janks capture. Prime/max scale with it."
-                  value={tune.audioHostMs}
-                  min={20}
-                  max={200}
-                  step={5}
-                  fmt={(v) => `${v}ms`}
-                  onChange={(v) => patchTune({ audioHostMs: v })}
-                />
-                <TuneSection label="Modes" />
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-0.5">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    Content <ScopeTag scope="both" />
-                  </span>
-                  <div className="flex rounded-md bg-white/[0.06] p-0.5">
-                    {(["text", "auto", "video"] as ContentMode[]).map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        onClick={() => patchTune({ contentMode: m })}
-                        className={`rounded px-1.5 py-0.5 text-[9px] font-700 capitalize ${
-                          tune.contentMode === m ? "bg-accent-3 text-white" : "text-ink-dim"
-                        }`}
-                      >
-                        {m}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    What the picture mostly is. <b className="text-ink-dim">Text</b> keeps glyph edges crisp and sacrifices
-                    frame rate under pressure; <b className="text-ink-dim">Video</b> keeps motion smooth and lets detail go
-                    soft; <b className="text-ink-dim">Auto</b> sits between.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    Adaptive FPS <ScopeTag scope="host" />
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => patchTune({ adaptiveFps: !tune.adaptiveFps })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
-                      tune.adaptiveFps ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tune.adaptiveFps ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    Shares network pressure between frame rate and per-frame detail, so motion eases before the picture becomes heavily compressed.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    Smart bitrate <ScopeTag scope="direct" />
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => patchTune({ abrV2: !tune.abrV2 })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
-                      tune.abrV2 ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tune.abrV2 ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    <b className="text-ink-dim">ON</b>: this phone tells the PC what it is actually receiving and how much
-                    delay the link is carrying, and the PC sets the bitrate from that — so it climbs back to your full
-                    setting the moment the network can take it. <b className="text-ink-dim">OFF</b>: the older controller,
-                    which guesses from its own send queue and can ratchet down over a long session until you nudge a
-                    slider. The <b className="text-ink-dim">ABR</b> row in the host stats shows which one is live.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    Encoder preset <ScopeTag scope="host" />
-                  </span>
-                  <div className="flex gap-1">
-                    {[1, 2, 3, 4].map((p) => (
-                      <button
-                        key={p}
-                        type="button"
-                        onClick={() => patchTune({ encPreset: p })}
-                        className={`rounded px-1.5 py-0.5 text-[9px] font-800 ${
-                          tune.encPreset === p ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                        }`}
-                      >
-                        P{p}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    NVENC quality/speed. <b className="text-ink-dim">P2</b> (default) encodes as fast as P1 but gives a
-                    visibly cleaner picture at the same bitrate; <b className="text-ink-dim">P3/P4</b> spend ~0.6–0.8ms
-                    more per frame for a little more. Go back to <b className="text-ink-dim">P1</b> only on an older GPU
-                    whose "H264 enc" time climbs. Changing it restarts the encoder (one keyframe).
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    Encoder passes <ScopeTag scope="host" />
-                  </span>
-                  <div className="flex gap-1">
-                    {[
-                      [0, "1"],
-                      [1, "2·¼"],
-                      [2, "2"],
-                    ].map(([v, label]) => (
-                      <button
-                        key={v}
-                        type="button"
-                        onClick={() => patchTune({ encMultipass: v as number })}
-                        className={`rounded px-1.5 py-0.5 text-[9px] font-800 ${
-                          tune.encMultipass === v ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                        }`}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    <b className="text-ink-dim">1</b> (default): single pass. <b className="text-ink-dim">2·¼</b> /{" "}
-                    <b className="text-ink-dim">2</b>: two-pass rate control (quarter / full resolution) — frame sizes
-                    stick closer to the budget, so the wire is steadier on a tight link, but it spends fewer bits and
-                    looked softer in testing. Try it only if bursts cause hitches.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    Direct (WebCodecs) <ScopeTag scope="direct" />
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => patchTune({ preferDirect: !tune.preferDirect })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
-                      tune.preferDirect ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tune.preferDirect ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    Decode H.264 straight off the data channel instead of using the browser's video pipeline — skips the
-                    jitter buffer entirely, which is the single biggest chunk of lag. Leave ON; turn it off only to
-                    A/B against the RTC path. The header badge shows which one is actually live right now.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    PC encoder (NVENC) <ScopeTag scope="host" />
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => patchTune({ hostNvenc: !tune.hostNvenc })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
-                      tune.hostNvenc ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tune.hostNvenc ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    <b className="text-ink-dim">ON</b>: the PC encodes the screen itself on the GPU (~1ms/frame) and
-                    sends finished H.264. <b className="text-ink-dim">OFF</b>: the older path — the PC sends JPEGs and
-                    the browser re-encodes them (~35ms/frame, but long-proven). Flip to OFF if the picture goes choppy
-                    or patches stop refreshing. No effect on a PC without an NVIDIA encoder. The header shows an
-                    <b className="text-ink-dim"> NVENC</b> badge whenever it's actually live.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    NVENC fast delivery (experimental) <ScopeTag scope="host" />
-                  </span>
-                  <button type="button" aria-pressed={tune.nvencFast}
-                    onClick={() => patchTune({ nvencFast: !tune.nvencFast })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${tune.nvencFast ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"}`}>
-                    {tune.nvencFast ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                  Limits queued video on the PC and sends smaller chunks so input and sound get more frequent turns.
-                  Keeps the same picture quality. Requires DIRECT + PC NVENC and an updated desktop;
-                  OFF restores classic delivery immediately. No effect on LAN, RTC, or immersive VR.
-                </p>}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    Phone decoder (MediaCodec) <ScopeTag scope="direct" />
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => patchTune({ preferNativeDecode: !tune.preferNativeDecode })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
-                      tune.preferNativeDecode ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tune.preferNativeDecode ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    <b className="text-ink-dim">APK only.</b> ON feeds H.264 into Android MediaCodec and paints a Surface
-                    under the WebView (lowest decode ms). OFF forces WebCodecs even on the APK. Web and Quest always use
-                    WebCodecs — this toggle is a no-op there. The header shows a <b className="text-ink-dim">MediaCodec</b>{" "}
-                    badge when native decode is live.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    H.264 High profile <ScopeTag scope="direct" />
-                  </span>
-                  <button
-                    type="button"
-                    aria-pressed={tune.h264High}
-                    onClick={() => patchTune({ h264High: !tune.h264High })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
-                      tune.h264High ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tune.h264High ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    ON asks the PC for Constrained High (CABAC + 8×8) when this device's decoder supports it — about
-                    12–24 % fewer bits for the same picture, same latency. If a High stream won't decode, it drops back
-                    to Baseline by itself. OFF always uses Baseline. Needs DIRECT + PC NVENC; the header shows{" "}
-                    <b className="text-ink-dim">High</b> when it is live.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    PC sound (DIRECT) <ScopeTag scope="direct" />
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => patchTune({ preferDirectAudio: !tune.preferDirectAudio })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
-                      tune.preferDirectAudio ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tune.preferDirectAudio ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    <b className="text-ink-dim">ON</b>: Opus over a high-priority, time-bounded data channel →
-                    adaptive phone worklet (~65ms) with smooth gap repair.{" "}
-                    <b className="text-ink-dim">OFF</b>: classic WebRTC Opus track (NetEQ). Flip OFF only if DIRECT
-                    still crackles on a flaky link. Header shows{" "}
-                    <b className="text-ink-dim">AUD·DIRECT</b> / <b className="text-ink-dim">AUD·RTC</b>.
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
-                  <span className="flex items-center gap-1 text-[9px] font-700 text-ink-faint">
-                    Studio sound <ScopeTag scope="direct" />
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => patchTune({ audioStudio: !tune.audioStudio })}
-                    className={`rounded px-2 py-0.5 text-[9px] font-800 ${
-                      tune.audioStudio ? "bg-green/25 text-green" : "bg-white/[0.08] text-ink-dim"
-                    }`}
-                  >
-                    {tune.audioStudio ? "ON" : "OFF"}
-                  </button>
-                </div>
-                {tuneHints && (
-                  <p className="px-0.5 text-[8px] leading-snug text-ink-faint">
-                    <b className="text-ink-dim">Needs PC sound (DIRECT) on.</b> Halves the packet size, drops Opus into
-                    its low-delay mode, and sends every packet twice — once fresh, once riding along with the next one —
-                    on a channel that never waits or retransmits. A lost packet is repaired instead of concealed, which
-                    is what the metallic edge actually was. Costs about 260kbps, nothing next to the picture. Header
-                    shows <b className="text-ink-dim">AUD·STUDIO</b>; the audio stats show how many losses it repaired.
-                  </p>
-                )}
-                <button
-                  type="button"
-                  onClick={resetTuneToDefaults}
-                  className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.06] py-1.5 text-[10px] font-800 text-white active:bg-white/[0.12]"
-                >
-                  <RotateCcw className="h-3 w-3" /> Reset to defaults
-                  {!streamTuneIsCustom(tune) && (
-                    <span className="text-[8px] font-600 text-ink-faint">({STREAM_TUNE_DEFAULTS.maxW}·{STREAM_TUNE_DEFAULTS.fps}fps)</span>
-                  )}
-                </button>
-              </div>
-            )}
           </div>
           </>}
         </div>
         </StatVerboseCtx.Provider>
       )}
+
+      <TuneSheet
+        open={tuneOpen && !pipView}
+        tune={tune}
+        patch={patchTune}
+        onReset={resetTuneToDefaults}
+        onClose={() => setTuneOpen(false)}
+        hints={tuneHints}
+        onHints={setTuneHints}
+        env={{ nativePossible: nativeDecoderPossible() }}
+      />
 
       {/* ---- free-place pinned quick buttons (drag in Pin mode; positions + styles saved) ---- */}
       {pinnedDefs.length > 0 && !pipView && (
@@ -5681,6 +5234,10 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
     long: "Standing link delay",
     info: "How much delay this stream is adding to the network path (one-way delay minus its own recent minimum). Over ~110 ms the PC lowers the bitrate; under ~45 ms it climbs.",
   },
+  Gradient: {
+    long: "Delay gradient",
+    info: "Whether the delay in front of each frame is growing (overuse), steady (normal) or shrinking (underuse), from how far apart frames arrive versus how far apart the PC sent them — GCC's trendline. Shown as state and trend/threshold. With Early congestion detection on, overuse plus a real standing queue (30 ms) lowers the bitrate well before the 110 ms Queue rule would.",
+  },
   Recv: { long: "Received rate", info: "Video data this phone reported actually receiving, as the PC saw it. The PC sets the new rate from this when the link overloads." },
   Ceil: { long: "Remembered ceiling", info: "The last rate that overloaded the link. The PC climbs carefully near it, and forgets it after about 6 clean seconds." },
   "Path loss": {
@@ -5690,6 +5247,22 @@ const STAT_INFO: Record<string, { long: string; info: string }> = {
   "SCTP cap": {
     long: "Loss ceiling",
     info: "60 % of what a reliable data channel can carry at this loss and round-trip time (≈ 0.85·MSS·8 / (RTT·√loss)). Asking for more than that only builds delay. It lifts by itself once the loss clears.",
+  },
+  RFI: {
+    long: "Reference-frame invalidation",
+    info: "When the PC has to drop a frame because the link backed up, it tells the encoder to stop predicting from it and carries on from the last frame this device got — no keyframe, no blur, no freeze. Shown as healed / asked; 'IDR' counts the ones that had to fall back to a keyframe (too many frames lost at once).",
+  },
+  Transport: {
+    long: "DIRECT transport",
+    info: "Data = the SCTP data channel (fastest on a clean link). RTP = the RTP carrier: the same frames ride a tiny VP8 video track, so lost packets are resent without the long stalls a data channel suffers. Auto switches to RTP on packet loss and back after 20 clean seconds. 'fr' counts frames the carrier has delivered.",
+  },
+  "RTP cap": {
+    long: "RTP bitrate cap",
+    info: "While on the RTP carrier the PC stays under WebRTC's own bandwidth estimate (GCC) so its pacer never builds a queue — that queue would be latency.",
+  },
+  "RTP loss": {
+    long: "RTP packet loss",
+    info: "Loss the phone reports for the carrier (RTCP). RTP resends lost packets, so a little loss costs a few ms instead of a stall. Only shown while the carrier is in use.",
   },
   Overshoot: {
     long: "Encoder overshoot",
@@ -5806,86 +5379,6 @@ function HitchSection() {
         </div>
       )}
     </>
-  );
-}
-
-/** Group divider inside the Tune panel — 15 bare sliders in one list is unreadable. */
-function TuneSection({ label }: { label: string }) {
-  return (
-    <div className="flex items-center gap-1.5 px-0.5 pt-1.5">
-      <span className="shrink-0 text-[8px] font-800 uppercase tracking-wide text-ink-dim">{label}</span>
-      <span className="h-px flex-1 bg-white/[0.08]" />
-    </div>
-  );
-}
-
-/** Which leg of the pipeline a Tune knob acts on — colour-coded to match the HUD badge. */
-type TuneScope = "host" | "direct" | "rtc" | "both";
-
-const TUNE_SCOPE_STYLE: Record<TuneScope, string> = {
-  host: "bg-white/[0.08] text-ink-dim",
-  direct: "bg-green/20 text-green",
-  rtc: "bg-accent-3/20 text-accent-3",
-  both: "bg-amber/20 text-amber",
-};
-
-/** Small badge naming the path a knob affects, so a no-op knob is obvious. */
-function ScopeTag({ scope }: { scope: TuneScope }) {
-  return (
-    <span className={`rounded px-1 py-px text-[7px] font-800 uppercase leading-tight ${TUNE_SCOPE_STYLE[scope]}`}>
-      {scope}
-    </span>
-  );
-}
-
-/**
- * Full-width labelled slider for the stats Tune panel. `hint` explains what the
- * knob does and which way to drag it — these are A/B experiment controls, and a
- * bare number with no units or direction is unusable without reading the source.
- */
-function TuneRow({
-  label,
-  min,
-  max,
-  step,
-  value,
-  fmt,
-  onChange,
-  hint,
-  scope,
-  showHint = true,
-}: {
-  label: string;
-  min: number;
-  max: number;
-  step: number;
-  value: number;
-  fmt: (v: number) => string;
-  onChange: (v: number) => void;
-  hint?: string;
-  scope?: TuneScope;
-  showHint?: boolean;
-}) {
-  return (
-    <div className="px-0.5">
-      <div className="mb-0.5 flex items-center justify-between gap-1 text-[9px] font-700">
-        <span className="flex min-w-0 items-center gap-1">
-          <span className="truncate text-ink-faint">{label}</span>
-          {scope && <ScopeTag scope={scope} />}
-        </span>
-        <span className="shrink-0 tabular-nums text-white">{fmt(value)}</span>
-      </div>
-      {showHint && hint && <p className="mb-0.5 text-[8px] leading-snug text-ink-faint">{hint}</p>}
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full accent-accent-3"
-      />
-    </div>
   );
 }
 

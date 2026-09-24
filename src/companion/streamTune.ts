@@ -7,6 +7,11 @@
 import type { ContentMode } from "./links";
 
 export const STREAM_TUNE_KEY = "gt.remote.streamTune";
+/** Picture-in-picture stream (Tune "Lighter picture-in-picture"): the window is a
+ *  few hundred px wide on a phone, so this is still sharp there. */
+export const PIP_MAX_W = 960;
+export const PIP_MAX_FPS = 30;
+export const PIP_MAX_KBPS = 4000;
 /** Legacy keys kept in sync so the Quality dock + tune panel stay aligned. */
 export const STREAM_Q_KEY = "gt.remote.streamQ";
 export const CONTENT_MODE_KEY = "gt.remote.contentMode";
@@ -76,12 +81,44 @@ export type StreamTune = {
    */
   preferNativeDecode: boolean;
   /**
+   * Guest: while the stream is in picture-in-picture, ask the PC for a light
+   * stream (≤960 px wide, ≤30 fps; a manual bitrate capped at 4 Mb/s). The PiP
+   * window is a few hundred pixels wide, so full 1080p60 was decoded and sent for
+   * nothing. The full stream comes back the moment PiP closes. OFF = unchanged.
+   */
+  pipLite: boolean;
+  /**
    * Guest capability opt-in: when this device's decoder lists H.264 High, ask the
    * PC for Constrained High + CABAC instead of Constrained Baseline — 12–24 % fewer
    * bits for the same picture (research R3). A High stream that fails to decode
    * falls back to Baseline for the rest of the app run. OFF = always Baseline.
    */
   h264High: boolean;
+  /**
+   * Guest opt-in for reference-frame invalidation (research R4). When the PC has
+   * to drop a frame to a backed-up link, it tells NVENC to stop predicting from it
+   * and carries on from the last frame this phone got — instead of a blurry IDR
+   * and a frozen picture until it lands. Costs a 4-frame reference buffer in the
+   * decoder. "auto" = only decoders known to handle it at full speed (Qualcomm,
+   * as Moonlight does); "on" = any decoder; "off" = never.
+   */
+  rfi: "auto" | "on" | "off";
+  /**
+   * Native codec (research R8). "auto" = H.264, switching to HEVC only while the
+   * link holds the stream under ~8 Mb/s (HEVC needs 27–54 % fewer bits for the same
+   * picture but costs this phone ~4 ms more decode); back to H.264 above ~12 Mb/s.
+   * "h264" / "hevc" force one (HEVC only when this device decodes it in hardware).
+   */
+  codec: "auto" | "h264" | "hevc";
+  /**
+   * APK only (research R9 A/B): where MediaCodec paints. "texture" (default) is a
+   * TextureView composited inside the app window — the fix for Android 16's WebView
+   * burn-in. "surface" is a SurfaceView under a see-through window: its frames go
+   * straight to the display compositor (can be a hardware overlay, ~1 frame sooner)
+   * but brings the translucent window back. Experimental; compare and keep the one
+   * that looks right on this device.
+   */
+  videoLayer: "texture" | "surface";
   /**
    * PC sound path. ON = DIRECT: Opus (or raw f32) over the high-priority,
    * time-bounded audio channel → adaptive phone worklet (~65ms target). OFF = RTC: WebRTC
@@ -114,6 +151,14 @@ export type StreamTune = {
    */
   abrV2: boolean;
   /**
+   * Smart bitrate only (research R7): also watch the delay GRADIENT (GCC's
+   * trendline over each frame's arrival spacing), so a queue that is starting to
+   * build is caught in ~0.25–0.5 s instead of waiting for ~110 ms of standing
+   * delay (~0.5–1 s). It only acts once there is a real standing queue (30 ms),
+   * which keeps big frames on a clean link from reading as congestion.
+   */
+  abrGradient: boolean;
+  /**
    * DIRECT audio only: the STUDIO wire — 10ms Opus frames carrying one
    * redundant copy of the previous frame, over an UNORDERED, zero-retransmit
    * channel, with pitch-aware gap repair on the phone. A single lost packet
@@ -136,6 +181,13 @@ export type StreamTune = {
    * equal bitrate on desktop content because it under-spends — opt-in.
    */
   encMultipass: number;
+  /**
+   * Host: which transport carries DIRECT frames. "auto" = the SCTP video channel
+   * while the link is clean (≈5–10 ms faster), the RTP carrier (lib/carrier.ts) as
+   * soon as packets are lost (SCTP turns loss into long stalls; RTP recovers it).
+   * "sctp" / "rtp" force one. Needs a carrier-capable host and browser.
+   */
+  videoTransport: "auto" | "sctp" | "rtp";
 };
 
 export const STREAM_TUNE_DEFAULTS: StreamTune = {
@@ -162,14 +214,20 @@ export const STREAM_TUNE_DEFAULTS: StreamTune = {
   hostNvenc: true,
   nvencFast: false,
   preferNativeDecode: true,
+  pipLite: true,
   h264High: true,
+  rfi: "auto",
+  codec: "auto",
+  videoLayer: "texture",
   preferDirectAudio: true,
   audioJbMs: 100,
   audioHostMs: 90,
   abrV2: true,
+  abrGradient: true,
   audioStudio: true,
   encPreset: 2,
   encMultipass: 0,
+  videoTransport: "auto",
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -233,9 +291,14 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     // Experiments must never turn on for existing installs or malformed prefs.
     nvencFast: r.nvencFast === true,
     preferNativeDecode: r.preferNativeDecode !== false,
+    pipLite: r.pipLite !== false,
     h264High: r.h264High !== false,
+    rfi: r.rfi === "on" || r.rfi === "off" ? r.rfi : "auto",
+    codec: r.codec === "h264" || r.codec === "hevc" ? r.codec : "auto",
+    videoLayer: r.videoLayer === "surface" ? "surface" : "texture",
     preferDirectAudio: r.preferDirectAudio !== false,
     abrV2: r.abrV2 !== false,
+    abrGradient: r.abrGradient !== false,
     audioStudio: r.audioStudio !== false,
     // 0 means "auto" (don't touch NetEQ). Finite test — like `pace`.
     audioJbMs: clamp(Number.isFinite(Number(r.audioJbMs)) ? Number(r.audioJbMs) : d.audioJbMs, 0, 400),
@@ -245,6 +308,7 @@ export function normalizeStreamTune(raw: Partial<StreamTune> | null | undefined)
     encMultipass: Math.round(
       clamp(Number.isFinite(Number(r.encMultipass)) ? Number(r.encMultipass) : d.encMultipass, 0, 2),
     ),
+    videoTransport: r.videoTransport === "sctp" || r.videoTransport === "rtp" ? r.videoTransport : "auto",
   };
 }
 
@@ -333,13 +397,19 @@ export function streamTuneIsCustom(t: StreamTune): boolean {
     t.hostNvenc !== d.hostNvenc ||
     t.nvencFast !== d.nvencFast ||
     t.preferNativeDecode !== d.preferNativeDecode ||
+    t.pipLite !== d.pipLite ||
     t.h264High !== d.h264High ||
+    t.rfi !== d.rfi ||
+    t.codec !== d.codec ||
+    t.videoLayer !== d.videoLayer ||
     t.preferDirectAudio !== d.preferDirectAudio ||
     t.audioJbMs !== d.audioJbMs ||
     t.audioHostMs !== d.audioHostMs ||
     t.abrV2 !== d.abrV2 ||
+    t.abrGradient !== d.abrGradient ||
     t.audioStudio !== d.audioStudio ||
     t.encPreset !== d.encPreset ||
+    t.videoTransport !== d.videoTransport ||
     t.encMultipass !== d.encMultipass
   );
 }

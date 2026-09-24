@@ -33,9 +33,16 @@
 //! testable on any platform (see the tests at the bottom).
 
 /// Values we force into every SPS. Named so the intent survives the bit-twiddling.
-const FORCE_MAX_NUM_REF_FRAMES: u32 = 1;
 const FORCE_MAX_NUM_REORDER_FRAMES: u32 = 0;
-const FORCE_MAX_DEC_FRAME_BUFFERING: u32 = 1;
+/// The default DPB: refs 1, dec-buffering 1. The phone only ever needs the last frame.
+pub const DPB_LOW_LATENCY: u32 = 1;
+/// The DPB when the guest opted into reference-frame invalidation (research R4): a
+/// frame the host had to drop is recovered by predicting from the frame BEFORE it,
+/// which must still be in both DPBs. Reorder stays 0, so a conforming decoder still
+/// outputs every picture at once — but some decoders size their output delay off
+/// the DPB anyway, which is why this is opt-in per decoder (Moonlight whitelists
+/// RFI the same way). NVENC encodes with the same depth and still searches one ref.
+pub const DPB_RFI: u32 = 4;
 
 // ---- bit IO ---------------------------------------------------------------
 
@@ -205,7 +212,7 @@ fn copy_scaling_list(r: &mut BitReader, w: &mut BitWriter, size: usize) -> Resul
 
 /// Rewrite one SPS **RBSP** (no start code, no NAL header). `Err` ⇒ caller keeps the
 /// original bytes rather than shipping a stream we half-understand.
-fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
+fn rewrite_rbsp(rbsp: &[u8], refs: u32) -> Result<Vec<u8>, ()> {
     let mut r = BitReader::new(rbsp);
     let mut w = BitWriter::default();
 
@@ -274,11 +281,18 @@ fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
         }
     }
 
-    // --- fix 1: DPB size. NVENC ships 16 here; the phone only needs the last frame.
+    // --- fix 1: DPB size. NVENC ships 16 here; the phone only needs the last frame
+    // (or DPB_RFI frames when invalidation is on).
     let _orig_refs = r.ue()?;
-    w.ue(FORCE_MAX_NUM_REF_FRAMES);
+    w.ue(refs);
 
-    w.u1(r.u1()?); // gaps_in_frame_num_value_allowed_flag
+    // gaps_in_frame_num_value_allowed_flag. After an invalidation the guest never
+    // sees the dropped frames, so frame_num jumps. With the flag set that jump is
+    // the spec's ordinary gap process (non-existing frames fill the sliding window)
+    // rather than an error some decoders refuse; the prior frame survives it as long
+    // as fewer than `refs` frames were skipped (NativeEncoder::invalidate_from).
+    let gaps = r.u1()?;
+    w.u1(if refs > 1 { 1 } else { gaps });
     w.ue(r.ue()?); // pic_width_in_mbs_minus1
     w.ue(r.ue()?); // pic_height_in_map_units_minus1
     let frame_mbs_only = r.u1()?;
@@ -403,7 +417,7 @@ fn rewrite_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, ()> {
         w.ue(16);
     }
     w.ue(FORCE_MAX_NUM_REORDER_FRAMES);
-    w.ue(FORCE_MAX_DEC_FRAME_BUFFERING);
+    w.ue(refs); // max_dec_frame_buffering
 
     w.trailing();
     Ok(w.d)
@@ -440,7 +454,7 @@ fn nal_units(d: &[u8]) -> Vec<(usize, usize)> {
 ///
 /// Any parse failure copies the original SPS through untouched: a stream that decodes
 /// with a stale DPB hint beats a stream that doesn't decode.
-pub fn fixup_into(src: &[u8], out: &mut Vec<u8>) -> bool {
+pub fn fixup_into(src: &[u8], out: &mut Vec<u8>, refs: u32) -> bool {
     out.clear();
     out.reserve(src.len() + 32);
     let units = nal_units(src);
@@ -470,7 +484,7 @@ pub fn fixup_into(src: &[u8], out: &mut Vec<u8>) -> bool {
         }
         if nal_type == 7 {
             let rbsp = unescape(&nal[1..]);
-            match rewrite_rbsp(&rbsp) {
+            match rewrite_rbsp(&rbsp, refs) {
                 Ok(new_rbsp) => {
                     out.push(nal[0]);
                     escape(&new_rbsp, out);
@@ -492,7 +506,7 @@ pub fn fixup_into(src: &[u8], out: &mut Vec<u8>) -> bool {
 /// `pic_order_cnt_type` is the interesting one — see the module docs. If this logs
 /// `poc_type=2` the Snapdragon reorder slow path was never armed; if it logs
 /// `poc_type=0` the remaining decode latency may need slice-level work.
-pub fn log_summary(src: &[u8]) {
+pub fn log_summary(src: &[u8], refs: u32) {
     for (s, e) in nal_units(src) {
         let nal = &src[s..e];
         if nal.is_empty() || nal[0] & 0x1f != 7 {
@@ -511,9 +525,9 @@ pub fn log_summary(src: &[u8]) {
                 info.bitstream_restriction,
                 info.max_num_reorder_frames,
                 info.max_dec_frame_buffering,
-                FORCE_MAX_NUM_REF_FRAMES,
+                refs,
                 FORCE_MAX_NUM_REORDER_FRAMES,
-                FORCE_MAX_DEC_FRAME_BUFFERING,
+                refs,
             );
         }
         return;
@@ -537,6 +551,7 @@ pub struct SpsInfo {
     pub level_idc: u32,
     pub poc_type: u32,
     pub max_num_ref_frames: u32,
+    pub gaps_allowed: bool,
     pub vui_present: bool,
     pub bitstream_restriction: bool,
     pub max_num_reorder_frames: Option<u32>,
@@ -591,7 +606,7 @@ pub fn summarize(rbsp: &[u8]) -> Option<SpsInfo> {
             }
         }
         let max_num_ref_frames = r.ue()?;
-        r.u1()?;
+        let gaps_allowed = r.u1()? == 1;
         r.ue()?;
         r.ue()?;
         if r.u1()? == 0 {
@@ -610,6 +625,7 @@ pub fn summarize(rbsp: &[u8]) -> Option<SpsInfo> {
             level_idc,
             poc_type,
             max_num_ref_frames,
+            gaps_allowed,
             vui_present,
             bitstream_restriction: false,
             max_num_reorder_frames: None,
@@ -717,19 +733,33 @@ mod tests {
         assert_eq!(before.max_num_ref_frames, 16);
         assert!(!before.vui_present);
 
-        let fixed = rewrite_rbsp(&orig).expect("rewrite");
+        let fixed = rewrite_rbsp(&orig, DPB_LOW_LATENCY).expect("rewrite");
         let after = summarize(&fixed).expect("parse rewritten");
 
-        assert_eq!(after.max_num_ref_frames, 1, "DPB must drop to 1 ref");
+        assert_eq!(after.max_num_ref_frames, DPB_LOW_LATENCY, "DPB must drop to 1 ref");
         assert!(after.vui_present, "must emit a VUI to carry the restriction");
         assert!(after.bitstream_restriction, "restriction block must be present");
         assert_eq!(after.max_num_reorder_frames, Some(0), "no reordering");
-        assert_eq!(after.max_dec_frame_buffering, Some(1), "1-frame DPB");
+        assert_eq!(after.max_dec_frame_buffering, Some(DPB_LOW_LATENCY), "1-frame DPB");
 
         // Untouched fields must survive the round trip bit-for-bit.
         assert_eq!(after.profile_idc, before.profile_idc);
         assert_eq!(after.level_idc, before.level_idc);
         assert_eq!(after.poc_type, before.poc_type, "poc_type is deliberately preserved");
+        assert!(!after.gaps_allowed, "the low-latency DPB leaves the gaps flag alone");
+    }
+
+    #[test]
+    fn rfi_depth_sets_refs_dpb_and_allows_frame_num_gaps() {
+        let orig = nvenc_like_sps_rbsp();
+        let after = summarize(&rewrite_rbsp(&orig, DPB_RFI).expect("rewrite")).expect("parse");
+        assert_eq!(after.max_num_ref_frames, DPB_RFI);
+        assert_eq!(after.max_dec_frame_buffering, Some(DPB_RFI), "DPB matches the refs");
+        assert_eq!(after.max_num_reorder_frames, Some(0), "still no reordering");
+        assert!(after.gaps_allowed, "a skipped frame must be a legal frame_num gap");
+        // The rest of the SPS is unchanged by the depth.
+        let low = summarize(&rewrite_rbsp(&orig, DPB_LOW_LATENCY).unwrap()).unwrap();
+        assert_eq!((after.profile_idc, after.level_idc, after.poc_type), (low.profile_idc, low.level_idc, low.poc_type));
     }
 
     /// The colour description we now ask NVENC for (BT.601 matrix — what its ARGB
@@ -768,10 +798,10 @@ mod tests {
         w.u1(0); // pic_struct
         w.u1(0); // no restriction yet
         w.trailing();
-        let fixed = rewrite_rbsp(&w.d).expect("rewrite");
+        let fixed = rewrite_rbsp(&w.d, DPB_LOW_LATENCY).expect("rewrite");
         let info = summarize(&fixed).expect("parse");
         assert_eq!(info.colour, Some((1, 1, 6)));
-        assert_eq!(info.max_dec_frame_buffering, Some(1));
+        assert_eq!(info.max_dec_frame_buffering, Some(DPB_LOW_LATENCY));
         assert_eq!(info.profile_idc, 66);
     }
 
@@ -826,10 +856,10 @@ mod tests {
         assert_eq!(before.max_num_reorder_frames, Some(2));
         assert_eq!(before.max_dec_frame_buffering, Some(4));
 
-        let after = summarize(&rewrite_rbsp(&orig).unwrap()).unwrap();
+        let after = summarize(&rewrite_rbsp(&orig, DPB_LOW_LATENCY).unwrap()).unwrap();
         assert_eq!(after.max_num_reorder_frames, Some(0));
-        assert_eq!(after.max_dec_frame_buffering, Some(1));
-        assert_eq!(after.max_num_ref_frames, 1);
+        assert_eq!(after.max_dec_frame_buffering, Some(DPB_LOW_LATENCY));
+        assert_eq!(after.max_num_ref_frames, DPB_LOW_LATENCY);
         // The VUI fields we don't own must round-trip.
         assert_eq!(after.poc_type, 2);
         assert_eq!(after.profile_idc, 100);
@@ -855,7 +885,7 @@ mod tests {
         stream.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00]); // IDR slice
 
         let mut out = Vec::new();
-        assert!(fixup_into(&stream, &mut out), "should report a rewrite");
+        assert!(fixup_into(&stream, &mut out, DPB_LOW_LATENCY), "should report a rewrite");
 
         // The PPS and slice must survive byte-for-byte.
         let pps = [0u8, 0, 0, 1, 0x68, 0xEE, 0x3C, 0x80];
@@ -871,9 +901,9 @@ mod tests {
             .find(|n| !n.is_empty() && n[0] & 0x1f == 7)
             .expect("SPS present");
         let info = summarize(&unescape(&sps[1..])).expect("parse");
-        assert_eq!(info.max_num_ref_frames, 1);
+        assert_eq!(info.max_num_ref_frames, DPB_LOW_LATENCY);
         assert_eq!(info.max_num_reorder_frames, Some(0));
-        assert_eq!(info.max_dec_frame_buffering, Some(1));
+        assert_eq!(info.max_dec_frame_buffering, Some(DPB_LOW_LATENCY));
     }
 
     #[test]
@@ -881,7 +911,7 @@ mod tests {
         let mut stream = vec![0, 0, 0, 1, 0x67];
         stream.extend_from_slice(&[0xFF; 3]); // truncated garbage
         let mut out = Vec::new();
-        let rewrote = fixup_into(&stream, &mut out);
+        let rewrote = fixup_into(&stream, &mut out, DPB_LOW_LATENCY);
         assert!(!rewrote, "must not claim a rewrite it couldn't do");
         assert_eq!(out, stream, "original bytes must be preserved verbatim");
     }
@@ -906,7 +936,7 @@ mod tests {
         w.u1(0); // no crop
         w.u1(0); // no vui (rewriter synthesises one)
         w.trailing();
-        let out = rewrite_rbsp(&w.d).expect("rewrite");
+        let out = rewrite_rbsp(&w.d, DPB_LOW_LATENCY).expect("rewrite");
         assert_eq!(out[0], 66);
         assert_ne!(out[1] & 0x40, 0, "constraint_set1_flag must be set");
     }
@@ -942,17 +972,17 @@ mod tests {
             w.trailing();
             w.d
         };
-        let out = rewrite_rbsp(&high(1)).expect("rewrite");
+        let out = rewrite_rbsp(&high(1), DPB_LOW_LATENCY).expect("rewrite");
         assert_eq!(out[0], 100);
         assert_eq!(out[1] & 0x0C, 0x0C, "set4 + set5 = Constrained High");
         assert_eq!(out[1] & 0x40, 0, "set1 is a Baseline-only promise");
         let info = summarize(&out).expect("parse");
         assert_eq!(info.profile_idc, 100);
-        assert_eq!(info.max_num_ref_frames, 1);
+        assert_eq!(info.max_num_ref_frames, DPB_LOW_LATENCY);
         assert_eq!(info.max_num_reorder_frames, Some(0));
 
         // Field-coded streams can't claim set4 (it asserts frame_mbs_only == 1).
-        let out = rewrite_rbsp(&high(0)).expect("rewrite");
+        let out = rewrite_rbsp(&high(0), DPB_LOW_LATENCY).expect("rewrite");
         assert_eq!(out[1] & 0x0C, 0x04, "set5 only when not frame-only");
     }
 }

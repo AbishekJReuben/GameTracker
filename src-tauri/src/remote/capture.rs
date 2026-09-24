@@ -384,6 +384,37 @@ pub fn request_refresh() {
     NATIVE_FORCE_IR.store(true, Ordering::Relaxed);
 }
 
+/// Reference-frame invalidation request (research R4): 0 = none, else
+/// `0x100 | id`, where `id` is the 6-bit wire id (GN flags bits 2..7) of the first
+/// frame the guest will never receive — the host webview dropped it at the 4×
+/// backpressure ceiling. Consumed by the encoder before its next frame, which then
+/// predicts from the last frame the guest did get instead of forcing an IDR.
+static NATIVE_RFI: AtomicU32 = AtomicU32::new(0);
+
+/// Host: the frame with wire id `id` (and every one after it so far) never reached
+/// the guest. See [`NATIVE_RFI`]; a request that can't be honoured becomes an IDR.
+pub fn request_rfi(id: u8) {
+    NATIVE_RFI.store(0x100 | (id as u32 & 63), Ordering::Relaxed);
+}
+
+/// Apply a pending [`request_rfi`] to `enc` before its next encode. Returns true when
+/// this frame has to be an IDR instead (invalidation off, or the frame to predict
+/// from may already be gone). A frame that is an IDR anyway just consumes it.
+#[cfg(windows)]
+fn take_rfi(enc: &mut super::native::NativeEncoder, key_anyway: bool) -> bool {
+    let req = NATIVE_RFI.swap(0, Ordering::Relaxed);
+    if req == 0 || key_anyway {
+        return false;
+    }
+    let id = (req & 63) as u8;
+    if enc.invalidate_from(id) {
+        false
+    } else {
+        eprintln!("[native] RFI #{id}: can't recover by invalidation — sending an IDR");
+        true
+    }
+}
+
 /// Backpressure gate for the native H.264 path: while set, captures are NOT fed
 /// to NVENC (keyframe requests still are). The host JS sets this when the video
 /// data channel backs up, instead of dropping already-encoded frames — a dropped
@@ -452,12 +483,33 @@ pub fn set_h264_high(on: bool) {
     CAP_H264_HIGH.store(on, Ordering::Relaxed);
 }
 
+/// Keep a 4-frame DPB so dropped frames can be invalidated (research R4). Set by the
+/// host from the guest's DIRECT opt-in; a change rebuilds the session like any tuning.
+static CAP_RFI: AtomicBool = AtomicBool::new(false);
+
+/// Host: the guest opted into (or out of) reference-frame invalidation.
+pub fn set_rfi(on: bool) {
+    CAP_RFI.store(on, Ordering::Relaxed);
+}
+
+/// Encode HEVC Main instead of H.264 — the host's low-bandwidth mode (research R8),
+/// only for guests whose decoder reported HEVC. A change rebuilds the session; the
+/// host re-announces the codec so the guest rebuilds its decoder before the IDR.
+static CAP_HEVC: AtomicBool = AtomicBool::new(false);
+
+/// Host: switch the native encoder between HEVC and H.264.
+pub fn set_hevc(on: bool) {
+    CAP_HEVC.store(on, Ordering::Relaxed);
+}
+
 #[cfg(windows)]
 fn encoder_tuning() -> super::native::EncoderTuning {
     super::native::EncoderTuning {
         preset: CAP_PRESET.load(Ordering::Relaxed) as u8,
         multipass: CAP_MULTIPASS.load(Ordering::Relaxed) as u8,
         high: CAP_H264_HIGH.load(Ordering::Relaxed),
+        rfi: CAP_RFI.load(Ordering::Relaxed),
+        hevc: CAP_HEVC.load(Ordering::Relaxed),
     }
 }
 
@@ -795,6 +847,7 @@ where
     // thousands of skips against a few thousand frames on a healthy stream,
     // which is exactly the wrong conclusion to hand someone reading the HUD.
     ST_PAUSE_SKIPS.store(0, Ordering::Relaxed);
+    NATIVE_RFI.store(0, Ordering::Relaxed);
     // Every session starts on JPEG and is upgraded only once THIS guest opts into
     // DIRECT. Leaving the previous session's flag set would hand native H.264 to a
     // brand-new RTC guest, which paints its canvas from pixels and would show black.
@@ -961,7 +1014,8 @@ where
                                     ST_PAUSE_SKIPS.fetch_add(1, Ordering::Relaxed);
                                 } else if ok {
                                     if let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) {
-                                        let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        force_key |= take_rfi(enc, force_key);
                                         let force_ir = !force_key && NATIVE_FORCE_IR.swap(false, Ordering::Relaxed);
                                         let ts_us = zc_started.elapsed().as_micros() as u64;
                                         let e0 = Instant::now();
@@ -1008,7 +1062,11 @@ where
                             // bytes of skip macroblocks).
                             if let Some((comp, enc)) = zc.as_mut() {
                                 let want_key = NATIVE_FORCE_KEY.load(Ordering::Relaxed);
-                                let want_ir = NATIVE_FORCE_IR.load(Ordering::Relaxed);
+                                // A pending invalidation also wants a frame NOW: on a
+                                // still screen the next keep-alive could be 700 ms away,
+                                // and the host holds the stream until it arrives.
+                                let want_ir = NATIVE_FORCE_IR.load(Ordering::Relaxed)
+                                    || NATIVE_RFI.load(Ordering::Relaxed) != 0;
                                 // The screen just settled after motion: sharpen what
                                 // the motion left at motion-grade QP.
                                 if zc_moved {
@@ -1028,7 +1086,8 @@ where
                                             || zc_last_emit.elapsed() >= Duration::from_millis(700)))
                                 {
                                     if let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) {
-                                        let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        force_key |= take_rfi(enc, force_key);
                                         let force_ir = !force_key && NATIVE_FORCE_IR.swap(false, Ordering::Relaxed);
                                         let ts_us = zc_started.elapsed().as_micros() as u64;
                                         if let Some(pkt) = enc.encode_texture_ex(comp.output(), force_key, force_ir, ts_us) {
@@ -1299,7 +1358,8 @@ where
                     };
                     // First frame of a session, a guest keyframe request, or the ~1s
                     // keep-alive on a static screen all need a self-contained IDR.
-                    let force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed) || stale;
+                    let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed) || stale;
+                    force_key |= take_rfi(n, force_key);
                     let ts_us = started.elapsed().as_micros() as u64;
                     if let Some(pkt) = n.encode_pixels(&frame.px, frame.w, frame.h, force_key, ts_us) {
                         ST_ENC_US.store(n.last_encode_us, Ordering::Relaxed);

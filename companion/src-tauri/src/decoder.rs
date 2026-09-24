@@ -26,6 +26,9 @@ pub struct DecoderProbe {
     /// The picked decoder lists H.264 High / Constrained High, so the host may send
     /// Constrained High + CABAC. False on older bridge templates.
     pub high: bool,
+    /// A hardware decoder lists HEVC Main (research R8: the host's low-bandwidth
+    /// mode). False on older bridge templates.
+    pub hevc: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,9 +58,18 @@ pub async fn decoder_probe() -> Result<DecoderProbe, String> {
         .map_err(|e| format!("decoder_probe panicked: {e}"))?
 }
 
+/// `codec`: "hevc" or "avc" (default) — the stream the host announced (research R8).
+/// `layer`: "surface" for the SurfaceView A/B (research R9), else the TextureView.
 #[tauri::command]
-pub async fn decoder_init(width: i32, height: i32) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || decoder_init_impl(width, height))
+pub async fn decoder_init(
+    width: i32,
+    height: i32,
+    codec: Option<String>,
+    layer: Option<String>,
+) -> Result<(), String> {
+    let codec = codec.unwrap_or_else(|| "avc".into());
+    let layer = layer.unwrap_or_else(|| "texture".into());
+    tauri::async_runtime::spawn_blocking(move || decoder_init_impl(width, height, &codec, &layer))
         .await
         .map_err(|e| format!("decoder_init panicked: {e}"))?
 }
@@ -274,6 +286,14 @@ mod android {
             if env.exception_check().unwrap_or(false) {
                 let _ = env.exception_clear();
             }
+            let hevc = env
+                .call_static_method(&class, "probeHevc", "()Z", &[])
+                .ok()
+                .and_then(|v| v.z().ok())
+                .unwrap_or(false);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
             Ok(DecoderProbe {
                 available,
                 name,
@@ -281,12 +301,38 @@ mod android {
                 detail,
                 max_bitrate_kbps,
                 high,
+                hevc,
             })
         })
     }
 
-    pub fn init(width: i32, height: i32) -> Result<(), String> {
+    pub fn init(width: i32, height: i32, codec: &str, layer: &str) -> Result<(), String> {
         with_bridge(|env, class| {
+            // Video layer first: a change drops the old view before init builds one.
+            if let Ok(js) = env.new_string(layer) {
+                let _ = env.call_static_method(
+                    &class,
+                    "setViewKind",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::Object(&js)],
+                );
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+            }
+            // Select the codec before init; an older template has no setCodec and
+            // simply decodes H.264 as before.
+            if let Ok(js) = env.new_string(codec) {
+                let _ = env.call_static_method(
+                    &class,
+                    "setCodec",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::Object(&js)],
+                );
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+            }
             env.call_static_method(
                 &class,
                 "init",
@@ -441,8 +487,8 @@ fn decoder_probe_impl() -> Result<DecoderProbe, String> {
     android::probe()
 }
 #[cfg(target_os = "android")]
-fn decoder_init_impl(width: i32, height: i32) -> Result<(), String> {
-    android::init(width, height)
+fn decoder_init_impl(width: i32, height: i32, codec: &str, layer: &str) -> Result<(), String> {
+    android::init(width, height, codec, layer)
 }
 #[cfg(target_os = "android")]
 fn decoder_set_bounds_impl(
@@ -485,10 +531,11 @@ fn decoder_probe_impl() -> Result<DecoderProbe, String> {
         detail: String::new(),
         max_bitrate_kbps: 0,
         high: false,
+        hevc: false,
     })
 }
 #[cfg(not(target_os = "android"))]
-fn decoder_init_impl(_width: i32, _height: i32) -> Result<(), String> {
+fn decoder_init_impl(_width: i32, _height: i32, _codec: &str, _layer: &str) -> Result<(), String> {
     Err("native MediaCodec is Android-only".into())
 }
 #[cfg(not(target_os = "android"))]

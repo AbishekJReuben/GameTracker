@@ -28,7 +28,8 @@ import {
 } from "@/lib/audioWire";
 import audioFeederWorkletUrl from "@/lib/audioFeeder.worklet.js?url";
 import { SeqLossWindow } from "@/lib/lossCeiling";
-import { H264_HIGH_CODEC } from "@/lib/nativeDelivery";
+import { REC_CONFIG, REC_KEY, SeqOrderer } from "@/lib/carrier";
+import { H264_HIGH_CODEC, HEVC_MAIN_CODEC, isHevcCodec } from "@/lib/nativeDelivery";
 import {
   dumpNativeDecoderDiag,
   feedNativeDecoder,
@@ -43,6 +44,7 @@ import {
 import { hitchMaybeE2eJump, hitchMaybeFrameGap, hitchNote } from "./hitchLog";
 import { isImmersiveActive, onImmersiveActiveChange } from "./runtime";
 import { loadStreamTune, resetStreamTune, type StreamTune } from "./streamTune";
+import { DelayTrendline } from "../lib/trendline";
 import { VideoAssembler, decodeOverloaded, type VideoHeader } from "./videoReceive";
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
@@ -283,6 +285,10 @@ export type WcStats = {
   recovering?: boolean;
   /** Cumulative guest-side decode errors that armed a keyframe request. */
   guestErrors?: number;
+  /** Transport carrying DIRECT frames now (lib/carrier.ts). */
+  transport?: "sctp" | "rtp";
+  /** Frames received over the RTP carrier this session. */
+  carrierFrames?: number;
 };
 
 const HEARTBEAT_MS = 5000; // ping cadence
@@ -328,6 +334,13 @@ const JITTER_MAX_DEFAULT = 120;
 const JITTER_MIN_DEFAULT = 40;
 /** Consecutive clean watchdog ticks (3s each) before easing from a raised target. */
 const JITTER_CLEAN_TICKS = 2;
+/**
+ * Hardware decoders that take the 4-frame RFI reference buffer (research R4) at
+ * full speed: Qualcomm's, as in Moonlight's refFrameInvalidationAvc list — Codec2
+ * ("c2.qti.", Android 10+) only: Moonlight turns RFI off on the old low-end
+ * Snapdragons above 720p, and those are the ones still on the OMX ("omx.qcom.") stack.
+ */
+const RFI_DECODERS = /^c2\.qti\./i;
 // H.264 decode candidates — MUST mirror rtcHost.ts. Baseline first so Android HW
 // can enter low-latency mode (Moonlight errata #8); High stays for JPEG→WC fallback.
 const WC_CODECS = ["avc1.42C028", "avc1.42E028", "avc1.4d0028", "avc1.640028", "avc1.640034"];
@@ -407,6 +420,8 @@ export class CloudConn {
   private preferDirect = true;
   /** Android APK: MediaCodec Surface decode when true (Tune: "Phone decoder"). */
   private preferNativeDecode = true;
+  /** Tune (R9 A/B): the MediaCodec sink — TextureView (default) or SurfaceView. */
+  private preferVideoLayer: "texture" | "surface" = "texture";
   /** DIRECT PCM audio over data channel (Tune: "PC sound"). Default ON. */
   private preferDirectAudio = true;
   private jitterTarget = JITTER_BASE_DEFAULT;
@@ -464,6 +479,14 @@ export class CloudConn {
   private wcHighFailed = false;
   /** Tune: allow asking the PC for Constrained High (research R3). */
   private preferH264High = true;
+  /** DEVICE fact: this decoder is one known to take the 4-frame RFI DPB at full speed. */
+  private wcRfiCap = false;
+  /** Tune: reference-frame invalidation (research R4). */
+  private preferRfi: "auto" | "on" | "off" = "auto";
+  /** DEVICE fact (probed with wcSupported): a hardware HEVC Main decoder (research R8). */
+  private wcHevcCap = false;
+  /** An HEVC stream failed to decode here — tell the PC to stay on H.264 this app run. */
+  private wcHevcFailed = false;
   /** Native decoder's declared bitrate ceiling (kbps; 0 = unknown) — sent with the opt-in. */
   private wcMaxKbps = 0;
   /** Frames the CURRENT WebCodecs decoder has output (0 ⇒ it never decoded anything). */
@@ -513,6 +536,20 @@ export class CloudConn {
     this.wcAwaitKey = true;
     this.wcRequestKeyframe();
   });
+  /** Orders DIRECT frames by the host's sequence across the SCTP video channel AND
+   *  the RTP carrier (lib/carrier.ts) — both share one counter, so a transport
+   *  switch needs no keyframe. A gap that doesn't fill in time is a real loss:
+   *  wait for a keyframe (a delta after a lost frame is garbage). */
+  private wcOrder = new SeqOrderer<{ head: VideoHeader; bytes: Uint8Array<ArrayBuffer> }>();
+  private wcOrderTimer: number | null = null;
+  /** RTP carrier: its m-line mid (host-announced), the primary video's mid (any
+   *  other video m-line is the carrier), the receive worker, frames it delivered. */
+  private carrierMid: string | null = null;
+  private videoMid: string | null = null;
+  private carrierWorker: Worker | null = null;
+  private carrierFrames = 0;
+  /** Which transport the host says carries DIRECT frames right now. */
+  private wcTransport: "sctp" | "rtp" = "sctp";
   /** Per-frame bookkeeping keyed by chunk timestamp (µs) for latency stats. */
   private wcMeta = new Map<number, { arrivedAt: number; submittedAt: number; tsMs: number; bytes: number }>();
   private wcFrames = 0;
@@ -549,6 +586,11 @@ export class CloudConn {
   private owdWin: { at: number; ms: number }[] = [];
   private owdMin = 0;
   private vstatTimer: number | null = null;
+  /** R7: GCC trendline over the data channel's frame headers (lib/trendline.ts). */
+  private trendline = new DelayTrendline();
+  /** An overuse was seen since the last report (the state can flip between reports). */
+  private trendOveruse = false;
+  private trendFedAt = 0;
   /** Host has been told to stop encoding because we're backgrounded. */
   private powerIdle = false;
   /** Pending "go idle" — see POWER_IDLE_GRACE_MS. */
@@ -707,7 +749,11 @@ export class CloudConn {
     }
     this.preferDirect = wantDirect;
     const wantNative = tune.preferNativeDecode !== false;
-    if (wantNative !== this.preferNativeDecode) {
+    const wantLayer = tune.videoLayer === "surface" ? "surface" : "texture";
+    // A layer change rebuilds the native decoder on the new view (APK only).
+    const layerChanged = wantLayer !== this.preferVideoLayer && this.wcNative;
+    this.preferVideoLayer = wantLayer;
+    if (wantNative !== this.preferNativeDecode || layerChanged) {
       this.preferNativeDecode = wantNative;
       // Flip takes effect on the next decoder build / keyframe.
       if (this.wcActive) {
@@ -719,10 +765,14 @@ export class CloudConn {
       this.preferNativeDecode = wantNative;
     }
     const wantHigh = tune.h264High !== false;
-    if (wantHigh !== this.preferH264High) {
+    const wantRfi = tune.rfi === "on" || tune.rfi === "off" ? tune.rfi : "auto";
+    if (wantHigh !== this.preferH264High || wantRfi !== this.preferRfi) {
       this.preferH264High = wantHigh;
+      this.preferRfi = wantRfi;
       // Live: the host rebuilds its NVENC session and re-announces the codec.
-      if (this.wcActive || this.wcRequestedAt) this.sendControl({ type: "vprofile", high: this.wcWantHigh() });
+      if (this.wcActive || this.wcRequestedAt) {
+        this.sendControl({ type: "vprofile", high: this.wcWantHigh(), rfi: this.wcWantRfi(), hevc: this.wcHevcOk() });
+      }
     }
     // RTC audio playout delay — applies live to the existing receiver, so the
     // slider is audible mid-stream without a reconnect.
@@ -1196,6 +1246,13 @@ export class CloudConn {
     this.redDepth = 1;
     this.chAudio = undefined;
     this.chAudioRed = undefined;
+    // A new peer session: new transceivers, new host sequence.
+    this.carrierMid = null;
+    this.videoMid = null;
+    this.carrierWorker?.terminate();
+    this.carrierWorker = null;
+    this.wcTransport = "sctp";
+    this.wcOrderReset();
     // One pre-gathered pool is enough for a fast ICE restart; four pools meant up to
     // four sets of TURN allocations on a public relay for every session.
     const pc = new RTCPeerConnection({ iceServers: defaultIceServers(this.iceServers), iceCandidatePoolSize: 1 });
@@ -1245,6 +1302,15 @@ export class CloudConn {
         this.emitAudio();
         return;
       }
+      // The RTP carrier (lib/carrier.ts) is a second, tiny VP8 track the host adds
+      // by renegotiation once we opted in. It must never replace the screen track.
+      const mid = e.transceiver?.mid ?? null;
+      if (e.track.kind === "video" && ((this.carrierMid && mid === this.carrierMid) ||
+        (this.videoMid !== null && mid !== null && mid !== this.videoMid))) {
+        this.attachCarrier(e.receiver);
+        return;
+      }
+      if (e.track.kind === "video" && this.videoMid === null) this.videoMid = mid;
       if (!this.stream) this.stream = new MediaStream();
       // Video only — never add audio here.
       for (const t of this.stream.getVideoTracks()) this.stream.removeTrack(t);
@@ -1450,6 +1516,8 @@ export class CloudConn {
     this.wcRequestedAt = 0;
     this.wcAwaitKey = true;
     this.wcAssembler.reset();
+    this.trendline.reset();
+    this.wcOrderReset();
     this.wcMeta.clear();
     this.wcStallTicks = 0;
     this.wcErrors = 0;
@@ -2059,13 +2127,52 @@ export class CloudConn {
       type: "vmode",
       mode: "wc",
       high: this.wcWantHigh(),
+      // Reference-frame invalidation (R4) and HEVC capability (R8): hosts before 3.9.105 ignore them.
+      rfi: this.wcWantRfi(),
+      hevc: this.wcHevcOk(),
       ...(this.wcMaxKbps > 0 ? { maxKbps: this.wcMaxKbps } : {}),
+      // RTP carrier (lib/carrier.ts): hosts before 3.9.105 ignore it.
+      carrier: this.carrierCapable(),
     });
   }
 
   /** Ask the PC for Constrained High? Capability AND Tune AND no failure this run. */
   private wcWantHigh(): boolean {
     return this.preferH264High && this.wcHighCap && !this.wcHighFailed;
+  }
+
+  /**
+   * Ask the PC for reference-frame invalidation (R4)? It needs a 4-frame DPB here.
+   * A conforming decoder still outputs every frame at once (reorder stays 0), but
+   * some size their output delay off the DPB, so "auto" trusts only decoders known
+   * to handle it at full speed — Moonlight whitelists RFI the same way.
+   */
+  private wcWantRfi(): boolean {
+    return this.preferRfi === "on" || (this.preferRfi === "auto" && this.wcRfiCap);
+  }
+
+  /** This decoder can take HEVC and hasn't failed on it (research R8). */
+  private wcHevcOk(): boolean {
+    return this.wcHevcCap && !this.wcHevcFailed;
+  }
+
+  /** The stream is HEVC (by the host's announce). */
+  private wcIsHevc(): boolean {
+    return isHevcCodec(this.wcCodec);
+  }
+
+  /**
+   * An HEVC stream would not decode here. Withdraw the capability for this app run;
+   * the PC switches back to H.264 (new session, re-announce, decoder rebuild).
+   */
+  private wcDropHevc(reason: string) {
+    if (this.wcHevcFailed) return;
+    this.wcHevcFailed = true;
+    console.warn(`[remote] HEVC failed here (${reason}) — asking for H.264`);
+    hitchNote("other", `HEVC failed: ${reason}`, {});
+    if (this.wcActive || this.wcRequestedAt) {
+      this.sendControl({ type: "vprofile", high: this.wcWantHigh(), rfi: this.wcWantRfi(), hevc: false });
+    }
   }
 
   /** The stream is High (by the host's announce). */
@@ -2083,7 +2190,9 @@ export class CloudConn {
     this.wcHighFailed = true;
     console.warn(`[remote] H.264 High failed here (${reason}) — using Baseline`);
     hitchNote("high-failed", `H.264 High failed: ${reason}`, {});
-    if (this.wcActive || this.wcRequestedAt) this.sendControl({ type: "vprofile", high: false });
+    if (this.wcActive || this.wcRequestedAt) {
+      this.sendControl({ type: "vprofile", high: false, rfi: this.wcWantRfi(), hevc: this.wcHevcOk() });
+    }
   }
 
   /** Can this device decode ANY codec on the host's ladder? (device fact, cached) */
@@ -2095,6 +2204,8 @@ export class CloudConn {
       if (p.available) {
         this.wcHighCap = p.high === true;
         this.wcMaxKbps = p.maxBitrateKbps > 0 ? p.maxBitrateKbps : 0;
+        this.wcRfiCap = RFI_DECODERS.test(p.name || "");
+        this.wcHevcCap = p.hevc === true;
         console.info(
           `[remote] native MediaCodec available (${p.name || "hw"}${p.lowLatency ? ", low-latency" : ""}` +
             `${this.wcHighCap ? ", High" : ""}${this.wcMaxKbps ? `, ≤${this.wcMaxKbps}k` : ""})`,
@@ -2126,6 +2237,18 @@ export class CloudConn {
                 this.wcHighCap = hi.supported === true;
               } catch {
                 this.wcHighCap = false;
+              }
+              // R8: HEVC only in hardware — a software HEVC decode would cost more
+              // than the bits it saves.
+              try {
+                const hv = await VideoDecoder.isConfigSupported({
+                  codec: HEVC_MAIN_CODEC,
+                  optimizeForLatency: true,
+                  hardwareAcceleration: "prefer-hardware",
+                });
+                this.wcHevcCap = hv.supported === true;
+              } catch {
+                this.wcHevcCap = false;
               }
               return true;
             }
@@ -2159,6 +2282,7 @@ export class CloudConn {
     this.wcFlushPaceQueue(false);
     this.wcMeta.clear();
     this.wcAssembler.reset();
+    this.wcOrderReset();
     this.wcStopNativePoll();
     if (this.wcNative) {
       void teardownNativeDecoder();
@@ -2249,7 +2373,8 @@ export class CloudConn {
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("no native or WebCodecs decoder");
           return;
         }
-        const initErr = await initNativeDecoder(w, h);
+        const hevc = this.wcIsHevc();
+        const initErr = await initNativeDecoder(w, h, hevc ? "hevc" : "avc", this.preferVideoLayer);
         if (generation !== this.wcBuildGeneration || this.closed) return;
         if (initErr) {
           console.warn("[remote] native MediaCodec init failed — WebCodecs fallback:", initErr);
@@ -2257,6 +2382,7 @@ export class CloudConn {
           // Lead with the real init error (Rust now attaches the Java throwable
           // + stack); the probe detail is secondary context.
           const detail = p.detail ? `${initErr}\nprobe: ${p.detail}` : initErr;
+          if (hevc) this.wcDropHevc("MediaCodec HEVC init failed");
           void this.emitDecoderFallback("MediaCodec failed to start — using WebCodecs", detail);
           if (!this.wcBuildWebCodecsDecoder()) this.wcFallback("native init failed");
           return;
@@ -2332,6 +2458,11 @@ export class CloudConn {
         // stream to Baseline now instead of burning the whole error budget.
         if (this.wcIsHigh() && this.wcDecodedOut === 0 && this.wcErrorTimes.length >= 2) {
           this.wcDropHigh("WebCodecs decoded nothing");
+          this.wcRequestKeyframe();
+          return;
+        }
+        if (this.wcIsHevc() && this.wcDecodedOut === 0 && this.wcErrorTimes.length >= 2) {
+          this.wcDropHevc("WebCodecs decoded nothing");
           this.wcRequestKeyframe();
           return;
         }
@@ -2532,8 +2663,86 @@ export class CloudConn {
       return;
     }
     if (!(data instanceof ArrayBuffer)) return;
-    const frame = this.wcAssembler.push(data);
-    if (frame) this.wcFeedFrame(frame.head, frame.bytes);
+    const frame = this.wcAssembler.push(data, performance.now());
+    if (frame) {
+      // R7: only data-channel frames — their header's arrival is the queue in front
+      // of the frame. Carrier frames arrive whole, after RTP's own recovery.
+      if (frame.head.firstAt) {
+        if (this.trendline.update(frame.head.tsMs, frame.head.firstAt) === "overuse") this.trendOveruse = true;
+        this.trendFedAt = Date.now();
+      }
+      this.wcIngest(frame.head, frame.bytes);
+    }
+  }
+
+  /** Every DIRECT frame, from either transport, goes through the orderer. */
+  private wcIngest(head: VideoHeader, bytes: Uint8Array<ArrayBuffer>) {
+    this.wcRelease(this.wcOrder.push(head.seq, head.key, { head, bytes }, performance.now()));
+  }
+
+  private wcRelease(r: { out: { head: VideoHeader; bytes: Uint8Array<ArrayBuffer> }[]; lost: boolean }) {
+    if (r.lost) {
+      // Skipped a gap: everything until the next keyframe would decode as garbage.
+      this.wcAwaitKey = true;
+      this.wcRequestKeyframe();
+      hitchNote("other", `DIRECT frame lost on ${this.wcTransport} — waiting for a keyframe`, {});
+    }
+    for (const f of r.out) this.wcFeedFrame(f.head, f.bytes);
+    if (this.wcOrder.holding > 0 && this.wcOrderTimer === null) {
+      this.wcOrderTimer = window.setTimeout(() => {
+        this.wcOrderTimer = null;
+        this.wcRelease(this.wcOrder.poll(performance.now()));
+      }, 60);
+    }
+  }
+
+  private wcOrderReset() {
+    this.wcOrder.reset();
+    if (this.wcOrderTimer !== null) {
+      window.clearTimeout(this.wcOrderTimer);
+      this.wcOrderTimer = null;
+    }
+  }
+
+  /** This browser can receive DIRECT over the RTP carrier (receiver transforms run
+   *  before the jitter buffer — verified on WebView 151). Immersive VR keeps RTC. */
+  private carrierCapable(): boolean {
+    return (
+      typeof (globalThis as { RTCRtpScriptTransform?: unknown }).RTCRtpScriptTransform === "function" &&
+      typeof Worker === "function" &&
+      !isImmersiveActive()
+    );
+  }
+
+  /** The host's carrier track: cut our access units out of each VP8 frame. */
+  private attachCarrier(receiver: RTCRtpReceiver) {
+    if (!this.carrierCapable()) return;
+    const pc = this.pc;
+    try {
+      this.carrierWorker?.terminate();
+      const w = new Worker(new URL("../lib/carrier.worker.ts", import.meta.url), { type: "module", name: "gt-carrier-recv" });
+      w.onmessage = (ev: MessageEvent) => {
+        if (this.closed || this.pc !== pc || this.carrierWorker !== w) return;
+        const m = ev.data as { type?: string; recs?: { flags: number; seq: number; tsMs: number; data: ArrayBuffer }[] };
+        if (m?.type !== "recs" || !m.recs) return;
+        for (const r of m.recs) {
+          if (r.flags & REC_CONFIG) {
+            this.onWcMsg(new TextDecoder().decode(r.data));
+            continue;
+          }
+          this.carrierFrames++;
+          const bytes = new Uint8Array(r.data);
+          this.wcIngest({ key: (r.flags & REC_KEY) !== 0, seq: r.seq, tsMs: r.tsMs, len: bytes.byteLength }, bytes);
+        }
+      };
+      const Transform = (globalThis as unknown as { RTCRtpScriptTransform: new (w: Worker, o: unknown) => unknown })
+        .RTCRtpScriptTransform;
+      (receiver as unknown as { transform: unknown }).transform = new Transform(w, { side: "recv" });
+      this.carrierWorker = w;
+      this.noteEvent("RTP carrier attached");
+    } catch (e) {
+      console.warn("[remote] RTP carrier receive unavailable:", e);
+    }
   }
 
   /** A complete encoded frame arrived — account for it and hand it to the decoder. */
@@ -2836,6 +3045,16 @@ export class CloudConn {
       // host can cap video at what reliable SCTP can actually carry. −1 = no signal.
       const loss = this.audioStudio ? this.a2Loss.loss(now) : null;
       const clk = this.bestClock();
+      // R7: delay-gradient state, only while data-channel frames are feeding it.
+      const grad =
+        now - this.trendFedAt < 1000
+          ? {
+              bw: this.trendOveruse ? "overuse" : this.trendline.state,
+              trend: Math.round(this.trendline.modifiedTrend * 10) / 10,
+              thr: Math.round(this.trendline.threshold * 10) / 10,
+            }
+          : {};
+      this.trendOveruse = false;
       this.sendControl({
         type: "vstat",
         recvKbps: Math.round((winBytes * 8) / 1000),
@@ -2846,6 +3065,7 @@ export class CloudConn {
         loss: loss ? Math.round(loss.p * 1e5) / 1e5 : -1,
         lossN: loss ? loss.lost : 0,
         rttMs: clk ? Math.round(clk.rtt) : 0,
+        ...grad,
       });
     }, 250);
   }
@@ -2857,6 +3077,8 @@ export class CloudConn {
     }
     this.owdWin = [];
     this.owdMin = 0;
+    this.trendline.reset();
+    this.trendOveruse = false;
   }
 
   /** Live wc-path telemetry for the HUD (null when the path isn't active). */
@@ -2894,6 +3116,8 @@ export class CloudConn {
       recovered: this.wcHostRecovered >= 0 ? this.wcHostRecovered : undefined,
       recovering: this.wcHostRecovering,
       guestErrors: this.wcErrors,
+      transport: this.wcTransport,
+      carrierFrames: this.carrierFrames,
     };
   }
 
@@ -3297,6 +3521,17 @@ export class CloudConn {
         } else {
           // Route through wcFallback so the retry timer + backoff get armed.
           this.wcFallback("host encoder fault", false);
+        }
+      }
+      if (msg.event === "carrier") {
+        const mid = (msg as { mid?: unknown }).mid;
+        if (typeof mid === "string") this.carrierMid = mid;
+      }
+      if (msg.event === "vtransport") {
+        const mode = (msg as { mode?: unknown }).mode;
+        if (mode === "rtp" || mode === "sctp") {
+          this.wcTransport = mode;
+          this.noteEvent(`DIRECT over ${mode === "rtp" ? "RTP carrier" : "data channel"}`);
         }
       }
       if (msg.event === "amode") {

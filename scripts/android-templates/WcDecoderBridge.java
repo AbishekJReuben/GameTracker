@@ -16,6 +16,8 @@ import android.util.Log;
 import android.graphics.SurfaceTexture;
 import android.view.Gravity;
 import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
@@ -34,6 +36,8 @@ import androidx.webkit.WebViewFeature;
 import androidx.webkit.WebMessageCompat;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -76,6 +80,12 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class WcDecoderBridge {
   private static final String TAG = "GtWcDecoder";
   private static final String MIME = MediaFormat.MIMETYPE_VIDEO_AVC;
+  /** HEVC (research R8): the host's low-bandwidth mode. Probed separately. */
+  private static final String MIME_HEVC = MediaFormat.MIMETYPE_VIDEO_HEVC;
+  /** Codec the NEXT init decodes (set by {@link #setCodec}); probes stay H.264. */
+  private static volatile String mime = MIME;
+  /** Codec the running MediaCodec was configured for — what CSD parsing keys off. */
+  private static volatile String configuredMime = MIME;
 
   // Vendor low-latency keys (Moonlight-known). Applied best-effort at configure;
   // unknown keys are dropped silently on most drivers, but a few reject them and
@@ -91,6 +101,21 @@ public final class WcDecoderBridge {
   private static WeakReference<Activity> actRef;
   /** Video sink under the WebView. Named historically; type is TextureView. */
   private static TextureView surfaceView;
+  /**
+   * Research R9 A/B: a SurfaceView sink instead of the TextureView. Its buffer goes
+   * straight to SurfaceFlinger as its own layer (a hardware-overlay candidate, no
+   * GPU composition pass, ~1 display frame sooner) at the cost of a translucent
+   * window — the Android 16 WebView burn-in that made TextureView the default.
+   * Opt-in per device from Tune ({@link #setViewKind}); exactly one of the two views
+   * exists at a time.
+   */
+  private static SurfaceView holeView;
+  private static volatile boolean useSurfaceView = false;
+
+  /** The live video sink, whichever kind it is (null before the first init). */
+  private static View videoView() {
+    return useSurfaceView ? holeView : surfaceView;
+  }
   private static SurfaceTexture surfaceTexture;
   private static Surface surface;
   /** Serialises init runnables so concurrent decoder_init calls can't triple-start. */
@@ -234,7 +259,7 @@ public final class WcDecoderBridge {
    * on some devices routinely does — land on the UI thread AFTER init()'s
    * VISIBLE. That hid the view again with no error and no way back.
    */
-  private static void applyVisibility(TextureView sv) {
+  private static void applyVisibility(View sv) {
     if (sv == null) return;
     int want = wanted.get() ? View.VISIBLE : View.GONE;
     if (sv.getVisibility() != want) sv.setVisibility(want);
@@ -259,12 +284,12 @@ public final class WcDecoderBridge {
    */
   private static void armSurfaceWatchdog() {
     if (!wanted.get()) return;
-    if (surfaceReady.get() || surfaceView == null) return;
+    if (surfaceReady.get() || videoView() == null) return;
     if (!surfaceWatchdogArmed.compareAndSet(false, true)) return;
     watchdogLooper()
         .postDelayed(
             () -> {
-              if (surfaceView == null || !surfaceWatchdogArmed.get()) return;
+              if (videoView() == null || !surfaceWatchdogArmed.get()) return;
               Activity act = activity();
               if (act == null) {
                 surfaceWatchdogArmed.set(false);
@@ -295,7 +320,8 @@ public final class WcDecoderBridge {
    * {@code onSurfaceTextureAvailable} never fires. Must run on the UI thread.
    */
   private static void surfaceKick() {
-    if (surfaceView == null) return;
+    View sv = videoView();
+    if (sv == null) return;
     // We may have raced a successful surface — nothing to recover from.
     if (surfaceReady.get()) {
       cancelSurfaceWatchdog();
@@ -317,34 +343,35 @@ public final class WcDecoderBridge {
               + " kicks. The JS watchdog will fall back to WebCodecs.");
       return;
     }
-    android.view.ViewGroup parent = (android.view.ViewGroup) surfaceView.getParent();
+    android.view.ViewGroup parent = (android.view.ViewGroup) sv.getParent();
     if (parent == null) {
       ensureSurfaceViewReseat();
     } else {
-      int index = parent.indexOfChild(surfaceView);
-      android.view.ViewGroup.LayoutParams lp = surfaceView.getLayoutParams();
-      jlog("SurfaceTexture never arrived — re-attaching TextureView (kick " + kick + ")");
-      parent.removeView(surfaceView);
+      int index = parent.indexOfChild(sv);
+      android.view.ViewGroup.LayoutParams lp = sv.getLayoutParams();
+      jlog("Surface never arrived — re-attaching " + sv.getClass().getSimpleName() + " (kick " + kick + ")");
+      parent.removeView(sv);
       surfaceReady.set(false);
       releaseSurfaceOnly();
       try {
-        parent.addView(surfaceView, Math.max(0, index), lp);
+        parent.addView(sv, Math.max(0, index), lp);
       } catch (Exception e) {
         Log.w(TAG, "re-add failed, reseating under content", e);
         ensureSurfaceViewReseat();
       }
     }
-    applyVisibility(surfaceView);
+    applyVisibility(sv);
     surfaceWatchdogArmed.set(false);
     armSurfaceWatchdog();
   }
 
-  /** Drop the MediaCodec Surface wrapper without touching the TextureView. */
+  /** Drop the MediaCodec Surface wrapper without touching the view. A SurfaceView's
+   *  Surface belongs to its holder — only the TextureView wrapper is ours to release. */
   private static void releaseSurfaceOnly() {
     Surface s = surface;
     surface = null;
     surfaceTexture = null;
-    if (s != null) {
+    if (s != null && !useSurfaceView) {
       try {
         s.release();
       } catch (Exception ignored) {
@@ -355,19 +382,20 @@ public final class WcDecoderBridge {
   /** Re-seat the existing TextureView under the content view (fallback). */
   private static void ensureSurfaceViewReseat() {
     Activity act = activity();
-    if (act == null || surfaceView == null) return;
+    View sv = videoView();
+    if (act == null || sv == null) return;
     ViewGroup content = act.findViewById(android.R.id.content);
     if (content == null) return;
     surfaceReady.set(false);
     releaseSurfaceOnly();
-    android.view.ViewGroup.LayoutParams prev = surfaceView.getLayoutParams();
+    android.view.ViewGroup.LayoutParams prev = sv.getLayoutParams();
     FrameLayout.LayoutParams lp =
         prev instanceof FrameLayout.LayoutParams
             ? (FrameLayout.LayoutParams) prev
             : new FrameLayout.LayoutParams(1, 1);
     lp.gravity = Gravity.TOP | Gravity.START;
     jlog("reseat: fallback under content[0]");
-    content.addView(surfaceView, 0, lp);
+    content.addView(sv, 0, lp);
   }
 
   /**
@@ -378,7 +406,7 @@ public final class WcDecoderBridge {
    * live Surface (re-parenting destroys it). Must run on the UI thread.
    */
   private static void reseatBelowWebView(Activity act) {
-    TextureView sv = surfaceView;
+    View sv = videoView();
     if (sv == null) return;
     ViewGroup content = act.findViewById(android.R.id.content);
     WebView web = content == null ? null : findWebView(content);
@@ -506,7 +534,7 @@ public final class WcDecoderBridge {
    */
   public static boolean probeAvailable() {
     try {
-      String name = pickDecoderName();
+      String name = pickDecoderName(MIME);
       boolean ok = name != null;
       if (ok) {
         lastProbeDetail.set("picked=" + name);
@@ -525,7 +553,7 @@ public final class WcDecoderBridge {
   public static boolean probeLowLatency() {
     String name;
     try {
-      name = pickDecoderName();
+      name = pickDecoderName(MIME);
     } catch (Throwable t) {
       return false;
     }
@@ -561,7 +589,7 @@ public final class WcDecoderBridge {
 
   public static String probeName() {
     try {
-      String n = pickDecoderName();
+      String n = pickDecoderName(MIME);
       return n == null ? "" : n;
     } catch (Throwable t) {
       return "";
@@ -577,7 +605,7 @@ public final class WcDecoderBridge {
    */
   public static int probeMaxBitrateKbps() {
     try {
-      String name = pickDecoderName();
+      String name = pickDecoderName(MIME);
       if (name == null) return 0;
       MediaCodecInfo info = findInfo(name);
       if (info == null) return 0;
@@ -598,7 +626,7 @@ public final class WcDecoderBridge {
    */
   public static boolean probeSupportsHigh() {
     try {
-      String name = pickDecoderName();
+      String name = pickDecoderName(MIME);
       if (name == null) return false;
       MediaCodecInfo info = findInfo(name);
       if (info == null) return false;
@@ -615,6 +643,38 @@ public final class WcDecoderBridge {
     return false;
   }
 
+  /**
+   * True when a HARDWARE decoder lists HEVC Main (research R8). A software HEVC
+   * decode would cost more than the bits it saves, so it doesn't count. Pure
+   * introspection, like the other probes.
+   */
+  public static boolean probeHevc() {
+    try {
+      String name = pickDecoderName(MIME_HEVC);
+      if (name == null || looksSoftware(name.toLowerCase())) return false;
+      MediaCodecInfo info = findInfo(name);
+      if (info == null) return false;
+      if (Build.VERSION.SDK_INT >= 29 && !info.isHardwareAccelerated()) return false;
+      MediaCodecInfo.CodecProfileLevel[] pls = info.getCapabilitiesForType(MIME_HEVC).profileLevels;
+      if (pls == null) return false;
+      for (MediaCodecInfo.CodecProfileLevel pl : pls) {
+        if (pl.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain) return true;
+      }
+    } catch (Throwable ignored) {
+    }
+    return false;
+  }
+
+  /**
+   * Codec for the next {@link #init}: "hevc" or anything else for H.264. A change
+   * at the same size still restarts the codec (init compares the configured MIME).
+   */
+  public static void setCodec(String codec) {
+    String next = "hevc".equalsIgnoreCase(codec) || MIME_HEVC.equalsIgnoreCase(codec) ? MIME_HEVC : MIME;
+    if (!next.equals(mime)) jlog("codec -> " + next);
+    mime = next;
+  }
+
   /** Diagnostic — surfaces the reason the probe returned its answer. */
   public static String probeDetail() {
     String d = lastProbeDetail.get();
@@ -627,7 +687,9 @@ public final class WcDecoderBridge {
     // init used to flip awaitKey/csdQueued back to "need keyframe" WHILE the codec
     // was already running — every in-flight AU was then dropped or mis-fed, and
     // the TextureView stayed black with no error anywhere.
-    if (wanted.get() && started.get() && configuredWidth == w && configuredHeight == h) {
+    // (A layer switch in setViewKind nulls the view, so it never looks "running".)
+    if (wanted.get() && started.get() && configuredWidth == w && configuredHeight == h
+        && mime.equals(configuredMime) && videoView() != null) {
       jlog("init " + w + "x" + h + " — already running, skip");
       return;
     }
@@ -667,7 +729,8 @@ public final class WcDecoderBridge {
           }
           // UI-thread re-check: concurrent inits can both pass the outer guard
           // before either sets started — without this we triple-start the codec.
-          if (started.get() && configuredWidth == w && configuredHeight == h && surfaceReady.get()) {
+          if (started.get() && configuredWidth == w && configuredHeight == h && surfaceReady.get()
+              && mime.equals(configuredMime) && videoView() != null) {
             jlog("init " + w + "x" + h + " — already running on UI thread, skip");
             return;
           }
@@ -678,10 +741,10 @@ public final class WcDecoderBridge {
           if (!surfaceReady.get()) reseatBelowWebView(act);
           hookWebView(act);
           makeCompositingTransparent(act);
-          applyVisibility(surfaceView);
+          applyVisibility(videoView());
           // Bitstream size may have changed while the view rect didn't (mid-
           // stream resolution bump) — recompute the contain-fit for the new aspect.
-          applyContentTransform(surfaceView);
+          applyContentLayout();
           if (surfaceReady.get()) {
             // Size change while a codec is live → rebuild against the new Surface.
             if (started.get()) {
@@ -697,6 +760,21 @@ public final class WcDecoderBridge {
 
   /** Push codec WxH into the SurfaceTexture so the view can scale without stretch. */
   private static void applyBufferSize(int w, int h) {
+    if (useSurfaceView) {
+      // The holder's buffer is the codec size; SurfaceFlinger scales it into the
+      // view (which layoutHole sizes to the contain-fit box). UI thread only.
+      SurfaceView hv = holeView;
+      Activity act = activity();
+      if (hv == null || act == null || w < 16 || h < 16) return;
+      act.runOnUiThread(() -> {
+        try {
+          hv.getHolder().setFixedSize(w, h);
+        } catch (Exception e) {
+          jlog("setFixedSize failed: " + e.getMessage());
+        }
+      });
+      return;
+    }
     SurfaceTexture st = surfaceTexture;
     if (st == null || w < 16 || h < 16) return;
     try {
@@ -735,7 +813,7 @@ public final class WcDecoderBridge {
     if (w < 1 || h < 1) return;
     act.runOnUiThread(
         () -> {
-          TextureView sv = surfaceView;
+          View sv = videoView();
           if (sv == null) return;
           // UI thread is the serialization point — compare-and-record here.
           if (seq != 0) {
@@ -771,6 +849,13 @@ public final class WcDecoderBridge {
           desiredY = iy;
           desiredW = iw;
           desiredH = ih;
+          if (sv instanceof SurfaceView) {
+            // No setTransform on a SurfaceView: size the view to the picture itself.
+            layoutHole((SurfaceView) sv);
+            applyVisibility(sv);
+            return;
+          }
+          TextureView tv = (TextureView) sv;
           // Lay out only the VISIBLE intersection with the parent. Android 16
           // clamps an oversized TextureView on its own terms (height pegged to
           // the window while width kept growing — a wrong-aspect view the
@@ -804,10 +889,10 @@ public final class WcDecoderBridge {
             lp.leftMargin = vx;
             lp.topMargin = vy;
             lp.gravity = Gravity.TOP | Gravity.START;
-            sv.setLayoutParams(lp);
+            tv.setLayoutParams(lp);
           }
           if (!sameLayout || !sameDesired) {
-            applyContentTransform(sv, vx, vy, vw, vh);
+            applyContentTransform(tv, vx, vy, vw, vh);
           }
           // NOT sv.setVisibility(visible ? ...) — see the javadoc above.
           applyVisibility(sv);
@@ -849,6 +934,69 @@ public final class WcDecoderBridge {
     m.postTranslate(fx, fy);
     sv.setTransform(m);
     sv.invalidate();
+  }
+
+  /** Re-fit the picture into the view after a geometry or bitstream-size change. */
+  private static void applyContentLayout() {
+    if (useSurfaceView) layoutHole(holeView);
+    else applyContentTransform(surfaceView);
+  }
+
+  /**
+   * SurfaceView geometry (R9): the view IS the picture — the contain-fit box of the
+   * bitstream inside the desired rect, in parent coordinates. SurfaceFlinger
+   * scales the codec-size buffer into it and crops anything past the window, so
+   * zooming past the screen edge crops like the TextureView path. UI thread only.
+   */
+  private static void layoutHole(SurfaceView hv) {
+    if (hv == null || desiredW < 2 || desiredH < 2) return;
+    int bw = width.get();
+    int bh = height.get();
+    if (bw < 2 || bh < 2) return;
+    float fitW = desiredW;
+    float fitH = (float) desiredW * bh / bw;
+    if (fitH > desiredH) {
+      fitH = desiredH;
+      fitW = (float) desiredH * bw / bh;
+    }
+    int w = Math.max(1, Math.round(fitW));
+    int h = Math.max(1, Math.round(fitH));
+    int x = Math.round(desiredX + (desiredW - fitW) / 2f);
+    int y = Math.round(desiredY + (desiredH - fitH) / 2f);
+    FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) hv.getLayoutParams();
+    if (lp != null && lp.width == w && lp.height == h && lp.leftMargin == x && lp.topMargin == y) return;
+    if (lp == null) lp = new FrameLayout.LayoutParams(w, h);
+    lp.width = w;
+    lp.height = h;
+    lp.leftMargin = x;
+    lp.topMargin = y;
+    lp.gravity = Gravity.TOP | Gravity.START;
+    hv.setLayoutParams(lp);
+  }
+
+  /**
+   * Pick the video layer for the next {@link #init}: "surface" for the SurfaceView
+   * A/B (research R9), anything else for the default TextureView. A change stops
+   * the codec and drops the old view; init builds the new one.
+   */
+  public static void setViewKind(String kind) {
+    boolean next = "surface".equalsIgnoreCase(kind);
+    if (next == useSurfaceView) return;
+    jlog("video layer -> " + (next ? "SurfaceView" : "TextureView"));
+    final View old = videoView();
+    stopCodecLocked();
+    surfaceReady.set(false);
+    // Release the TextureView's wrapper while we still know which kind it was.
+    releaseSurfaceOnly();
+    useSurfaceView = next;
+    surfaceView = null;
+    holeView = null;
+    Activity act = activity();
+    if (act != null && old != null) {
+      act.runOnUiThread(() -> {
+        if (old.getParent() instanceof ViewGroup) ((ViewGroup) old.getParent()).removeView(old);
+      });
+    }
   }
 
   /** Recompute the content transform from the view's ACTUAL layout (post-clamp). */
@@ -991,7 +1139,7 @@ public final class WcDecoderBridge {
     Runnable stop =
         () -> {
           stopCodecLocked();
-          applyVisibility(surfaceView);
+          applyVisibility(videoView());
         };
     if (act != null) act.runOnUiThread(stop);
     else stop.run();
@@ -1175,6 +1323,15 @@ public final class WcDecoderBridge {
       sb.append("no content view\n");
       return;
     }
+    SurfaceView hv = holeView;
+    if (hv != null) {
+      sb.append("SurfaceView (R9) attached=").append(hv.isAttachedToWindow())
+          .append(" shown=").append(hv.isShown())
+          .append(" vis=").append(visName(hv.getVisibility()))
+          .append(" size=").append(hv.getWidth()).append('x').append(hv.getHeight())
+          .append(" surfaceValid=").append(hv.getHolder().getSurface().isValid())
+          .append('\n');
+    }
     TextureView sv = surfaceView;
     if (sv != null) {
       sb.append("TextureView attached=").append(sv.isAttachedToWindow())
@@ -1212,6 +1369,7 @@ public final class WcDecoderBridge {
         .append(" bg=").append(describeDrawable(v.getBackground()))
         .append(" layer=").append(v.getLayerType());
     if (v == surfaceView) sb.append("  <== OUR TEXTUREVIEW");
+    if (v == holeView) sb.append("  <== OUR SURFACEVIEW (R9)");
     if (v instanceof WebView) sb.append("  <== WEBVIEW");
     sb.append('\n');
     if (v instanceof ViewGroup) {
@@ -1351,50 +1509,64 @@ public final class WcDecoderBridge {
     }
   }
 
+  /** The running codec is HEVC: parameter sets are VPS/SPS/PPS, 2-byte NAL headers. */
+  private static boolean hevcStream() {
+    return MIME_HEVC.equals(configuredMime);
+  }
+
+  /** NAL unit type at `nalStart` for the running codec. */
+  private static int nalTypeAt(byte[] annexB, int nalStart) {
+    return hevcStream() ? (annexB[nalStart] >> 1) & 0x3f : annexB[nalStart] & 0x1f;
+  }
+
+  /** Parameter-set NAL types, in CSD order: SPS, PPS (H.264) or VPS, SPS, PPS (HEVC). */
+  private static int[] paramSetTypes() {
+    return hevcStream() ? new int[] {32, 33, 34} : new int[] {7, 8};
+  }
+
   /**
-   * Pull SPS (7) + PPS (8) out of Annex-B and build CSD-0 WITH start codes
-   * (Moonlight/Chiaki shape). Returns null if either NAL is missing.
+   * Pull the parameter sets out of Annex-B and build CSD-0 WITH start codes
+   * (Moonlight/Chiaki shape; HEVC's csd-0 carries VPS+SPS+PPS the same way).
+   * Returns null if any is missing.
    */
   private static byte[] extractCsd(byte[] annexB) {
-    byte[][] hold = new byte[2][];
-    if (!findSpsPps(annexB, hold)) {
-      jlog("extractCsd: missing " + (hold[0] == null ? "SPS" : "") + (hold[1] == null ? "PPS" : ""));
+    byte[][] sets = findParamSets(annexB);
+    if (sets == null) {
+      jlog("extractCsd: missing parameter set(s) (" + (hevcStream() ? "HEVC" : "H.264") + ")");
       return null;
     }
-    byte[] sps = hold[0];
-    byte[] pps = hold[1];
-    byte[] csd = new byte[4 + sps.length + 4 + pps.length];
-    csd[0] = 0;
-    csd[1] = 0;
-    csd[2] = 0;
-    csd[3] = 1;
-    System.arraycopy(sps, 0, csd, 4, sps.length);
-    int o = 4 + sps.length;
-    csd[o] = 0;
-    csd[o + 1] = 0;
-    csd[o + 2] = 0;
-    csd[o + 3] = 1;
-    System.arraycopy(pps, 0, csd, o + 4, pps.length);
-    return csd;
+    java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+    for (byte[] ps : sets) {
+      out.write(0);
+      out.write(0);
+      out.write(0);
+      out.write(1);
+      out.write(ps, 0, ps.length);
+    }
+    return out.toByteArray();
   }
 
-  /** Same SPS/PPS but concatenated without start codes (fallback for picky OEMs). */
+  /** Same parameter sets concatenated without start codes (fallback for picky OEMs). */
   private static byte[] extractCsdRaw(byte[] annexB) {
-    byte[][] hold = new byte[2][];
-    if (!findSpsPps(annexB, hold)) return null;
-    byte[] sps = hold[0];
-    byte[] pps = hold[1];
-    byte[] csd = new byte[sps.length + pps.length];
-    System.arraycopy(sps, 0, csd, 0, sps.length);
-    System.arraycopy(pps, 0, csd, sps.length, pps.length);
-    return csd;
+    byte[][] sets = findParamSets(annexB);
+    if (sets == null) return null;
+    java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+    for (byte[] ps : sets) out.write(ps, 0, ps.length);
+    return out.toByteArray();
   }
 
-  /** Find first SPS + PPS NAL payloads (no start codes). */
-  private static boolean findSpsPps(byte[] annexB, byte[][] outSpsPps) {
+  /** First NAL of each parameter-set type (no start codes), or null if any is missing. */
+  private static byte[][] findParamSets(byte[] annexB) {
+    int[] types = paramSetTypes();
+    byte[][] hold = new byte[types.length][];
+    if (!findNals(annexB, types, hold)) return null;
+    return hold;
+  }
+
+  /** Find the first NAL payload (no start code) of each type in `types`. */
+  private static boolean findNals(byte[] annexB, int[] types, byte[][] out) {
     try {
-      byte[] sps = null;
-      byte[] pps = null;
+      int found = 0;
       int i = 0;
       int n = annexB.length;
       while (i + 3 <= n) {
@@ -1423,22 +1595,20 @@ public final class WcDecoderBridge {
         }
         int nalEnd = (j + 3 <= n) ? j : n;
         if (nalEnd > nalStart) {
-          int nalType = annexB[nalStart] & 0x1f;
+          int nalType = nalTypeAt(annexB, nalStart);
           int len = nalEnd - nalStart;
-          if (nalType == 7 && sps == null) {
-            sps = new byte[len];
-            System.arraycopy(annexB, nalStart, sps, 0, len);
-          } else if (nalType == 8 && pps == null) {
-            pps = new byte[len];
-            System.arraycopy(annexB, nalStart, pps, 0, len);
+          for (int k = 0; k < types.length; k++) {
+            if (types[k] == nalType && out[k] == null) {
+              out[k] = new byte[len];
+              System.arraycopy(annexB, nalStart, out[k], 0, len);
+              found++;
+            }
           }
         }
         i = nalEnd;
-        if (sps != null && pps != null) break;
+        if (found == types.length) break;
       }
-      outSpsPps[0] = sps;
-      outSpsPps[1] = pps;
-      return sps != null && pps != null;
+      return found == types.length;
     } catch (Exception e) {
       return false;
     }
@@ -1481,9 +1651,11 @@ public final class WcDecoderBridge {
         }
         int nalEnd = (j + 3 <= n) ? j : n;
         if (nalEnd > nalStart) {
-          int nalType = annexB[nalStart] & 0x1f;
-          // Keep everything except SPS(7) / PPS(8).
-          if (nalType != 7 && nalType != 8) {
+          int nalType = nalTypeAt(annexB, nalStart);
+          // Keep everything except the parameter sets (they went in as CSD).
+          boolean paramSet = false;
+          for (int t : paramSetTypes()) paramSet |= t == nalType;
+          if (!paramSet) {
             out.write(annexB, scStart, nalEnd - scStart);
             any = true;
           }
@@ -1570,7 +1742,7 @@ public final class WcDecoderBridge {
   }
 
   private static void ensureSurfaceView(Activity act) {
-    if (surfaceView != null) return;
+    if (videoView() != null) return;
     ViewGroup content = act.findViewById(android.R.id.content);
     if (content == null) return;
     WebView web = findWebView(content);
@@ -1582,6 +1754,10 @@ public final class WcDecoderBridge {
     } else {
       parent = content;
       index = 0;
+    }
+    if (useSurfaceView) {
+      addHoleView(act, parent, index);
+      return;
     }
     // TextureView (not SurfaceView): composites in the normal View hierarchy so
     // Android 16 WebView can clear/blend chrome over video without burn-in.
@@ -1620,7 +1796,7 @@ public final class WcDecoderBridge {
             // Keep the producer buffer locked to the bitstream aspect; the view
             // scales. Don't rebuild the codec on every layout bounce (zoom/pan).
             applyBufferSize(width.get(), height.get());
-            applyContentTransform(surfaceView);
+            applyContentLayout();
           }
 
           @Override
@@ -1647,6 +1823,59 @@ public final class WcDecoderBridge {
         });
     parent.addView(sv, Math.max(0, index), lp);
     surfaceView = sv;
+  }
+
+  /**
+   * The R9 SurfaceView sink. Z-below the window (the default), so it punches its
+   * own rect clear and the transparent WebView draws the chrome over it. Its
+   * Surface belongs to the holder: when {@code surfaceDestroyed} returns it is
+   * gone, so the codec must have stopped rendering into it first — the only place
+   * this bridge waits on the codec thread from the UI thread (bounded, 500 ms).
+   */
+  private static void addHoleView(Activity act, ViewGroup parent, int index) {
+    SurfaceView hv = new SurfaceView(act);
+    FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
+    lp.gravity = Gravity.TOP | Gravity.START;
+    hv.setVisibility(View.GONE);
+    hv.getHolder().addCallback(
+        new SurfaceHolder.Callback() {
+          @Override
+          public void surfaceCreated(SurfaceHolder holder) {
+            surface = holder.getSurface();
+            surfaceReady.set(true);
+            jlog("surfaceCreated (SurfaceView) valid=" + (surface != null && surface.isValid()));
+            applyBufferSize(width.get(), height.get());
+            cancelSurfaceWatchdog();
+            if (width.get() > 0 && height.get() > 0) startCodecLocked();
+          }
+
+          @Override
+          public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+            jlog("surfaceChanged (SurfaceView) " + w + "x" + h);
+          }
+
+          @Override
+          public void surfaceDestroyed(SurfaceHolder holder) {
+            surfaceReady.set(false);
+            surface = null;
+            jlog("surfaceDestroyed (SurfaceView)");
+            CountDownLatch done = new CountDownLatch(1);
+            onCodecThread(() -> {
+              try {
+                stopCodecOnThread();
+              } finally {
+                done.countDown();
+              }
+            });
+            try {
+              done.await(500, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ignored) {
+              Thread.currentThread().interrupt();
+            }
+          }
+        });
+    parent.addView(hv, Math.max(0, index), lp);
+    holeView = hv;
   }
 
   /**
@@ -1737,7 +1966,7 @@ public final class WcDecoderBridge {
     // they may stay opaque. Collect the chain so the walk below can tell a
     // shared ancestor (keep opaque) from a WebView-only wrapper (must clear).
     java.util.HashSet<View> videoAncestors = new java.util.HashSet<>();
-    for (View v = surfaceView; v != null; v = v.getParent() instanceof View ? (View) v.getParent() : null) {
+    for (View v = videoView(); v != null; v = v.getParent() instanceof View ? (View) v.getParent() : null) {
       videoAncestors.add(v);
     }
     if (content != null && videoAncestors.contains(content)) {
@@ -1802,10 +2031,12 @@ public final class WcDecoderBridge {
     int h = height.get();
     if (s == null || !s.isValid() || w < 16 || h < 16) return;
 
-    String name = pickDecoderName();
+    final String m = mime;
+    String name = pickDecoderName(m);
     if (name == null) {
-      lastError.set("no H.264 decoder");
-      lastProbeDetail.set("startCodec: no H.264 decoder");
+      String what = MIME_HEVC.equals(m) ? "HEVC" : "H.264";
+      lastError.set("no " + what + " decoder");
+      lastProbeDetail.set("startCodec: no " + what + " decoder");
       return;
     }
     codecName.set(name);
@@ -1856,6 +2087,7 @@ public final class WcDecoderBridge {
         csdQueued.set(false);
         configuredWidth = w;
         configuredHeight = h;
+        configuredMime = m;
         codecGeneration = generation;
         c.start();
         started.set(true);
@@ -1912,7 +2144,7 @@ public final class WcDecoderBridge {
       // createDecoderByType is deprecated but still the safest fallback — it
       // lets the framework pick the best HW decoder for the mime type when our
       // name-based pick is rejected.
-      return MediaCodec.createDecoderByType(MIME);
+      return MediaCodec.createDecoderByType(mime);
     } catch (Exception e) {
       Log.w(TAG, "createDecoderByType failed: " + e.getMessage());
       return null;
@@ -2035,7 +2267,7 @@ public final class WcDecoderBridge {
             // The codec's true output size is authoritative for the contain-fit.
             Activity act = activity();
             if (act != null) {
-              act.runOnUiThread(() -> applyContentTransform(surfaceView));
+              act.runOnUiThread(WcDecoderBridge::applyContentLayout);
             }
           } catch (Exception ignored) {
           }
@@ -2097,7 +2329,7 @@ public final class WcDecoderBridge {
   }
 
   private static MediaFormat baseFormat(int w, int h) {
-    MediaFormat format = MediaFormat.createVideoFormat(MIME, w, h);
+    MediaFormat format = MediaFormat.createVideoFormat(mime, w, h);
     format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, Math.max(512_000, w * h));
     if (Build.VERSION.SDK_INT >= 23) {
       format.setInteger(MediaFormat.KEY_PRIORITY, 0);
@@ -2162,7 +2394,7 @@ public final class WcDecoderBridge {
    * — this version still returns a name in that case so the caller's progressive
    * {@link #startCodecLocked} can try plain-config too.
    */
-  private static String pickDecoderName() {
+  private static String pickDecoderName(String m) {
     MediaCodecInfo[] infos;
     try {
       infos = new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos();
@@ -2191,7 +2423,7 @@ public final class WcDecoderBridge {
         }
         boolean supports = false;
         for (String t : types) {
-          if (MIME.equalsIgnoreCase(t)) {
+          if (m.equalsIgnoreCase(t)) {
             supports = true;
             break;
           }
@@ -2204,14 +2436,7 @@ public final class WcDecoderBridge {
         // Skip software decoders — they're tracked separately as the absolute
         // last resort. Don't gate on isSoftwareOnly() alone (some emulator
         // builds only ship SW).
-        boolean looksSoftware =
-            lower.contains("sw")
-                || lower.contains("google")
-                || lower.contains("android.video.avc")
-                || lower.contains("c2.android")
-                || lower.contains("omx.google")
-                || lower.contains("avcdecoder");
-        if (looksSoftware) {
+        if (looksSoftware(lower)) {
           if (anySw == null) anySw = name;
           continue;
         }
@@ -2232,7 +2457,7 @@ public final class WcDecoderBridge {
         }
 
         try {
-          MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(MIME);
+          MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(m);
           boolean llFeature = false;
           if (Build.VERSION.SDK_INT >= 30) {
             try {
@@ -2258,7 +2483,7 @@ public final class WcDecoderBridge {
 
     // Framework pick: lets the platform decide the best decoder for the format.
     try {
-      MediaFormat fmt = MediaFormat.createVideoFormat(MIME, 1280, 720);
+      MediaFormat fmt = MediaFormat.createVideoFormat(m, 1280, 720);
       String found = new MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(fmt);
       if (found != null) return found;
     } catch (Throwable t) {
@@ -2308,6 +2533,17 @@ public final class WcDecoderBridge {
       }
     }
     return false;
+  }
+
+  /** Name heuristics for software decoders (they are the picker's last resort). */
+  private static boolean looksSoftware(String lower) {
+    return lower.contains("sw")
+        || lower.contains("google")
+        || lower.contains("android.video.avc")
+        || lower.contains("c2.android")
+        || lower.contains("omx.google")
+        || lower.contains("avcdecoder")
+        || lower.contains("hevcdecoder");
   }
 
   private static MediaCodecInfo findInfo(String name) {

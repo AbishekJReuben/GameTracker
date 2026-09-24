@@ -21,11 +21,11 @@ below are the record.
 | R3 | H.264 High + CABAC (Constrained High) for known-good decoders | **Shipped 3.9.103** — guest opt-in (`high`), live `vprofile` fallback; `high_vs_baseline`: +1.22 dB / −3.5 % bytes @ 6 Mb/s |
 | R6 | Loss-aware SCTP ceiling from `audio2` gaps | **Shipped 3.9.103** (`lossCeiling.ts`; needs STUDIO audio for the signal) |
 | — | Cap this phone's LL decoder at 30 Mb/s | **Shipped 3.9.103** — generic: decoder's declared max − 10 % (`maxKbps` on the opt-in) |
-| R7 | ABR v2: delay-gradient + overshoot correction | **Overshoot half shipped 3.9.103** (`overshoot.ts`; `rate_overshoot_busy`: 2 → 3.57, 3 → 3.92 Mb/s). Delay gradient still planned |
-| R5 | DIRECT over RTP with a VP8 "append carrier" | Planned — large; needs on-device spike |
-| R4 | Reference-frame invalidation instead of recovery IDRs | Planned — pairs with R5 (SCTP host drops almost no encoded frames) |
-| R8 | HEVC low-bandwidth mode | Planned (new MediaCodec/WebCodecs path; on-device) |
-| R9 | SurfaceView vs TextureView A/B | Needs per-device A/B |
+| R7 | ABR v2: delay-gradient + overshoot correction | **Overshoot half shipped 3.9.103**; **delay gradient shipped 3.9.105** (`trendline.ts`, acts with a 30 ms queue floor: drop to 0.8× caught in 500 vs 1000 ms, 0 false cuts in simulation) |
+| R5 | DIRECT over RTP with a VP8 "append carrier" | **Shipped 3.9.105** (`carrier.ts` + worker; Auto = SCTP while clean, RTP on loss). On-device spike: 340/341 frames, p50 16 ms |
+| R4 | Reference-frame invalidation instead of recovery IDRs | **Shipped 3.9.105** — DPB 4 for opted-in (Qualcomm Codec2) decoders; 1–3-frame drops stay at 27–35 dB vs 8–11 dB without |
+| R8 | HEVC low-bandwidth mode | **Shipped 3.9.105** — Auto below 8 Mb/s; +1.2 / +2.5 dB at 2.5 / 6 Mb/s on dense 720p |
+| R9 | SurfaceView vs TextureView A/B | **A/B toggle shipped 3.9.105** (Tune → Phone → Video layer; default TextureView) |
 
 ---
 
