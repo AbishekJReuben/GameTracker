@@ -268,8 +268,8 @@ export const TUNE_GROUPS: TuneGroup[] = [
         hint: (
           <>
             HEVC needs a third to a half fewer bits for the same picture but takes a few ms longer to decode.{" "}
-            <b>Auto</b> stays on H.264 and switches to HEVC only while the connection holds the stream under ~8 Mb/s,
-            then back above ~12 Mb/s (one keyframe per switch). HEVC needs a hardware decoder here and falls back by
+            <b>Auto</b> uses H.264 (automatic HEVC switching is paused while it's proven per device);{" "}
+            <b>HEVC</b> forces it. HEVC needs a hardware decoder here and falls back by
             itself if it won't decode. The header shows <b>HEVC</b> when it's live.
           </>
         ),

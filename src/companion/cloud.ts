@@ -2568,6 +2568,16 @@ export class CloudConn {
       if (this.wcNativeStallAt === 0) this.wcNativeStallAt = now;
       else if (now - this.wcNativeStallAt > budgetMs) {
         this.wcNativeStallAt = 0;
+        // An HEVC stream that stalls MediaCodec (seen on the moto g57's
+        // c2.qti.hevc.decoder.low_latency: 1 frame out, inputs never returned) is a
+        // codec problem, not a decoder-path one: withdraw HEVC so the PC goes back to
+        // H.264 and the re-announce rebuilds this same native decoder.
+        if (this.wcIsHevc() && !this.wcHevcFailed) {
+          this.wcDropHevc("MediaCodec HEVC produced no frames");
+          this.wcAwaitKey = true;
+          this.wcRequestKeyframe();
+          return;
+        }
         console.warn("[remote] native decoder stopped producing frames — falling back to WebCodecs");
         hitchNote("native-stall", "MediaCodec stopped producing frames — falling back to WebCodecs", {
           fed: this.wcFrames,

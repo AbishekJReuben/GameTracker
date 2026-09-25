@@ -816,10 +816,17 @@ export function startHost(opts: HostOptions): () => void {
   const HEVC_ENTER_MS = 5000;
   const HEVC_LEAVE_MS = 10000;
   const CODEC_MIN_GAP_MS = 20000;
+  /** Auto HEVC switching (off since 3.9.106 — see pickCodec). */
+  const HEVC_AUTO = false;
   const pickCodec = (why: string) => {
     if (opts.fixedMonitor != null) return;
     if (!guestHevcCap || quality.codec === "h264") return setGuestHevc(false, why);
     if (quality.codec === "hevc") return setGuestHevc(true, why);
+    // Auto stays on H.264 for now: on the moto g57 the automatic switch to HEVC
+    // (triggered by a weak link, exactly when a stall hurts most) wedged MediaCodec
+    // and forced a reconnect. HEVC is opt-in via Tune → Codec until it's proven per
+    // device. The hysteresis below is kept for when auto is re-enabled.
+    if (quality.codec === "auto" && !HEVC_AUTO) return setGuestHevc(false, why);
     const now = Date.now();
     const tgt = targetKbps();
     const rate = adaptKbps > 0 ? Math.min(adaptKbps, tgt) : tgt;
