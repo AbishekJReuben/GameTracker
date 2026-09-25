@@ -435,7 +435,7 @@ async fn get_steam_achievements(
             .ok_or_else(|| crate::error::AppError::msg("This game has no linked Steam app ID."))?;
         let api_key = crate::steam::steam_api_key()?;
         let steam_id = settings::get(&pool, "steam_id")?.unwrap_or_default();
-        let install_folder = game.install_folder.clone();
+        let install_folder = game.install_folder;
 
         crate::steam::refresh_achievements_for_game(
             &pool,

@@ -33,6 +33,7 @@ import { useProgress } from "@/store/progress";
 import { runBulkAppImages, runBulkAppInfo } from "@/lib/bulkTasks";
 import { clockString, dur, hours, relativeTime } from "@/lib/format";
 import { api, Game } from "@/lib/api";
+import { useDocumentVisible } from "@/lib/useVisible";
 
 function AppCard({ app, index }: { app: Game; index: number }) {
   const enabled = useMotionEnabled();
@@ -105,11 +106,13 @@ function AppNowUsing() {
   useEffect(() => {
     setTick(0);
   }, [tracking?.appSessionActiveSeconds, tracking?.appSessionRuntimeSeconds, tracking?.appId]);
+  // The tracker's own updates re-sync the clock, so nothing is lost while hidden.
+  const visible = useDocumentVisible();
   useEffect(() => {
-    if (!active) return;
+    if (!active || !visible) return;
     const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
-  }, [active]);
+  }, [active, visible]);
 
   if (!active || !tracking?.appId) return null;
   // Runtime keeps counting in the background (like games); focused pauses when AFK.

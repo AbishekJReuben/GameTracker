@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { X, ChevronLeft, ChevronRight } from "lucide-react";
 import { assetUrl } from "@/lib/api";
 import { useMotionEnabled } from "@/store/app";
+import { screenshotThumb, thumbFallback } from "@/lib/imageSizes";
 
 /** Responsive screenshot grid with a full-screen lightbox (keyboard + arrows). */
 export const ScreenshotGallery = memo(function ScreenshotGallery({ urls, name }: { urls: string[]; name: string }) {
@@ -45,7 +46,8 @@ export const ScreenshotGallery = memo(function ScreenshotGallery({ urls, name }:
             whileHover={enabled ? { scale: 1.02 } : undefined}
           >
             <img
-              src={src}
+              src={screenshotThumb(src)}
+              onError={thumbFallback}
               alt={`${name} screenshot ${i + 1}`}
               className="h-full w-full object-cover transition duration-300 group-hover:brightness-110"
               draggable={false}

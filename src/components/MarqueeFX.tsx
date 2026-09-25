@@ -1,5 +1,6 @@
 import { useMemo, type CSSProperties, type ReactNode } from "react";
 import { assetUrl, type Game } from "@/lib/api";
+import { screenshotThumb, thumbFallback } from "@/lib/imageSizes";
 import { GameArt } from "./GameArt";
 import { MarqueeShader } from "./animations/MarqueeShader";
 import { Card } from "./ui";
@@ -222,7 +223,7 @@ function PhotoTrack({
       >
         {strip.map((src, i) => (
           <div key={`${i}-${src}`} className="aspect-video h-full shrink-0 overflow-hidden rounded-lg border border-white/5 bg-black/40">
-            <img src={src} alt="" loading="lazy" draggable={false} className={cn("h-full w-full object-cover", imgClassName)} />
+            <img src={screenshotThumb(src)} alt="" loading="lazy" decoding="async" draggable={false} onError={thumbFallback} className={cn("h-full w-full object-cover", imgClassName)} />
           </div>
         ))}
       </div>

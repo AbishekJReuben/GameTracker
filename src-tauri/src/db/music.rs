@@ -373,7 +373,7 @@ pub fn insights(pool: &DbPool) -> AppResult<MusicInsights> {
 
     // most repeated track (by play count)
     let mut tracks: HashMap<String, Agg> = HashMap::new();
-    let mut hours = vec![0i64; 24];
+    let mut hours = [0i64; 24];
     let mut night = 0i64;
     let mut day_map: BTreeMap<NaiveDate, i64> = BTreeMap::new();
     let mut longest = 0i64;

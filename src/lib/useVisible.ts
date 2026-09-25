@@ -4,9 +4,62 @@ let windowVisible = true;
 const listeners = new Set<() => void>();
 export const isUiVisible = () => windowVisible && (typeof document === "undefined" || document.visibilityState === "visible");
 function notifyVisibility() {
-  document.documentElement.dataset.uiVisible = String(isUiVisible());
+  const visible = isUiVisible();
+  document.documentElement.dataset.uiVisible = String(visible);
+  syncScriptAnimations(visible);
+  holdFrames(!visible);
   listeners.forEach((listener) => listener());
 }
+
+/*
+ * Hiding to the tray hides the native window, but wry leaves the WebView2
+ * controller visible, so the page never goes document-hidden and the browser
+ * throttles nothing. Measured behind the tray: renderer ~20% and GPU process
+ * ~26% of a core, from three sources, each handled here:
+ *   - CSS animations: the stylesheet rule on data-ui-visible pauses them.
+ *   - Web Animations (Motion's accelerated loops): paused below, re-swept for
+ *     ones mounted since, and exactly those resumed on show.
+ *   - requestAnimationFrame (Motion's JS loops, shader canvases): held until the
+ *     window is shown again, as a browser does for a hidden tab. The wrapper is
+ *     public/frame-gate.js, which must load before any module (Motion captures
+ *     rAF at import time); this only flips it.
+ * Nothing that must work in the tray (remote hosting, Notes sync, music) runs
+ * off rAF or Web Animations.
+ */
+const SWEEP_MS = 5_000;
+const pausedByUs = new Set<Animation>();
+let sweepTimer: ReturnType<typeof setInterval> | undefined;
+function pauseScriptAnimations() {
+  for (const animation of document.getAnimations()) {
+    // CSSAnimation / CSSTransition: the stylesheet rule owns those.
+    if ("animationName" in animation || "transitionProperty" in animation) continue;
+    if (animation.playState !== "running") continue;
+    animation.pause();
+    pausedByUs.add(animation);
+  }
+}
+function syncScriptAnimations(visible: boolean) {
+  if (typeof document.getAnimations !== "function") return;
+  if (!visible) {
+    pauseScriptAnimations();
+    sweepTimer ??= setInterval(pauseScriptAnimations, SWEEP_MS);
+    return;
+  }
+  if (sweepTimer !== undefined) { clearInterval(sweepTimer); sweepTimer = undefined; }
+  for (const animation of pausedByUs) {
+    // Cancelled or replaced by Motion while hidden: leave it alone.
+    if (animation.playState === "paused") animation.play();
+  }
+  pausedByUs.clear();
+}
+type FrameGate = { hold: boolean; release: () => void };
+function holdFrames(hold: boolean) {
+  const gate = (window as { __gtFrameGate?: FrameGate }).__gtFrameGate;
+  if (!gate || gate.hold === hold) return;
+  gate.hold = hold;
+  if (!hold) gate.release();
+}
+
 export function subscribeUiVisibility(listener: () => void) {
   if (listeners.size === 0) document.addEventListener("visibilitychange", notifyVisibility);
   listeners.add(listener);

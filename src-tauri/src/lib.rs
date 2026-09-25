@@ -271,7 +271,7 @@ pub fn run() {
                     pool: pool.clone(),
                     tracking: shared.clone(),
                     media_dir: Arc::new(media_dir.clone()),
-                    remote: remote_shared.clone(),
+                    remote: remote_shared,
                     sys: sys_shared.clone(),
                 });
                 // Re-apply opt-in AnyDesk-style UAC handling if it was left on.

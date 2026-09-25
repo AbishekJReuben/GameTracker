@@ -29,6 +29,7 @@ import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
 import { SectionTitle, Toggle, Skeleton } from "@/components/ui";
 import { api, RemoteStatus, RemoteGrants } from "@/lib/api";
+import { useDocumentVisible } from "@/lib/useVisible";
 import { DEFAULT_SIGNAL_URL, SIGNAL_PORT } from "@/lib/remoteConfig";
 import { useApp } from "@/store/app";
 import { useRemoteHost } from "@/store/remote";
@@ -66,7 +67,7 @@ export default function RemotePage() {
     .replace(/\/+$/, "")}/quest`;
   const companionUrl = questUrl.replace(/\/quest$/, "/companion");
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (probeDevices = true) => {
     try {
       const s = await api.remoteStatus();
       setStatus(s);
@@ -76,6 +77,8 @@ export default function RemotePage() {
       }
       // Grants (for the live countdown) + USB devices (for the install button).
       api.remoteListGrants().then(setGrants).catch(() => {});
+      if (!probeDevices) return;
+      // Spawns `adb devices`: a plugged-in phone can wait a few seconds to show up.
       api.remoteAdbDevices().then(setUsbDevices).catch(() => setUsbDevices([]));
       api.remoteGamepadAvailable().then(setGamepadReady).catch(() => setGamepadReady(null));
     } catch {
@@ -83,12 +86,16 @@ export default function RemotePage() {
     }
   }, []);
 
+  // Poll while the page is on screen so the connected-device count stays live.
+  // Remote-only installs sit on this page for good, so it must stop in the tray.
+  const visible = useDocumentVisible();
   useEffect(() => {
-    refresh();
-    // Poll while the page is open so the connected-device count stays live.
-    const id = setInterval(refresh, 2000);
+    if (!visible) return;
+    void refresh();
+    let tick = 0;
+    const id = setInterval(() => void refresh(++tick % 3 === 0), 2000);
     return () => clearInterval(id);
-  }, [refresh]);
+  }, [refresh, visible]);
 
   const toggle = async (enabled: boolean) => {
     setBusy(true);

@@ -1909,3 +1909,57 @@ manual bitrate at 4 Mb/s (`PIP_MAX_*`, `streamTune.ts`). Full stream on exit.
   `WcDecoderBridge.java` at 0 bytes once (restored from git + replayed patches).
 - The companion embeds `dist/` at compile time and has **no** `beforeBuildCommand`: run
   `npm run build` before any local APK build, or it ships stale JS.
+
+---
+
+## 18. Whole-app efficiency audit (September 2026) — do not regress
+
+### Nothing renders behind the tray
+- **Why the browser doesn't do it for us:** wry's window `Hide` hides the native window but
+  never calls `SetIsVisible(false)` on the WebView2 controller, so the page stays
+  `document.visibilityState === "visible"` and Chromium throttles nothing. Measured behind the
+  tray before this pass: renderer ~20% and GPU process ~26% of a core. Don't "fix" this by
+  hiding the controller: remote hosting, Notes sync and music run in this webview and would get
+  hidden-page timer throttling.
+- `src/lib/useVisible.ts` (`notifyVisibility`) owns three brakes, all keyed off `isUiVisible()`:
+  1. CSS animations: the `html[data-ui-visible="false"]` rule in `index.css`.
+  2. Web Animations (Motion's accelerated loops): paused, re-swept every 5 s for ones mounted
+     since, and on show exactly the ones we paused are resumed (never ones Motion cancelled
+     or the app paused itself).
+  3. `requestAnimationFrame`: **`public/frame-gate.js`**, a classic script loaded by
+     `index.html` *before* the module entry. Motion's frameloop captures
+     `requestAnimationFrame` when its module is evaluated, and ES imports all run before
+     `main.tsx`'s body, so wrapping rAF from a module would silently miss Motion. The gate
+     holds callbacks (negative ids) while hidden and replays them in one frame on show.
+     `frameGate.motion.test.tsx` loads the shipping script and real Motion and checks both
+     directions; a negative control without the gate fails it.
+- **Don't make `useMotionEnabled` visibility-aware.** Every loop is written
+  `animate={on ? keyframes : undefined}`; when it flips back on with the same keyframes Motion
+  sees no change and the loop stays frozen. Hold frames instead (above). Where a loop
+  must toggle with the motion pref, remount it (``key={`${i}-${on}`}``) or render it conditionally.
+- UI polls follow `useDocumentVisible()`: the Apps page's 1 s clock and the Remote page's poll
+  (which spawns `adb devices`; remote-only installs sit on that page permanently). The Remote
+  poll probes adb/gamepad on every third 2 s tick.
+- Measured with headless Edge over CDP against the production bundle: 124 native rAF/s on the
+  visible dashboard → 0 while hidden → 123 after show, orbs frozen then moving again.
+
+### Images
+- Steam screenshots are stored as the `.1920x1080.jpg` original (~0.8 MB, ~8 MB decoded).
+  Tiles use `screenshotThumb()` (`src/lib/imageSizes.ts`) → Steam's own `.600x338.jpg`
+  (~100 KB) with `thumbFallback` as `onError` (back to the original, once). Applied to
+  `ImageMarquee`, `VerticalCoverMarquee`, `MarqueeFX` photo tracks and the `ScreenshotGallery`
+  grid. The lightbox, hero slides and the full-panel Ken Burns backdrop keep the original.
+
+### Database
+- **Migration 28** rebuilds `app_samples` as `WITHOUT ROWID`. The rowid layout stored every
+  sample twice (table + the TEXT `(ts, game_id)` key's autoindex: 107 MB of a 244 MB file, plus a
+  redundant `idx_app_samples_ts`). After: 59 MB, one b-tree write per sample, history reads
+  ~20% faster, same key serves the range read and the prune. One-time cost measured on the real
+  DB: ~1.2 s rebuild + ~1.1 s VACUUM (file 244 → 141 MB). The VACUUM is best-effort. Latest DB
+  `user_version` is **28**. `ensure_app_table` creates the new layout for fresh installs; never
+  add a separate `ts` index back.
+
+### Rust hygiene
+- Clippy's perf lints (`redundant_clone`, `manual_contains`, `useless_vec`, plus
+  `unused_mut`/`unused_unsafe`) are clean on the lib. They were cold paths, so this is tidiness,
+  not speed.

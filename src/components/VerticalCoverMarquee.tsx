@@ -4,6 +4,7 @@ import { assetUrl } from "@/lib/api";
 import { GameArt } from "./GameArt";
 import { useMarqueeTier, useMotionEnabled } from "@/store/app";
 import { cn } from "@/lib/cn";
+import { screenshotThumb, thumbFallback } from "@/lib/imageSizes";
 
 type WallItem =
   | { kind: "cover"; game: Game }
@@ -52,7 +53,8 @@ export function VerticalCoverMarquee({
     const shots = screenshots
       .map((u) => assetUrl(u))
       .filter((u): u is string => !!u)
-      .slice(0, Math.ceil(max / 3));
+      .slice(0, Math.ceil(max / 3))
+      .map(screenshotThumb);
 
     const out: WallItem[] = [];
     let si = 0;
@@ -102,7 +104,7 @@ export function VerticalCoverMarquee({
                 rounded="rounded-xl"
               />
             ) : (
-              <img src={it.src} alt="" loading="lazy" draggable={false} className="h-full w-full object-cover" />
+              <img src={it.src} alt="" loading="lazy" decoding="async" draggable={false} onError={thumbFallback} className="h-full w-full object-cover" />
             )}
           </div>
         ))}

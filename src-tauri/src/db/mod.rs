@@ -544,6 +544,47 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 27;
     }
 
+    if version < 28 {
+        // app_samples (created by system::ensure_app_table) was a rowid table with a
+        // TEXT (ts, game_id) primary key, so every sample was stored twice: once in the
+        // table and once in the key's autoindex (107 MB for 30 days on a real install,
+        // 44% of the file). WITHOUT ROWID keeps rows in the key's own b-tree: 59 MB,
+        // one b-tree write per sample, and the history read and prune search the same
+        // key (~20% faster). Measured one-time cost: ~1.2 s for 600k rows.
+        let old_layout: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'table' AND name = 'app_samples' AND sql NOT LIKE '%WITHOUT ROWID%'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        let tx = conn.unchecked_transaction()?;
+        if old_layout {
+            tx.execute_batch(
+                r#"
+                CREATE TABLE app_samples_new (
+                    ts       TEXT NOT NULL,
+                    game_id  TEXT NOT NULL,
+                    cpu      REAL NOT NULL DEFAULT 0,
+                    ram_mb   REAL NOT NULL DEFAULT 0,
+                    gpu      REAL,
+                    PRIMARY KEY (ts, game_id)
+                ) WITHOUT ROWID;
+                INSERT INTO app_samples_new SELECT ts, game_id, cpu, ram_mb, gpu FROM app_samples;
+                DROP TABLE app_samples;
+                ALTER TABLE app_samples_new RENAME TO app_samples;
+                "#,
+            )?;
+        }
+        tx.execute_batch("PRAGMA user_version = 28;")?;
+        tx.commit()?;
+        version = 28;
+        if old_layout {
+            // Hand the freed pages back to the disk (244 → 141 MB measured, ~1.1 s).
+            // Best-effort: a full disk just leaves them on the freelist for reuse.
+            let _ = conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+    }
+
     let _ = version;
     Ok(())
 }
@@ -588,4 +629,74 @@ fn reclassify_smtc_plays(conn: &rusqlite::Connection) -> AppResult<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_28_moves_app_samples_to_without_rowid_and_keeps_every_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // The pre-28 layout, as ensure_app_table used to create it.
+        conn.execute_batch(
+            "CREATE TABLE app_samples (
+                ts TEXT NOT NULL, game_id TEXT NOT NULL,
+                cpu REAL NOT NULL DEFAULT 0, ram_mb REAL NOT NULL DEFAULT 0, gpu REAL,
+                PRIMARY KEY (ts, game_id));
+             CREATE INDEX idx_app_samples_ts ON app_samples(ts);
+             INSERT INTO app_samples VALUES ('2026-09-01T00:00:00Z', 'a', 1.5, 100, NULL);
+             INSERT INTO app_samples VALUES ('2026-09-01T00:00:00Z', 'b', 2.5, 200, 7);
+             INSERT INTO app_samples VALUES ('2026-09-02T00:00:00Z', 'a', 3.5, 300, NULL);
+             PRAGMA user_version = 27;",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        assert_eq!(user_version(&conn).unwrap(), 28);
+        let sql: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name = 'app_samples'", [], |r| r.get(0))
+            .unwrap();
+        assert!(sql.contains("WITHOUT ROWID"), "{sql}");
+        let old_index: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_app_samples_ts'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_index, 0);
+        let rows: Vec<(String, String, f64, f64, Option<f64>)> = conn
+            .prepare("SELECT ts, game_id, cpu, ram_mb, gpu FROM app_samples ORDER BY ts, game_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1], ("2026-09-01T00:00:00Z".into(), "b".into(), 2.5, 200.0, Some(7.0)));
+        // The tracker's upsert still works on the new layout.
+        conn.execute(
+            "INSERT OR REPLACE INTO app_samples(ts, game_id, cpu, ram_mb, gpu) VALUES('2026-09-02T00:00:00Z', 'a', 9, 9, NULL)",
+            [],
+        )
+        .unwrap();
+        let cpu: f64 = conn
+            .query_row("SELECT cpu FROM app_samples WHERE ts = '2026-09-02T00:00:00Z' AND game_id = 'a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cpu, 9.0);
+
+        // A second launch is a no-op.
+        run_migrations(&conn).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), 28);
+    }
+
+    #[test]
+    fn migration_28_on_a_fresh_install_just_bumps_the_version() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), 28);
+        let tables: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'app_samples'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0, "created later, already WITHOUT ROWID, by ensure_app_table");
+    }
 }

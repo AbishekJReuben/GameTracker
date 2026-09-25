@@ -16,22 +16,23 @@ import { Panel } from "./Panel";
 import { SectionTitle, EmptyState } from "./ui";
 import { AddToPlaylist } from "./AddToPlaylist";
 import { useJukebox } from "@/store/jukebox";
-import { useApp } from "@/store/app";
+import { useApp, useMotionEnabled } from "@/store/app";
 import { buildGameTrackList, buildWatchVideosUrl, playlistUrl } from "@/lib/jukeboxTracks";
 import { cn } from "@/lib/cn";
 import { openExternalUrl } from "@/lib/tauri";
 
 /** Animated equalizer shown on the currently-playing row. */
 function Equalizer() {
+  const animate = useMotionEnabled();
   return (
     <span className="flex h-3.5 items-end gap-[2px]">
       {[0, 1, 2].map((i) => (
         <motion.span
-          key={i}
+          key={`${i}-${animate}`}
           className="w-[3px] rounded-full bg-accent"
-          animate={{ height: ["30%", "100%", "45%", "85%", "30%"] }}
-          transition={{ duration: 0.9, repeat: Infinity, ease: "easeInOut", delay: i * 0.18 }}
-          style={{ height: "30%" }}
+          animate={animate ? { height: ["30%", "100%", "45%", "85%", "30%"] } : undefined}
+          transition={animate ? { duration: 0.9, repeat: Infinity, ease: "easeInOut", delay: i * 0.18 } : undefined}
+          style={{ height: animate ? "30%" : `${[55, 90, 70][i]}%` }}
         />
       ))}
     </span>

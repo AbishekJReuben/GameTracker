@@ -107,7 +107,7 @@ fn direct_image(url: &Url) -> Option<LinkPreview> {
     let name = url.path_segments()?.next_back()?.to_string();
     Some(LinkPreview {
         url: url.to_string(),
-        host: host.clone(),
+        host,
         title: name,
         description: None,
         image_url: Some(url.to_string()),
@@ -231,5 +231,5 @@ pub fn fetch(raw: String) -> Result<LinkPreview, String> {
     // Plenty of pages set description to the title verbatim; showing it twice
     // just wastes the card's second line.
     let description = og_description.or(twitter_description).or(meta_description).filter(|d| d != &title);
-    Ok(LinkPreview { url: url.to_string(), host: host.clone(), title, description, image_url, favicon_url: favicon.or_else(|| Some(format!("{}/favicon.ico", url.origin().ascii_serialization()))), source: source.into() })
+    Ok(LinkPreview { url: url.to_string(), host, title, description, image_url, favicon_url: favicon.or_else(|| Some(format!("{}/favicon.ico", url.origin().ascii_serialization()))), source: source.into() })
 }

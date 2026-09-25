@@ -24,6 +24,8 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- Before the module entry: Motion captures requestAnimationFrame at import. -->
+    <script src="/frame-gate.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

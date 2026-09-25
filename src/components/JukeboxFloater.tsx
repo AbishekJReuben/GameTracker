@@ -17,7 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { useJukebox } from "@/store/jukebox";
-import { useApp } from "@/store/app";
+import { useApp, useMotionEnabled } from "@/store/app";
 import { assetUrl } from "@/lib/api";
 import { isTauri } from "@/lib/tauri";
 import { GameArt } from "./GameArt";
@@ -69,15 +69,16 @@ function MarqueeTitle({ text, className }: { text: string; className?: string })
 }
 
 function Equalizer({ className, bars = 4 }: { className?: string; bars?: number }) {
+  const animate = useMotionEnabled();
   return (
     <span className={cn("flex h-3.5 items-end gap-[2px]", className)}>
       {Array.from({ length: bars }, (_, i) => (
         <motion.span
-          key={i}
+          key={`${i}-${animate}`}
           className="w-[2px] rounded-full bg-gradient-to-t from-accent to-white"
-          animate={{ height: ["22%", "100%", "35%", "90%", "22%"] }}
-          transition={{ duration: 0.85, repeat: Infinity, ease: "easeInOut", delay: i * 0.14 }}
-          style={{ height: "28%" }}
+          animate={animate ? { height: ["22%", "100%", "35%", "90%", "22%"] } : undefined}
+          transition={animate ? { duration: 0.85, repeat: Infinity, ease: "easeInOut", delay: i * 0.14 } : undefined}
+          style={{ height: animate ? "28%" : `${[45, 80, 60, 90, 55, 70][i % 6]}%` }}
         />
       ))}
     </span>
@@ -131,6 +132,7 @@ export function JukeboxFloater() {
 
   const track = tracks[index];
   const audible = playing && !muted;
+  const motionOn = useMotionEnabled();
   const expanded = hovered || pinned || changed || showQueue;
   const pct = duration > 0 ? Math.min(100, (progress / duration) * 100) : 0;
   const cardH = expanded ? contentH : TINY;
@@ -288,7 +290,7 @@ export function JukeboxFloater() {
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
-      {audible && (
+      {audible && motionOn && (
         <motion.div
           className="pointer-events-none absolute -inset-4 -z-10 rounded-[32px]"
           style={{
@@ -375,7 +377,7 @@ export function JukeboxFloater() {
           style={{ pointerEvents: expanded ? "auto" : "none" }}
           aria-hidden={!expanded}
         >
-          {audible && (
+          {audible && motionOn && (
             <motion.div
               className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px"
               style={{ background: "linear-gradient(90deg, transparent, var(--accent-1), var(--accent-3), transparent)" }}

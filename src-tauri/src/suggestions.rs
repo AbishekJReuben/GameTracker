@@ -655,7 +655,7 @@ pub fn generate(pool: &DbPool, refresh: bool) -> AppResult<SuggestionsResult> {
                 if age < CACHE_TTL_SECS {
                     if let Ok(mut cached) = serde_json::from_str::<SuggestionsResult>(&json) {
                         cached.cached = true;
-                        cached.excluded_tags = excluded_display.clone();
+                        cached.excluded_tags = excluded_display;
                         return Ok(cached);
                     }
                 }

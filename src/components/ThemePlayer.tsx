@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 import { motion } from "motion/react";
 import { Volume2, VolumeX, Music2 } from "lucide-react";
 import type { Game } from "@/lib/api";
-import { useApp } from "@/store/app";
+import { useApp, useMotionEnabled } from "@/store/app";
 import { useJukebox, useJukeboxOwnsPlayback } from "@/store/jukebox";
 import { buildGameTrackList } from "@/lib/jukeboxTracks";
 import { cn } from "@/lib/cn";
@@ -130,6 +130,7 @@ export function ThemeToggleButton({ game, className }: { game: Game; className?:
   const muted = useApp((s) => s.prefs.themeMuted);
   const setPref = useApp((s) => s.setPref);
   const jukeboxOwns = useJukeboxOwnsPlayback();
+  const motionOn = useMotionEnabled();
 
   const trackCount = useMemo(() => buildGameTrackList(game).length, [game]);
 
@@ -153,7 +154,7 @@ export function ThemeToggleButton({ game, className }: { game: Game; className?:
     >
       <span className="relative grid h-4 w-4 place-items-center">
         <Music2 className="h-3.5 w-3.5 text-accent" />
-        {!muted && !jukeboxOwns && (
+        {!muted && !jukeboxOwns && motionOn && (
           <motion.span
             className="absolute inset-0 rounded-full"
             style={{ boxShadow: "0 0 0 2px color-mix(in srgb, var(--accent-1) 50%, transparent)" }}

@@ -607,8 +607,9 @@ pub fn ensure_app_table(pool: &DbPool) -> AppResult<()> {
             ram_mb   REAL NOT NULL DEFAULT 0,
             gpu      REAL,
             PRIMARY KEY (ts, game_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_app_samples_ts ON app_samples(ts);",
+        ) WITHOUT ROWID;",
+        // No separate ts index: the key leads with ts and serves both the history
+        // range read and the prune. Older installs are converted by migration 28.
     )?;
     Ok(())
 }

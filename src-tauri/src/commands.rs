@@ -255,7 +255,7 @@ pub async fn check_for_updates(app: tauri::AppHandle) -> AppResult<UpdateStatus>
         .map_err(|e| AppError::msg(e.to_string()))?;
     Ok(UpdateStatus {
         available: update.is_some(),
-        version: update.map(|u| u.version.clone()),
+        version: update.map(|u| u.version),
         current_version,
     })
 }
@@ -1434,7 +1434,7 @@ pub fn steam_game_achievements(
         .ok_or_else(|| AppError::msg("This game has no linked Steam app ID."))?;
     let api_key = crate::steam::steam_api_key()?;
     let steam_id = settings::get(pool, "steam_id")?.unwrap_or_default();
-    let install_folder = game.install_folder.clone();
+    let install_folder = game.install_folder;
 
     crate::steam::refresh_achievements_for_game(
         pool,
@@ -1652,7 +1652,7 @@ pub fn local_launcher_import(
 ) -> AppResult<(i64, i64)> {
     let pool = state.pool.clone();
     let media_dir = state.media_dir.clone();
-    let app_handle = app.clone();
+    let app_handle = app;
     let pool_for_closure = pool.clone();
     crate::launcher_catalog::import_local(&pool, &platform, &names, move |id| {
         if let Ok(Some(game)) = games::get(&pool_for_closure, id) {
@@ -2117,7 +2117,7 @@ pub fn remote_grant(
         trusted.retain(|d| d.id != device_id);
         trusted.push(TrustedDevice {
             id: device_id.clone(),
-            name: name.clone(),
+            name,
             added_utc: now.to_rfc3339(),
         });
         settings::set(
@@ -2197,7 +2197,7 @@ pub fn remote_check_auth(
             let mut trusted = read_trusted(&state.pool);
             if !trusted.iter().any(|d| d.id == device_id) {
                 trusted.push(TrustedDevice {
-                    id: device_id.clone(),
+                    id: device_id,
                     name: name.unwrap_or_else(|| "Phone".into()),
                     added_utc: now.to_rfc3339(),
                 });
@@ -2890,7 +2890,7 @@ pub fn clipboard_set_tags(
 ) -> AppResult<Vec<String>> {
     let tags = clip_store::set_tags(&state.pool, &id, tags)?;
     if propagate.unwrap_or(true) {
-        let _ = app.emit("clipboard://tags", &(id.clone(), tags.clone()));
+        let _ = app.emit("clipboard://tags", &(id, tags.clone()));
     }
     let _ = app.emit("clipboard://changed", ());
     let _ = app.emit_to(crate::clipboard::OVERLAY_LABEL, "clipboard://changed", ());
@@ -3130,7 +3130,7 @@ pub async fn speech_to_text(
         let boundary = format!("----gtclip{}", uuid::Uuid::new_v4().simple());
 
         let mut body: Vec<u8> = Vec::new();
-        let mut field = |name: &str, value: &str, body: &mut Vec<u8>| {
+        let field = |name: &str, value: &str, body: &mut Vec<u8>| {
             body.extend_from_slice(
                 format!(
                     "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"

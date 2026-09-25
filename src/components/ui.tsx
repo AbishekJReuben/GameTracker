@@ -2,6 +2,7 @@ import { motion } from "motion/react";
 import { Loader2 } from "lucide-react";
 import { ReactNode, useId } from "react";
 import { cn } from "@/lib/cn";
+import { useMotionEnabled } from "@/store/app";
 
 export function Card({
   className,
@@ -57,6 +58,7 @@ export function SectionTitle({
   /** Subtle scan/sheen across the title bar — use on dashboard hero sections. */
   sheen?: boolean;
 }) {
+  const motionOn = useMotionEnabled();
   return (
     <div className="mb-4 flex items-end justify-between gap-3">
       <div className="min-w-0">
@@ -68,7 +70,7 @@ export function SectionTitle({
             transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
           />
           <span className="relative truncate">{title}</span>
-          {sheen && (
+          {sheen && motionOn && (
             <motion.span
               aria-hidden
               className="pointer-events-none absolute inset-y-0 left-4 right-0 bg-gradient-to-r from-transparent via-white/[0.07] to-transparent"

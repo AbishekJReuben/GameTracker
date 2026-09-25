@@ -550,7 +550,7 @@ fn push_tag(set: &mut Vec<String>, seen: &mut std::collections::HashSet<String>,
 }
 
 fn category_is_useful(desc: &str) -> bool {
-    !SKIP_CATEGORIES.iter().any(|s| *s == desc)
+    !SKIP_CATEGORIES.contains(&desc)
 }
 
 /// SteamSpy returns community tags with vote weights (keyless).
@@ -1588,7 +1588,7 @@ pub fn resolve_metacritic_slug(name: &str) -> Option<String> {
         return None;
     }
     if metacritic_slug_valid(&q, name) {
-        return Some(q.clone());
+        return Some(q);
     }
     let url = format!("https://www.metacritic.com/search/{q}/?category=13");
     let Some(html) = fetch_html(&url) else {

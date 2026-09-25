@@ -588,8 +588,9 @@ impl Encoder {
             }
             let mut cfg = preset.presetCfg;
             cfg.version = NV_ENC_CONFIG_VER;
-            // SAFETY: presetCfg was filled by GetEncodePresetConfigEx for p's codec.
-            unsafe { apply_guest_friendly(&mut cfg, &p) };
+            // SAFETY (inside the enclosing unsafe block): presetCfg was filled by
+            // GetEncodePresetConfigEx for p's codec.
+            apply_guest_friendly(&mut cfg, &p);
 
             let mut re = NV_ENC_RECONFIGURE_PARAMS {
                 version: NV_ENC_RECONFIGURE_PARAMS_VER,

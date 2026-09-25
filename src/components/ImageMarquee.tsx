@@ -3,6 +3,7 @@ import { assetUrl } from "@/lib/api";
 import { useMarqueeTier, useMotionEnabled } from "@/store/app";
 import { cn } from "@/lib/cn";
 import { useInView } from "@/lib/useVisible";
+import { screenshotThumb, thumbFallback } from "@/lib/imageSizes";
 
 /**
  * A slowly drifting strip of landscape images (game screenshots / posters),
@@ -27,7 +28,7 @@ export function ImageMarquee({
   const { ref, inView } = useInView<HTMLDivElement>();
   const showMarquee = useMarqueeTier("base");
   const shots = useMemo(
-    () => images.map((u) => assetUrl(u)).filter((u): u is string => !!u).slice(0, 16),
+    () => images.map((u) => assetUrl(u)).filter((u): u is string => !!u).slice(0, 16).map(screenshotThumb),
     [images]
   );
   if (!showMarquee || shots.length === 0) return null;
@@ -55,7 +56,7 @@ export function ImageMarquee({
               key={`${i}-${src}`}
               className="aspect-video h-full shrink-0 overflow-hidden rounded-xl border border-white/5 bg-black/40 shadow-card"
             >
-              <img src={src} alt="" loading="lazy" decoding="async" draggable={false} className="h-full w-full object-cover" />
+              <img src={src} alt="" loading="lazy" decoding="async" draggable={false} onError={thumbFallback} className="h-full w-full object-cover" />
             </div>
           ))}
         </div>

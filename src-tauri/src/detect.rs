@@ -610,7 +610,7 @@ fn is_app_noise(path: &str) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    APP_NOISE.iter().any(|n| *n == file)
+    APP_NOISE.contains(&file)
 }
 
 /// Enumerate processes that own a visible top-level (alt-tab style) window and

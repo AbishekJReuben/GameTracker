@@ -91,7 +91,7 @@ pub fn revoke(pool: &DbPool, id: &str) -> AppResult<()> {
 pub fn start_session(pool: &DbPool, share_id: &str, peer_name: Option<String>, total_bytes: u64) -> AppResult<ShareDownloadSession> {
     let now = Utc::now().to_rfc3339();
     let session = ShareDownloadSession {
-        id: uuid::Uuid::new_v4().to_string(), share_id: share_id.to_string(), started_utc: now.clone(), ended_utc: None,
+        id: uuid::Uuid::new_v4().to_string(), share_id: share_id.to_string(), started_utc: now, ended_utc: None,
         state: "transferring".into(), peer_name, route: None, bytes_transferred: 0, total_bytes: total_bytes.min(i64::MAX as u64) as i64,
         average_speed_bps: 0.0, peak_speed_bps: 0.0, rtt_ms: None, error: None,
     };
