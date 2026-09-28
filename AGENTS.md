@@ -1966,7 +1966,7 @@ manual bitrate at 4 Mb/s (`PIP_MAX_*`, `streamTune.ts`). Full stream on exit.
 
 ---
 
-## 19. Voice: Claude Code narrated to the phone (3.9.108) — do not regress
+## 19. Voice: Claude Code narrated to the phone (3.9.108–109) — do not regress
 
 Every Claude Code session on the PC (CLI and the desktop Code tab), read aloud on the Android
 app in the background. No AI API is called anywhere; the voice is local.

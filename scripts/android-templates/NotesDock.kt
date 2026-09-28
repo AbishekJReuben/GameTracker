@@ -959,7 +959,7 @@ private class OverlayTextActionMode(
       return
     }
     b.visibility = View.INVISIBLE
-    val ms = if (duration == android.view.ActionMode.DEFAULT_HIDE_DURATION) 2000L else duration.coerceAtMost(3000L)
+    val ms = if (duration == android.view.ActionMode.DEFAULT_HIDE_DURATION.toLong()) 2000L else duration.coerceAtMost(3000L)
     b.postDelayed({ if (!finished) b.visibility = View.VISIBLE }, ms)
   }
 
