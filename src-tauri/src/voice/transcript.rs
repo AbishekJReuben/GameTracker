@@ -116,10 +116,16 @@ impl Parser {
                         .and_then(|id| self.tools.remove(id))
                         .unwrap_or_default();
                     // Answers to your own questions and plumbing results aren't worth reading.
+                    let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                     if matches!(tool.as_str(), "AskUserQuestion" | "ToolSearch" | "TodoWrite") {
                         None
+                    } else if speak::category(&tool) == "command" {
+                        // Command output is never read (the user's call): the action
+                        // line already said what ran. A failure is still worth one line.
+                        category = "command";
+                        failed = is_error;
+                        is_error.then(|| (Kind::Output, "The command failed.".to_string()))
                     } else {
-                        let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                         category = speak::category(&tool);
                         failed = is_error;
                         let text = result_text(b.get("content"));
@@ -297,12 +303,32 @@ mod tests {
         assert_eq!(ev[0].project, "GameTracker");
         assert_eq!(ev[0].id, "u1:0");
 
+        // Command output is never read…
         let ev = p.line(&rec(json!({
             "type":"user","uuid":"u2","sessionId":"s1",
             "message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok. 85 passed"}]}
         })));
-        assert_eq!(ev[0].kind, Kind::Output);
-        assert_eq!(ev[0].text, "test result: ok. 85 passed.");
+        assert!(ev.is_empty());
+        // …but a failed command gets one line.
+        p.line(&rec(json!({
+            "type":"assistant","uuid":"u2b","sessionId":"s1",
+            "message":{"content":[{"type":"tool_use","id":"t2","name":"PowerShell","input":{"command":"x"}}]}
+        })));
+        let ev = p.line(&rec(json!({
+            "type":"user","uuid":"u2c","sessionId":"s1",
+            "message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"boom"}]}
+        })));
+        assert_eq!((ev[0].kind, ev[0].text.as_str(), ev[0].failed), (Kind::Output, "The command failed.", true));
+        // Other tools' results are still read.
+        p.line(&rec(json!({
+            "type":"assistant","uuid":"u2d","sessionId":"s1",
+            "message":{"content":[{"type":"tool_use","id":"t3","name":"Grep","input":{"pattern":"x"}}]}
+        })));
+        let ev = p.line(&rec(json!({
+            "type":"user","uuid":"u2e","sessionId":"s1",
+            "message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"Found 4 files"}]}
+        })));
+        assert_eq!(ev[0].text, "Found 4 files.");
 
         let ev = p.line(&rec(json!({
             "type":"assistant","uuid":"u3","sessionId":"s1",

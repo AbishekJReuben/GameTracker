@@ -1978,7 +1978,9 @@ app in the background. No AI API is called anywhere; the voice is local.
   mostly stored empty (signed placeholder): only non-empty ones are spoken.
 - `speak.rs` turns Markdown/paths/URLs/versions into speech (`3.9.107` → "3 point 9 point 107",
   `src/a/b.ts:42` → "b.ts line 42", code blocks → "Code block, N lines"), actions into one sentence
-  (Bash's own `description`, "Reading lib.rs", …), and outputs capped by `voice_output_max_chars`.
+  (Bash's own `description`, "Reading lib.rs", …). **Command (Bash/PowerShell) output is never read**
+  (user's call, 3.9.110) — a failed command is one line, "The command failed."; other tools' results
+  are capped by `voice_output_max_chars`.
 - `plan.rs` is the log: order = arrival (×4 so a summary slots in front of a run); **just-in-time
   synthesis** only 40 s ahead of the phone's playhead, nothing until a phone reports; **condensing**
   over a 90 s backlog merges runs of old actions/outputs into "Skipping ahead: ran 4 commands…";

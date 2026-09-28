@@ -42,7 +42,7 @@ const KINDS: { key: keyof VoiceVoices; label: string; hint: string; fallback: nu
   { key: "reply", label: "Replies", hint: "What Claude writes to you, and its questions", fallback: 3 },
   { key: "thinking", label: "Thinking", hint: "When the transcript carries it", fallback: 6 },
   { key: "action", label: "Actions", hint: "\"Running the tests\", \"Editing lib.rs\"", fallback: 16 },
-  { key: "output", label: "Output", hint: "Command and tool results", fallback: 26 },
+  { key: "output", label: "Results", hint: "File reads, searches, web pages", fallback: 26 },
 ];
 
 const CAPS = [
@@ -242,7 +242,7 @@ export default function VoicePage() {
                 ))}
               </div>
               <div className="mt-5">
-                <div className="mb-1.5 text-sm font-700">Command output</div>
+                <div className="mb-1.5 text-sm font-700">Tool results</div>
                 <div className="flex flex-wrap gap-1.5">
                   {CAPS.map((c) => (
                     <button
@@ -257,8 +257,9 @@ export default function VoicePage() {
                   ))}
                 </div>
                 <p className="mt-1.5 text-xs text-ink-faint">
-                  How much of each result is read. When the phone falls behind, older actions and results are merged into
-                  one line; replies and questions are always read.
+                  How much of each file read, search or web page is read out. Command output is never read; a failed
+                  command is announced in one line. When the phone falls behind, older actions and results are merged
+                  into one line; replies and questions are always read.
                 </p>
               </div>
             </Panel>
