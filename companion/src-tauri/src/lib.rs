@@ -12,6 +12,7 @@ mod decoder;
 mod link_preview;
 mod pip;
 mod update;
+mod voice;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -46,6 +47,9 @@ pub fn run() {
             clipboard::clipboard_write,
             clipboard::clipboard_service_snapshot,
             clipboard::speech_to_text,
+            voice::voice_service_start,
+            voice::voice_snapshot,
+            voice::voice_control,
             link_preview,
         ])
         .run(tauri::generate_context!())

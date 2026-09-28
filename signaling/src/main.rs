@@ -18,6 +18,7 @@
 //! It listens on `$PORT` (default 8080). No state is persisted; rooms are ephemeral.
 
 mod clip;
+mod voice;
 
 use axum::{
     body::Bytes,
@@ -46,6 +47,8 @@ struct AppState {
     next_id: Arc<AtomicU64>,
     /// Persistent, E2E-encrypted shared-clipboard store (the /clip namespace).
     clip: Arc<clip::ClipState>,
+    /// Claude Code narration relay (the /voice namespace), same E2E model.
+    voice: Arc<voice::VoiceState>,
 }
 
 struct Peer {
@@ -69,7 +72,20 @@ async fn main() {
         rooms: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
         clip: clip::ClipState::new(&clip_data_dir()),
+        voice: voice::VoiceState::new(&clip_data_dir()),
     };
+    // Voice history expires after 30 days; sweep hourly.
+    {
+        let v = state.voice.clone();
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                t.tick().await;
+                let v = v.clone();
+                let _ = tokio::task::spawn_blocking(move || v.prune()).await;
+            }
+        });
+    }
 
     // Host both discovery clients from signaling/static:
     //   / and /companion → companion.html (phone browser)
@@ -91,6 +107,9 @@ async fn main() {
             "/clip/blob/:clip/:item",
             get(clip_blob_get).put(clip_blob_put),
         )
+        // Voice narration: one socket per device; audio of older lines over HTTP.
+        .route("/voice/ws", get(voice_ws_handler))
+        .route("/voice/blob/:space/:name", get(voice_blob_get))
         .route("/quest", {
             let p = quest.clone();
             get(move || serve_html(p.clone()))
@@ -222,6 +241,33 @@ async fn clip_blob_put(
     match s.clip.write_blob(&clip_id, &item, &body) {
         Ok(_) => StatusCode::OK.into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "write failed").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct VoiceJoin {
+    clip: String,
+    role: Option<String>,
+}
+
+async fn voice_ws_handler(
+    ws: WebSocketUpgrade,
+    Query(q): Query<VoiceJoin>,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let role = q.role.unwrap_or_default();
+    // Audio parts ride this socket; allow comfortably more than one part.
+    ws.max_message_size(voice::MAX_AUDIO_B64 + 64 * 1024)
+        .on_upgrade(move |socket| voice::handle(socket, q.clip, role, s.voice.clone()))
+}
+
+async fn voice_blob_get(
+    AxumPath((space, name)): AxumPath<(String, String)>,
+    State(s): State<AppState>,
+) -> Response {
+    match s.voice.read_blob(&space, &name) {
+        Some(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 

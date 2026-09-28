@@ -236,6 +236,22 @@ const COMPOSE_BOM = "2025.08.00";
     m = m.replace(/([ \t]*<\/application>)/, `${svc}$1`);
   }
 
+  // Voice: plays the PC's Claude Code narration in the background (VoiceService).
+  // specialUse like Notes: it runs indefinitely and must be able to come back
+  // after a reboot, which Android 15 forbids for a mediaPlayback-typed service.
+  if (!m.includes(".VoiceService")) {
+    const svc =
+      `        <service${eol}` +
+      `          android:name=".VoiceService"${eol}` +
+      `          android:exported="false"${eol}` +
+      `          android:foregroundServiceType="specialUse">${eol}` +
+      `          <property${eol}` +
+      `            android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"${eol}` +
+      `            android:value="reads the user's own PC coding sessions aloud" />${eol}` +
+      `        </service>${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${svc}$1`);
+  }
+
   // ClipboardPickActivity — transparent proxy that lets the foreground
   // ClipboardService pick an image from the gallery (services can't receive an
   // Activity-result callback). Translucent.NoTitleBar keeps it invisible; it
@@ -921,6 +937,9 @@ const COMPOSE_BOM = "2025.08.00";
       `-keep class ${pkg}.ClipboardPickActivity { *; }\n` +
       `-keep class ${pkg}.NotesTileService { *; }\n` +
       `-keep class ${pkg}.NotesDockActivity { *; }\n` +
+      `# Voice: VoiceBridge statics are called from Rust over JNI.\n` +
+      `-keep class ${pkg}.VoiceBridge { *; }\n` +
+      `-keep class ${pkg}.VoiceService { *; }\n` +
       `\n` +
       `# The mobile-network icon is reached only through the launcher manifest.\n` +
       `# Keep the activity stable in release R8.\n` +
@@ -1262,7 +1281,7 @@ const COMPOSE_BOM = "2025.08.00";
   if (!pkg) {
     console.warn("[patch-android] no identifier — skipping clipboard components.");
   } else {
-    for (const file of ["ClipboardBridge.java", "ClipboardService.java", "ClipboardBootReceiver.java", "ClipboardPickActivity.java", "ClipboardNetworkState.java", "NotesTileService.java", "NotesDockActivity.java", "NotesDock.kt"]) {
+    for (const file of ["ClipboardBridge.java", "ClipboardService.java", "ClipboardBootReceiver.java", "ClipboardPickActivity.java", "ClipboardNetworkState.java", "NotesTileService.java", "NotesDockActivity.java", "NotesDock.kt", "VoiceService.java", "VoiceBridge.java"]) {
       const name = file.replace(/\.(java|kt)$/, "");
       const templatePath = join(root, "scripts", "android-templates", file);
       if (!existsSync(templatePath)) {

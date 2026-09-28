@@ -1026,6 +1026,38 @@ export interface LocalLauncherGame {
 
 // ---------- Command wrappers ----------
 
+/** Voice: Claude Code narrated to the phone (src-tauri/src/voice). */
+export interface VoiceLine {
+  id: string;
+  kind: "reply" | "thinking" | "action" | "output" | "question" | "summary";
+  text: string;
+  project: string;
+  title: string;
+  audio: "ready" | "pending" | "skipped";
+  played: boolean;
+}
+
+export interface VoiceStatus {
+  enabled: boolean;
+  installed: boolean;
+  installing: boolean;
+  progress: number;
+  progressLabel: string;
+  running: boolean;
+  relay: string;
+  phoneListening: boolean;
+  engineLoaded: boolean;
+  backlogSecs: number;
+  lastSynthMs: number;
+  lastEncodeMs: number;
+  lastAudioMs: number;
+  error: string | null;
+  recent: VoiceLine[];
+}
+
+/** Kokoro speaker id per kind of line. */
+export type VoiceVoices = Partial<Record<"reply" | "thinking" | "action" | "output" | "question" | "summary", number>>;
+
 export const api = {
   getSettings: () => call<Settings>("get_settings"),
   setSetting: (key: string, value: string) => call<void>("set_setting", { key, value }),
@@ -1212,6 +1244,11 @@ export const api = {
     call<"secret" | "permanent" | "temporary" | "none">("remote_check_auth", { deviceId, name, secret }),
   // USB direct-install via adb.
   remoteAdbDevices: () => call<string[]>("remote_adb_devices"),
+  voiceStatus: () => call<VoiceStatus>("voice_status"),
+  voiceSetEnabled: (enabled: boolean) => call<VoiceStatus>("voice_set_enabled", { enabled }),
+  voiceSetSettings: (voices: VoiceVoices, outputMaxChars: number) =>
+    call<VoiceStatus>("voice_set_settings", { voices, outputMaxChars }),
+  voiceTest: (kind: string) => call<void>("voice_test", { kind }),
   remoteAdbInstall: () => call<string>("remote_adb_install"),
   // Streaming capture for the cloud WebRTC video-track path (frames arrive as
   // ArrayBuffer JPEGs over the channel; no per-frame invoke round-trip).

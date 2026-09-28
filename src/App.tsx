@@ -30,6 +30,7 @@ const GameDetail = lazyRoute(() => import("./routes/GameDetail"));
 const TimelinePage = lazyRoute(() => import("./routes/Timeline"));
 const MusicPage = lazyRoute(() => import("./routes/Music"));
 const RemotePage = lazyRoute(() => import("./routes/Remote"));
+const VoicePage = lazyRoute(() => import("./routes/Voice"));
 const CollectionPage = lazyRoute(() => import("./routes/Collection"));
 const TagsPage = lazyRoute(() => import("./routes/Tags"));
 const SuggestedPage = lazyRoute(() => import("./routes/Suggested"));
@@ -166,6 +167,7 @@ export default function App() {
         <Route path="/sessions" element={<Navigate to="/timeline" replace />} />
         <Route path="/music" element={<MusicPage />} />
         <Route path="/remote" element={<RemotePage />} />
+        <Route path="/voice" element={<VoicePage />} />
         <Route path="/collection" element={<CollectionPage />} />
         {/* Insights merged into Collection — keep old links working. */}
         <Route path="/insights" element={<Navigate to="/collection" replace />} />

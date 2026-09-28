@@ -29,6 +29,7 @@ mod tracking;
 mod thumbnails;
 mod tray;
 mod util;
+pub mod voice;
 
 #[cfg(test)]
 mod audit_regression;
@@ -190,6 +191,11 @@ fn apply_pending_restore(data_dir: &std::path::Path, db_path: &std::path::Path) 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The Voice feature's speech worker is this same exe with --tts-worker: it
+    // must branch off before Tauri (and single-instance) ever start.
+    if let Some(code) = voice::engine::maybe_run_worker() {
+        std::process::exit(code);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             tray::show_main(app);
@@ -319,6 +325,9 @@ pub fn run() {
                     let _ = autostart::sync_from_setting(enabled);
                 });
             }
+
+            // Voice: narrate Claude Code sessions to the phone (off by default).
+            voice::init(pool.clone(), handle.path().app_local_data_dir()?);
 
             // Background system monitor (CPU/GPU/RAM/disk + the sensor sidecar).
             system::spawn(pool, sys_shared, None);
@@ -484,6 +493,10 @@ pub fn run() {
             commands::remote_revoke,
             commands::remote_check_auth,
             commands::remote_adb_devices,
+            commands::voice_status,
+            commands::voice_set_enabled,
+            commands::voice_set_settings,
+            commands::voice_test,
             commands::remote_adb_install,
             commands::remote_start_capture,
             commands::remote_pipe_info,

@@ -29,5 +29,10 @@ public class ClipboardBootReceiver extends BroadcastReceiver {
           p.getString("signalUrl", ""),
           p.getString("sarvamKey", ""));
     }
+    // Voice narration, if it was left on.
+    try {
+      VoiceService.startIfEnabled(ctx);
+    } catch (Exception ignored) {
+    }
   }
 }

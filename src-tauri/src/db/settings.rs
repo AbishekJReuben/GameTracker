@@ -53,6 +53,11 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // controllable from the phone. Opt-in (lowers local security); restored on
     // disable/exit. See remote/uac.rs.
     ("remote_show_uac", "false"),
+    // Voice: Claude Code narrated to the phone (src/voice). Off until turned on;
+    // turning it on downloads the local Kokoro model once.
+    ("voice_enabled", "false"),
+    ("voice_voices", r#"{"reply":3,"thinking":6,"action":16,"output":26,"question":3,"summary":16}"#),
+    ("voice_output_max_chars", "800"),
     // Shared clipboard: a floating widget + a permanent, E2E-encrypted history
     // synced across desktop + Android. Off by default; enabling walks permissions.
     // The encryption key and relay space derive from `remote_secret_code` (shared

@@ -3199,3 +3199,35 @@ pub async fn speech_to_text(
     })
     .await
 }
+
+// ---------------------------------------------------------------- voice ----
+// Claude Code narrated to the phone (src/voice). All fast: installing and
+// narrating run on their own threads.
+
+#[tauri::command]
+pub fn voice_status() -> crate::voice::Status {
+    crate::voice::status()
+}
+
+#[tauri::command]
+pub fn voice_set_enabled(enabled: bool) -> AppResult<crate::voice::Status> {
+    crate::voice::set_enabled(enabled).map_err(AppError::msg)
+}
+
+#[tauri::command]
+pub fn voice_set_settings(
+    state: State<AppState>,
+    voices: serde_json::Value,
+    output_max_chars: i64,
+) -> AppResult<crate::voice::Status> {
+    if voices.is_object() {
+        settings::set(&state.pool, "voice_voices", &voices.to_string())?;
+    }
+    settings::set(&state.pool, "voice_output_max_chars", &output_max_chars.clamp(0, 20_000).to_string())?;
+    Ok(crate::voice::status())
+}
+
+#[tauri::command]
+pub fn voice_test(kind: String) -> AppResult<()> {
+    crate::voice::test(&kind).map_err(AppError::msg)
+}

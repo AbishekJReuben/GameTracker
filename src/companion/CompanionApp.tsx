@@ -21,7 +21,11 @@ import {
   Power,
   Download,
   X,
+  AudioLines,
+  ChevronLeft,
+  Home as HomeIcon,
 } from "lucide-react";
+import { isTauri } from "@/lib/tauri";
 import { DEFAULT_SIGNAL_URL, auxMonitorRoom } from "@/lib/remoteConfig";
 import { readRemoteOnly, tabAllowed } from "@/lib/setupMode";
 import { Pairing, type Connected } from "./Pairing";
@@ -46,6 +50,7 @@ const MusicScreen = lazyRoute(() => import("./screens/MusicView").then((m) => ({
 const SystemScreen = lazyRoute(() => import("./screens/System").then((m) => ({ default: m.SystemScreen })));
 const SettingsScreen = lazyRoute(() => import("./screens/Settings").then((m) => ({ default: m.SettingsScreen })));
 const ClipboardScreen = lazyRoute(() => import("./screens/Clipboard"));
+const VoiceScreen = lazyRoute(() => import("./screens/Voice"));
 const GameDetailScreen = lazyRoute(() =>
   import("./screens/GameDetail").then((m) => ({ default: m.GameDetailScreen })),
 );
@@ -100,7 +105,101 @@ const TABS: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "settings", label: "More", icon: SettingsIcon },
 ];
 
+/**
+ * The phone app has three paths: Voice (Claude Code read aloud), Remote desktop
+ * (everything that needs a live session with the PC, including Stats and Music)
+ * and Notes. In the Android app it opens on a chooser and remembers the last
+ * path, so Voice and Notes never start a remote session they don't need. The
+ * browser and Quest builds have no background Voice player and keep going
+ * straight to Remote.
+ */
 export function CompanionApp() {
+  if (!isTauri() || POPOUT_MONITOR != null) return <RemoteShell />;
+  return <HomeShell />;
+}
+
+type Path = "home" | "voice" | "remote" | "notes";
+const LS_PATH = "gt.home.path";
+
+function HomeShell() {
+  const [path, setPath] = useState<Path>(() => {
+    const p = localStorage.getItem(LS_PATH);
+    return p === "voice" || p === "remote" || p === "notes" ? p : "home";
+  });
+  const go = useCallback((p: Path) => {
+    if (p !== "home") localStorage.setItem(LS_PATH, p);
+    else localStorage.removeItem(LS_PATH);
+    setPath(p);
+  }, []);
+  const home = useCallback(() => go("home"), [go]);
+  if (path === "remote") return <RemoteShell onHome={home} />;
+  if (path === "voice")
+    return (
+      <Suspense fallback={<FullscreenSpinner label="Opening Voice…" />}>
+        <VoiceScreen onHome={home} />
+      </Suspense>
+    );
+  if (path === "notes")
+    return (
+      <div className="flex h-[100dvh] flex-col bg-bg-base text-ink">
+        <header
+          className="flex items-center gap-2 border-b border-line px-3 py-3"
+          style={{ paddingTop: "max(0.75rem, calc(env(safe-area-inset-top) + 0.5rem))" }}
+        >
+          <button onClick={home} className="btn btn-ghost h-9 w-9 p-0" title="Home">
+            <ChevronLeft className="h-5 w-5" />
+          </button>
+          <div className="font-display text-lg font-800">Notes</div>
+        </header>
+        <main className="min-h-0 flex-1">
+          <ScreenErrorBoundary label="notes">
+            <Suspense fallback={null}>
+              <ClipboardScreen />
+            </Suspense>
+          </ScreenErrorBoundary>
+        </main>
+      </div>
+    );
+  return <Home onPick={go} />;
+}
+
+function Home({ onPick }: { onPick: (p: Path) => void }) {
+  const cards: { id: Path; title: string; body: string; icon: typeof LayoutDashboard }[] = [
+    { id: "voice", title: "Voice", body: "Hear everything Claude Code does on your PC, even with this app closed.", icon: AudioLines },
+    { id: "remote", title: "Remote desktop", body: "See and control your PC, plus your stats, library and music.", icon: MonitorSmartphone },
+    { id: "notes", title: "Notes", body: "Your shared notes and clipboard, synced with the PC.", icon: ClipboardList },
+  ];
+  return (
+    <div
+      className="flex h-[100dvh] flex-col bg-bg-base px-4 text-ink"
+      style={{ paddingTop: "max(1.25rem, calc(env(safe-area-inset-top) + 1rem))", paddingBottom: "max(1rem, env(safe-area-inset-bottom))" }}
+    >
+      <div className="mb-6">
+        <div className="font-display text-2xl font-800 accent-text">GameTracker</div>
+        <div className="text-sm text-ink-dim">What would you like to do?</div>
+      </div>
+      <div className="flex flex-1 flex-col gap-3">
+        {cards.map((c) => (
+          <button
+            key={c.id}
+            onClick={() => onPick(c.id)}
+            className="card flex flex-1 items-center gap-4 p-5 text-left active:scale-[0.99]"
+          >
+            <div className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-accent/15">
+              <c.icon className="h-7 w-7 text-accent-3" />
+            </div>
+            <div className="min-w-0">
+              <div className="font-display text-lg font-800">{c.title}</div>
+              <div className="text-sm text-ink-dim">{c.body}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RemoteShell({ onHome }: { onHome?: () => void } = {}) {
   // Warm the lazily-split screens once startup has settled.
   useEffect(() => preloadWhenIdle(SCREEN_CHUNKS), []);
   useEffect(() => {
@@ -257,6 +356,13 @@ export function CompanionApp() {
     setConn(null);
   };
 
+  // Leaving the Remote path ends the session: nothing should hold a stream or a
+  // signaling socket open while you're in Voice or Notes.
+  const goHome = () => {
+    closeAll();
+    onHome?.();
+  };
+
   // Disconnect: end the live session but KEEP the remembered code — one tap
   // reconnects, no code needed. This is why "disconnect" never re-prompts.
   const disconnect = () => {
@@ -299,6 +405,16 @@ export function CompanionApp() {
       <>
         {updateBanner}
         {body}
+        {onHome && (
+          <button
+            onClick={goHome}
+            className="btn btn-ghost fixed left-3 z-40 h-9 w-9 p-0"
+            style={{ top: "max(0.75rem, calc(env(safe-area-inset-top) + 0.5rem))" }}
+            title="Home"
+          >
+            <ChevronLeft className="h-5 w-5" />
+          </button>
+        )}
       </>
     );
   }
@@ -334,6 +450,11 @@ export function CompanionApp() {
               Cloud · peer-to-peer
             </div>
           </div>
+          {onHome && (
+            <button onClick={goHome} className="btn btn-ghost ml-auto mr-1 h-9 w-9 p-0" title="Home">
+              <HomeIcon className="h-4 w-4" />
+            </button>
+          )}
           <button onClick={disconnect} className="btn btn-ghost h-9" title="Disconnect (keeps this PC saved)">
             <LogOut className="h-4 w-4" /> Disconnect
           </button>

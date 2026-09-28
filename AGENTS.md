@@ -1963,3 +1963,63 @@ manual bitrate at 4 Mb/s (`PIP_MAX_*`, `streamTune.ts`). Full stream on exit.
 - Clippy's perf lints (`redundant_clone`, `manual_contains`, `useless_vec`, plus
   `unused_mut`/`unused_unsafe`) are clean on the lib. They were cold paths, so this is tidiness,
   not speed.
+
+---
+
+## 19. Voice: Claude Code narrated to the phone (3.9.108) — do not regress
+
+Every Claude Code session on the PC (CLI and the desktop Code tab), read aloud on the Android
+app in the background. No AI API is called anywhere; the voice is local.
+
+**Pipeline (PC, `src-tauri/src/voice/`).**
+- `transcript.rs` tails `~/.claude/projects/**/*.jsonl` (subagents at depth 3). Files that exist
+  when watching starts are read from their END (history is never replayed); a file created after
+  that is read from its start. Poll 120 ms; rescan for new files every 2 s. Thinking blocks are
+  mostly stored empty (signed placeholder): only non-empty ones are spoken.
+- `speak.rs` turns Markdown/paths/URLs/versions into speech (`3.9.107` → "3 point 9 point 107",
+  `src/a/b.ts:42` → "b.ts line 42", code blocks → "Code block, N lines"), actions into one sentence
+  (Bash's own `description`, "Reading lib.rs", …), and outputs capped by `voice_output_max_chars`.
+- `plan.rs` is the log: order = arrival (×4 so a summary slots in front of a run); **just-in-time
+  synthesis** only 40 s ahead of the phone's playhead, nothing until a phone reports; **condensing**
+  over a 90 s backlog merges runs of old actions/outputs into "Skipping ahead: ran 4 commands…";
+  replies, thinking and questions are never condensed; the first unplayed item and the newest 4
+  are untouched. First part ≤ 80 chars so a line starts fast; later parts ≤ 320.
+- `engine.rs`: Kokoro via the **sherpa-onnx C API**, in a **worker process** = this exe with
+  `--tts-worker` (dispatched first thing in `run()`, before Tauri/single-instance). Struct layouts
+  mirror sherpa-onnx **v1.13.8**'s `c-api.h` and are size-asserted; `install.rs` pins that version
+  and the model by SHA-256 — bump them together or not at all. Worker priority is below normal; it
+  is pre-warmed when Voice starts and when a phone connects, and exits after 30 idle minutes.
+  Load `onnxruntime.dll` by full path with `LOAD_WITH_ALTERED_SEARCH_PATH` (System32 has an older
+  one). MP3 32 kb/s mono (`mp3lame-encoder`, builds with `cc`, no cmake).
+- `relay.rs`: AES-256-GCM, key = HKDF-SHA256(permanent key, salt **"gt-voice-v1"**), space id =
+  Notes' `clipId`. The test vector in `testdata/hkdf_abc.txt` came from Python's hmac; the phone's
+  `VoiceService.deriveKey` must match it. **Audio rides the WebSocket** and the relay forwards it
+  to live phones in the same message (no upload/download round trip); it's also stored for
+  catch-up over `GET /voice/blob/<space>/<item>_<part>`.
+- Measured (24 threads, a game benchmark running in another session): warm synthesis ~0.9 s for
+  ~4 s of speech, MP3 encode 34 ms; first line incl. model load 2.2 s end to end.
+- `examples/voice_probe.rs` + a Node phone stand-in ran the whole thing end to end against a local
+  relay with a throwaway key: all lines decrypted, all audio valid MP3, condensing fired.
+
+**Relay (`signaling/src/voice.rs`).** `/voice/ws?clip=&role=pc|phone`, `WITHOUT ROWID` items with
+rev cursor; phones get the newest 1500 on `hello since=0`; `head` (the phone's playhead) is stored
+and forwarded to the PC; `want` asks the PC to voice an old line; 30-day retention, hourly prune.
+Server edits need the running `gametracker-signal.exe` rebuilt and restarted (it runs elevated).
+
+**Phone (`scripts/android-templates/VoiceService.java`, `VoiceBridge.java`,
+`companion/src-tauri/src/voice.rs`, `src/companion/screens/Voice.tsx`).** A `specialUse` FGS (a
+mediaPlayback FGS can't be restarted from BOOT_COMPLETED on Android 15) with one OkHttp socket,
+framework `MediaPlayer` + `MediaSession`, no new libraries. Plays in order; audio focus
+`GAIN_TRANSIENT_MAY_DUCK` only while speaking, released 1.2 s after the queue drains (your music
+ducks and comes back); the session is inactive when idle so headset buttons return to the music
+app. A line whose audio never comes is skipped once a later one is ready (15 s). First start
+listens from "now". The Voice screen polls `voice_snapshot(ver)` every 700 ms while visible; an
+unchanged state is answered with `{"ver":n}` alone.
+
+**Three-path home (APK only).** `CompanionApp` → `HomeShell`: Voice / Remote desktop / Notes,
+remembers the last. Leaving Remote closes its session. Browser + Quest keep the old shell.
+
+**Notes dock text selection (same release).** The overlay's root answers
+`startActionModeForChild` with `OverlayTextActionMode` (a toolbar drawn inside the same window)
+because a bare WindowManager view otherwise returns null → no Select/Copy/Paste and no selection.
+Don't replace it with a popup window over the overlay.

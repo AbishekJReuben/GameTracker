@@ -787,14 +787,189 @@ class NotesDock(service: Context, private val host: NotesDockHost) {
   }
 }
 
-/** Window root: swallows Back (pre-predictive-back devices) to close the dock. */
+/**
+ * Window root: swallows Back (pre-predictive-back devices) to close the dock, and
+ * provides the text action mode the composer needs.
+ *
+ * An EditText asks its parents for Select / Cut / Copy / Paste through
+ * startActionModeForChild. In an Activity the DecorView answers; this window is a
+ * bare WindowManager view, so the request reached ViewRootImpl and got null: no
+ * toolbar, and without an action mode the editor never enters selection mode —
+ * you couldn't select, copy or paste in the composer at all. The root answers
+ * instead with [OverlayTextActionMode], a toolbar drawn as a child of this same
+ * window (a separate popup window over an overlay is exactly what this dock
+ * avoids elsewhere).
+ */
 private class DockRoot(ctx: Context, private val onBack: () -> Unit) : FrameLayout(ctx) {
+  private var textMode: OverlayTextActionMode? = null
+
   override fun dispatchKeyEvent(event: KeyEvent): Boolean {
     if (event.keyCode == KeyEvent.KEYCODE_BACK) {
-      if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) onBack()
+      if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
+        // Back first dismisses an open text toolbar, like it does in an app.
+        val mode = textMode
+        if (mode != null) mode.finish() else onBack()
+      }
       return true
     }
     return super.dispatchKeyEvent(event)
+  }
+
+  override fun startActionModeForChild(
+    originalView: View,
+    callback: android.view.ActionMode.Callback,
+    type: Int,
+  ): android.view.ActionMode? {
+    textMode?.finish()
+    val mode = OverlayTextActionMode(this, originalView, callback) { if (textMode === it) textMode = null }
+    if (!mode.start()) return null
+    textMode = mode
+    return mode
+  }
+
+  override fun startActionModeForChild(
+    originalView: View,
+    callback: android.view.ActionMode.Callback,
+  ): android.view.ActionMode? = startActionModeForChild(originalView, callback, android.view.ActionMode.TYPE_PRIMARY)
+
+  override fun onDetachedFromWindow() {
+    textMode?.finish()
+    super.onDetachedFromWindow()
+  }
+}
+
+/**
+ * A floating text toolbar (the platform's FloatingActionMode is internal API)
+ * shown inside [root]. It renders the menu the EditText itself fills in, so the
+ * items and their behaviour (cut, copy, paste, select all, …) are the platform's.
+ */
+private class OverlayTextActionMode(
+  private val root: FrameLayout,
+  private val target: View,
+  private val callback: android.view.ActionMode.Callback,
+  private val onFinished: (OverlayTextActionMode) -> Unit,
+) : android.view.ActionMode() {
+  private val ctx = root.context
+  private val mMenu: android.view.Menu = android.widget.PopupMenu(ctx, target).menu
+  private val density = ctx.resources.displayMetrics.density
+  private var bar: android.widget.LinearLayout? = null
+  private var finished = false
+  private var mTitle: CharSequence? = null
+  private var mSubtitle: CharSequence? = null
+  private var mCustom: View? = null
+
+  fun start(): Boolean {
+    if (!callback.onCreateActionMode(this, mMenu)) return false
+    callback.onPrepareActionMode(this, mMenu)
+    render()
+    return true
+  }
+
+  private fun dp(v: Float) = (v * density).toInt()
+
+  private fun render() {
+    val items = (0 until mMenu.size()).map { mMenu.getItem(it) }.filter { it.isVisible && !it.title.isNullOrBlank() }
+    bar?.let { root.removeView(it) }
+    bar = null
+    if (items.isEmpty() || finished) return
+    val b = android.widget.LinearLayout(ctx)
+    b.orientation = android.widget.LinearLayout.HORIZONTAL
+    val bg = GradientDrawable()
+    bg.setColor(0xF2202637.toInt())
+    bg.cornerRadius = dp(10f).toFloat()
+    bg.setStroke(dp(1f), 0x22FFFFFF)
+    b.background = bg
+    b.elevation = dp(6f).toFloat()
+    b.setPadding(dp(4f), 0, dp(4f), 0)
+    // Buttons never take focus: the composer keeps it, and with it the keyboard.
+    b.isFocusable = false
+    for (item in items.take(6)) {
+      val t = android.widget.TextView(ctx)
+      t.text = item.title
+      t.setTextColor(0xFFF1F5F9.toInt())
+      t.textSize = 14f
+      t.setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
+      t.isFocusable = false
+      t.setOnClickListener {
+        if (!finished) callback.onActionItemClicked(this, item)
+      }
+      b.addView(t)
+    }
+    root.addView(b, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    bar = b
+    b.visibility = View.INVISIBLE
+    // Position once it has measured.
+    b.post { place() }
+  }
+
+  /** Above the selection (below it if there's no room), clamped to the window. */
+  private fun place() {
+    val b = bar ?: return
+    val rect = android.graphics.Rect()
+    if (callback is android.view.ActionMode.Callback2) {
+      callback.onGetContentRect(this, target, rect)
+    } else {
+      rect.set(0, 0, target.width, target.height)
+    }
+    val t = IntArray(2)
+    val r = IntArray(2)
+    target.getLocationInWindow(t)
+    root.getLocationInWindow(r)
+    val left = t[0] - r[0] + rect.left
+    val top = t[1] - r[1] + rect.top
+    val bottom = t[1] - r[1] + rect.bottom
+    val w = b.width
+    val h = b.height
+    val gap = dp(8f)
+    var x = left + (rect.width() - w) / 2
+    x = x.coerceIn(dp(8f), (root.width - w - dp(8f)).coerceAtLeast(dp(8f)))
+    var y = top - h - gap
+    if (y < dp(8f)) y = bottom + gap
+    y = y.coerceIn(0, (root.height - h).coerceAtLeast(0))
+    b.translationX = x.toFloat()
+    b.translationY = y.toFloat()
+    b.visibility = View.VISIBLE
+  }
+
+  override fun setTitle(title: CharSequence?) { mTitle = title }
+  override fun setTitle(resId: Int) { mTitle = if (resId != 0) ctx.getString(resId) else null }
+  override fun setSubtitle(subtitle: CharSequence?) { mSubtitle = subtitle }
+  override fun setSubtitle(resId: Int) { mSubtitle = if (resId != 0) ctx.getString(resId) else null }
+  override fun setCustomView(view: View?) { mCustom = view }
+  override fun getTitle(): CharSequence? = mTitle
+  override fun getSubtitle(): CharSequence? = mSubtitle
+  override fun getCustomView(): View? = mCustom
+  override fun getMenu(): android.view.Menu = mMenu
+  override fun getMenuInflater(): android.view.MenuInflater = android.view.MenuInflater(ctx)
+
+  override fun invalidate() {
+    if (finished) return
+    callback.onPrepareActionMode(this, mMenu)
+    render()
+  }
+
+  override fun invalidateContentRect() {
+    bar?.post { place() }
+  }
+
+  override fun hide(duration: Long) {
+    val b = bar ?: return
+    if (duration == 0L) {
+      b.visibility = View.VISIBLE
+      return
+    }
+    b.visibility = View.INVISIBLE
+    val ms = if (duration == android.view.ActionMode.DEFAULT_HIDE_DURATION) 2000L else duration.coerceAtMost(3000L)
+    b.postDelayed({ if (!finished) b.visibility = View.VISIBLE }, ms)
+  }
+
+  override fun finish() {
+    if (finished) return
+    finished = true
+    bar?.let { root.removeView(it) }
+    bar = null
+    callback.onDestroyActionMode(this)
+    onFinished(this)
   }
 }
 

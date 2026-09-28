@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.9.107"
+version = "3.9.108"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -53,6 +53,15 @@ local-ip-address = "0.6"
 xcap = "0.9.6"
 enigo = "0.3.0"
 base64 = "0.22"
+# Voice (Claude Code narration to the phone, src/voice): relay socket, E2E crypto
+# (ring is already in the tree via rustls), loading the downloaded sherpa-onnx
+# engine, unpacking its .tar.bz2 releases, and MP3 for the audio sent to the phone.
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+ring = "0.17"
+libloading = "0.8"
+bzip2 = "0.6"
+tar = "0.4"
+mp3lame-encoder = "0.2"
 # Fast screen-stream pipeline: SIMD downscale + SIMD (AVX2) JPEG encode. Both are
 # pure Rust (no C/NASM build deps) so the Windows/Android builds stay turnkey.
 # `rayon` spreads the SIMD resize across all cores — the downscale was the #2
