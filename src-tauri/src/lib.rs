@@ -8,6 +8,7 @@ mod detect;
 mod embed;
 mod error;
 mod file_share;
+mod hostproc;
 mod gog;
 mod gog_auth;
 mod hltb;
@@ -65,6 +66,7 @@ fn check_for_update_once(handle: &tauri::AppHandle) {
             Err(_) => return,
         };
         if let Ok(Some(update)) = updater.check().await {
+            hostproc::mark_updating();
             if update
                 .download_and_install(|_chunk, _total| {}, || {})
                 .await
@@ -72,6 +74,7 @@ fn check_for_update_once(handle: &tauri::AppHandle) {
             {
                 handle.restart();
             }
+            hostproc::clear_updating();
         }
     });
 }
@@ -190,176 +193,10 @@ fn apply_pending_restore(data_dir: &std::path::Path, db_path: &std::path::Path) 
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    // The Voice feature's speech worker is this same exe with --tts-worker: it
-    // must branch off before Tauri (and single-instance) ever start.
-    if let Some(code) = voice::engine::maybe_run_worker() {
-        std::process::exit(code);
-    }
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            tray::show_main(app);
-        }))
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec!["--minimized"]),
-        ))
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .setup(|app| {
-            let handle = app.handle();
-            let data_dir = handle.path().app_local_data_dir()?;
-            std::fs::create_dir_all(&data_dir)?;
-            let db_path = data_dir.join("gametracker.db");
-            let media_dir = data_dir.join("media");
-
-            apply_pending_restore(&data_dir, &db_path);
-
-            let pool = db::init_pool(&db_path).map_err(|e| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-            seed_install_mode(&pool);
-
-            let shared = Arc::new(TrackingShared::new());
-            let sys_shared = Arc::new(SystemShared::new());
-
-            let remote_port = db::settings::get_i64(&pool, "remote_port", 47800)
-                .unwrap_or(47800)
-                .clamp(1024, 65535) as u16;
-            let remote_shared = Arc::new(remote::RemoteShared::new(remote_port));
-            if db::settings::get_bool(&pool, "remote_cloud_enabled").unwrap_or(false) {
-                remote_shared
-                    .cloud_enabled
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            // Restore the persisted connection code so it stays STABLE across restarts
-            // and crashes — otherwise the phone's remembered code would break every
-            // launch. Generate + persist one on first run.
-            match db::settings::get(&pool, "remote_code").ok().flatten() {
-                Some(code) if !code.is_empty() => *remote_shared.code.lock() = code,
-                _ => {
-                    let code = remote_shared.code.lock().clone();
-                    let _ = db::settings::set(&pool, "remote_code", &code);
-                }
-            }
-            // Same for the secret permanent key (code 2) — stable across restarts.
-            match db::settings::get(&pool, "remote_secret_code")
-                .ok()
-                .flatten()
-            {
-                Some(secret) if !secret.is_empty() => *remote_shared.secret.lock() = secret,
-                _ => {
-                    let secret = remote_shared.secret.lock().clone();
-                    let _ = db::settings::set(&pool, "remote_secret_code", &secret);
-                }
-            }
-
-            app.manage(AppState {
-                pool: pool.clone(),
-                shared: shared.clone(),
-                sys: sys_shared.clone(),
-                remote: remote_shared.clone(),
-                data_dir,
-                media_dir: media_dir.clone(),
-                db_path,
-            });
-
-            // If the remote server was left enabled, start it on launch.
-            if db::settings::get_bool(&pool, "remote_enabled").unwrap_or(false) {
-                remote_shared
-                    .enabled
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                remote::start(remote::ApiState {
-                    pool: pool.clone(),
-                    tracking: shared.clone(),
-                    media_dir: Arc::new(media_dir.clone()),
-                    remote: remote_shared,
-                    sys: sys_shared.clone(),
-                });
-                // Re-apply opt-in AnyDesk-style UAC handling if it was left on.
-                if db::settings::get_bool(&pool, "remote_show_uac").unwrap_or(false) {
-                    let _ = remote::uac::set_visible(true);
-                }
-            }
-
-            tray::build(handle)?;
-
-            // Keep the tray tooltip in sync with live tracking state.
-            let tip_handle = handle.clone();
-            handle.listen("tracking://state", move |event| {
-                if let Ok(st) = serde_json::from_str::<tracking::TrackingState>(event.payload()) {
-                    if let Some(tray) = tip_handle.tray_by_id(tray::TRAY_ID) {
-                        let tip = tray_tooltip(&st);
-                        let _ = tray.set_tooltip(Some(&tip));
-                    }
-                }
-            });
-
-            tracking::spawn(
-                handle.clone(),
-                pool.clone(),
-                shared,
-                sys_shared.clone(),
-                media_dir,
-            );
-
-            // Shared clipboard: start the native capture listener + floating
-            // overlay if the feature was left enabled (off by default). Runs in
-            // the setup hook (main thread) — safe to build the window here, the
-            // pump is not blocked by a command. Errors land in the diagnostics log.
-            if let Err(e) = clipboard::apply_settings(handle) {
-                clipboard::log(format!("startup apply_settings failed: {e}"));
-            }
-
-            // Keep the elevated logon task pointed at this install folder (survives
-            // reinstalls / custom install paths without requiring a Settings toggle).
-            {
-                let pool_sync = pool.clone();
-                std::thread::spawn(move || {
-                    let enabled =
-                        db::settings::get_bool(&pool_sync, "start_with_windows").unwrap_or(true);
-                    let _ = autostart::sync_from_setting(enabled);
-                });
-            }
-
-            // Voice: narrate Claude Code sessions to the phone (off by default).
-            voice::init(pool.clone(), handle.path().app_local_data_dir()?);
-
-            // Background system monitor (CPU/GPU/RAM/disk + the sensor sidecar).
-            system::spawn(pool, sys_shared, None);
-
-            // Silently check GitHub Releases for a newer signed build and install
-            // it in the background (no prompt). The app already runs elevated, so
-            // the perMachine NSIS update applies without a second UAC prompt.
-            spawn_update_check(handle.clone());
-
-            // Honor --minimized (startup launch): stay in tray.
-            let minimized = std::env::args().any(|a| a == "--minimized");
-            if minimized {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.hide();
-                }
-            }
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let app = window.app_handle();
-                let close_to_tray = app
-                    .try_state::<AppState>()
-                    .map(|s| db::settings::get_bool(&s.pool, "close_to_tray").unwrap_or(true))
-                    .unwrap_or(true);
-                if close_to_tray {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
-            }
-        })
-        .invoke_handler(tauri::generate_handler![
+/// Every command, shared by the main app and the remote-host process.
+macro_rules! app_commands {
+    () => {
+        tauri::generate_handler![
             commands::get_settings,
             commands::set_setting,
             commands::complete_onboarding,
@@ -493,6 +330,8 @@ pub fn run() {
             commands::remote_revoke,
             commands::remote_check_auth,
             commands::remote_adb_devices,
+            commands::remote_host_publish,
+            commands::remote_host_info,
             commands::voice_status,
             commands::voice_set_enabled,
             commands::voice_set_settings,
@@ -549,8 +388,201 @@ pub fn run() {
             commands::clipboard_diagnostics,
             commands::clipboard_overlay_set_pos,
             commands::speech_to_text,
-        ])
-        .build(tauri::generate_context!())
+        ]
+    };
+}
+
+/// A command that panics must not take the process down (sync commands run on
+/// the main thread, inside WebView2 callbacks): the call is dropped instead.
+fn guarded<R: tauri::Runtime>(
+    handler: impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static,
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    move |invoke| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(invoke))).unwrap_or(true)
+}
+
+pub fn run() {
+    // The Voice feature's speech worker is this same exe with --tts-worker: it
+    // must branch off before Tauri (and single-instance) ever start.
+    if let Some(code) = voice::engine::maybe_run_worker() {
+        std::process::exit(code);
+    }
+    let context = tauri::generate_context!();
+    // Remote desktop runs in its own process so a crash here can't end a session.
+    if hostproc::is_remote_host() {
+        hostproc::trace("remote-host process launched");
+        hostproc::install_panic_log("remote-host");
+        run_remote_host(context);
+        return;
+    }
+    hostproc::install_panic_log("app");
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::show_main(app);
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            let handle = app.handle();
+            let data_dir = handle.path().app_local_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let db_path = data_dir.join("gametracker.db");
+            let media_dir = data_dir.join("media");
+
+            apply_pending_restore(&data_dir, &db_path);
+
+            let pool = db::init_pool(&db_path).map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
+            seed_install_mode(&pool);
+            hostproc::main_started();
+
+            let shared = Arc::new(TrackingShared::new());
+            let sys_shared = Arc::new(SystemShared::new());
+
+            let remote_port = db::settings::get_i64(&pool, "remote_port", 47800)
+                .unwrap_or(47800)
+                .clamp(1024, 65535) as u16;
+            let remote_shared = Arc::new(remote::RemoteShared::new(remote_port));
+            if db::settings::get_bool(&pool, "remote_cloud_enabled").unwrap_or(false) {
+                remote_shared
+                    .cloud_enabled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // Restore the persisted connection code so it stays STABLE across restarts
+            // and crashes — otherwise the phone's remembered code would break every
+            // launch. Generate + persist one on first run.
+            match db::settings::get(&pool, "remote_code").ok().flatten() {
+                Some(code) if !code.is_empty() => *remote_shared.code.lock() = code,
+                _ => {
+                    let code = remote_shared.code.lock().clone();
+                    let _ = db::settings::set(&pool, "remote_code", &code);
+                }
+            }
+            // Same for the secret permanent key (code 2) — stable across restarts.
+            match db::settings::get(&pool, "remote_secret_code")
+                .ok()
+                .flatten()
+            {
+                Some(secret) if !secret.is_empty() => *remote_shared.secret.lock() = secret,
+                _ => {
+                    let secret = remote_shared.secret.lock().clone();
+                    let _ = db::settings::set(&pool, "remote_secret_code", &secret);
+                }
+            }
+
+            app.manage(AppState {
+                pool: pool.clone(),
+                shared: shared.clone(),
+                sys: sys_shared.clone(),
+                remote: remote_shared.clone(),
+                data_dir,
+                media_dir: media_dir.clone(),
+                db_path,
+            });
+
+            // If the remote server was left enabled, start it on launch.
+            if db::settings::get_bool(&pool, "remote_enabled").unwrap_or(false) {
+                remote_shared
+                    .enabled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                // The LAN server and the WebRTC host run in the remote-host
+                // process (hostproc.rs), started below.
+                // Re-apply opt-in AnyDesk-style UAC handling if it was left on.
+                if db::settings::get_bool(&pool, "remote_show_uac").unwrap_or(false) {
+                    let _ = remote::uac::set_visible(true);
+                }
+            }
+
+            tray::build(handle)?;
+
+            // Keep the tray tooltip in sync with live tracking state.
+            let tip_handle = handle.clone();
+            handle.listen("tracking://state", move |event| {
+                if let Ok(st) = serde_json::from_str::<tracking::TrackingState>(event.payload()) {
+                    if let Some(tray) = tip_handle.tray_by_id(tray::TRAY_ID) {
+                        let tip = tray_tooltip(&st);
+                        let _ = tray.set_tooltip(Some(&tip));
+                    }
+                }
+            });
+
+            tracking::spawn(
+                handle.clone(),
+                pool.clone(),
+                shared,
+                sys_shared.clone(),
+                media_dir,
+            );
+
+            // Shared clipboard: start the native capture listener + floating
+            // overlay if the feature was left enabled (off by default). Runs in
+            // the setup hook (main thread) — safe to build the window here, the
+            // pump is not blocked by a command. Errors land in the diagnostics log.
+            if let Err(e) = clipboard::apply_settings(handle) {
+                clipboard::log(format!("startup apply_settings failed: {e}"));
+            }
+
+            // Keep the elevated logon task pointed at this install folder (survives
+            // reinstalls / custom install paths without requiring a Settings toggle).
+            {
+                let pool_sync = pool.clone();
+                std::thread::spawn(move || {
+                    let enabled =
+                        db::settings::get_bool(&pool_sync, "start_with_windows").unwrap_or(true);
+                    let _ = autostart::sync_from_setting(enabled);
+                });
+            }
+
+            // Voice: narrate Claude Code sessions to the phone (off by default).
+            voice::init(pool.clone(), handle.path().app_local_data_dir()?);
+
+            // Background system monitor (CPU/GPU/RAM/disk + the sensor sidecar).
+            system::spawn(pool, sys_shared, None);
+
+            if let Some(w) = app.get_webview_window("main") {
+                hostproc::reload_on_renderer_crash(&w);
+            }
+            // Remote desktop: keep the separate host process running.
+            hostproc::trace("main app started; supervising the remote host");
+            hostproc::supervise_host();
+
+            // Silently check GitHub Releases for a newer signed build and install
+            // it in the background (no prompt). The app already runs elevated, so
+            // the perMachine NSIS update applies without a second UAC prompt.
+            spawn_update_check(handle.clone());
+
+            // Honor --minimized (startup launch): stay in tray.
+            let minimized = std::env::args().any(|a| a == "--minimized");
+            if minimized {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let close_to_tray = app
+                    .try_state::<AppState>()
+                    .map(|s| db::settings::get_bool(&s.pool, "close_to_tray").unwrap_or(true))
+                    .unwrap_or(true);
+                if close_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .invoke_handler(guarded(app_commands!()))
+        .build(context)
         .expect("error while building Tracker")
         .run(|handle, event| {
             // Flush before the process goes away (tray Quit, real window close, or
@@ -597,4 +629,113 @@ fn tray_tooltip(st: &tracking::TrackingState) -> String {
         );
     }
     format!("Tracker · {} today", fmt(st.today_active_seconds))
+}
+
+/// The remote-desktop host process (`--remote-host`, see `hostproc.rs`): the
+/// WebRTC host, capture, input and the LAN server, with nothing else — no
+/// tracker, no tray, no updater — so a crash in the main app can't end a
+/// session. Its window stays hidden except for the device-approval prompt, and
+/// it uses its own WebView2 user-data folder so it gets its own browser process.
+fn run_remote_host(mut context: tauri::Context<tauri::Wry>) {
+    if !hostproc::host_started() {
+        return; // another host already serves remote access
+    }
+    hostproc::trace("host: building");
+    // The main window from the config belongs to the main app.
+    context.config_mut().app.windows.clear();
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let handle = app.handle();
+            let data_dir = handle.path().app_local_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let db_path = data_dir.join("gametracker.db");
+            let media_dir = data_dir.join("media");
+            let pool = db::init_pool(&db_path)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            let shared = Arc::new(TrackingShared::new());
+            let sys_shared = Arc::new(SystemShared::new());
+            let remote_port = db::settings::get_i64(&pool, "remote_port", 47800)
+                .unwrap_or(47800)
+                .clamp(1024, 65535) as u16;
+            let remote_shared = Arc::new(remote::RemoteShared::new(remote_port));
+            hostproc::sync_remote_from_db(&pool, &remote_shared);
+            app.manage(AppState {
+                pool: pool.clone(),
+                shared: shared.clone(),
+                sys: sys_shared.clone(),
+                remote: remote_shared.clone(),
+                data_dir: data_dir.clone(),
+                media_dir: media_dir.clone(),
+                db_path,
+            });
+            // Follow the Remote page's settings (they're written by the main app).
+            {
+                let api = remote::ApiState {
+                    pool: pool.clone(),
+                    tracking: shared,
+                    media_dir: Arc::new(media_dir),
+                    remote: remote_shared.clone(),
+                    sys: sys_shared,
+                };
+                std::thread::Builder::new()
+                    .name("remote-host-config".into())
+                    .spawn(move || loop {
+                        hostproc::sync_remote_from_db(&api.pool, &api.remote);
+                        let on = api.remote.enabled.load(std::sync::atomic::Ordering::SeqCst);
+                        let running = api.remote.running.load(std::sync::atomic::Ordering::SeqCst);
+                        if on && !running {
+                            remote::start(api.clone());
+                        } else if !on && running {
+                            remote::stop(&api.remote);
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    })
+                    .ok();
+            }
+            // Shown only for the approval prompt; created on-screen-capable but
+            // parked and hidden. (Building it with visible(false) would mark the
+            // WebView itself hidden, and Chromium then throttles the host's timers.)
+            let window = tauri::WebviewWindowBuilder::new(
+                app,
+                "remote-host",
+                tauri::WebviewUrl::App("index.html#/remote-host".into()),
+            )
+            .title("Tracker Remote")
+            .inner_size(460.0, 600.0)
+            .resizable(false)
+            .skip_taskbar(true)
+            .focused(false)
+            .position(-32000.0, -32000.0)
+            .background_color(tauri::webview::Color(8, 9, 15, 255))
+            .data_directory(data_dir.join("EBWebView-remote"))
+            .build()?;
+            hostproc::reload_on_renderer_crash(&window);
+            let _ = window.hide();
+            hostproc::trace("host window ready");
+            hostproc::watch_main(|| {
+                let _ = remote::uac::set_visible(false);
+                std::process::exit(0);
+            });
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // The host window is never closed, only hidden again.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .invoke_handler(guarded(app_commands!()))
+        .build(context)
+        .map_err(|e| {
+            hostproc::trace(&format!("host failed to start: {e}"));
+            e
+        })
+        .expect("error while building the remote host")
+        .run(|_, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let _ = remote::uac::set_visible(false);
+            }
+        });
 }

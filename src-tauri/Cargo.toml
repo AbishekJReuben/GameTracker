@@ -1,6 +1,6 @@
 [package]
 name = "gametracker"
-version = "3.9.110"
+version = "3.9.111"
 description = "Tracker — premium play & app analytics"
 authors = ["Abishek Reuben"]
 edition = "2021"
@@ -71,6 +71,9 @@ jpeg-encoder = { version = "0.6", features = ["simd"] }
 rayon = "1"
 
 [target.'cfg(windows)'.dependencies]
+# Same version wry uses: reload a WebView whose renderer crashed or hung
+# (hostproc::reload_on_renderer_crash) instead of leaving a black window.
+webview2-com = "0.38"
 windows = { version = "0.58", features = [
   "Foundation",
   "Foundation_Collections",
@@ -119,7 +122,11 @@ vigem-client = "0.1"
 tokio-tungstenite = "0.24"
 
 [profile.release]
-panic = "abort"
+# Unwind, not abort: a panic on any background thread used to kill the whole app
+# (crash code 0xc0000409 / FAST_FAIL_FATAL_APP_EXIT) and every remote session with
+# it. Now the thread is restarted (hostproc::spawn_supervised), commands are
+# guarded, and every panic is logged to crash.log with its location.
+panic = "unwind"
 codegen-units = 1
 lto = true
 opt-level = "s"

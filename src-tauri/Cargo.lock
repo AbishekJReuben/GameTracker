@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "gametracker"
-version = "3.9.110"
+version = "3.9.111"
 dependencies = [
  "anyhow",
  "axum",
@@ -1898,6 +1898,7 @@ dependencies = [
  "url",
  "uuid",
  "vigem-client",
+ "webview2-com",
  "windows 0.58.0",
  "winreg 0.52.0",
  "xcap",

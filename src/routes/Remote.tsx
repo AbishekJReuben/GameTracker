@@ -28,13 +28,11 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { Page } from "@/components/Page";
 import { Panel } from "@/components/Panel";
 import { SectionTitle, Toggle, Skeleton } from "@/components/ui";
-import { api, RemoteStatus, RemoteGrants } from "@/lib/api";
+import { api, RemoteStatus, RemoteGrants, type RemoteHostInfo } from "@/lib/api";
 import { useDocumentVisible } from "@/lib/useVisible";
 import { DEFAULT_SIGNAL_URL, SIGNAL_PORT } from "@/lib/remoteConfig";
 import { useApp } from "@/store/app";
-import { useRemoteHost } from "@/store/remote";
 import type { HostLiveStats } from "@/lib/rtcHost";
-import { getHostStreamLog } from "@/lib/rtcHost";
 
 const RELEASES_URL = "https://github.com/AbishekJReuben/GameTracker/releases";
 
@@ -43,10 +41,11 @@ export default function RemotePage() {
   const [status, setStatus] = useState<RemoteStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [signalDraft, setSignalDraft] = useState(DEFAULT_SIGNAL_URL);
-  // The WebRTC host now runs app-wide (see RemoteHostManager) so the phone can
-  // connect no matter which page is open; we just read its live client count.
-  const cloudClients = useRemoteHost((s) => s.cloudClients);
-  const hostStats = useRemoteHost((s) => s.hostStats);
+  // The WebRTC host runs in its own process (hostproc.rs) so a crash here can't
+  // end a session; it reports its live state, which we poll while on screen.
+  const [hostInfo, setHostInfo] = useState<RemoteHostInfo | null>(null);
+  const cloudClients = hostInfo?.cloudClients ?? 0;
+  const hostStats = hostInfo?.stats ?? null;
   const [showSecret, setShowSecret] = useState(false);
   const [grants, setGrants] = useState<RemoteGrants | null>(null);
   const [usbDevices, setUsbDevices] = useState<string[]>([]);
@@ -89,6 +88,13 @@ export default function RemotePage() {
   // Poll while the page is on screen so the connected-device count stays live.
   // Remote-only installs sit on this page for good, so it must stop in the tray.
   const visible = useDocumentVisible();
+  useEffect(() => {
+    if (!visible) return;
+    const tick = () => void api.remoteHostInfo().then(setHostInfo).catch(() => {});
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [visible]);
   useEffect(() => {
     if (!visible) return;
     void refresh();
@@ -241,6 +247,7 @@ export default function RemotePage() {
                       }}
                     />
                     {status.running ? "Server running" : on ? "Starting…" : "Off"}
+                    {on && hostInfo && !hostInfo.hostRunning && <> · remote service restarting…</>}
                     {status.running && (
                       <>
                         {" · "}
@@ -602,7 +609,7 @@ function LiveSessionPanel({ stats, connected }: { stats: HostLiveStats | null; c
   const copyStreamLog = async () => {
     try {
       await navigator.clipboard.writeText(
-        [`GameTracker stream log @ ${new Date().toISOString()}`, "", getHostStreamLog()].join("\n"),
+        [`GameTracker stream log @ ${new Date().toISOString()}`, "", (await api.remoteHostInfo().catch(() => null))?.log ?? "(the remote host hasn't reported a log yet)"].join("\n"),
       );
       setLogCopied(true);
       window.setTimeout(() => setLogCopied(false), 1500);

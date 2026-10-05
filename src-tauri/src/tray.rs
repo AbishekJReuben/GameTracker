@@ -19,7 +19,10 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main(app),
             "toggle_pause" => toggle_pause(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                crate::hostproc::mark_quitting();
+                app.exit(0)
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

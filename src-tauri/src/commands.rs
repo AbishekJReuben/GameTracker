@@ -1904,13 +1904,22 @@ pub struct RemoteStatus {
 
 fn remote_snapshot(state: &State<AppState>) -> RemoteStatus {
     let r = &state.remote;
+    // The main app shows the remote-host process's server, not its own (it has none).
+    let host = if crate::hostproc::is_remote_host() { None } else { crate::hostproc::read_status() };
+    let host_lan = |k: &str| host.as_ref().and_then(|v| v.get(k).cloned());
     RemoteStatus {
         enabled: r.enabled.load(Ordering::SeqCst),
-        running: r.running.load(Ordering::SeqCst),
+        running: match host_lan("lanRunning") {
+            Some(v) => v.as_bool().unwrap_or(false),
+            None => r.running.load(Ordering::SeqCst),
+        },
         port: r.port.load(Ordering::SeqCst),
         pin: r.pin.lock().clone(),
         host: crate::remote::best_host_ip(),
-        clients: r.clients.load(Ordering::SeqCst),
+        clients: host_lan("lanClients")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or_else(|| r.clients.load(Ordering::SeqCst)),
         cloud_enabled: r.cloud_enabled.load(Ordering::SeqCst),
         signal_url: settings::get(&state.pool, "remote_signal_url")
             .ok()
@@ -1948,20 +1957,15 @@ pub fn remote_set_enabled(state: State<AppState>, enabled: bool) -> AppResult<Re
     // Cloud host runs in the desktop webview (RemoteHostManager) gated on this flag.
     state.remote.cloud_enabled.store(enabled, Ordering::SeqCst);
     if enabled {
-        state.remote.rotate_pin();
-        crate::remote::start(crate::remote::ApiState {
-            pool: state.pool.clone(),
-            tracking: state.shared.clone(),
-            media_dir: std::sync::Arc::new(state.media_dir.clone()),
-            remote: state.remote.clone(),
-            sys: state.sys.clone(),
-        });
+        let pin = state.remote.rotate_pin();
+        settings::set(&state.pool, "remote_pin", &pin)?;
+        // The LAN server itself runs in the remote-host process (hostproc.rs),
+        // which follows these settings within ~2 s.
         // Re-apply the opt-in UAC handling for this session.
         if settings::get_bool(&state.pool, "remote_show_uac").unwrap_or(false) {
             let _ = crate::remote::uac::set_visible(true);
         }
     } else {
-        crate::remote::stop(&state.remote);
         // Always restore the UAC secure desktop when remote is turned off.
         let _ = crate::remote::uac::set_visible(false);
     }
@@ -1993,7 +1997,8 @@ pub fn remote_set_show_uac(state: State<AppState>, enabled: bool) -> AppResult<R
 /// Generate a fresh pairing PIN and invalidate any devices paired with the old one.
 #[tauri::command]
 pub fn remote_regen_pin(state: State<AppState>) -> RemoteStatus {
-    state.remote.rotate_pin();
+    let pin = state.remote.rotate_pin();
+    let _ = settings::set(&state.pool, "remote_pin", &pin);
     remote_snapshot(&state)
 }
 
@@ -3230,4 +3235,28 @@ pub fn voice_set_settings(
 #[tauri::command]
 pub fn voice_test(kind: String) -> AppResult<()> {
     crate::voice::test(&kind).map_err(AppError::msg)
+}
+
+// ------------------------------------------------------- remote host process ----
+// The remote desktop runs in its own process (hostproc.rs). Its window reports
+// the live session here; the main app's Remote page reads it back.
+
+/// Host window → its live status (connected phones, stream stats, stream log).
+#[tauri::command]
+pub fn remote_host_publish(state: State<AppState>, info: serde_json::Value) {
+    crate::hostproc::write_status(info, &state.remote);
+}
+
+/// Main app: is the remote host running, and what is it doing?
+#[tauri::command]
+pub fn remote_host_info() -> serde_json::Value {
+    match crate::hostproc::read_status() {
+        Some(mut v) => {
+            if let Some(o) = v.as_object_mut() {
+                o.insert("hostRunning".into(), true.into());
+            }
+            v
+        }
+        None => serde_json::json!({ "hostRunning": crate::hostproc::host_running(), "cloudClients": 0 }),
+    }
 }

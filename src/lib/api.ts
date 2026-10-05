@@ -1026,6 +1026,15 @@ export interface LocalLauncherGame {
 
 // ---------- Command wrappers ----------
 
+/** The remote-host process (hostproc.rs) as the main app sees it. */
+export interface RemoteHostInfo {
+  hostRunning: boolean;
+  cloudClients: number;
+  stats?: import("./rtcHost").HostLiveStats | null;
+  log?: string;
+  updatedMs?: number;
+}
+
 /** Voice: Claude Code narrated to the phone (src-tauri/src/voice). */
 export interface VoiceLine {
   id: string;
@@ -1244,6 +1253,8 @@ export const api = {
     call<"secret" | "permanent" | "temporary" | "none">("remote_check_auth", { deviceId, name, secret }),
   // USB direct-install via adb.
   remoteAdbDevices: () => call<string[]>("remote_adb_devices"),
+  remoteHostInfo: () => call<RemoteHostInfo>("remote_host_info"),
+  remoteHostPublish: (info: Record<string, unknown>) => call<void>("remote_host_publish", { info }),
   voiceStatus: () => call<VoiceStatus>("voice_status"),
   voiceSetEnabled: (enabled: boolean) => call<VoiceStatus>("voice_set_enabled", { enabled }),
   voiceSetSettings: (voices: VoiceVoices, outputMaxChars: number) =>

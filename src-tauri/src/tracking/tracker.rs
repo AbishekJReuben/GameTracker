@@ -159,10 +159,10 @@ pub fn spawn(
     sys_shared: Arc<SystemShared>,
     media_dir: PathBuf,
 ) {
-    std::thread::Builder::new()
-        .name("gametracker-tracker".into())
-        .spawn(move || run_loop(app, pool, shared, sys_shared, media_dir))
-        .ok();
+    // Restarted if a tick panics, so one bad process entry can't end tracking.
+    crate::hostproc::spawn_supervised("gametracker-tracker", move || {
+        run_loop(app.clone(), pool.clone(), shared.clone(), sys_shared.clone(), media_dir.clone())
+    });
 }
 
 /// Stage 1 of the per-tick scan: list every process with its exe path only

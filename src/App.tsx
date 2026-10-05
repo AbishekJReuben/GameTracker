@@ -9,8 +9,6 @@ import { Toasts } from "./components/Toasts";
 import { ProgressDock } from "./components/ProgressDock";
 import { JukeboxEngine } from "./components/JukeboxEngine";
 import { JukeboxFloater } from "./components/JukeboxFloater";
-import { RemoteHostManager } from "./components/RemoteHostManager";
-import { RemoteApprovalModal } from "./components/RemoteApprovalModal";
 import { Onboarding } from "./components/Onboarding";
 import { SplashScreen } from "./components/SplashScreen";
 import { GameModal } from "./components/GameModal";
@@ -30,6 +28,7 @@ const GameDetail = lazyRoute(() => import("./routes/GameDetail"));
 const TimelinePage = lazyRoute(() => import("./routes/Timeline"));
 const MusicPage = lazyRoute(() => import("./routes/Music"));
 const RemotePage = lazyRoute(() => import("./routes/Remote"));
+const RemoteHostApp = lazyRoute(() => import("./components/RemoteHostApp"));
 const VoicePage = lazyRoute(() => import("./routes/Voice"));
 const CollectionPage = lazyRoute(() => import("./routes/Collection"));
 const TagsPage = lazyRoute(() => import("./routes/Tags"));
@@ -108,10 +107,8 @@ function AppShell() {
       <ProgressDock />
       <JukeboxEngine />
       <JukeboxFloater />
-      <RemoteHostManager />
       <ClipSyncEngine />
       <ShareHostManager />
-      <RemoteApprovalModal />
       <GameModal />
       <DropZone />
       {settings && !onboarded && <Onboarding />}
@@ -148,6 +145,15 @@ export default function App() {
   return (
     <Routes>
       {/* Bare, transparent floating overlay window — no app shell. */}
+      {/* The remote-host process's window (hostproc.rs): WebRTC host + approval prompt. */}
+      <Route
+        path="/remote-host"
+        element={
+          <Suspense fallback={null}>
+            <RemoteHostApp />
+          </Suspense>
+        }
+      />
       <Route
         path="/clip-overlay"
         element={

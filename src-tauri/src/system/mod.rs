@@ -323,10 +323,7 @@ fn build_specs(sys: &System, disks: &Disks, sensor: &SensorReading) -> SystemSpe
 
 pub fn spawn(pool: DbPool, shared: Arc<SystemShared>, sidecar: Option<PathBuf>) {
     sensor::spawn(shared.clone(), sidecar);
-    std::thread::Builder::new()
-        .name("gametracker-sysmon".into())
-        .spawn(move || run_loop(pool, shared))
-        .ok();
+    crate::hostproc::spawn_supervised("gametracker-sysmon", move || run_loop(pool.clone(), shared.clone()));
 }
 
 fn run_loop(pool: DbPool, shared: Arc<SystemShared>) {

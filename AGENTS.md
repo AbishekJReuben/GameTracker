@@ -1,5 +1,9 @@
 # GameTracker — Agent & Contributor Guide
 
+> Offroader shared-world addition (2026-10-02): read `signaling/OFFROADER.md` before
+> operating its separate sidecar. Its dedicated supervisor/manifest must not restart
+> the live port 8080 discovery/notes/voice service or touch its sessions/data.
+
 > A working knowledge base for any AI agent (or human) picking up this project. Read this top
 > to bottom once before touching code. It explains **what the app is, why it's built this way,
 > how every layer fits together, the conventions you must follow, and the traps that already cost
@@ -2025,3 +2029,49 @@ remembers the last. Leaving Remote closes its session. Browser + Quest keep the 
 `startActionModeForChild` with `OverlayTextActionMode` (a toolbar drawn inside the same window)
 because a bare WindowManager view otherwise returns null → no Select/Copy/Paste and no selection.
 Don't replace it with a popup window over the overlay.
+
+---
+
+## 20. Crash resilience: remote desktop in its own process (3.9.111) — do not regress
+
+**What was crashing.** Event log: `gametracker.exe` faulting in itself with `0xc0000409`,
+exception data 7 (`FAST_FAIL_FATAL_APP_EXIT`) — the release profile had `panic = "abort"`, so
+a panic on ANY background thread killed the app and every remote session with it.
+
+- **`panic = "unwind"`** in the release profile. Do not switch it back.
+- **`crash.log`** (data folder): every panic from either process, with role, version, thread
+  and `file:line` (`hostproc::install_panic_log`) — release builds are stripped, so this is the
+  only trace. Check it first when the app "just died".
+- **Commands are guarded** (`guarded(app_commands!())` in `lib.rs`): sync commands run on the
+  main thread inside WebView2 callbacks, where an unwinding panic would still abort; a panicking
+  command is dropped instead.
+- **Tracker and system monitor restart after a panic** (`hostproc::spawn_supervised`, backoff
+  2 s → 60 s, reset after 2 healthy minutes).
+- **A WebView whose renderer crashed or hung is reloaded** (`reload_on_renderer_crash`,
+  WebView2 `ProcessFailed`, `webview2-com` 0.38 = wry's version) — the black-window symptom.
+
+**Remote desktop runs in a second process** (`hostproc.rs`): the same exe with `--remote-host`,
+dispatched at the top of `run()` into `run_remote_host` (no tray, tracker, updater or
+single-instance). It owns the WebRTC host (`/remote-host` route → `RemoteHostApp` →
+`RemoteHostManager` + `RemoteApprovalModal`), capture, input and the LAN server. Rules:
+- **Its WebView has its own user-data folder** (`EBWebView-remote`) → its own browser process,
+  so a GPU/renderer crash in the main window can't reach it.
+- **The window is created visible, parked at (-32000,-32000) and then hidden.** Building it
+  with `visible(false)` makes wry call `SetIsVisible(false)` on the controller → document hidden
+  → Chromium throttles the host's timers. It's only shown (centred, on top) for the approval prompt.
+- **Mutual supervision via named mutexes** (`Local\GameTrackerMain-v1`,
+  `Local\GameTrackerRemoteHost-v1`): the main app respawns a missing host (5 s, doubling per
+  quick death up to 120 s); the host relaunches a missing main app after 8 s unless
+  `quit.flag` (tray Quit — the host exits too) or a fresh `updating.flag` (< 5 min) exists. The
+  main app deletes both flags at startup. Breakaway from Task Scheduler's job is denied; the
+  fallback plain spawn works.
+- **Config flows through the DB.** The Remote page (main app) writes settings; the host re-reads
+  `remote_enabled`, `remote_cloud_enabled`, `remote_code`, `remote_secret_code`, `remote_pin`
+  every 2 s (`sync_remote_from_db`) and starts/stops the LAN server itself. The main app never
+  starts the LAN server.
+- **Status flows through `remote-host.json`**: the host window publishes connected phones,
+  stream stats and (every 5 s) the stream log via `remote_host_publish`; the main app reads it
+  with `remote_host_info` (fresh < 10 s and host mutex held) for the Remote page.
+- `hostproc.log` traces every spawn/restart and host startup stage.
+- Verified on this PC by killing processes (elevated script): main killed → host stayed up and
+  kept publishing, relaunched main in ~18 s; host killed → respawned in ~3 s.
