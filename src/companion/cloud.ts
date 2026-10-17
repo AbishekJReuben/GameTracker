@@ -35,6 +35,7 @@ import {
   feedNativeDecoder,
   getNativeDecoderStats,
   initNativeDecoder,
+  resetNativeDecoder,
   nativeDecoderPossible,
   nativeFrameProofAvailable,nativeFeedGeneration,nativeBoundsSequence,nativeBoundsViewEpoch,nativePresentationTimestamp,
   revealNativeFrame,clearNativeTransition,
@@ -55,6 +56,7 @@ import { ClientViewSession } from './clientViewSession';
 import { parseCaptureIdentity,sameCapture,type CaptureIdentity } from '@/lib/captureView';
 import type { EpochStream } from '@/lib/epochVideo';
 import {coordinateIndependent,includesRelease} from './inputPolicy';
+import { NativeDecoderRecovery } from './nativeDecoderRecovery';
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 /** "pending" = link up, awaiting host approval; "denied" = host rejected us. */
@@ -522,11 +524,7 @@ export class CloudConn {
   private wcNativeFps = 0;
   /** Invalidate async native init/polls when a mode/session changes. */
   private wcBuildGeneration = 0;
-  /** When the native path first looked stalled (complete frames handed to
-   *  MediaCodec but zero decoded frames coming back). Drives the watchdog that
-   *  self-heals onto WebCodecs — a silent native decoder is a blank screen, and
-   *  before this the only cure was a manual reconnect. 0 = not stalling. */
-  private wcNativeStallAt = 0;
+  private readonly nativeRecovery = new NativeDecoderRecovery();
   private wcCodec = "";
   /** Coded frame size from the host's codec announce — fed into VideoDecoderConfig
    *  so Android MediaCodec allocates the right buffers up front (avoids a mid-stream
@@ -773,6 +771,7 @@ export class CloudConn {
     const layerChanged = wantLayer !== this.preferVideoLayer && this.wcNative;
     this.preferVideoLayer = wantLayer;
     if (wantNative !== this.preferNativeDecode || layerChanged) {
+      this.nativeRecovery.reset();
       this.preferNativeDecode = wantNative;
       // Flip takes effect on the next decoder build / keyframe.
       if (this.wcActive) {
@@ -920,6 +919,7 @@ export class CloudConn {
       return;
     }
     this.powerIdle = idle;
+    this.nativeRecovery.resetProgress();
     this.syncRemotePresence();
     if (idle) this.wcFlushPaceQueue(false);
     // Resuming: the decoder threw away everything that arrived while hidden, so
@@ -1569,6 +1569,7 @@ export class CloudConn {
 
   /** Reset all wc state (new session / teardown). `reprobe` re-allows opt-in. */
   private wcReset(reprobe: boolean) {
+    this.nativeRecovery.reset();
     this.nativeTransitionPending=false;
     this.wcBuildGeneration++;
     this.wcIdentity=null;this.nativeFrameViews.clear();
@@ -2421,7 +2422,7 @@ export class CloudConn {
       this.wcNativeFrames = 0;
       this.wcNativePollAt = 0;
       this.wcNativeFps = 0;
-      this.wcNativeStallAt = 0;
+      this.nativeRecovery.resetProgress();
       this.wcStartNativePoll();
       void (async () => {
         const p = await probeNativeDecoder();
@@ -2481,7 +2482,7 @@ export class CloudConn {
       this.wcNative = false;
       this.nativeTransitionPending=true;
       this.wcNativeFrames = 0;
-      this.wcNativeStallAt = 0;
+      this.nativeRecovery.resetProgress();
       this.wcStopNativePoll();
       void teardownNativeDecoder(true);
       if (this.wcActive) this.emitEvent({ event: "wc", active: true, native: false });
@@ -2591,6 +2592,28 @@ export class CloudConn {
     }
   }
 
+  /** Keep the connection, capture identity, surface kind and geometry. Only the
+   * codec/feed are replaced; old callbacks cannot acknowledge the new picture. */
+  private async wcRecoverNative() {
+    const generation = ++this.wcBuildGeneration;
+    this.wcNativeReady = false;
+    this.wcAwaitKey = true;
+    this.nativeFrameViews.clear();
+    this.wcNativeFrames = 0;
+    this.wcNativePollAt = 0;
+    this.wcNativeFps = 0;
+    const error = await resetNativeDecoder();
+    if (this.closed || generation !== this.wcBuildGeneration || !this.wcNative) return;
+    this.nativeRecovery.resetProgress();
+    if (error) {
+      void this.emitDecoderFallback('Phone decoder recovery failed — using WebCodecs', error);
+      this.wcBuildWebCodecsDecoder();
+    } else {
+      this.wcNativeReady = true;
+    }
+    this.wcRequestKeyframe();
+  }
+
   /** Last native-decoder error string we surfaced as a toast — used to dedupe
    *  the poll so a sticky `lastError` from a recovered configure attempt can't
    *  spam the "decoder error" message every tick. */
@@ -2642,14 +2665,16 @@ export class CloudConn {
     }
     this.wcNativeQueue = st.queue;
     if (st.awaitKey) this.wcRequestKeyframe();
-    // Detect initial AND mid-session stalls, but never penalize a static
-    // desktop that isn't sending new pictures. Startup gets more time for CSD.
-    if (this.wcFrames > 0 && st.frames === this.wcNativeFrames && Date.now() - this.wcLastFrameAt < 1500) {
-      const now = Date.now();
-      const budgetMs = st.csdQueued ? 3000 : 8000;
-      if (this.wcNativeStallAt === 0) this.wcNativeStallAt = now;
-      else if (now - this.wcNativeStallAt > budgetMs) {
-        this.wcNativeStallAt = 0;
+    // A releaseOutputBuffer counter is not proof that the TextureView rendered.
+    // Prefer the existing real-presentation proof, with old-APK compatibility.
+    const proof=st.rendered;
+    const recovery = this.wcNativeReady && !this.powerIdle ? this.nativeRecovery.observe({
+      now: performance.now(), fed: this.wcFrames,
+      output: proof?.version===2 ? `${proof.feedSession}:${proof.codecGeneration}:${proof.frames}` : `${st.frames}`,
+      receiving: Date.now()-this.wcLastFrameAt < 1500, csdQueued: st.csdQueued===true,
+    }) : null;
+    if (recovery?.action === 'keyframe') this.wcRequestKeyframe();
+    if (recovery?.action === 'restart' || recovery?.action === 'fallback') {
         // An HEVC stream that stalls MediaCodec (seen on the moto g57's
         // c2.qti.hevc.decoder.low_latency: 1 frame out, inputs never returned) is a
         // codec problem, not a decoder-path one: withdraw HEVC so the PC goes back to
@@ -2660,15 +2685,23 @@ export class CloudConn {
           this.wcRequestKeyframe();
           return;
         }
+        if (recovery.action === 'restart') {
+          hitchNote('native-recovery', 'MediaCodec picture stalled — restarting phone decoder', {
+            fed: recovery.fedSinceProgress, stalledMs: recovery.stalledMs, output: st.frames,
+          });
+          void this.wcRecoverNative();
+          return;
+        }
         console.warn("[remote] native decoder stopped producing frames — falling back to WebCodecs");
         hitchNote("native-stall", "MediaCodec stopped producing frames — falling back to WebCodecs", {
-          fed: this.wcFrames,
+          fed: recovery.fedSinceProgress,
           csdQueued: st.csdQueued ? 1 : 0,
           awaitKey: st.awaitKey ? 1 : 0,
         });
         void this.emitDecoderFallback(
           "Phone decoder produced no picture — using WebCodecs",
-          `MediaCodec was fed ${this.wcFrames} frame(s) but output stayed at ${st.frames} for ${Math.round(budgetMs / 1000)}s.` +
+          `MediaCodec accepted ${recovery.fedSinceProgress} bridge frame(s) without picture progress for ${Math.round(recovery.stalledMs / 1000)}s after two recovery attempts.` +
+            `\nSession bridge frames=${this.wcFrames}; codec output=${st.frames}; rendered=${proof?.frames ?? "unavailable"}.` +
             (st.error ? `\ncodec error: ${st.error}` : "") +
             `\ncodec active=${st.active} surfaceReady=${st.surfaceReady ?? "?"} ` +
             `csdQueued=${st.csdQueued ?? "?"} awaitKey=${st.awaitKey ?? "?"} ` +
@@ -2683,9 +2716,6 @@ export class CloudConn {
         this.wcBuildWebCodecsDecoder();
         this.wcRequestKeyframe();
         return;
-      }
-    } else {
-      this.wcNativeStallAt = 0;
     }
     if (st.decodeMs > 0) {
       this.wcDecMs = this.wcDecMs === 0 ? st.decodeMs : this.wcDecMs * 0.7 + st.decodeMs * 0.3;

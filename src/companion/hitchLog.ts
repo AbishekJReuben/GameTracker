@@ -16,6 +16,7 @@ export type HitchKind =
   | "audio-underrun"
   | "jb-grow"
   | "native-stall"
+  | "native-recovery"
   | "high-failed"
   | "other";
 

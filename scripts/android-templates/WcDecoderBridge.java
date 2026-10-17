@@ -131,6 +131,7 @@ public final class WcDecoderBridge {
   private static final AtomicBoolean drainPosted = new AtomicBoolean(false);
   private static final int MAX_CODEC_INPUTS = 6;
   private static volatile int configuredWidth, configuredHeight;
+  private static volatile int configuredFormatTry;
   private static volatile int codecGeneration;
   private static volatile long codecFeedSession;
   private static volatile String codecLayer="";
@@ -1092,14 +1093,18 @@ public final class WcDecoderBridge {
   }
 
   public static void reset() {
-    // Full stop+restart beats flush alone after a session gap (MediaCodec docs:
-    // flush does not handle discontinuities; first input after restart must be
-    // a keyframe — we gate that with awaitKey).
-    stopCodecLocked();
-    Activity act = activity();
-    if (act != null && width.get() > 0 && height.get() > 0 && surfaceReady.get()) {
-      act.runOnUiThread(WcDecoderBridge::startCodecLocked);
-    }
+    // Silent failures do not reach onError. Retire this codec's proof right away
+    // and rebuild on the SAME owner looper, without an intervening UI hop that
+    // could restart after teardown/new init. JS has already rotated feedSession.
+    final int generation = initGen.incrementAndGet();
+    onCodecThread(() -> {
+      if (!wanted.get() || generation != initGen.get()) return;
+      fmtSkip.updateAndGet(v -> Math.max(v, configuredFormatTry + 1));
+      jlog("silent-stall recovery fmtSkip=" + fmtSkip.get());
+      stopCodecOnThread();
+      lastStartFailAt = 0L;
+      if (surfaceReady.get()) startCodecOnThread();
+    });
   }
 
   /** Held while a remote session is live — see {@link #setStreamActive}. */
@@ -2175,7 +2180,9 @@ public final class WcDecoderBridge {
         c.setOnFrameRenderedListener((source,ptsUs,nanoTime)->{
           if(source==renderingCodec&&source==WcDecoderBridge.codec&&wanted.get()&&started.get()&&generation==initGen.get()&&renderingFeed==feedSession&&"surface".equals(renderingLayer))renderedProof.rendered(generation,renderingFeed,ptsUs,"surface");
         },codecHandler);
-        applyRuntimeLowLatency(c);
+        // The final plain-format rung must stay plain. Re-enabling LL here
+        // defeated both configure-error and silent-stall demotion on that rung.
+        if (fmt.containsKey("low-latency")) applyRuntimeLowLatency(c);
         if (!wanted.get() || generation != initGen.get()) {
           c.release();
           return;
@@ -2195,6 +2202,7 @@ public final class WcDecoderBridge {
         configuredWidth = w;
         configuredHeight = h;
         configuredMime = m;
+        configuredFormatTry = i;
         codecGeneration = generation;codecFeedSession=renderingFeed;codecLayer=renderingLayer;renderedProof.beginCodec(generation,renderingFeed);
         c.start();
         started.set(true);
@@ -2341,7 +2349,7 @@ public final class WcDecoderBridge {
           // one rung further down the format ladder (see fmtSkip). Without
           // this the bridge kept feeding a Released codec forever.
           started.set(false);
-          fmtSkip.incrementAndGet();
+          fmtSkip.updateAndGet(v -> Math.max(v, configuredFormatTry + 1));
           int n = errorRestarts.incrementAndGet();
           if (n > ERROR_RESTART_MAX) {
             jlog("codec error-restart budget exhausted (" + ERROR_RESTART_MAX + ") — stopping (JS watchdog will fall back)");

@@ -7,6 +7,7 @@ vi.mock("./nativeDecoder", () => ({
   nativeDecoderPossible: vi.fn(() => false), nativeFeedReady: vi.fn(() => true),
   probeNativeDecoder: vi.fn(), initNativeDecoder: vi.fn().mockResolvedValue(null),
   teardownNativeDecoder: vi.fn().mockResolvedValue(undefined),
+  resetNativeDecoder: vi.fn().mockResolvedValue(null),
   setStreamPowerActive: vi.fn().mockResolvedValue(undefined),
   dumpNativeDecoderDiag: vi.fn().mockResolvedValue(""),
   getNativeDecoderStats: vi.fn(), feedNativeDecoder: vi.fn(() => true),
@@ -30,7 +31,8 @@ type Internals = {
   wcMeta: Map<number, unknown>; wcAwaitKey: boolean; wcFrameCb: (f: VideoFrame) => void;
   wcPlayQ: { frame: VideoFrame; showAt: number }[];
   wcNative: boolean; wcActive: boolean; wcNativeFrames: number; wcNativePollAt: number;
-  wcFrames: number; wcLastFrameAt: number; wcNativeStallAt: number;
+  wcFrames: number; wcLastFrameAt: number;
+  wcNativeReady: boolean;
   powerIdle: boolean;
 };
 let conn: CloudConn;
@@ -54,6 +56,59 @@ beforeEach(() => {
 afterEach(() => { conn.close(); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
 describe("phone decoder lifecycle (no visual testing)", () => {
+  it("recovers a silent mid-session native stall before abandoning the phone decoder", async () => {
+    c.wcNative = true; c.wcNativeReady = true; c.wcActive = true; c.wcFrames = 48256;
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue({
+      frames: 3990, queue: 0, decodeMs: 13.2, active: true, width: 2160, height: 1214,
+      error: "", surfaceReady: true, csdQueued: true, awaitKey: false,
+    });
+    for (let i = 0; i < 15; i++) {
+      c.wcFrames++; c.wcLastFrameAt = Date.now();
+      await c.wcPollNativeStats(); await vi.advanceTimersByTimeAsync(250);
+    }
+    expect(native.resetNativeDecoder).toHaveBeenCalledOnce();
+    expect(c.wcNative).toBe(true);
+    expect(Decoder.all).toHaveLength(0);
+  });
+  it('uses actual surface presentation when codec releases buffers but the TextureView freezes', async () => {
+    c.wcNative = true; c.wcNativeReady = true; c.wcActive = true;
+    const rendered={version:2,feedSession:4,codecGeneration:7,ptsUs:100,frames:3990,boundsSequence:8,layer:'texture' as const};
+    for (let i = 0; i < 15; i++) {
+      vi.mocked(native.getNativeDecoderStats).mockResolvedValue({ rendered, frames: 3990+i, queue: 0, decodeMs: 13.2,
+        active: true, width: 2160, height: 1214, error: '', csdQueued: true });
+      c.wcFrames++; c.wcLastFrameAt = Date.now();
+      await c.wcPollNativeStats(); await vi.advanceTimersByTimeAsync(250);
+    }
+    expect(native.resetNativeDecoder).toHaveBeenCalledOnce();
+    expect(c.wcNative).toBe(true);
+  });
+
+  it('falls back after two native recovery attempts when pictures never resume', async () => {
+    c.wcNative = true; c.wcNativeReady = true; c.wcActive = true;
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue({ frames:3990,queue:0,decodeMs:13.2,active:true,
+      width:2160,height:1214,error:'',surfaceReady:true,csdQueued:true });
+    for (let i=0;i<45;i++) {
+      c.wcFrames++;c.wcLastFrameAt=Date.now();
+      await c.wcPollNativeStats();await vi.advanceTimersByTimeAsync(250);
+    }
+    expect(native.resetNativeDecoder).toHaveBeenCalledTimes(2);
+    expect(c.wcNative).toBe(false);expect(Decoder.all).toHaveLength(1);
+    expect(native.teardownNativeDecoder).toHaveBeenCalledWith(true);
+  });
+
+  it('cannot revive native decoding when recovery completes after teardown', async () => {
+    c.wcNative = true;c.wcNativeReady = true;c.wcActive = true;
+    let resolve!: (value:null)=>void;
+    vi.mocked(native.resetNativeDecoder).mockReturnValue(new Promise(r=>{resolve=r;}));
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue({frames:3990,queue:0,decodeMs:13.2,active:true,
+      width:2160,height:1214,error:'',csdQueued:true});
+    for(let i=0;i<15;i++){
+      c.wcFrames++;c.wcLastFrameAt=Date.now();await c.wcPollNativeStats();await vi.advanceTimersByTimeAsync(250);
+    }
+    expect(native.resetNativeDecoder).toHaveBeenCalledOnce();c.wcReset(false);resolve(null);
+    await Promise.resolve();await Promise.resolve();
+    expect(c.wcNative).toBe(false);expect(c.wcNativeReady).toBe(false);
+  });
   it('reveals actual native resized frames on the old-host compatibility path without inventing an epoch acknowledgment',async()=>{
     c.wcNative=true;c.wcActive=true;vi.mocked(native.nativeBoundsSequence).mockReturnValue(8);vi.mocked(native.nativeFeedGeneration).mockReturnValue(4);
     const rendered={version:2,feedSession:4,codecGeneration:7,ptsUs:100,frames:1,boundsSequence:8,visiblePtsUs:0,visibleBoundsSequence:0,layer:'texture' as const};

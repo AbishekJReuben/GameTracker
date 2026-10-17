@@ -90,12 +90,17 @@ function lifecycleInvoke(cmd: string, args?: Record<string, unknown>,retainPictu
   const epoch=lifecycleEpoch,finalStop=cmd==='decoder_teardown'&&!retainPicture;
   if(finalStop)clearNativeTransition();
   const next = lifecycle.then(async() => {
-    if(cmd==='decoder_init'&&epoch!==lifecycleEpoch)throw new Error('Retired decoder initialization');
-    if (cmd === "decoder_init" || cmd === "decoder_teardown") {
-      if((cmd==='decoder_init'||retainPicture)&&window.__GT_DECODER__?.frameProofVersion?.()===2&&window.__GT_DECODER__?.prepareTransition?.()===false)throw new Error('Unable to retain the last native picture for this view transition');
+    if((cmd==='decoder_init'||cmd==='decoder_reset')&&epoch!==lifecycleEpoch)throw new Error('Retired decoder initialization');
+    if (cmd === "decoder_init" || cmd === "decoder_reset" || cmd === "decoder_teardown") {
+      if((cmd==='decoder_init'||cmd==='decoder_reset'||retainPicture)&&window.__GT_DECODER__?.frameProofVersion?.()===2){
+        // A wedged/tiny TextureView can refuse getBitmap. That must never stop
+        // recovery or leave the native layer covering the fallback canvas.
+        let retained=false;
+        try{retained=window.__GT_DECODER__?.prepareTransition?.()!==false;}catch{/* broken surface */}
+        if(!retained&&cmd==='decoder_init')throw new Error('Unable to retain the last native picture for this view transition');
+      }
       // Java forgets its desired rect on init; make the next bounds call go out.
-      lastBounds = null;
-      boundsViewEpoch=0;
+      if(cmd!=='decoder_reset'){lastBounds = null;boundsViewEpoch=0;}
       nativeFeedSession = (nativeFeedSession + 1) >>> 0;
       binaryPendingKeys.length = 0;
       binaryInFlight = 0;
@@ -205,12 +210,13 @@ export async function setNativeDecoderBounds(opts: {
   }
 }
 
-export async function resetNativeDecoder(): Promise<void> {
-  if (!nativeDecoderPossible()) return;
+export async function resetNativeDecoder(): Promise<string | null> {
+  if (!nativeDecoderPossible()) return "not Tauri/companion";
   try {
     await lifecycleInvoke("decoder_reset");
-  } catch {
-    /* ignore */
+    return null;
+  } catch (error) {
+    return String(error).slice(0,2000);
   }
 }
 

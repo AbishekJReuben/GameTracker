@@ -80,11 +80,22 @@ describe("binary native decoder feed", () => {
 });
 
 describe("native surface bounds", () => {
+  it('recovery rotates feed identity, preserves geometry and survives snapshot failure',async()=>{
+    const invoke=vi.fn().mockResolvedValue(undefined);vi.doMock('@tauri-apps/api/core',()=>({invoke}));vi.doMock('@/lib/tauri',()=>({isTauri:()=>true}));(window as any).__GT_COMPANION__=true;
+    const begin=vi.fn();window.__GT_DECODER__={feed:vi.fn(),beginFeed:begin,frameProofVersion:()=>2,prepareTransition:()=>{throw new Error('surface unavailable');}};
+    try{
+      const decoder=await import('./nativeDecoder');const bounds={x:10,y:20,w:300,h:200,visible:true,viewEpoch:4};
+      await decoder.setNativeDecoderBounds(bounds);const before=decoder.nativeFeedGeneration(),seq=decoder.nativeBoundsSequence();
+      expect(await decoder.resetNativeDecoder()).toBeNull();expect(decoder.nativeFeedGeneration()).toBe(before+1);
+      expect(begin).toHaveBeenCalledExactlyOnceWith(before+1);expect(decoder.nativeBoundsSequence()).toBe(seq);expect(decoder.nativeBoundsViewEpoch()).toBe(4);
+      await decoder.setNativeDecoderBounds(bounds);expect(invoke.mock.calls.map(call=>call[0])).toEqual(['decoder_set_bounds','decoder_reset']);
+    }finally{delete (window as any).__GT_COMPANION__;vi.doUnmock('@tauri-apps/api/core');vi.doUnmock('@/lib/tauri');}
+  });
   it('final stop invalidates queued init and always tears down even if a transition snapshot fails',async()=>{
     const invoke=vi.fn().mockResolvedValue(undefined);vi.doMock('@tauri-apps/api/core',()=>({invoke}));vi.doMock('@/lib/tauri',()=>({isTauri:()=>true}));(window as any).__GT_COMPANION__=true;
     const prepare=vi.fn(()=>false),clear=vi.fn();window.__GT_DECODER__={feed:vi.fn(),frameProofVersion:()=>2,prepareTransition:prepare,clearTransition:clear};
     try{const decoder=await import('./nativeDecoder');const init=decoder.initNativeDecoder(1920,1080);const stop=decoder.teardownNativeDecoder();expect(await init).toContain('Retired');await stop;expect(prepare).not.toHaveBeenCalled();expect(invoke.mock.calls.map(c=>c[0])).toEqual(['decoder_teardown']);expect(clear).toHaveBeenCalledTimes(2);
-      await decoder.teardownNativeDecoder(true);expect(prepare).toHaveBeenCalledOnce();expect(invoke).toHaveBeenCalledOnce();await decoder.teardownNativeDecoder();expect(invoke).toHaveBeenCalledTimes(2);
+      await decoder.teardownNativeDecoder(true);expect(prepare).toHaveBeenCalledOnce();expect(invoke).toHaveBeenCalledTimes(2);await decoder.teardownNativeDecoder();expect(invoke).toHaveBeenCalledTimes(3);
     }finally{delete (window as any).__GT_COMPANION__;}
   });
   it("drops identical rects and resends after a decoder (re)init", async () => {
