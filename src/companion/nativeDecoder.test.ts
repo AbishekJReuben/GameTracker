@@ -80,6 +80,13 @@ describe("binary native decoder feed", () => {
 });
 
 describe("native surface bounds", () => {
+  it('final stop invalidates queued init and always tears down even if a transition snapshot fails',async()=>{
+    const invoke=vi.fn().mockResolvedValue(undefined);vi.doMock('@tauri-apps/api/core',()=>({invoke}));vi.doMock('@/lib/tauri',()=>({isTauri:()=>true}));(window as any).__GT_COMPANION__=true;
+    const prepare=vi.fn(()=>false),clear=vi.fn();window.__GT_DECODER__={feed:vi.fn(),frameProofVersion:()=>2,prepareTransition:prepare,clearTransition:clear};
+    try{const decoder=await import('./nativeDecoder');const init=decoder.initNativeDecoder(1920,1080);const stop=decoder.teardownNativeDecoder();expect(await init).toContain('Retired');await stop;expect(prepare).not.toHaveBeenCalled();expect(invoke.mock.calls.map(c=>c[0])).toEqual(['decoder_teardown']);expect(clear).toHaveBeenCalledTimes(2);
+      await decoder.teardownNativeDecoder(true);expect(prepare).toHaveBeenCalledOnce();expect(invoke).toHaveBeenCalledOnce();await decoder.teardownNativeDecoder();expect(invoke).toHaveBeenCalledTimes(2);
+    }finally{delete (window as any).__GT_COMPANION__;}
+  });
   it("drops identical rects and resends after a decoder (re)init", async () => {
     const invoke = vi.fn().mockResolvedValue(undefined);
     vi.doMock("@tauri-apps/api/core", () => ({ invoke }));

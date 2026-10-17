@@ -1,0 +1,267 @@
+{
+  "recordedUtc": "2026-10-17T09:55:14.7432703Z",
+  "version": "3.9.112",
+  "path": "H:\\Works\\ChilloutGames\\2026\\May\\GameTracker\\.logs\\release-web-v3.9.112",
+  "files": [
+    {
+      "path": "app-icon.png",
+      "bytes": 76144,
+      "sha256": "9199c2c3a860c4fe2a8fe0a2382fe5ecd83410984de75592e987a219e7fecdf8"
+    },
+    {
+      "path": "assets\\activity-Ph6CYrUE.js",
+      "bytes": 235,
+      "sha256": "659a330b2d20597b719e3b78ab8aa3eab4f50c8da0c8a15c787251445fb05ccd"
+    },
+    {
+      "path": "assets\\AreaChart-BMhtDB8M.js",
+      "bytes": 339999,
+      "sha256": "51be988d43cdf2560c57175582b87a8a09a6be2eae9f94b46f7ff1d92710115d"
+    },
+    {
+      "path": "assets\\audioFeeder.worklet-CWU2KWYl.js",
+      "bytes": 18761,
+      "sha256": "d4cd3d7db14859142739eaf30cd59c7a42435cf1ddbb10d8a29e2735fb7b9d07"
+    },
+    {
+      "path": "assets\\carrier.worker-B-_-CE2d.js",
+      "bytes": 2048,
+      "sha256": "6886c028dc283742efe04532917befab8c661420f670638a5b19bc87f3af4593"
+    },
+    {
+      "path": "assets\\Charts-BqXhq5Yp.js",
+      "bytes": 4377,
+      "sha256": "f64a59c33cb2eeeb84d94d2b763c1c20066dd08bc7c426ff5ab0bdf105233587"
+    },
+    {
+      "path": "assets\\Clipboard-DGTZD7Cj.js",
+      "bytes": 60948,
+      "sha256": "705650d8afb029ceedfc050383307f6fbf68fd0f437a68b32f2ccb93c35e79f3"
+    },
+    {
+      "path": "assets\\clsx-B-dksMZM.js",
+      "bytes": 374,
+      "sha256": "c7b843bc2bba461110e5ddf916d9c40180a383804ce73658730ec46e5196d2fd"
+    },
+    {
+      "path": "assets\\cn-SWYxlXfx.js",
+      "bytes": 27217,
+      "sha256": "6b40032bebbe53e0ce334a841390f8f16c2707dc50fcf3dce2bf58da68da2653"
+    },
+    {
+      "path": "assets\\Collections-DQqWFrBV.js",
+      "bytes": 71978,
+      "sha256": "a1e109a063009a7cd144fd49f42fbe1ad5214892ca1f71821293515bf7c2fef0"
+    },
+    {
+      "path": "assets\\companion-D72SOO48.js",
+      "bytes": 226,
+      "sha256": "9fead101e481df1d618b11c6ebcf3b728e0aca27d0b9c7a288f14feeabd46d89"
+    },
+    {
+      "path": "assets\\CompanionApp-DthaCkqi.js",
+      "bytes": 400945,
+      "sha256": "9248e4e7355b0855141ccf2c06a74227184e918dfeaae2feb811c1658ba2e5aa"
+    },
+    {
+      "path": "assets\\Dashboard-CVJn05Sq.js",
+      "bytes": 19443,
+      "sha256": "bfa53572c1bf6617118aee5c41b23877705798f2e4e64517d0265cb97d14b2ee"
+    },
+    {
+      "path": "assets\\ErrorBarContext-BRcaq55c.js",
+      "bytes": 10969,
+      "sha256": "f4882196bb521d29e5881c03658e8e847355f8472159509979e1301dfc9495ca"
+    },
+    {
+      "path": "assets\\event-CnKP_Ub-.js",
+      "bytes": 1096,
+      "sha256": "244aa3f203dc171eae80f7ea8ba5fc472594705821274a78ef60c4d9ff0787f6"
+    },
+    {
+      "path": "assets\\flame-C3Qx6uG1.js",
+      "bytes": 195,
+      "sha256": "f19e693cd97d1228133f65ad92e660fe84caee6af6410df7d2476539dbe4c6a4"
+    },
+    {
+      "path": "assets\\GameDetail-CvbYJEX1.js",
+      "bytes": 32315,
+      "sha256": "f25adb2a0f3df23f170e0b8f09f5536511b45a0eeb641aebaa58a03f9e9163e1"
+    },
+    {
+      "path": "assets\\Heatmap-38UTTAhz.js",
+      "bytes": 4158,
+      "sha256": "caa97faa2749d765beaf1716116a090641c9f510c94a3f83f0fdd285862c6e89"
+    },
+    {
+      "path": "assets\\history-UpMBlk-H.js",
+      "bytes": 238,
+      "sha256": "624c890dd74d46e3a02a7c3d91ea159a223a556c59b143cc400c9ffed5258959"
+    },
+    {
+      "path": "assets\\index-3N34GBA8.css",
+      "bytes": 173576,
+      "sha256": "38349f91459b292c2d77783bbbcb5833324b8ba81c82f75212800ca974ab918f"
+    },
+    {
+      "path": "assets\\index-HY3QpStL.js",
+      "bytes": 330947,
+      "sha256": "286c4aaee259a3675725c4d18e407d3b758f4c6dfa380584005cd4da8a145a17"
+    },
+    {
+      "path": "assets\\layers-DeEqxphg.js",
+      "bytes": 422,
+      "sha256": "30e8b646279cc83955b07f0ce42d198cc7a77bb0fff50e155c0323be140ad423"
+    },
+    {
+      "path": "assets\\Library-CMZmdWUq.js",
+      "bytes": 5510,
+      "sha256": "df63b4ae74ab1ce2cbcc1936ea20b2d1a65a4511c2b4709f59a03410ed78c62a"
+    },
+    {
+      "path": "assets\\Marquee-ChnFMDDT.js",
+      "bytes": 23781,
+      "sha256": "a67e7c68b7380ada5e65481c14ae4c9456a141c9e5065218dd6d4175e261a149"
+    },
+    {
+      "path": "assets\\mic-BfIgpgqP.js",
+      "bytes": 231,
+      "sha256": "5063ef85d797de3f5207633214b1c3f66bf2bffcdf5825f8d3faf87dec481468"
+    },
+    {
+      "path": "assets\\mock-W2HqjTMP.js",
+      "bytes": 27441,
+      "sha256": "234521fcffbfbdf47caf7349e3e2831d8426a5f455791ddd041f4a4cf0ab2f5a"
+    },
+    {
+      "path": "assets\\music-2-DOsjgc3i.js",
+      "bytes": 166,
+      "sha256": "b7dc7761ceff2ae82de781d342320d86f4941f35940b7fae72fe7fd22f684c83"
+    },
+    {
+      "path": "assets\\MusicView-D-a8splO.js",
+      "bytes": 19281,
+      "sha256": "1874833e1991e6725a76510ff276a58681f83ad823be240084afc8936837499d"
+    },
+    {
+      "path": "assets\\pencil-CPk6f65L.js",
+      "bytes": 277,
+      "sha256": "50a5821c7ed1eae8dfc596acd8521d28d1d4bcb114b359aefc9921acd9f398c1"
+    },
+    {
+      "path": "assets\\play-DcCgnEr1.js",
+      "bytes": 191,
+      "sha256": "720320a90e57f81b2553aafb14cb6767e25af5e6344fdaedf83c27878036e41c"
+    },
+    {
+      "path": "assets\\quest-DBbSU3aD.js",
+      "bytes": 19170,
+      "sha256": "5e4c0ee59c76561681b55f447bc58f6b0841903bdfa0054c05e3c9dc35b291d6"
+    },
+    {
+      "path": "assets\\RadialGauge-TaVafaS4.js",
+      "bytes": 1935,
+      "sha256": "bee88bc6ca4d1e26fc9598c2ab336bdbdcff7dc548c370d2cd5f6da85f9d4480"
+    },
+    {
+      "path": "assets\\radio-CdzHRrE7.js",
+      "bytes": 375,
+      "sha256": "bd1c81fee126af172fc478db3530a96a5aacfca935910cd26c12bd6e31d2ed3c"
+    },
+    {
+      "path": "assets\\search-CTxE69Bt.js",
+      "bytes": 170,
+      "sha256": "77b2f7c88b554ce671d8e44e7a822747f5595023b26bcfdb611d5f94b6a133c4"
+    },
+    {
+      "path": "assets\\Settings-DDJqvPlS.js",
+      "bytes": 9210,
+      "sha256": "d410a61b7c4a83fb2719250cc81cc7504c520a98fed6badac083468eb9844fbb"
+    },
+    {
+      "path": "assets\\share-CejjAgbQ.js",
+      "bytes": 41617,
+      "sha256": "400068482148b1b7b18d2a30f6f46277d874011020a2e785fb49885fc79ac439"
+    },
+    {
+      "path": "assets\\star-DierKegj.js",
+      "bytes": 473,
+      "sha256": "5f82b813317ba5edd729e075f39d6bd1b0f85e19d3da6ede62c39b8e6d677d15"
+    },
+    {
+      "path": "assets\\System-BC3s4MMa.js",
+      "bytes": 25798,
+      "sha256": "51c844d58519728697a956db611f2bc0c42a4d8ed0c0c7b5193cece49a90f180"
+    },
+    {
+      "path": "assets\\tag-4irvO_gI.js",
+      "bytes": 322,
+      "sha256": "b445f29bd1e3c5fd9b3b4fee3bbb0321128e7a07a685145eb1e687de04f7927b"
+    },
+    {
+      "path": "assets\\Timeline-BNFw_59l.js",
+      "bytes": 5974,
+      "sha256": "1be5002d30006feeaecd098bcb51d7e13995fc97e6457cd3e0c751b7e31878cf"
+    },
+    {
+      "path": "assets\\timer-UTpDBtIR.js",
+      "bytes": 239,
+      "sha256": "0c85dab99c816f858e842e7a5184dc6f3269b4236c2b34841b7896c1b56d3b27"
+    },
+    {
+      "path": "assets\\use-spring-ZCTqPe0Z.js",
+      "bytes": 2130,
+      "sha256": "f9224e394db7f4a98f06ece564f8ce012d7b7554fc3d75c2f82b1fc379f09cf9"
+    },
+    {
+      "path": "assets\\useRemote-L7g3fj4-.js",
+      "bytes": 531,
+      "sha256": "25dcb6c4ffd585631bd29b96677fd3c4104e825498ccc7c9c62caed48e0fa01c"
+    },
+    {
+      "path": "assets\\Voice-Bi6ZoCst.js",
+      "bytes": 7637,
+      "sha256": "be4518a90095782ca485140d7936b5245f8b78e99782ca5ad6f8e483618edc6d"
+    },
+    {
+      "path": "assets\\zap-DA0czpuu.js",
+      "bytes": 263,
+      "sha256": "34075548434d8bece38dd56b682719653405eb9cd6006332873c366f599bc2bc"
+    },
+    {
+      "path": "companion.html",
+      "bytes": 1494,
+      "sha256": "aa22c2df64bd195bbc32f5bddf13f8be7bbd6e1721a4753cef57903ccb754488"
+    },
+    {
+      "path": "frame-gate.js",
+      "bytes": 1485,
+      "sha256": "7af4649c2e5c5d52290cc1dc66716891da84de8471a87c1220014935b72c7589"
+    },
+    {
+      "path": "lottie\\idle-sparkle.json",
+      "bytes": 16444,
+      "sha256": "369b51be6dfd2c52e16c7f3b89fe2b178c720a1a9a74dfc28e49435df700f814"
+    },
+    {
+      "path": "lottie\\loading-dots.json",
+      "bytes": 33301,
+      "sha256": "285eeae61191ff72fa6db2ae5e0ea7871efce62c4108c1ef96d870488d6de90f"
+    },
+    {
+      "path": "quest-manifest.webmanifest",
+      "bytes": 373,
+      "sha256": "2e3f5b971fb77316824c46789421e2c18b87cb1c18e97ac268628bbe8beefa40"
+    },
+    {
+      "path": "quest.html",
+      "bytes": 1537,
+      "sha256": "d20504468d15c59c7d76d11e4ccef8b859df1446ffbc11e5c4516c3d3a22771c"
+    },
+    {
+      "path": "share.html",
+      "bytes": 1082,
+      "sha256": "0bd91c75e7c842476e46360d8e94470e53dded9a1398b216bc66093a5741a999"
+    }
+  ]
+}

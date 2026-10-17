@@ -10,6 +10,7 @@ vi.mock("./nativeDecoder", () => ({
   setStreamPowerActive: vi.fn().mockResolvedValue(undefined),
   dumpNativeDecoderDiag: vi.fn().mockResolvedValue(""),
   getNativeDecoderStats: vi.fn(), feedNativeDecoder: vi.fn(() => true),
+  nativeFrameProofAvailable:vi.fn(()=>true),nativeFeedGeneration:vi.fn(()=>0),nativeBoundsSequence:vi.fn(()=>0),nativeBoundsViewEpoch:vi.fn(()=>0),nativePresentationTimestamp:vi.fn(()=>1),revealNativeFrame:vi.fn(),clearNativeTransition:vi.fn(),
 }));
 
 class Decoder {
@@ -53,6 +54,12 @@ beforeEach(() => {
 afterEach(() => { conn.close(); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
 describe("phone decoder lifecycle (no visual testing)", () => {
+  it('reveals actual native resized frames on the old-host compatibility path without inventing an epoch acknowledgment',async()=>{
+    c.wcNative=true;c.wcActive=true;vi.mocked(native.nativeBoundsSequence).mockReturnValue(8);vi.mocked(native.nativeFeedGeneration).mockReturnValue(4);
+    const rendered={version:2,feedSession:4,codecGeneration:7,ptsUs:100,frames:1,boundsSequence:8,visiblePtsUs:0,visibleBoundsSequence:0,layer:'texture' as const};
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue({rendered,frames:1,queue:0,decodeMs:1,active:true,width:1920,height:1080,error:''});await c.wcPollNativeStats();expect(native.revealNativeFrame).toHaveBeenCalledExactlyOnceWith(rendered);
+    vi.mocked(native.nativeBoundsSequence).mockReturnValue(0);vi.mocked(native.nativeFeedGeneration).mockReturnValue(0);
+  });
   it("caps hidden hardware work even when decodeQueueSize remains zero, then waits for IDR", () => {
     c.wcBuildWebCodecsDecoder();
     feed(true);

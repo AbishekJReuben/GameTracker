@@ -131,7 +131,10 @@ public final class WcDecoderBridge {
   private static final AtomicBoolean drainPosted = new AtomicBoolean(false);
   private static final int MAX_CODEC_INPUTS = 6;
   private static volatile int configuredWidth, configuredHeight;
-  private static int codecGeneration;
+  private static volatile int codecGeneration;
+  private static volatile long codecFeedSession;
+  private static volatile String codecLayer="";
+  private static final RenderedFrameProof renderedProof=new RenderedFrameProof();
   private static final AtomicBoolean started = new AtomicBoolean(false);
   private static final AtomicBoolean surfaceReady = new AtomicBoolean(false);
   /**
@@ -165,6 +168,71 @@ public final class WcDecoderBridge {
   private static WeakReference<WebView> hookedWebView;
   private static volatile boolean binaryDisabled = false;
   private static volatile long feedSession = 0;
+  // One bounded retained picture, never another decoder. It covers a native
+  // surface while codec/view geometry changes, and also a native -> RTC/WC handoff.
+  private static android.widget.ImageView transitionCover;
+  private static android.graphics.Bitmap transitionBitmap;
+  private static final TransitionOwnership transitionOwnership=new TransitionOwnership();
+  private static volatile String revealPending="";
+
+  private static void clearTransitionOnUi(){
+    android.widget.ImageView old=transitionCover;android.graphics.Bitmap bitmap=transitionBitmap;
+    transitionCover=null;transitionBitmap=null;
+    if(old!=null){old.setImageDrawable(null);if(old.getParent() instanceof ViewGroup)((ViewGroup)old.getParent()).removeView(old);}
+    if(bitmap!=null&&!bitmap.isRecycled()){View root=old!=null?old:videoView();if(root!=null)root.postOnAnimation(bitmap::recycle);else bitmap.recycle();}
+  }
+  private static void raiseTransition(){
+    View target=videoView();android.widget.ImageView cover=transitionCover;
+    if(target==null||cover==null||!(target.getParent() instanceof ViewGroup))return;
+    ViewGroup parent=(ViewGroup)target.getParent();if(cover.getParent() instanceof ViewGroup)((ViewGroup)cover.getParent()).removeView(cover);
+    parent.addView(cover,Math.min(parent.getChildCount(),parent.indexOfChild(target)+1),cover.getLayoutParams());
+  }
+  private static boolean prepareTransition(){
+    Activity act=activity();if(act==null)return false;
+    final long ticket=transitionOwnership.begin();if(ticket==0)return false;final CountDownLatch done=new CountDownLatch(1);final AtomicBoolean okay=new AtomicBoolean(false);
+    act.runOnUiThread(()->{
+      if(!transitionOwnership.current(ticket)){transitionOwnership.complete(ticket);done.countDown();return;}
+      View view=videoView();
+      if(transitionCover!=null||view==null||!started.get()||!renderedProof.hasFrame()){okay.set(true);transitionOwnership.complete(ticket);done.countDown();return;}
+      if(view.getWidth()<1||view.getHeight()<1||!(view.getParent() instanceof ViewGroup)){transitionOwnership.complete(ticket);done.countDown();return;}
+      // A bounded 4 Mi-pixel maximum, allocated once per pending transaction.
+      double scale=Math.min(1.0,Math.sqrt(4194304.0/((double)view.getWidth()*view.getHeight())));
+      final android.graphics.Bitmap bitmap;
+      try{bitmap=android.graphics.Bitmap.createBitmap(Math.max(1,(int)(view.getWidth()*scale)),Math.max(1,(int)(view.getHeight()*scale)),android.graphics.Bitmap.Config.ARGB_8888);}catch(Throwable error){transitionOwnership.complete(ticket);done.countDown();return;}
+      java.util.function.Consumer<Boolean> finish=success->{
+        if(success&&transitionOwnership.current(ticket)&&view==videoView()&&transitionCover==null){
+          android.widget.ImageView image=new android.widget.ImageView(act);image.setScaleType(android.widget.ImageView.ScaleType.FIT_XY);image.setImageBitmap(bitmap);image.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);image.setClickable(false);image.setFocusable(false);
+          FrameLayout.LayoutParams lp=new FrameLayout.LayoutParams(view.getWidth(),view.getHeight());lp.leftMargin=view.getLeft();lp.topMargin=view.getTop();lp.gravity=Gravity.TOP|Gravity.START;
+          transitionBitmap=bitmap;transitionCover=image;((ViewGroup)view.getParent()).addView(image,((ViewGroup)view.getParent()).indexOfChild(view)+1,lp);okay.set(true);
+        }else bitmap.recycle();transitionOwnership.complete(ticket);done.countDown();
+      };
+      try{
+        if(view instanceof TextureView){android.graphics.Bitmap copied=((TextureView)view).isAvailable()?((TextureView)view).getBitmap(bitmap):null;finish.accept(copied!=null);}
+        else if(view instanceof SurfaceView&&Build.VERSION.SDK_INT>=24)android.view.PixelCopy.request((SurfaceView)view,bitmap,result->finish.accept(result==android.view.PixelCopy.SUCCESS),new Handler(android.os.Looper.getMainLooper()));
+        else finish.accept(false);
+      }catch(Throwable error){finish.accept(false);}
+    });
+    try{if(!done.await(450,TimeUnit.MILLISECONDS)){transitionOwnership.invalidate(ticket);return false;}}catch(InterruptedException interrupted){Thread.currentThread().interrupt();transitionOwnership.invalidate(ticket);return false;}
+    return okay.get();
+  }
+  private static void revealFrame(long session,int generation,long pts,long bounds){
+    if(!renderedProof.canReveal(generation,session,pts,bounds))return;
+    final String key=session+":"+generation+":"+pts+":"+bounds;if(!revealPending.isEmpty())return;revealPending=key;
+    Activity act=activity();if(act==null){revealPending="";return;}
+    act.runOnUiThread(()->{
+      View target=videoView();
+      if(target==null||session!=feedSession||generation!=initGen.get()||bounds!=appliedBoundsSeq.get()||!renderedProof.canReveal(generation,session,pts,bounds)){if(key.equals(revealPending))revealPending="";return;}
+      // Remove the retained picture only in a traversal of the correct live
+      // surface, then acknowledge on the following animation boundary.
+      target.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener(){public boolean onPreDraw(){
+        if(target.getViewTreeObserver().isAlive())target.getViewTreeObserver().removeOnPreDrawListener(this);
+        if(target==videoView()&&session==feedSession&&generation==initGen.get()&&bounds==appliedBoundsSeq.get()&&renderedProof.canReveal(generation,session,pts,bounds)){
+          clearTransitionOnUi();target.postOnAnimation(()->{if(target==videoView()&&session==feedSession&&generation==initGen.get()&&bounds==appliedBoundsSeq.get())renderedProof.reveal(generation,session,pts,bounds);if(key.equals(revealPending))revealPending="";});
+        }else if(key.equals(revealPending))revealPending="";
+        return true;
+      }});target.invalidate();
+    });
+  }
   /**
    * Async codec errors survived this session. A {@link MediaCodec.CodecException}
    * kills the codec instance (it is typically already Released by the time
@@ -189,6 +257,9 @@ public final class WcDecoderBridge {
   private static volatile long lastStartFailAt = 0L;
   /** Newest applied setBounds sequence number — stale (reordered) calls are dropped. */
   private static final AtomicLong boundsSeq = new AtomicLong(0);
+  private static final AtomicLong appliedBoundsSeq=new AtomicLong(0);
+  private static View boundsProofView;
+  private static android.view.ViewTreeObserver.OnPreDrawListener boundsProofListener;
   /**
    * The DESIRED video rect in window px — what JS asked for, before clamping.
    * The view itself is laid out as the intersection of this with the window:
@@ -485,7 +556,9 @@ public final class WcDecoderBridge {
                 if (packet[0] == 0x47 && packet[1] == 0x44 && packet[2] == 2 && session == feedSession &&
                     header.getInt(12) == packet.length - 20 &&
                     !Double.isNaN(ts) && !Double.isInfinite(ts) && ts >= 0 && ts <= Long.MAX_VALUE) {
-                  accepted = submit(Math.round(ts), (packet[3] & 1) != 0, packet, 20, packet.length - 20, session);
+                  synchronized(backlog){
+                    if(!binaryDisabled)accepted = submit(Math.round(ts), (packet[3] & 1) != 0, packet, 20, packet.length - 20, session);
+                  }
                 }
               }
               // A credit bounds WebView IPC itself; JS allows only four sends
@@ -688,7 +761,7 @@ public final class WcDecoderBridge {
     // was already running — every in-flight AU was then dropped or mis-fed, and
     // the TextureView stayed black with no error anywhere.
     // (A layer switch in setViewKind nulls the view, so it never looks "running".)
-    if (wanted.get() && started.get() && configuredWidth == w && configuredHeight == h
+    if (wanted.get() && started.get() && codecGeneration==initGen.get() && codecFeedSession==feedSession && configuredWidth == w && configuredHeight == h
         && mime.equals(configuredMime) && videoView() != null) {
       jlog("init " + w + "x" + h + " — already running, skip");
       return;
@@ -705,7 +778,7 @@ public final class WcDecoderBridge {
     // high-water mark would silently drop every setBounds after that).
     errorRestarts.set(0);
     lastStartFailAt = 0L;
-    boundsSeq.set(0);
+    boundsSeq.set(0);appliedBoundsSeq.set(0);
     // Forget the previous session's desired rect — JS re-syncs geometry right
     // after init, and a stale zoomed rect would mis-map the first frames.
     desiredW = 0;
@@ -729,12 +802,13 @@ public final class WcDecoderBridge {
           }
           // UI-thread re-check: concurrent inits can both pass the outer guard
           // before either sets started — without this we triple-start the codec.
-          if (started.get() && configuredWidth == w && configuredHeight == h && surfaceReady.get()
+          if (started.get() && codecGeneration==gen && codecFeedSession==feedSession && configuredWidth == w && configuredHeight == h && surfaceReady.get()
               && mime.equals(configuredMime) && videoView() != null) {
             jlog("init " + w + "x" + h + " — already running on UI thread, skip");
             return;
           }
           ensureSurfaceView(act);
+          raiseTransition();
           // attach() ran before Tauri created the WebView, so the TextureView
           // was seated at content[0] — potentially below wry wrapper views.
           // Seat it as the WebView's immediate lower sibling.
@@ -853,6 +927,7 @@ public final class WcDecoderBridge {
             // No setTransform on a SurfaceView: size the view to the picture itself.
             layoutHole((SurfaceView) sv);
             applyVisibility(sv);
+            scheduleBoundsProof(sv,seq);
             return;
           }
           TextureView tv = (TextureView) sv;
@@ -895,8 +970,19 @@ public final class WcDecoderBridge {
             applyContentTransform(tv, vx, vy, vw, vh);
           }
           // NOT sv.setVisibility(visible ? ...) — see the javadoc above.
-          applyVisibility(sv);
+          applyVisibility(sv);scheduleBoundsProof(sv,seq);
         });
+  }
+
+  private static void scheduleBoundsProof(View target,long sequence){
+    if(boundsProofListener!=null&&boundsProofView!=null&&boundsProofView.getViewTreeObserver().isAlive())boundsProofView.getViewTreeObserver().removeOnPreDrawListener(boundsProofListener);
+    final int generation=initGen.get();boundsProofView=target;
+    boundsProofListener=new android.view.ViewTreeObserver.OnPreDrawListener(){public boolean onPreDraw(){
+      if(target.getViewTreeObserver().isAlive())target.getViewTreeObserver().removeOnPreDrawListener(this);
+      if(boundsProofListener==this){boundsProofListener=null;boundsProofView=null;}
+      if(generation==initGen.get()&&sequence==boundsSeq.get()&&target==videoView()&&target.isLaidOut()&&target.getWidth()>0&&target.getHeight()>0)appliedBoundsSeq.set(sequence);
+      return true;
+    }};target.getViewTreeObserver().addOnPreDrawListener(boundsProofListener);
   }
 
   /**
@@ -1153,6 +1239,8 @@ public final class WcDecoderBridge {
     return queueDepth.get() + backlog.size();
   }
 
+  public static String statsRendered(){return renderedProof.snapshot(appliedBoundsSeq.get());}
+
   public static long statsFrames() {
     return frames.get();
   }
@@ -1384,15 +1472,28 @@ public final class WcDecoderBridge {
     public void beginFeed(double session) {
       synchronized (backlog) {
         feedSession = Math.round(session);
+        renderedProof.beginFeed(feedSession);
+        revealPending="";
         backlog.clear();
       }
     }
 
     @JavascriptInterface
+    public int frameProofVersion(){return 2;}
+
+    @JavascriptInterface public boolean prepareTransition(){return WcDecoderBridge.prepareTransition();}
+    @JavascriptInterface public void revealFrame(double session,double generation,double pts,double bounds){WcDecoderBridge.revealFrame(Math.round(session),(int)generation,Math.round(pts),Math.round(bounds));}
+    @JavascriptInterface public void clearTransition(){transitionOwnership.invalidate();Activity act=activity();if(act!=null)act.runOnUiThread(WcDecoderBridge::clearTransitionOnUi);}
+    @JavascriptInterface public void setPipAspect(double width,double height,double revision){MainActivity.setPipAspect((int)width,(int)height,Math.round(revision));}
+
+    @JavascriptInterface
     public void disableBinary() {
       synchronized (backlog) {
         binaryDisabled = true;
-        feedSession = (feedSession + 1) & 0xffffffffL;
+        // Admission and disabling share the same lock, so no late binary AU
+        // can enter after the legacy bridge's next IDR. This is one codec/feed;
+        // changing its identity here would invalidate all rendered proofs.
+        awaitKey.set(true);
         backlog.clear();
       }
     }
@@ -1818,7 +1919,9 @@ public final class WcDecoderBridge {
 
           @Override
           public void onSurfaceTextureUpdated(SurfaceTexture st) {
-            // Per-frame; no-op (MediaCodec pushes; we don't need a draw loop).
+            if(surfaceView==sv&&!useSurfaceView&&wanted.get()&&started.get()&&codecGeneration==initGen.get()&&codecFeedSession==feedSession){
+              renderedProof.rendered(codecGeneration,codecFeedSession,st.getTimestamp()/1000L,"texture");
+            }
           }
         });
     parent.addView(sv, Math.max(0, index), lp);
@@ -2068,6 +2171,10 @@ public final class WcDecoderBridge {
         }
         c.setCallback(callback, codecHandler);
         c.configure(fmt, s, null, 0);
+        final MediaCodec renderingCodec=c;final long renderingFeed=feedSession;final String renderingLayer=useSurfaceView?"surface":"texture";
+        c.setOnFrameRenderedListener((source,ptsUs,nanoTime)->{
+          if(source==renderingCodec&&source==WcDecoderBridge.codec&&wanted.get()&&started.get()&&generation==initGen.get()&&renderingFeed==feedSession&&"surface".equals(renderingLayer))renderedProof.rendered(generation,renderingFeed,ptsUs,"surface");
+        },codecHandler);
         applyRuntimeLowLatency(c);
         if (!wanted.get() || generation != initGen.get()) {
           c.release();
@@ -2088,7 +2195,7 @@ public final class WcDecoderBridge {
         configuredWidth = w;
         configuredHeight = h;
         configuredMime = m;
-        codecGeneration = generation;
+        codecGeneration = generation;codecFeedSession=renderingFeed;codecLayer=renderingLayer;renderedProof.beginCodec(generation,renderingFeed);
         c.start();
         started.set(true);
         // Successful start clears any prior error: the progressive ladder may
@@ -2156,6 +2263,7 @@ public final class WcDecoderBridge {
   }
 
   private static void stopCodecOnThread() {
+    renderedProof.stopCodec();
     started.set(false);
     MediaCodec c = codec;
     codec = null;
@@ -2204,7 +2312,8 @@ public final class WcDecoderBridge {
           queueDepth.updateAndGet(v -> Math.max(0, v - 1));
           try {
             // Render immediately to the Surface (Moonlight/deskstream path).
-            boolean display = wanted.get() && codecGeneration == initGen.get();
+            boolean display = wanted.get() && codecGeneration == initGen.get() && codecFeedSession==feedSession;
+            if(display)renderedProof.output(codecGeneration,codecFeedSession,info.presentationTimeUs,codecLayer);
             codec.releaseOutputBuffer(index, display);
             if (display) frames.incrementAndGet();
             // Codec is producing frames → any prior error is stale. Clear it so

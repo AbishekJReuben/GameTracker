@@ -1279,7 +1279,7 @@ export const api = {
   /// all off Tauri's UI-thread IPC. Null when it could not start.
   remotePipeInfo: () => call<RemotePipeInfo | null>("remote_pipe_info"),
   /// Focus + cursor state in one call (was three invokes per 250ms tick).
-  remotePollState: () => call<RemotePollState>("remote_poll_state"),
+  remotePollState: (sessionId?:string) => call<RemotePollState>("remote_poll_state",{sessionId}),
   // `bitrateKbps` drives the NATIVE H.264 encoder (0/omitted = derive from
   // resolution × fps × quality). It does nothing on the JPEG fallback.
   // `preset` 1..4 = NVENC P1..P4, `multipass` 0 single / 1 quarter-res / 2 full-res
@@ -1327,10 +1327,18 @@ export const api = {
   remoteCursorPosition: () => call<[number, number] | null>("remote_cursor_position"),
   remoteCaptureStats: () => call<RemoteCaptureStats>("remote_capture_stats"),
   remoteListMonitors: () => call<RemoteMonitor[]>("remote_list_monitors"),
+  remotePresenceAuthorize: (sessionId:string,deviceId:string,displayName:string,capabilities:string[],fixedMonitor?:number) =>
+    call<import('./remoteProtocol').RemoteHandshake | null>('remote_presence_authorize',{sessionId,deviceId,displayName,capabilities,fixedMonitor}),
+  remotePresenceUpdate: (sessionId:string,update:import('./remoteProtocol').RemotePresenceUpdate) => call<import('./remoteProtocol').RemotePresenceReply>('remote_presence_update',{sessionId,update}),
+  remotePresenceEnd: (sessionId:string,explicit:boolean) => call<void>('remote_presence_end',{sessionId,explicit}),
+  remoteViewRequest:(sessionId:string,request:import('./captureView').ViewRequest)=>call<import('./captureView').CaptureIdentity>('remote_view_request',{sessionId,request}),
+  remoteViewAcknowledge:(sessionId:string,epoch:number)=>call<boolean>('remote_view_acknowledge',{sessionId,epoch}),
+  remoteViewStatus:(sessionId:string)=>call<import('./captureView').ViewStatus|null>('remote_view_status',{sessionId}),
+  remoteViewCancel:(sessionId:string,epoch:number)=>call<import('./captureView').ViewStatus|null>('remote_view_cancel',{sessionId,epoch}),
   remoteReadMedia: (path: string) => call<string | null>("remote_read_media", { path }),
-  remoteInject: (event: Record<string, unknown>) => call<void>("remote_inject", { event }),
-  remoteInjectOn: (monitor: number, event: Record<string, unknown>) =>
-    call<void>("remote_inject_on", { monitor, event }),
+  remoteInject: (event: Record<string, unknown>,sessionId?:string) => call<void>("remote_inject", { event,sessionId }),
+  remoteInjectOn: (monitor: number, event: Record<string, unknown>,sessionId?:string) =>
+    call<void>("remote_inject_on", { monitor, event,sessionId }),
   remoteGamepadAvailable: () => call<boolean>("remote_gamepad_available"),
   // Direct browser Share. Rust owns selected-file reads; this only returns a
   // frozen manifest or one bounded WebRTC payload at a time.
@@ -1354,6 +1362,12 @@ export interface RemoteMonitor {
   isPrimary: boolean;
   /** The display the host is currently capturing (persists across connections). */
   selected: boolean;
+  /** Present after display-geometry-v1 negotiation; absent on old hosts. */
+  id?: string;
+  x?: number;
+  y?: number;
+  rotation?: number;
+  layoutRevision?: number;
 }
 
 /** Desktop-audio loopback PCM format (see remote_start_audio). */
@@ -1368,6 +1382,7 @@ export interface RemotePollState {
   textField: boolean;
   cursorKind: string;
   cursorPos: [number, number] | null;
+  cursorDisplayId?:string|null;
 }
 
 export interface RemoteAudioFormat {

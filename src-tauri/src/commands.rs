@@ -2262,14 +2262,14 @@ use base64::Engine as _;
 
 /// Inject one remote input event (mouse/keyboard) received over the data channel.
 #[tauri::command]
-pub fn remote_inject(event: crate::remote::input::ControlEvent) {
-    crate::remote::input::inject(event);
+pub fn remote_inject(event: crate::remote::input::ControlEvent,session_id:Option<String>) {
+    crate::remote::input::inject_session(session_id,None,event);
 }
 
 /// Inject on a specific monitor (multi-monitor pop-out tabs).
 #[tauri::command]
-pub fn remote_inject_on(monitor: usize, event: crate::remote::input::ControlEvent) {
-    crate::remote::input::inject_on_monitor(monitor, event);
+pub fn remote_inject_on(monitor: usize, event: crate::remote::input::ControlEvent,session_id:Option<String>) {
+    crate::remote::input::inject_session(session_id,Some(monitor),event);
 }
 
 /// Whether a virtual gamepad can be created on this PC (the ViGEmBus driver is
@@ -2328,14 +2328,17 @@ pub struct RemotePollState {
     pub text_field: bool,
     pub cursor_kind: String,
     pub cursor_pos: Option<[f32; 2]>,
+    pub cursor_display_id:Option<String>,
 }
 
 #[tauri::command]
-pub async fn remote_poll_state() -> RemotePollState {
+pub async fn remote_poll_state(session_id:Option<String>) -> RemotePollState {
+    let applied=session_id.and_then(|sid|crate::remote::view_session::status(&sid)).and_then(|s|s.applied);
+    let (cursor_pos,cursor_display_id)=applied.as_ref().map(|i|crate::remote::focus::cursor_for_view(&i.view)).unwrap_or_else(||(crate::remote::focus::foreground_cursor_position(),None));
     RemotePollState {
         text_field: crate::remote::focus::foreground_text_field_active(),
         cursor_kind: crate::remote::focus::foreground_cursor_kind().to_string(),
-        cursor_pos: crate::remote::focus::foreground_cursor_position(),
+        cursor_pos,cursor_display_id,
     }
 }
 
@@ -2546,6 +2549,38 @@ pub fn remote_capture_stats() -> crate::remote::capture::CaptureStats {
 #[tauri::command]
 pub fn remote_list_monitors() -> Vec<crate::remote::capture::MonitorInfo> {
     crate::remote::capture::list_monitors()
+}
+
+#[tauri::command]
+pub async fn remote_presence_authorize(session_id:String,device_id:String,display_name:String,capabilities:Vec<String>,fixed_monitor:Option<usize>)->AppResult<Option<crate::remote::presence::Handshake>> {
+    if !crate::hostproc::is_remote_host() {return Err(AppError::msg("Presence belongs to the remote host process"));}
+    run_blocking(move||Ok(crate::remote::presence::authorize(&session_id,&device_id,&display_name,&capabilities,fixed_monitor))).await
+}
+#[tauri::command]
+pub fn remote_presence_update(session_id:String,update:crate::remote::presence::PresenceUpdate)->AppResult<crate::remote::overlay::PresenceReply> {
+    if !crate::hostproc::is_remote_host() {return Err(AppError::msg("Presence belongs to the remote host process"));}
+    Ok(crate::remote::overlay::PresenceReply{accepted:crate::remote::presence::update(&session_id,update),overlay:crate::remote::overlay::status()})
+}
+#[tauri::command]
+pub fn remote_presence_end(session_id:String,explicit:bool) {
+    if crate::hostproc::is_remote_host() {crate::remote::presence::end(&session_id,explicit);}
+}
+#[tauri::command]
+pub fn remote_view_request(session_id:String,request:crate::remote::view_session::ViewRequest)->AppResult<crate::remote::view::CaptureIdentity>{
+    if !crate::hostproc::is_remote_host(){return Err(AppError::msg("Views belong to the remote host process"));}
+    crate::remote::view_session::request(&session_id,request).map_err(AppError::msg)
+}
+#[tauri::command]
+pub fn remote_view_acknowledge(session_id:String,epoch:u64)->bool{
+    crate::hostproc::is_remote_host()&&crate::remote::view_session::acknowledge(&session_id,epoch)
+}
+#[tauri::command]
+pub fn remote_view_status(session_id:String)->Option<crate::remote::view_session::Status>{
+    if crate::hostproc::is_remote_host(){crate::remote::view_session::status(&session_id)}else{None}
+}
+#[tauri::command]
+pub fn remote_view_cancel(session_id:String,epoch:u64)->Option<crate::remote::view_session::Status>{
+    if crate::hostproc::is_remote_host(){crate::remote::view_session::cancel(&session_id,epoch)}else{None}
 }
 
 /// Read a media file (cover/icon/screenshot) as a base64 data URL, for the cloud

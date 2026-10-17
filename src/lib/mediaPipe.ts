@@ -118,13 +118,15 @@ export class MediaPipe {
   }
 
   /** Primary-display input. `rawEvent` is the guest's JSON text, forwarded as-is. */
-  injectRaw(rawEvent: string): boolean {
-    return this.sendText(`{"t":"in","e":${rawEvent}}`);
+  injectRaw(rawEvent: string,sessionId?:string): boolean {
+    const owner=sessionId?`,"s":${JSON.stringify(sessionId)}`:'';
+    return this.sendText(`{"t":"in"${owner},"e":${rawEvent}}`);
   }
 
   /** Pop-out input pinned to `monitor`. */
-  injectOnRaw(monitor: number, rawEvent: string): boolean {
-    return this.sendText(`{"t":"inm","m":${monitor | 0},"e":${rawEvent}}`);
+  injectOnRaw(monitor: number, rawEvent: string,sessionId?:string): boolean {
+    const owner=sessionId?`,"s":${JSON.stringify(sessionId)}`:'';
+    return this.sendText(`{"t":"inm","m":${monitor | 0}${owner},"e":${rawEvent}}`);
   }
 
   /** Fast-delivery credit return (was an invoke per frame). */

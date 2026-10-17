@@ -1,0 +1,7 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>Parent epoch video browser probe</title>
+<style>body{font:15px system-ui;background:#10151e;color:#edf3ff;margin:24px}button{padding:10px}video,canvas{width:320px;height:180px;border:1px solid #8793aa}#sources{display:flex;flex-wrap:wrap;gap:8px}pre{white-space:pre-wrap}#screen{min-height:182px}</style></head>
+<body><h1>Epoch video browser module probe</h1>
+<p>Synthetic local canvas sources and loopback RTC only. Mock authorized signaling. No desktop capture, input, audio, credentials or discovery access.</p>
+<button id="run">Run real RTC module checks</button><p id="status">Ready</p><div id="screen"></div><div id="sources"></div><pre id="result"></pre>
+<script type="module" src="./parent-epoch-probe.ts"></script></body></html>

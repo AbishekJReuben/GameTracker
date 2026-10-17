@@ -8,7 +8,10 @@
 //!
 //! Web / Quest keep WebCodecs; this module is a no-op off Android.
 
-use serde::Serialize;
+use serde::{Serialize,Deserialize};
+#[derive(Debug,Clone,Serialize,Deserialize)]
+#[serde(rename_all="camelCase")]
+pub struct RenderedFrame {pub version:u32,pub feed_session:u64,pub codec_generation:i64,pub pts_us:u64,pub frames:u64,pub bounds_sequence:u64,#[serde(default)]pub visible_pts_us:u64,#[serde(default)]pub visible_bounds_sequence:u64,pub layer:String}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +37,7 @@ pub struct DecoderProbe {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecoderStats {
+    pub rendered:Option<RenderedFrame>,
     pub decode_ms: f64,
     pub queue: i32,
     pub frames: i64,
@@ -466,7 +470,12 @@ mod android {
                 let js: JString = err_obj.into();
                 env.get_string(&js).map(|s| s.into()).unwrap_or_default()
             };
+            let rendered=match env.call_static_method(&class,"statsRendered","()Ljava/lang/String;",&[]){
+                Ok(value)=>value.l().ok().filter(|o|!o.is_null()).and_then(|o|{let js:JString=o.into();let text:String=env.get_string(&js).ok()?.into();serde_json::from_str(&text).ok()}),
+                Err(_)=>{let _=env.exception_clear();None},
+            };
             Ok(DecoderStats {
+                rendered,
                 decode_ms,
                 queue,
                 surface_ready,
@@ -568,6 +577,7 @@ fn decoder_dump_diag_impl() -> Result<String, String> {
 #[cfg(not(target_os = "android"))]
 fn decoder_get_stats_impl() -> Result<DecoderStats, String> {
     Ok(DecoderStats {
+        rendered:None,
         decode_ms: 0.0,
         queue: 0,
         frames: 0,

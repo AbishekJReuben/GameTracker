@@ -5,6 +5,7 @@ export type VideoHeader = {
   seq: number;
   tsMs: number;
   len: number;
+  epoch?:number;
   /** Guest clock when the header arrived — the R7 delay gradient's receive side. */
   firstAt?: number;
 };
@@ -28,22 +29,23 @@ export class VideoAssembler {
   push(data: ArrayBuffer, at = 0): { head: VideoHeader; bytes: Uint8Array<ArrayBuffer> } | null {
     // A sender can fail after the header or halfway through the payload. A new
     // header must discard that partial AU, not become 20 bytes of H.264 garbage.
-    if (data.byteLength === 20) {
+    if (data.byteLength === 20||data.byteLength===28) {
       const v = new DataView(data);
-      if (v.getUint8(0) === 0x47 && v.getUint8(1) === 0x56 && v.getUint8(3) === 0) {
+      if (v.getUint8(0) === 0x47 && v.getUint8(1) === 0x56 && ((data.byteLength===20&&v.getUint8(3)===0)||(data.byteLength===28&&v.getUint8(3)===1))) {
         const len = v.getUint32(16, true);
         const tsMs = v.getFloat64(8, true);
+        const epoch=data.byteLength===28?v.getFloat64(20,true):undefined;
         if (this.head) this.discontinuity();
         this.head = null;
         this.buffer = null;
         this.received = 0;
-        if (!len || len > MAX_VIDEO_BYTES || !Number.isFinite(tsMs) || tsMs < 0) {
+        if (!len || len > MAX_VIDEO_BYTES || !Number.isFinite(tsMs) || tsMs < 0 ||(epoch!==undefined&&(!Number.isSafeInteger(epoch)||epoch<1))) {
           this.discontinuity();
           return null;
         }
         const seq = v.getUint32(4, true);
         if (this.sequence !== null && seq !== ((this.sequence + 1) >>> 0)) this.discontinuity();
-        this.head = { key: (v.getUint8(2) & 1) !== 0, seq, tsMs, len, ...(at > 0 ? { firstAt: at } : {}) };
+        this.head = { key: (v.getUint8(2) & 1) !== 0, seq, tsMs, len, ...(at > 0 ? { firstAt: at } : {}),...(epoch!==undefined?{epoch}:{}) };
         return null;
       }
     }

@@ -10,6 +10,7 @@ vi.mock("./nativeDecoder", () => ({
   setStreamPowerActive: vi.fn().mockResolvedValue(undefined),
   dumpNativeDecoderDiag: vi.fn().mockResolvedValue(""),
   getNativeDecoderStats: vi.fn(), feedNativeDecoder: vi.fn(() => true),
+  nativeFrameProofAvailable:vi.fn(()=>true),nativeFeedGeneration:vi.fn(()=>0),nativeBoundsSequence:vi.fn(()=>0),nativeBoundsViewEpoch:vi.fn(()=>0),nativePresentationTimestamp:vi.fn(()=>1),revealNativeFrame:vi.fn(),clearNativeTransition:vi.fn(),
 }));
 
 /** Codecs the fake WebCodecs decoder claims to support. */

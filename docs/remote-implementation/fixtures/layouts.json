@@ -1,0 +1,10 @@
+[
+  {"name":"current-two-4k","displays":[{"id":"left","x":-3840,"y":0,"width":3840,"height":2160},{"id":"primary","x":0,"y":0,"width":3840,"height":2160}],"bounds":{"x":-3840,"y":0,"width":7680,"height":2160}},
+  {"name":"secondary-left","displays":[{"id":"primary","x":0,"y":0,"width":1920,"height":1080},{"id":"left","x":-1920,"y":0,"width":1920,"height":1080}],"bounds":{"x":-1920,"y":0,"width":3840,"height":1080}},
+  {"name":"above-primary","displays":[{"id":"above","x":0,"y":-1440,"width":2560,"height":1440},{"id":"primary","x":0,"y":0,"width":1920,"height":1080}],"bounds":{"x":0,"y":-1440,"width":2560,"height":2520}},
+  {"name":"unequal-mixed-dpi-physical","displays":[{"id":"scaled-150","x":-2560,"y":0,"width":2560,"height":1440},{"id":"scaled-200","x":0,"y":0,"width":3840,"height":2160}],"bounds":{"x":-2560,"y":0,"width":6400,"height":2160}},
+  {"name":"portrait-landscape","displays":[{"id":"portrait","x":-1080,"y":-200,"width":1080,"height":1920,"rotation":90},{"id":"primary","x":0,"y":0,"width":2560,"height":1440}],"bounds":{"x":-1080,"y":-200,"width":3640,"height":1920}},
+  {"name":"three-with-gaps","displays":[{"id":"left","x":-2100,"y":0,"width":1920,"height":1080},{"id":"primary","x":0,"y":0,"width":2560,"height":1440},{"id":"above-right","x":2800,"y":-1200,"width":1920,"height":1080}],"bounds":{"x":-2100,"y":-1200,"width":6820,"height":2640}},
+  {"name":"removed-secondary","displays":[{"id":"primary","x":0,"y":0,"width":3840,"height":2160}],"bounds":{"x":0,"y":0,"width":3840,"height":2160}},
+  {"name":"reordered-enumeration","displays":[{"id":"primary","x":0,"y":0,"width":3840,"height":2160},{"id":"left","x":-3840,"y":0,"width":3840,"height":2160}],"bounds":{"x":-3840,"y":0,"width":7680,"height":2160}}
+]

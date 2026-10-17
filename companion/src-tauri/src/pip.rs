@@ -23,6 +23,14 @@ pub async fn set_rotation_hold_ms(value: u64) -> Result<(), String> {
         .map_err(|e| format!("rotation task panicked: {e}"))?
 }
 
+#[tauri::command]
+pub async fn set_remote_rotation(active: bool, value: u64, revision: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || set_remote_rotation_impl(active,value,revision))
+        .await.map_err(|e| format!("rotation task panicked: {e}"))?
+}
+
+fn valid_rotation_ms(value: u64) -> i64 { if value == 0 || (400..=3000).contains(&value) { value as i64 } else { 1200 } }
+
 #[cfg(target_os = "android")]
 fn set_rotation_hold_impl(value: u64) -> Result<(), String> {
     use jni::objects::{JClass, JObject, JValue};
@@ -38,7 +46,7 @@ fn set_rotation_hold_impl(value: u64) -> Result<(), String> {
         let class_obj = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])
             .map_err(|e| format!("loadClass: {e}"))?.l().map_err(|e| e.to_string())?;
         let class = JClass::from(class_obj);
-        env.call_static_method(&class, "setRotationHoldMs", "(J)V", &[JValue::Long(value.clamp(400, 3000) as i64)])
+        env.call_static_method(&class, "setRotationHoldMs", "(J)V", &[JValue::Long(valid_rotation_ms(value))])
             .map_err(|e| format!("setRotationHoldMs: {e}"))?;
         Ok(())
     })();
@@ -48,6 +56,26 @@ fn set_rotation_hold_impl(value: u64) -> Result<(), String> {
 
 #[cfg(not(target_os = "android"))]
 fn set_rotation_hold_impl(_value: u64) -> Result<(), String> { Ok(()) }
+
+#[cfg(target_os = "android")]
+fn set_remote_rotation_impl(active: bool, value: u64, revision: u64) -> Result<(), String> {
+    use jni::objects::{JClass,JObject,JValue};
+    let ctx = crate::update::tao_android_context()?;
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.java_vm.cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let context = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
+    let result = (|| -> Result<(),String> {
+        let loader = env.call_method(&context,"getClassLoader","()Ljava/lang/ClassLoader;",&[]).map_err(|e|e.to_string())?.l().map_err(|e|e.to_string())?;
+        let name: JObject = env.new_string("com.chilloutgames.gametracker.companion.MainActivity").map_err(|e|e.to_string())?.into();
+        let class = JClass::from(env.call_method(&loader,"loadClass","(Ljava/lang/String;)Ljava/lang/Class;",&[JValue::Object(&name)]).map_err(|e|e.to_string())?.l().map_err(|e|e.to_string())?);
+        env.call_static_method(&class,"setRemoteRotation","(ZJJ)V",&[JValue::Bool(u8::from(active)),JValue::Long(valid_rotation_ms(value)),JValue::Long(revision.min(i64::MAX as u64) as i64)]).map_err(|e|format!("setRemoteRotation: {e}"))?;
+        Ok(())
+    })();
+    if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
+    result
+}
+#[cfg(not(target_os = "android"))]
+fn set_remote_rotation_impl(_active: bool, _value: u64, _revision: u64) -> Result<(), String> { Ok(()) }
 
 #[cfg(target_os = "android")]
 fn set_pip_impl(enabled: bool) -> Result<(), String> {

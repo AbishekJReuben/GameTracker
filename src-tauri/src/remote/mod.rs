@@ -16,7 +16,21 @@
 pub(crate) mod adb;
 pub(crate) mod audio;
 pub(crate) mod capture;
+#[cfg(windows)]
+pub(crate) mod capture_broker;
+#[cfg(windows)]
+pub(crate) mod capture_surface;
+#[cfg(windows)]
+pub(crate) mod gpu_transfer;
+#[cfg(windows)]
+pub(crate) mod system_cursor;
 pub(crate) mod delivery;
+pub(crate) mod display;
+pub(crate) mod appearance;
+pub(crate) mod presence;
+pub(crate) mod view;
+pub(crate) mod view_session;
+pub(crate) mod overlay;
 #[cfg(windows)]
 pub(crate) mod dxdupe;
 pub(crate) mod focus;
@@ -35,6 +49,7 @@ pub(crate) mod native;
 pub(crate) mod nvenc;
 pub(crate) mod gamepad;
 pub(crate) mod input;
+pub(crate) mod input_mapping;
 /// Loopback WebSocket carrying frames/audio to the host page and input back,
 /// off Tauri's UI-thread IPC.
 pub(crate) mod pipe;

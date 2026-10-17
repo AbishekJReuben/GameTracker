@@ -97,6 +97,17 @@ export type QualitySettings = {
 };
 
 export interface RemoteLink {
+  appliedView?():import('@/lib/captureView').CaptureIdentity|null;
+  viewChanging?():boolean;
+  requestView?(mode:'single'|'all',selectedDisplayId:string,maxWidth:number):boolean;
+  epochStream?():import('@/lib/epochVideo').EpochStream|null;
+  presentedRtcView?(peerId:string,element:HTMLVideoElement):boolean;
+  presentedDirectView?(identity:import('@/lib/captureView').CaptureIdentity):boolean;
+  presentedLegacyRtc?():void;
+  epochSurfaceStage?():import('@/lib/epochVideo').EpochSurfaceStage|null;
+  remoteHandshake?(): import('@/lib/remoteProtocol').RemoteHandshake | null;
+  remoteOverlayStatus?(): import('@/lib/remoteProtocol').RemoteOverlayStatus | null;
+  reportView?(view: import('@/lib/remoteProtocol').ClientViewReport): void;
   /** Deliver the inbound screen as a WebRTC media stream (cloud video-track path). */
   onStream(cb: (stream: MediaStream) => void): void | (() => void);
   /** Desktop audio only — never merged into the video stream (A/V sync lag). */
@@ -129,7 +140,7 @@ export interface RemoteLink {
    * When this path is live the host stops feeding the WebRTC track and the
    * link emits `{event:"wc", active}` so the UI can swap video ↔ canvas.
    */
-  onWcFrame?(cb: (f: VideoFrame) => void): () => void;
+  onWcFrame?(cb: (f: VideoFrame,identity?:import('@/lib/captureView').CaptureIdentity|null) => boolean|void): () => void;
   /** Live wc-path telemetry (null when inactive). */
   wcStats?(): WcStats | null;
   /** Live audio-path telemetry (DIRECT PCM vs RTC Opus). */
@@ -153,6 +164,7 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
   // the host's cursor is at the finger's position when the button event lands,
   // even if every lossy packet in between was dropped.
   let unanchoredMove: ControlMsg | null = null;
+  let lastAbsolute:{point:[number,number];epoch:number;session:string}|undefined;let maxWidth=1920;
   return {
     onStream(cb) {
       return conn.onStream(cb);
@@ -170,6 +182,16 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
       return conn.onProgress(cb);
     },
     send(msg) {
+      if(conn.remoteHandshake?.capabilities.includes('view-epoch-input-v1')){
+        if(msg.type==='gamepadprobe'||msg.type==='auxHost'||msg.type==='auxStop')return conn.sendControl(msg);
+        if(msg.type==='monitor'){const display=conn.remoteHandshake.layout.displays.find(d=>d.index===msg.index);return !!display&&conn.requestRemoteView('single',display.id,maxWidth);}
+        if(msg.type==='move'){const accepted=conn.sendViewInput(msg,true),view=conn.displayedView;if(accepted&&view)lastAbsolute={point:[msg.x,msg.y],epoch:view.view.epoch,session:view.sessionId};return accepted;}
+        if(msg.type==='moverel')lastAbsolute=undefined;
+        const view=conn.displayedView,valid=lastAbsolute&&view&&lastAbsolute.epoch===view.view.epoch&&lastAbsolute.session===view.sessionId;
+        if(!valid)lastAbsolute=undefined;
+        const anchor=msg.type==='click'&&typeof msg.x==='number'&&typeof msg.y==='number'?[msg.x,msg.y] as [number,number]:msg.type==='click'||msg.type==='down'||msg.type==='up'?lastAbsolute?.point:undefined;
+        return conn.sendViewInput(msg,false,anchor);
+      }
       // Absolute pointer moves are idempotent and superseded by the next one, so
       // they ride the unordered/no-retransmit "move" channel: a dropped packet
       // never delays fresher input, and a burst of moves can't head-of-line
@@ -187,6 +209,7 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
       return conn.sendControl(msg);
     },
     setQuality(q) {
+      maxWidth=q.maxW;
       // The host intercepts `quality` messages on the control channel and re-tunes
       // its capture loop; they never reach the input injector.
       conn.sendControl({ type: "quality", ...q });
@@ -194,6 +217,15 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
     noteVideoSink(active) {
       conn.setVideoSink(active);
     },
+    remoteHandshake() { return conn.remoteHandshake; },
+    remoteOverlayStatus() {return conn.remoteOverlayStatus;},
+    reportView(view) { conn.reportRemoteView(view); },
+    appliedView(){return conn.displayedView;},viewChanging(){return conn.viewChanging;},
+    requestView(mode,display,maxW){return conn.requestRemoteView(mode,display,maxW);},
+    epochStream(){return conn.epochStream;},presentedRtcView(peerId,element){return conn.presentedRtcView(peerId,element);},
+    presentedDirectView(identity){return conn.presentedDirectView(identity);},
+    presentedLegacyRtc(){conn.presentedLegacyRtc();},
+    epochSurfaceStage(){return conn.epochSurfaceStage;},
     netStats() {
       return conn.videoStats();
     },

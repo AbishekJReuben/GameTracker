@@ -1054,6 +1054,11 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return { ...mockRemote, running: mockRemote.enabled } as T;
     case "remote_status":
       return { ...mockRemote, running: mockRemote.enabled } as T;
+    case "remote_list_monitors":
+      return [
+        { id: "mock-left", index: 0, name: "Left display", x: -3840, y: 0, width: 3840, height: 2160, rotation: 0, isPrimary: false, selected: true, layoutRevision: 1 },
+        { id: "mock-primary", index: 1, name: "Primary display", x: 0, y: 0, width: 3840, height: 2160, rotation: 0, isPrimary: true, selected: false, layoutRevision: 1 },
+      ] as T;
     case "remote_inject":
       return undefined as T;
     case "remote_set_encode_paused":

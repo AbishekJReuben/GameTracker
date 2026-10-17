@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Parent RTC sink boundary probe</title>
+<style>body{font:15px system-ui;background:#131820;color:#e9eff7;margin:24px}button{padding:12px}pre{white-space:pre-wrap}canvas{width:160px;height:90px}#stage{position:relative;width:180px;height:110px}</style>
+<h1>RTC sink boundary probe</h1>
+<p>Synthetic local canvas and loopback peers only. No desktop capture, input, audio, credentials, or discovery connection.</p>
+<button id="run">Run sink comparison</button><p id="status" role="status">Ready</p>
+<canvas id="source" width="320" height="180"></canvas><div id="stage"></div><pre id="result"></pre>
+<script>
+const status=document.querySelector('#status'),result=document.querySelector('#result'),stage=document.querySelector('#stage'),canvas=document.querySelector('#source');
+const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+document.querySelector('#run').onclick=async()=>{
+  document.querySelector('#run').disabled=true;
+  const outcomes=[];let sender,receiver,source,timer;
+  try{
+    result.textContent='';status.textContent='Connecting synthetic loopback video';
+    sender=new RTCPeerConnection({iceServers:[]});receiver=new RTCPeerConnection({iceServers:[]});
+    sender.onicecandidate=e=>{if(e.candidate)receiver.addIceCandidate(e.candidate).catch(()=>{});};
+    receiver.onicecandidate=e=>{if(e.candidate)sender.addIceCandidate(e.candidate).catch(()=>{});};
+    const remoteTrack=new Promise(resolve=>{receiver.ontrack=e=>resolve(e.track);});
+    source=canvas.captureStream(0);const track=source.getVideoTracks()[0];let tick=0;const context=canvas.getContext('2d');
+    timer=setInterval(()=>{tick++;context.fillStyle=tick%2?'#166bcb':'#30985c';context.fillRect(0,0,320,180);context.fillStyle='white';context.font='32px sans-serif';context.fillText('Synthetic '+tick,10,90);track.requestFrame?.();},65);
+    sender.addTrack(track,source);await sender.setLocalDescription(await sender.createOffer());await receiver.setRemoteDescription(sender.localDescription);await receiver.setLocalDescription(await receiver.createAnswer());await sender.setRemoteDescription(receiver.localDescription);
+    const received=await Promise.race([remoteTrack,delay(5000).then(()=>{throw new Error('No remote track');})]);
+    for(const mode of ['detached','display-none','opacity-zero','visible']){
+      const video=document.createElement('video');video.muted=true;video.autoplay=true;video.playsInline=true;video.style.cssText='position:absolute;left:0;top:0;width:160px;height:90px;pointer-events:none';
+      if(mode==='display-none')video.style.display='none';
+      if(mode==='opacity-zero')video.style.opacity='0';
+      if(mode!=='detached')stage.append(video);
+      video.srcObject=new MediaStream([received]);
+      let callbacks=0,callbackId;const onFrame=()=>{callbacks++;callbackId=video.requestVideoFrameCallback(onFrame);};
+      if(video.requestVideoFrameCallback)callbackId=video.requestVideoFrameCallback(onFrame);
+      status.textContent='Testing '+mode;await video.play().catch(()=>{});await delay(3500);
+      const stats=await receiver.getStats();let decoded=0;stats.forEach(s=>{if(s.type==='inbound-rtp'&&s.kind==='video')decoded+=s.framesDecoded||0;});
+      outcomes.push({mode,frameCallbacks:callbacks,readyState:video.readyState,width:video.videoWidth,height:video.videoHeight,currentTime:video.currentTime,totalFramesDecoded:decoded,documentVisibility:document.visibilityState});
+      result.textContent=JSON.stringify({browser:navigator.userAgent,results:outcomes},null,2);
+      if(callbackId!==undefined)video.cancelVideoFrameCallback(callbackId);video.pause();video.srcObject=null;video.remove();
+    }
+    status.textContent='Complete';
+  }catch(error){status.textContent='Probe failed: '+error;result.textContent=JSON.stringify(outcomes,null,2);}
+  finally{clearInterval(timer);source?.getTracks().forEach(t=>t.stop());sender?.close();receiver?.close();document.querySelector('#run').disabled=false;}
+};
+</script></html>

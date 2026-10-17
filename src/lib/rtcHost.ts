@@ -30,8 +30,15 @@ import {
 } from "./nativeDelivery";
 import { lossCeilingKbps, sctpCapacityKbps } from "./lossCeiling";
 import { OvershootEstimator } from "./overshoot";
-import { REC_CONFIG, REC_KEY, boostCarrierSdp } from "./carrier";
+import { REC_CONFIG, REC_KEY, REC_VIEW, boostCarrierSdp } from "./carrier";
 import { MediaPipe, type PipeEndpoint } from "./mediaPipe";
+import { HostPresenceSession } from './hostPresenceSession';
+import { HostViewSession } from './hostViewSession';
+import { CaptureVideoFeed } from './captureVideoFeed';
+import { EpochVideoHost } from './epochVideo';
+import { parseCapturePacket, sameCapture, type CaptureIdentity } from './captureView';
+import { supportsRemote } from './remoteProtocol';
+import { onlyLiveSession, runAuthorizedStartup } from './hostAuthorization';
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
 /**
@@ -1299,7 +1306,12 @@ export function startHost(opts: HostOptions): () => void {
   // When set, composited frames are diverted from the WebRTC generator track into
   // the WebCodecs encoder → "video" data channel (the guest opted in with
   // {type:"vmode",mode:"wc"}). Owned by the current peer session (startPeer).
-  let wcSink: ((canvas: HTMLCanvasElement) => void) | null = null;
+  let wcSink: ((canvas: HTMLCanvasElement, identity?:CaptureIdentity|null) => void) | null = null;
+  let currentViewHost:HostViewSession|null=null;
+  let epochVideoHost:EpochVideoHost|null=null;
+  let captureFeeds:CaptureVideoFeed|null=null;
+  let activeVideoPc:RTCPeerConnection|null=null;
+  let currentPresenceHandshake:()=>import('./remoteProtocol').RemoteHandshake|null=()=>null;
   /** Tear down the current session's WebCodecs encoder (set by startPeer). */
   let wcStop: (() => void) | null = null;
   /**
@@ -1309,7 +1321,7 @@ export function startHost(opts: HostOptions): () => void {
    * JPEG (the RTC track needs real pixels to composite).
    */
   let nativeSink:
-    | ((payload: Uint8Array<ArrayBuffer>, key: boolean, w?: number, h?: number, tsMs?: number, fast?: boolean, frameId?: number, rfiClean?: boolean) => void)
+    | ((payload: Uint8Array<ArrayBuffer>, key: boolean, w?: number, h?: number, tsMs?: number, fast?: boolean, frameId?: number, rfiClean?: boolean, identity?:CaptureIdentity|null) => void)
     | null = null;
   /** True once Rust has told us (via the frame container) that it's encoding natively. */
   let nativeActive = false;
@@ -1422,21 +1434,22 @@ export function startHost(opts: HostOptions): () => void {
     audioPipe = null;
   };
   /** Forward one authorized guest input message (raw JSON text) to the injector. */
-  const injectInput = (raw: string, msg: Record<string, unknown>) => {
+  const injectInput = (raw: string, msg: Record<string, unknown>,sessionId?:string) => {
     const p = videoPipe;
     const sent =
       !!p &&
-      (opts.fixedMonitor != null ? p.injectOnRaw(opts.fixedMonitor, raw) : p.injectRaw(raw));
+      (opts.fixedMonitor != null ? p.injectOnRaw(opts.fixedMonitor, raw,sessionId) : p.injectRaw(raw,sessionId));
     if (sent) return;
-    if (opts.fixedMonitor != null) api.remoteInjectOn(opts.fixedMonitor, msg);
-    else api.remoteInject(msg);
+    if (opts.fixedMonitor != null) api.remoteInjectOn(opts.fixedMonitor, msg,sessionId);
+    else api.remoteInject(msg,sessionId);
   };
 
   /** Push focus + cursor changes to the guest (one backend call per poll). */
   const pollFocusAndCursor = async (reassertFocus: boolean) => {
     if (!dataCh || dataCh.readyState !== "open") return;
-    const st = await api.remotePollState();
-    if (!dataCh || dataCh.readyState !== "open") return;
+    const channel=dataCh,owner=currentViewHost;
+    const st = await api.remotePollState(owner?.sessionId);
+    if (dataCh!==channel||currentViewHost!==owner||!dataCh || dataCh.readyState !== "open") return;
     if (st.textField !== lastTextField) {
       lastTextField = st.textField;
       dataCh.send(JSON.stringify({ event: "focus", textField: st.textField }));
@@ -1450,7 +1463,7 @@ export function startHost(opts: HostOptions): () => void {
       lastCursorKind = kind;
       lastCursorPos = pos;
       const source = Date.now() - lastRemotePointerAt < 700 ? "remote" : "desktop";
-      dataCh.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1], source }));
+      dataCh.send(JSON.stringify({ event: "cursor", kind, x: pos?.[0], y: pos?.[1], source,selectedDisplayId:st.cursorDisplayId }));
     }
   };
 
@@ -1505,6 +1518,7 @@ export function startHost(opts: HostOptions): () => void {
     // Kill every session-owned timer, including ones belonging to a start that
     // lost a race and is no longer reachable through the single-slot hooks.
     runSessionCleanups();
+    currentViewHost?.close();currentViewHost=null;epochVideoHost?.close();epochVideoHost=null;captureFeeds?.close();captureFeeds=null;activeVideoPc=null;currentPresenceHandshake=()=>null;
     stopCapture();
     stopAudio();
     closePipes();
@@ -1540,192 +1554,36 @@ export function startHost(opts: HostOptions): () => void {
   const buildVideoTrack = async (): Promise<{ track: MediaStreamTrack; start: () => Promise<void> } | null> => {
     let feedEpoch = -1;
     let feedGeneration: number | null = null;
-    const canvas = document.createElement("canvas");
-    canvas.width = 1280;
-    canvas.height = 720;
-    const cctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
-
-    // Prefer an insertable-streams track (MediaStreamTrackGenerator): we hand each
-    // composited frame to WebRTC the moment it's drawn, instead of letting
-    // `captureStream()` sample the canvas on the compositor's vsync — that sampling
-    // adds up to a display frame of latency and throttles when the window is
-    // hidden/minimized to tray. Falls back to captureStream where unsupported.
-    type GenTrack = MediaStreamTrack & { writable: WritableStream<VideoFrame> };
-    const GenCtor = (window as unknown as { MediaStreamTrackGenerator?: new (init: { kind: "video" }) => GenTrack })
-      .MediaStreamTrackGenerator;
-    let writer: WritableStreamDefaultWriter<VideoFrame> | null = null;
-    let genTrack: GenTrack | null = null;
-    if (GenCtor) {
-      try {
-        genTrack = new GenCtor({ kind: "video" });
-        writer = genTrack.writable.getWriter();
-      } catch {
-        genTrack = null;
-        writer = null;
-      }
-    }
-    videoWriter = writer;
-    // If the encoder ever falls behind, drop instead of queueing: a queued frame
-    // is already stale, and backpressure here would turn into growing latency.
-    let pendingWrites = 0;
-    // Pace MediaStreamTrackGenerator timestamps to the target fps. JPEG decode
-    // latency varies frame-to-frame; stamping with wall-clock-at-draw made the
-    // encoder see irregular inter-frame gaps, which the phone's de-jitter buffer
-    // treated as network jitter and periodically "corrected" (smooth → hitch →
-    // smooth). A monotonic cadence + explicit duration keeps playout even.
-    let nextTsUs = 0;
-    const pushFrame = () => {
-      // Direct WebCodecs path active: the guest decodes H.264 off the data
-      // channel, so feeding the WebRTC track too would double-encode every frame.
-      // Native NVENC owns the channel while `nativeActive` — don't also run the
-      // canvas WebCodecs encoder or two independent H.264 streams interleave.
-      if (wcSink) {
-        if (nativeActive) return;
-        try {
-          wcSink(canvas);
-        } catch {
-          /* encoder mid-reconfigure */
+    const owner=currentViewHost;
+    const feeds=new CaptureVideoFeed(()=>quality.fps,()=>!stopped&&feedEpoch===captureEpoch&&currentViewHost===owner,(canvas,identity)=>{
+      if(!wcSink)return false;if(!nativeActive)wcSink(canvas,identity);return true;
+    },(identity,track)=>{if(currentViewHost===owner&&feedEpoch===captureEpoch)void epochVideoHost?.stage(identity,track);});
+    captureFeeds?.close();captureFeeds=feeds;
+    const ch=new Channel<ArrayBuffer>();
+    const onFrameBytes=(bytes:ArrayBuffer)=>{
+      const packet=parseCapturePacket(bytes);if(!packet)return;
+      const frame=parseNativeFrame(packet.payload);
+      try{
+        if(feedEpoch!==captureEpoch||currentViewHost!==owner)return;
+        const identity=packet.identity;
+        if(identity&&!owner?.observe(identity))return;
+        if(!identity&&supportsRemote(currentPresenceHandshake(),'view-epoch-input-v1'))return;
+        feeds.select(identity);
+        if(frame){
+          if(frame.fast&&frame.generation!==feedGeneration)return;
+          nativeActive=true;nativeDeliveryMs=frame.hostAgeMs;
+          nativeSink?.(frame.payload,frame.key,frame.w,frame.h,frame.timestamp,frame.fast,frame.frameId,frame.rfiClean,identity);return;
         }
-        return;
-      }
-      if (!writer || pendingWrites > 2) return;
-      try {
-        const fps = Math.max(1, quality.fps);
-        const durUs = Math.round(1_000_000 / fps);
-        const nowUs = Math.round(performance.now() * 1000);
-        if (nextTsUs === 0 || nextTsUs < nowUs - durUs * 4) {
-          // First frame, or we fell far behind a stall — resync to wall clock.
-          nextTsUs = nowUs;
-        }
-        const ts = nextTsUs;
-        nextTsUs += durUs;
-        const vf = new VideoFrame(canvas, { timestamp: ts, duration: durUs });
-        pendingWrites++;
-        writer
-          .write(vf)
-          .catch(() => {})
-          .finally(() => pendingWrites--);
-      } catch {
-        /* canvas not drawable yet */
+        nativeActive=false;feeds.paint(packet.payload,identity);
+      }finally{
+        // Even rejected/retired GE identities return the inner GN credit. The
+        // source identity gate cannot disable the two-packet native window.
+        if(frame?.fast&&!videoPipe?.ack(frame.generation,frame.sequence))void api.remoteAckNativeFrame(frame.generation,frame.sequence).catch(()=>{});
       }
     };
-    // Composite a "GS" strip container (parallel-encoded horizontal bands): decode
-    // every strip, then draw them all in one synchronous batch so `captureStream`
-    // never samples a half-updated canvas (avoids tearing between bands).
-    const drawStrips = async (u8: Uint8Array) => {
-      const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-      const w = dv.getUint16(3, true);
-      const h = dv.getUint16(5, true);
-      const count = u8[7];
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-      }
-      const jobs: { y: number; p: Promise<ImageBitmap> }[] = [];
-      let off = 8;
-      for (let i = 0; i < count && off + 8 <= u8.length; i++) {
-        const y = dv.getUint16(off, true);
-        const len = dv.getUint32(off + 4, true);
-        off += 8;
-        const jpg = u8.slice(off, off + len);
-        off += len;
-        // Our encoder emits plain sRGB JPEGs with no ICC profile — skip the color
-        // conversion pass for a faster decode.
-        jobs.push({ y, p: createImageBitmap(new Blob([jpg], { type: "image/jpeg" }), { colorSpaceConversion: "none" }) });
-      }
-      const bmps = await Promise.all(jobs.map((j) => j.p));
-      bmps.forEach((bmp, i) => {
-        cctx?.drawImage(bmp, 0, jobs[i].y);
-        bmp.close?.();
-      });
-    };
-
-    const drawFull = async (bytes: ArrayBuffer) => {
-      const bmp = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), { colorSpaceConversion: "none" });
-      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-        canvas.width = bmp.width;
-        canvas.height = bmp.height;
-      }
-      cctx?.drawImage(bmp, 0, 0);
-      bmp.close?.();
-    };
-
-    // Latest-wins decode: if a frame is still decoding when the next arrives,
-    // keep only the newest and drop the rest. Decoding a backlog can only ever
-    // ADD latency — every queued frame is already stale — and it also guarantees
-    // frames hit the canvas in arrival order (parallel async decodes could
-    // finish out of order and paint an old frame over a newer one).
-    let decoding = false;
-    let newestPending: ArrayBuffer | null = null;
-    const pump = (bytes: ArrayBuffer) => {
-      decoding = true;
-      const u8 = new Uint8Array(bytes);
-      // "GS" = parallel-strip container; anything else is a plain full-frame JPEG.
-      const p = u8.length >= 8 && u8[0] === 0x47 && u8[1] === 0x53 ? drawStrips(u8) : drawFull(bytes);
-      p.then(pushFrame)
-        .catch(() => {})
-        .finally(() => {
-          decoding = false;
-          if (newestPending) {
-            const next = newestPending;
-            newestPending = null;
-            pump(next);
-          }
-        });
-    };
-
-    const ch = new Channel<ArrayBuffer>();
-    const onFrameBytes = (bytes: ArrayBuffer) => {
-      if (feedEpoch !== captureEpoch) return;
-      // Native container ('G' 'N' | flags | rsv | w u16 | h u16 | Annex-B): Rust
-      // encoded this with NVENC, so there is nothing to do but forward it. This is
-      // the whole point of the native path — no JPEG decode, no canvas, no
-      // re-encode, none of the ~27ms round trip those cost.
-      const u8 = new Uint8Array(bytes);
-      if (u8.length > 8 && u8[0] === 0x47 && u8[1] === 0x4e) {
-        nativeActive = true;
-        // Little-endian u16 width/height live in the GN header — pass them so
-        // the first native frame can announce a codec+size to the guest before
-        // any Annex-B lands (without that JSON the guest never builds a
-        // VideoDecoder and sits on "Waking your screen…" forever).
-        const frame = parseNativeFrame(bytes);
-        if (!frame) return;
-        if (frame.fast && frame.generation !== feedGeneration) return;
-        nativeDeliveryMs = frame.hostAgeMs;
-        try {
-          nativeSink?.(frame.payload, frame.key, frame.w, frame.h, frame.timestamp, frame.fast, frame.frameId, frame.rfiClean);
-        } finally {
-          // Credit is returned only AFTER the frame reached the send/gate logic.
-          // Never wait for ACK on the main thread. Stale generations are ignored
-          // by Rust; a missing ACK automatically falls back to classic delivery.
-          if (frame.fast && !videoPipe?.ack(frame.generation, frame.sequence)) {
-            void api.remoteAckNativeFrame(frame.generation, frame.sequence).catch(() => {});
-          }
-        }
-        return;
-      }
-      nativeActive = false;
-      if (decoding) {
-        newestPending = bytes;
-        return;
-      }
-      pump(bytes);
-    };
-    ch.onmessage = (buf) => onFrameBytes(buf as unknown as ArrayBuffer);
-    // Generator path: frames are pushed explicitly, so delivery tracks the Rust
-    // capture thread exactly. Fallback captureStream() with no fps arg does the
-    // same via draw-sampling (encoder fps ceiling is set via setParameters).
-    let track: MediaStreamTrack | null = genTrack;
-    if (!track) {
-      const stream = canvas.captureStream?.();
-      track = stream?.getVideoTracks?.()[0] ?? null;
-    }
-    if (!track) return null;
-    try {
-      (track as MediaStreamTrack & { contentHint: string }).contentHint = trackTuning(quality.mode).hint;
-    } catch {
-      /* not supported */
-    }
+    ch.onmessage=buf=>onFrameBytes(buf as unknown as ArrayBuffer);
+    const track=feeds.track;
+    feeds.setContentHint(trackTuning(quality.mode).hint);
     // Capture is DEFERRED: the track is added to the offer immediately (so no
     // renegotiation), but the Rust screen capture only starts once the guest is
     // authorized. Until then the track carries no frames, so the phone sees nothing.
@@ -1743,6 +1601,7 @@ export function startHost(opts: HostOptions): () => void {
       if (videoPipe && !videoPipe.open) videoPipe = null;
       if (!videoPipe) {
         const ep = await pipeEndpointOnce();
+        if (stopped || startedEpoch !== captureEpoch) return;
         if (ep) {
           const pipe = await MediaPipe.open(ep, (buf) => {
             if (videoPipe === pipe) onFrameBytes(buf);
@@ -1764,6 +1623,7 @@ export function startHost(opts: HostOptions): () => void {
           }
         }
       }
+      if (stopped || startedEpoch !== captureEpoch) return;
       const pipeId = videoPipe?.id;
       if (opts.fixedMonitor != null) {
         await api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap), pipeId);
@@ -2249,6 +2109,7 @@ export function startHost(opts: HostOptions): () => void {
       if (audioPipe && !audioPipe.open) audioPipe = null;
       if (!audioPipe) {
         const ep = await pipeEndpointOnce();
+        if (stopped || mySeq !== audioStartSeq || audioNode !== node) return;
         if (ep) {
           const pipe = await MediaPipe.open(ep, (buf) => {
             if (audioPipe === pipe) onPcm(buf);
@@ -2269,7 +2130,9 @@ export function startHost(opts: HostOptions): () => void {
           }
         }
       }
+      if (stopped || mySeq !== audioStartSeq || audioNode !== node) return;
       const fmt = await api.remoteStartAudio(ch, audioPipe?.id);
+      if (stopped || mySeq !== audioStartSeq || audioNode !== node) return;
       const channels = fmt ? Math.max(1, Math.min(2, fmt.channels)) : 2;
       const captureRate =
         fmt && fmt.sampleRate > 8000 && fmt.sampleRate <= 384000 ? fmt.sampleRate : ctx.sampleRate;
@@ -2358,6 +2221,8 @@ export function startHost(opts: HostOptions): () => void {
     // Access gate: the screen/audio capture and input injection stay off until the
     // guest is authorized (trusted device, correct secret, or user approval).
     let authorized = false;
+    let authAnnounced=false;
+    let presenceSession: HostPresenceSession | null = null;
     // Latest auth message from this peer asked for the clipboard secret. Reset per
     // session and re-read on every auth message (the guest resends auth periodically).
     let lastAuthWantedSecret = false;
@@ -2401,6 +2266,9 @@ export function startHost(opts: HostOptions): () => void {
     const rebuildVideoPipeline = async () => {
       if (pc !== myPc || !videoSender || !authorized) return;
       console.warn("[remote] video encoder stalled — rebuilding the video track in place");
+      if(supportsRemote(presenceSession?.negotiated??null,'view-epoch-input-v1')){
+        const identity=viewHost.identity;if(identity)captureFeeds?.rebuild(identity);return;
+      }
       stopCapture();
       videoWriter?.close().catch(() => {});
       videoWriter = null;
@@ -2458,46 +2326,26 @@ export function startHost(opts: HostOptions): () => void {
 
     const authorize = async () => {
       if (authorized) return;
-      authorized = true;
-      try {
-        await startVideoCapture?.();
-      } catch (e) {
-        console.warn("[remote] start capture failed:", e);
-      }
-      try {
-        await startAudioCapture?.();
-      } catch {
-        /* audio is optional */
-      }
-      // First-approval path: the guest already attached an empty track before
-      // capture started. Force a keyframe (and a mute flip) so receivers that
-      // painted black don't sit forever on "Waking your screen…".
-      try {
-        const sender = videoSender as (RTCRtpSender & { generateKeyFrame?: () => Promise<void> }) | null;
-        await sender?.generateKeyFrame?.();
-      } catch {
-        /* optional API */
-      }
-      try {
-        if (videoTrack) {
-          videoTrack.enabled = false;
-          videoTrack.enabled = true;
-        }
-      } catch {
-        /* ignore */
-      }
-      if (dataCh?.readyState === "open") {
-        // Attach the shared-clipboard secret ONLY when (a) this host has one
-        // configured and (b) the guest explicitly asked for it on its auth
-        // message. Never broadcast — it rides the auth-ok the guest already
-        // trusts, and only after the user approved this device. Aux pop-out
-        // hosts have no secret and skip this entirely.
-        const authOk: Record<string, unknown> = { event: "auth", state: "ok" };
-        if (opts.clipboardSecret && lastAuthWantedSecret) {
-          authOk.secret = opts.clipboardSecret;
-        }
-        dataCh.send(JSON.stringify(authOk));
-      }
+      await runAuthorizedStartup({
+        isAlive: () => sessionAlive && pc === myPc && activeSessionId === sessionId && !stopped,
+        registerPresence: () => presenceSession?.authorize() ?? Promise.resolve(),
+        activate: () => { authorized = true; },
+        startVideo: () => startVideoCapture?.(),
+        startAudio: () => startAudioCapture?.(),
+        requestRecoveryFrame: () => (videoSender as (RTCRtpSender & { generateKeyFrame?: () => Promise<void> }) | null)?.generateKeyFrame?.(),
+        showTrack: () => {
+          if (videoTrack) { videoTrack.enabled = false; videoTrack.enabled = true; }
+        },
+        acknowledge: () => {
+          if (dataCh?.readyState !== "open") return;
+          const authOk: Record<string, unknown> = { event: "auth", state: "ok", ...presenceSession?.authFields() };
+          // Secret is only read/sent after every asynchronous startup boundary
+          // has proved that this is still the authorized peer.
+          if (opts.clipboardSecret && lastAuthWantedSecret) authOk.secret = opts.clipboardSecret;
+          dataCh.send(JSON.stringify(authOk));authAnnounced=true;
+        },
+        onVideoError: (error) => console.warn("[remote] start capture failed:", error),
+      });
     };
 
     // Pre-gather a small candidate pool so a reconnect/ICE-restart has paths ready
@@ -2514,6 +2362,10 @@ export function startHost(opts: HostOptions): () => void {
     // Unique id for THIS peer session. Sent with every offer so the guest can tell
     // an in-place ICE restart (re-route the same live session) from a fresh session.
     const sessionId = Math.random().toString(36).slice(2);
+    presenceSession = new HostPresenceSession(sessionId, opts.fixedMonitor,overlay=>{
+      if(sessionAlive&&pc===myPc&&activeSessionId===sessionId&&!stopped&&data.readyState==='open')data.send(JSON.stringify({event:'remote-overlay-status',sessionId,overlay}));
+    });
+    sessionCleanups.add(() => presenceSession?.end());
     activeSessionId = sessionId;
     // Liveness for THIS session's timers. `pc !== myPc` covers most async
     // handlers, but a session that lost a concurrent-start race never becomes
@@ -2617,6 +2469,21 @@ export function startHost(opts: HostOptions): () => void {
     // Reliable+ordered channel for the WebCodecs direct-video path. Created up
     // front (no renegotiation); carries nothing until the guest opts in.
     const videoCh = pc.createDataChannel("video");
+    let baseVideoSender:RTCRtpSender|null=null;
+    const liveView=()=>sessionAlive&&pc===myPc&&activeSessionId===sessionId&&!stopped&&authorized&&authAnnounced;
+    const sendView=(message:Record<string,unknown>)=>{if(!liveView()||data.readyState!=='open')return false;data.send(JSON.stringify(message));return true;};
+    const viewHost=new HostViewSession(sessionId,()=>supportsRemote(presenceSession?.negotiated??null,'view-epoch-input-v1'),liveView,sendView,
+      identity=>{captureFeeds?.select(identity);},
+      (identity,mode)=>{captureFeeds?.commit(identity);if(mode==='direct'){
+        epochHost.directCommit(identity);activeVideoPc=null;videoSender=baseVideoSender;videoTrack=baseVideoSender?.track??null;
+      }});
+    const epochHost=new EpochVideoHost(sessionId,sendView,()=>myPc.getConfiguration(),liveView,
+      identity=>viewHost.acknowledge(identity,'rtc'),
+      (sender,videoPc,identity)=>{if(!liveView())return;videoSender=sender;activeVideoPc=videoPc;videoTrack=sender.track;applyContentHint();applyBitrate();captureFeeds?.commit(identity);},
+      (identity,message,track)=>{if(!liveView())return;captureFeeds?.reject(identity,track);void viewHost.fail(identity,message);});
+    currentViewHost=viewHost;epochVideoHost=epochHost;currentPresenceHandshake=()=>presenceSession?.negotiated??null;
+    viewHost.start();sessionCleanups.add(()=>{viewHost.close();epochHost.close();});
+
     videoCh.binaryType = "arraybuffer";
     // DIRECT audio: Opus (preferred) or raw float32. Created up front (no
     // renegotiation); idle until the guest opts in with `{type:"amode",mode:"pcm"}`.
@@ -2660,6 +2527,10 @@ export function startHost(opts: HostOptions): () => void {
     let wcBps = 0;
     let wcFps = 0;
     let wcSeq = 0;
+    let directIdentity:CaptureIdentity|null=null;
+    let lastVideoConfig:Record<string,unknown>|null=null;
+    const encodedIdentities=new Map<number,CaptureIdentity|null>();
+    let encodedTimestamp=0;
     let wcForceKey = false;
     let wcLastKeyAt = 0;
     /** Last periodic intra-refresh request (the safety net no longer sends IDRs). */
@@ -2725,6 +2596,7 @@ export function startHost(opts: HostOptions): () => void {
         /* HUD only */
       }
       pushAdaptBitrate(true);
+      if(lastVideoConfig)sendVideoConfig(lastVideoConfig);
     };
 
     /** Auto: RTP as soon as the link loses packets (reliable SCTP would stall on
@@ -2838,16 +2710,17 @@ export function startHost(opts: HostOptions): () => void {
 
     /** One access unit (or a config JSON) onto the carrier: queue it in the send
      *  worker, then push one dummy frame for VP8 to encode it into. */
-    const carrierSend = (payload: Uint8Array, key: boolean, tsMs: number, config = false): boolean => {
+    const carrierSend = (payload: Uint8Array, key: boolean, tsMs: number, config = false,identity:CaptureIdentity|null=null): boolean => {
       const c = carrier;
       if (!c?.ready) return false;
       // Own buffer: the payload may be a view into a larger pipe buffer, and the
       // worker takes it by transfer.
-      const copy = payload.slice();
+      let copy=payload.slice();
+      if(!config&&identity){const framed=new Uint8Array(copy.length+8);new DataView(framed.buffer).setFloat64(0,identity.view.epoch,true);framed.set(copy,8);copy=framed;}
       const seq = config ? 0 : wcSeq++ >>> 0;
       try {
         c.worker.postMessage(
-          { type: "rec", flags: (key ? REC_KEY : 0) | (config ? REC_CONFIG : 0), seq, tsMs, data: copy.buffer },
+          { type: "rec", flags: (key ? REC_KEY : 0) | (config ? REC_CONFIG : 0) | (!config&&identity?REC_VIEW:0), seq, tsMs, data: copy.buffer },
           [copy.buffer],
         );
         const ts = Math.max(c.lastTs + 1, Math.round(performance.now() * 1000));
@@ -2866,7 +2739,8 @@ export function startHost(opts: HostOptions): () => void {
     /** Codec announces go on the video channel always, and on the carrier too while
      *  it carries the frames — a keyframe must never overtake its own announce. */
     const sendVideoConfig = (cfg: Record<string, unknown>) => {
-      const json = JSON.stringify(cfg);
+      lastVideoConfig={...cfg,...(directIdentity?{identity:directIdentity}:{})};
+      const json = JSON.stringify(lastVideoConfig);
       try {
         videoCh.send(json);
       } catch {
@@ -2879,9 +2753,9 @@ export function startHost(opts: HostOptions): () => void {
      *  a view (not a copy) so the native path can forward Rust's bytes as-is. */
     // `Uint8Array<ArrayBuffer>` (not the default `ArrayBufferLike`): RTCDataChannel.send
     // won't take a possibly-SharedArrayBuffer-backed view.
-    const wcSendBytes = (payload: Uint8Array<ArrayBuffer>, key: boolean, tsMs: number, fast = false): boolean => {
+    const wcSendBytes = (payload: Uint8Array<ArrayBuffer>, key: boolean, tsMs: number, fast = false,identity:CaptureIdentity|null=null): boolean => {
       if (transport === "rtp" && carrier?.ready) {
-        if (!carrierSend(payload, key, tsMs)) return false;
+        if (!carrierSend(payload, key, tsMs,false,identity)) return false;
         wcFrames++;
         wcBytes += payload.byteLength;
         if (key) {
@@ -2891,15 +2765,16 @@ export function startHost(opts: HostOptions): () => void {
         return true;
       }
       if (videoCh.readyState !== "open") return false;
-      const head = new ArrayBuffer(20);
+      const head = new ArrayBuffer(identity?28:20);
       const dv = new DataView(head);
       dv.setUint8(0, 0x47); // 'G'
       dv.setUint8(1, 0x56); // 'V'
       dv.setUint8(2, key ? 1 : 0);
-      dv.setUint8(3, 0);
+      dv.setUint8(3, identity?1:0);
       dv.setUint32(4, wcSeq++ >>> 0, true);
       dv.setFloat64(8, tsMs, true); // host perf.now() ms at capture
       dv.setUint32(16, payload.byteLength, true);
+      if(identity)dv.setFloat64(20,identity.view.epoch,true);
       const fragment = videoFragmentSize(fast, myPc.sctp?.maxMessageSize);
       if (fragment < head.byteLength) return false;
       try {
@@ -2923,9 +2798,11 @@ export function startHost(opts: HostOptions): () => void {
     };
 
     const wcSend = (chunk: EncodedVideoChunk) => {
+      const identity=encodedIdentities.get(chunk.timestamp)??null;encodedIdentities.delete(chunk.timestamp);
+      if(supportsRemote(presenceSession?.negotiated??null,'view-epoch-input-v1')&&(!identity||!sameCapture(identity,directIdentity)))return;
       const payload = new ArrayBuffer(chunk.byteLength);
       chunk.copyTo(payload);
-      wcSendBytes(new Uint8Array(payload), chunk.type === "key", chunk.timestamp / 1000);
+      wcSendBytes(new Uint8Array(payload), chunk.type === "key", chunk.timestamp / 1000,false,identity);
     };
 
     // ---- native path: Rust already produced the H.264 ------------------------
@@ -3022,6 +2899,7 @@ export function startHost(opts: HostOptions): () => void {
     const restoreMode = async () => {
       if (!sessionAlive || pc !== myPc || opts.fixedMonitor != null) return;
       if (wcSink || nativeActive) await api.remoteSetCaptureNative(quality.hostNvenc, quality.nvencFast);
+      if (!sessionAlive || pc !== myPc || opts.fixedMonitor != null) return;
       await api.remoteSetEncodePaused(encodePaused || guestIdle);
     };
     restoreCaptureMode = restoreMode;
@@ -3194,9 +3072,10 @@ export function startHost(opts: HostOptions): () => void {
       if (skipsSinceKey < SKIP_RECOVER_AT) return;
       if (armNativeRecovery(true)) skipsSinceKey = 0;
     };
-    nativeSink = (payload, key, w = 0, h = 0, tsMs = performance.now(), fast = false, frameId = -1, rfiClean = false) => {
+    nativeSink = (payload, key, w = 0, h = 0, tsMs = performance.now(), fast = false, frameId = -1, rfiClean = false,identity=null) => {
       if (!sessionAlive || pc !== myPc) return;
       if (videoCh.readyState !== "open") return;
+      if(identity&&!sameCapture(identity,directIdentity)){directIdentity=identity;nativeAnnounced=false;setNativeAwaitKey(!key,'view epoch');}
       // Announce what the stream IS: a keyframe carries the SPS. A profile switch
       // (R3) arrives as a fresh session's IDR at the same size, so the codec is
       // compared too — the guest must rebuild its decoder before that IDR.
@@ -3362,7 +3241,7 @@ export function startHost(opts: HostOptions): () => void {
       // this clock on arrival. Classic retains its original arrival timestamp.
       noteFrameBytes(payload.byteLength);
       noteEncodedBytes(payload.byteLength, key, encodePaused);
-      if (!wcSendBytes(payload, key, tsMs, fast)) {
+      if (!wcSendBytes(payload, key, tsMs, fast,identity)) {
         // Channel threw mid-frame — the guest received a partial access unit, which
         // IS a true reference-chain break for H.264. HARD-gate until the IDR lands.
         slog("fault", `channel send threw mid-${key ? "keyframe" : "P-frame"} (partial AU) — hard gate`);
@@ -3414,6 +3293,7 @@ export function startHost(opts: HostOptions): () => void {
       // flips CAP_NATIVE_OK; if we null the sink here those GN frames go nowhere
       // and the phone sits on "Waking your screen…" again.
       nativeActive = false;
+      if(sessionAlive&&pc===myPc){activeVideoPc=epochHost.peer;videoSender=epochHost.sender??baseVideoSender;videoTrack=videoSender?.track??null;applyContentHint();applyBitrate();}
       nativeAnnounced = false;
       nativeCodec = "";
       nativeConfigW = 0;
@@ -3455,9 +3335,10 @@ export function startHost(opts: HostOptions): () => void {
     wcStop = () => wcTeardown(false);
 
     /** Encode one composited canvas frame (called from pushFrame via wcSink). */
-    const wcEncodeFrame = (canvas: HTMLCanvasElement) => {
+    const wcEncodeFrame = (canvas: HTMLCanvasElement,identity:CaptureIdentity|null=null) => {
       const enc = wcEncoder;
       if (!enc || enc.state === "closed" || videoCh.readyState !== "open") return;
+      if(identity&&!sameCapture(identity,directIdentity)){directIdentity=identity;encodedIdentities.clear();enc.reset();wcW=0;wcH=0;wcForceKey=true;}
       const w = canvas.width;
       const h = canvas.height;
       if (w < 2 || h < 2) return;
@@ -3516,7 +3397,9 @@ export function startHost(opts: HostOptions): () => void {
       }
       const key = wcForceKey || performance.now() - wcLastKeyAt > quality.wcKeyMs;
       wcForceKey = false;
-      const vf = new VideoFrame(canvas, { timestamp: Math.round(performance.now() * 1000) });
+      encodedTimestamp=Math.max(encodedTimestamp+1,Math.round(performance.now()*1000));
+      const vf = new VideoFrame(canvas, { timestamp: encodedTimestamp });
+      encodedIdentities.set(encodedTimestamp,identity);while(encodedIdentities.size>16)encodedIdentities.delete(encodedIdentities.keys().next().value!);
       try {
         enc.encode(vf, { keyFrame: key });
       } catch {
@@ -3649,6 +3532,7 @@ export function startHost(opts: HostOptions): () => void {
     if (v) {
       videoTrack = v.track;
       videoSender = pc.addTrack(videoTrack, new MediaStream([videoTrack]));
+      baseVideoSender=videoSender;
       startVideoCapture = v.start;
     }
     // Aux pop-out hosts skip desktop audio — the primary session already carries it.
@@ -3689,13 +3573,14 @@ export function startHost(opts: HostOptions): () => void {
       }
     }
 
-    const onControlMsg = async (e: MessageEvent) => {
+    const onControlMsg = onlyLiveSession(() => sessionAlive && pc === myPc && activeSessionId === sessionId && !stopped, async (e: MessageEvent) => {
       try {
         const msg = JSON.parse(e.data as string);
         lastGuestMsg = Date.now();
         // Explicit goodbye from the phone (user tapped Disconnect): tear down now
         // instead of waiting ~30s for ICE to notice the peer is gone.
         if (msg && msg.type === "bye") {
+          presenceSession?.end(true);
           guestNeedsOffer = true;
           teardownPeer();
           return;
@@ -3706,13 +3591,14 @@ export function startHost(opts: HostOptions): () => void {
         // already-authorized session re-acks "ok" instead of staying silent (a lost
         // "ok" used to wedge the phone in "authorizing" until an app restart).
         if (msg && msg.type === "auth") {
+          if (!authorized && !authBusy) presenceSession?.learnAuth(msg);
           // The guest may ask the host to include the shared-clipboard secret on
           // the auth-ok event (so the companion's clipboard can derive its key
           // without the user typing the permanent key). Captured here and read by
           // the authorize() callback above — the secret only ships post-approval.
           lastAuthWantedSecret = msg.wantSecret === true;
           if (authorized) {
-            const ack: Record<string, unknown> = { event: "auth", state: "ok" };
+            const ack: Record<string, unknown> = { event: "auth", state: "ok", ...presenceSession?.authFields() };
             if (opts.clipboardSecret && lastAuthWantedSecret) ack.secret = opts.clipboardSecret;
             if (dataCh?.readyState === "open") dataCh.send(JSON.stringify(ack));
             return;
@@ -4096,20 +3982,25 @@ export function startHost(opts: HostOptions): () => void {
         }
         // Everything else is an input event — never inject before authorization.
         if (!authorized) return;
-        if (msg && (msg.type === "move" || msg.type === "moverel" ||
-          ((msg.type === "click" || msg.type === "down" || msg.type === "up") &&
-            (Number.isFinite(msg.x) || Number.isFinite(msg.y))))) {
+        if (presenceSession?.handle(msg)) return;
+        if(msg.type==='view-request'||msg.type==='view-frame'){await viewHost.handle(msg);return;}
+        if(String(msg.type).startsWith('epoch-video-')){await epochHost.handle(msg);return;}
+        if(!liveView())return;
+        const inputMsg=msg.type==='viewinput'&&msg.event&&typeof msg.event==='object'?msg.event as Record<string,unknown>:msg;
+        if (inputMsg && (inputMsg.type === "move" || inputMsg.type === "moverel" ||
+          ((inputMsg.type === "click" || inputMsg.type === "down" || inputMsg.type === "up") &&
+            (Number.isFinite(inputMsg.x) || Number.isFinite(inputMsg.y))))) {
           lastRemotePointerAt = Date.now();
         }
-        injectInput(e.data as string, msg);
+        injectInput(e.data as string, msg,presenceSession?.inputSessionId());
         // A click can move focus into (or out of) a PC text field. Poll focus a few
         // times right after so the phone learns to pop its keyboard with minimal
         // lag — while the tap's user-activation is still fresh on the phone.
-        if (msg && (msg.type === "click" || msg.type === "up")) pokeFocus();
+        if (inputMsg && (inputMsg.type === "click" || inputMsg.type === "up")) pokeFocus();
       } catch {
         /* ignore malformed */
       }
-    };
+    });
     control.onmessage = onControlMsg;
     // Lossy pointer-move stream feeds the same handler (auth gate included).
     move.onmessage = onControlMsg;
@@ -4195,7 +4086,7 @@ export function startHost(opts: HostOptions): () => void {
       if (!pc) return empty;
       let report: RTCStatsReport;
       try {
-        report = await pc.getStats();
+        report = await (activeVideoPc??pc).getStats();
       } catch {
         return empty;
       }
@@ -4238,7 +4129,7 @@ export function startHost(opts: HostOptions): () => void {
     data.onopen = () => {
       // If authorization somehow completed before this channel opened, make sure
       // the guest still learns it's allowed (otherwise it stays "pending").
-      if (authorized && data.readyState === "open") data.send(JSON.stringify({ event: "auth", state: "ok" }));
+      if (authorized && data.readyState === "open") data.send(JSON.stringify({ event: "auth", state: "ok", ...presenceSession?.authFields() }));
       // Session-scoped, not just module-scoped. This loop drives `adaptFromBuffer`
       // → `remoteSetCaptureQuality`, which is PROCESS-wide: an orphan from a
       // start that lost a race would sit there re-setting the live session's

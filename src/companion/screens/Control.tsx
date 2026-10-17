@@ -1,4 +1,12 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { frameToDesktop,displayAt,videoContentRect,visibleDisplayIds } from '@/lib/displayLayout';
+import type { CaptureIdentity } from '@/lib/captureView';
+import type { EpochStream } from '@/lib/epochVideo';
+import {sameCapture} from '@/lib/captureView';
+import {TransitionPicture} from '../transitionPicture';
+import {foregroundEdit} from '../imeInput';
+import {pipCrop,pipFit,type ViewCamera} from '../pipView';
+import { supportsRemote } from '@/lib/remoteProtocol';
 import { isHevcCodec } from "@/lib/nativeDelivery";
 import { mainThreadStats, startMainThreadMonitor } from "../mainThreadMonitor";
 import { createPortal } from "react-dom";
@@ -53,6 +61,7 @@ import {
   Headphones,
   Cpu as CpuIcon,
   Settings as SettingsIcon,
+  Palette,
   NotebookPen,
   Send,
   Type as TypeIcon,
@@ -86,7 +95,10 @@ import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { tabAllowed } from "@/lib/setupMode";
 import { isTauri } from "@/lib/tauri";
-import { nativeDecoderPossible, setNativeDecoderBounds, setStreamPowerActive } from "../nativeDecoder";
+import { readView,saveView,rotationDetent, rotationFromDetent } from "../remotePreferences";
+import { useRemoteRotation } from "../useRemoteRotation";
+import { DesktopAppearanceSheet } from './DesktopAppearanceSheet';
+import { setNativePipAspect,clearNativeTransition,nativeDecoderPossible, setNativeDecoderBounds, setStreamPowerActive } from "../nativeDecoder";
 import { TuneSheet } from "./TuneSheet";
 import {
   hitchFormat,
@@ -568,6 +580,24 @@ export function ControlScreen({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const transitionCanvasRef=useRef<HTMLCanvasElement|null>(null);
+  const transitionPicture=useRef<TransitionPicture|null>(null);
+  if(!transitionPicture.current)transitionPicture.current=new TransitionPicture(()=>transitionCanvasRef.current);
+  const paintedDirect=useRef<CaptureIdentity|null>(null);const revealingPeer=useRef('');
+  const viewportCache=useRef(new Map<string,{zoom:number;pan:{x:number;y:number};selected:string}>());const stagedViewport=useRef('');
+  const [epochStream,setEpochStream]=useState<EpochStream|null>(link.epochStream?.()??null);
+  const [appliedView,setAppliedView]=useState<CaptureIdentity|null>(link.appliedView?.()??null);
+  const displayedViewRef=useRef<CaptureIdentity|null>(appliedView);
+  const nativeViewRef=useRef<CaptureIdentity|null>(null);
+  const [viewChanging,setViewChanging]=useState(link.viewChanging?.()??false);
+  const [remoteHandshake,setRemoteHandshake]=useState(link.remoteHandshake?.()??null);
+  const selectedDisplayRef=useRef(appliedView?.view.selectedDisplayId??'');
+  const [selectedDisplay,setSelectedDisplay]=useState(selectedDisplayRef.current);
+  const allViewportRef=useRef<{zoom:number;pan:{x:number;y:number};selected:string}|null>(null);
+  const pendingViewportRef=useRef<{mode:'single'|'all';selected:string;zoom:number;pan:{x:number;y:number}}|null>(null);
+  const lastViewportReport=useRef('');const presentedPeer=useRef('');
+  const restoredViewSession=useRef('');
+
   /** Separate from <video> — sharing a MediaStream with audio triggers A/V sync lag. */
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -671,6 +701,8 @@ export function ControlScreen({
   wcActiveRef.current = wcActive;
   /** APK MediaCodec → Surface path (no canvas paint). */
   const [wcNative, setWcNative] = useState(false);
+  const [nativeRetained,setNativeRetained]=useState(false);const [canvasReady,setCanvasReady]=useState(false);
+  const nativeBackdrop=wcNative||nativeRetained;const nativeBackdropRef=useRef(false);nativeBackdropRef.current=nativeBackdrop;
   const wcNativeRef = useRef(false);
   wcNativeRef.current = wcNative;
   // Video-box rect (viewport-relative CSS px) while native MediaCodec paints.
@@ -713,6 +745,7 @@ export function ControlScreen({
   // at all) can mint one on demand. Hence: a real PiP element, entered by tap.
   const pipVideoRef = useRef<HTMLVideoElement | null>(null);
   const pipStreamRef = useRef<MediaStream | null>(null);
+  const pipCanvasRef=useRef<HTMLCanvasElement|null>(null);
   const [pipOn, setPipOn] = useState(false);
   const pipSupported = useMemo(
     () => typeof document !== "undefined" && !!document.pictureInPictureEnabled && !isTauri(),
@@ -721,8 +754,9 @@ export function ControlScreen({
 
   /** The <video> to hand the OS: RTC already has one; DIRECT needs a canvas tap. */
   const pipSourceVideo = async (): Promise<HTMLVideoElement | null> => {
-    if (!wcActiveRef.current) return videoRef.current;
-    const canvas = canvasRef.current;
+    // A persistent PiP carrier survives keyed RTC sink replacements and crops
+    // exactly the selected output while the main all-screen view is retained.
+    const canvas=pipCanvasRef.current??(pipCanvasRef.current=document.createElement('canvas'));
     const v = pipVideoRef.current;
     if (!canvas || !v) return null;
     if (!pipStreamRef.current) {
@@ -733,6 +767,7 @@ export function ControlScreen({
       pipStreamRef.current = cs;
       v.srcObject = cs;
     }
+    paintPipFrame();
     try {
       await v.play();
     } catch {
@@ -760,8 +795,8 @@ export function ControlScreen({
   // the OS, which never routes back through our button.
   useEffect(() => {
     const vids = [videoRef.current, pipVideoRef.current].filter(Boolean) as HTMLVideoElement[];
-    const on = () => setPipOn(true);
-    const off = () => setPipOn(false);
+    const on = () => {setPipOn(true);window.dispatchEvent(new CustomEvent('gt:pip',{detail:{active:true,browser:true}}));};
+    const off = () => {setPipOn(false);window.dispatchEvent(new CustomEvent('gt:pip',{detail:{active:false,browser:true}}));};
     for (const v of vids) {
       v.addEventListener("enterpictureinpicture", on);
       v.addEventListener("leavepictureinpicture", off);
@@ -787,13 +822,13 @@ export function ControlScreen({
   // There is no direct signal inside the webview, but the PiP window is far
   // smaller than any phone layout — hide ALL chrome and show pure video there.
   const [pipView, setPipView] = useState(false);
+  const pipActiveRef=useRef(false);pipActiveRef.current=pipView||pipOn;
   useEffect(() => {
     const check = () => setPipView(
       (window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__ === true ||
       (window.innerWidth <= 550 && window.innerHeight <= 350),
     );
-    const onPip = (event: Event) =>
-      setPipView(!!(event as CustomEvent<{ active?: boolean }>).detail?.active);
+    const onPip = (event: Event) => {const detail=(event as CustomEvent<{active?:boolean;browser?:boolean}>).detail;if(!detail?.browser)setPipView(!!detail?.active);};
     check();
     window.addEventListener("resize", check);
     window.addEventListener("gt:pip", onPip);
@@ -894,14 +929,7 @@ export function ControlScreen({
   const [pcTextField, setPcTextField] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [sensitivity, setSensitivity] = useState(1.6);
-  const [rotationHoldMs, setRotationHoldMs] = useState(() => {
-    const saved = Number(localStorage.getItem("gt.remote.rotationHoldMs"));
-    return Number.isFinite(saved) && saved >= 400 ? saved : 1200;
-  });
-  useEffect(() => {
-    localStorage.setItem("gt.remote.rotationHoldMs", String(rotationHoldMs));
-    if (isTauri()) invoke("set_rotation_hold_ms", { value: Math.round(rotationHoldMs) }).catch(() => {});
-  }, [rotationHoldMs]);
+  const { holdMs: rotationHoldMs, setHoldMs: setRotationHoldMs, error: rotationError } = useRemoteRotation();
   const [dragLock, setDragLock] = useState(false);
   const [mods, setMods] = useState<Set<Mod>>(new Set());
   const autoKbdRef = useRef(false); // guards the once-per-focus auto keyboard pop
@@ -939,12 +967,14 @@ export function ControlScreen({
   // Returns the link's delivery result so gesture feedback (vibration) can be
   // tied to the input actually reaching the PC.
   const send: RemoteLink["send"] = (msg) => {
+    if(msg.type==='move')identifyDisplay(msg.x,msg.y);
+    const accepted=link.send(msg);if(!accepted){if(msg.type==='up')setDragging(false);return false;}
     const m = msg as { type?: string; button?: string; dy?: number };
     if (m.type === "click") flashCursor(m.button === "right" ? "right" : m.button === "left" ? "left" : "left");
     else if (m.type === "scroll") flashCursor("scroll", m.dy ?? 0);
     else if (m.type === "down" && m.button) setDragging(true);
     else if (m.type === "up" && m.button) setDragging(false);
-    return link.send(msg);
+    return accepted;
   };
   /** Send a right click; vibrate ONLY if it was actually delivered to the PC. */
   const sendRightClick = () => {
@@ -1190,6 +1220,7 @@ export function ControlScreen({
   // host pipeline + guest JB stay in sync with localStorage.
   const [tune, setTune] = useState<StreamTune>(() => loadStreamTune());
   const [tuneOpen, setTuneOpen] = useState(false);
+  const [appearanceOpen,setAppearanceOpen]=useState(false);
   /** Per-knob explanations in the Tune panel — on by default; power users can fold them away. */
   const [tuneHints, setTuneHints] = useState(true);
   const patchTune = (partial: Partial<StreamTune>) => {
@@ -1303,6 +1334,62 @@ export function ControlScreen({
   // Multi-monitor.
   const [monitors, setMonitors] = useState<RemoteMonitor[]>([]);
   const [monitorIdx, setMonitorIdx] = useState(0);
+  const selectDisplayId=(id:string)=>{
+    const view=displayedViewRef.current?.view;if(!view?.displays.some(d=>d.id===id)||selectedDisplayRef.current===id)return;
+    selectedDisplayRef.current=id;setSelectedDisplay(id);const display=view.displays.find(d=>d.id===id);if(display)setMonitorIdx(display.index);
+    reportRemoteViewport();
+  };
+  const identifyDisplay=(x:number,y:number)=>{
+    const view=displayedViewRef.current?.view;if(view?.mode!=='all')return;
+    const point=frameToDesktop(view.source,{x,y});const display=point?displayAt(view.displays,point):undefined;if(display)selectDisplayId(display.id);
+  };
+  const reportRemoteViewport=()=>{
+    const identity=displayedViewRef.current,vp=viewportRef.current;if(!identity||!vp)return;const view=identity.view,rect=vp.getBoundingClientRect();
+    const content=videoContentRect(view.width,view.height,{width:rect.width,height:rect.height,zoom:zoomRef.current,panX:panRef.current.x,panY:panRef.current.y});
+    const ids=visibleDisplayIds(view,content,{x:0,y:0,width:rect.width,height:rect.height});const selected=view.displays.some(d=>d.id===selectedDisplayRef.current)?selectedDisplayRef.current:view.selectedDisplayId;
+    const report={mode:view.mode,epoch:view.epoch,selectedDisplayId:selected,visibleDisplayIds:ids},key=JSON.stringify(report);if(lastViewportReport.current===key)return;lastViewportReport.current=key;link.reportView?.(report);
+  };
+  const requestCaptureMode=(mode:'single'|'all',id=selectedDisplayRef.current)=>{
+    const current=displayedViewRef.current;if(!current||!id)return false;
+    if(current.view.mode==='all'&&mode==='single')allViewportRef.current={zoom:zoomRef.current,pan:{...panRef.current},selected:selectedDisplayRef.current};
+    const saved=mode==='all'?allViewportRef.current:null;
+    pendingViewportRef.current={mode,selected:id,zoom:saved?.zoom??1,pan:saved?{...saved.pan}:{x:0,y:0}};
+    rememberViewport(current);const sent=link.requestView?.(mode,id,streamQ.maxW)??false;if(!sent)pendingViewportRef.current=null;return sent;
+  };
+  const cameraKey=(identity:CaptureIdentity)=>{const v=identity.view;return JSON.stringify([v.layoutRevision,v.mode,v.source,v.mode==='single'?v.selectedDisplayId:'']);};
+  const rememberViewport=(identity=displayedViewRef.current)=>{if(!identity)return;const cache=viewportCache.current;cache.set(cameraKey(identity),{zoom:zoomRef.current,pan:{...panRef.current},selected:selectedDisplayRef.current});while(cache.size>8)cache.delete(cache.keys().next().value!);};
+  const stageViewport=(identity:CaptureIdentity)=>{
+    const key=`${identity.sessionId}:${identity.view.epoch}`;if(stagedViewport.current===key)return;stagedViewport.current=key;
+    const pending=pendingViewportRef.current;const requested=pending&&identity.view.mode===pending.mode&&(pending.mode==='all'||identity.view.selectedDisplayId===pending.selected)?pending:null;
+    const camera=requested??viewportCache.current.get(cameraKey(identity));
+    zoomRef.current=camera?.zoom??1;panRef.current=camera?{...camera.pan}:{x:0,y:0};
+    const selected=camera&&identity.view.displays.some(d=>d.id===camera.selected)?camera.selected:identity.view.selectedDisplayId;selectedDisplayRef.current=selected;setSelectedDisplay(selected);commitView();if(requested)pendingViewportRef.current=null;
+  };
+  const retainPicture=()=>{
+    if(wcNativeRef.current)return;const vp=viewportRef.current;if(!vp)return;const rect=vp.getBoundingClientRect(),video=videoRef.current,canvas=canvasRef.current;
+    const source=wcActiveRef.current?canvas:video;if(!source)return;const width=source instanceof HTMLVideoElement?source.videoWidth:source.width,height=source instanceof HTMLVideoElement?source.videoHeight:source.height;
+    if(source instanceof HTMLVideoElement&&source.readyState<2)return;
+    transitionPicture.current?.retain(source,width,height,{width:rect.width,height:rect.height,zoom:zoomRef.current,panX:panRef.current.x,panY:panRef.current.y});
+  };
+  const finishRtcPicture=(epoch:EpochStream,video:HTMLVideoElement)=>{
+    if(revealingPeer.current===epoch.peerId||presentedPeer.current===epoch.peerId)return;revealingPeer.current=epoch.peerId;stageViewport(epoch.identity);
+    transitionPicture.current?.finish(()=>videoRef.current===video&&video.srcObject===epoch.stream&&link.epochStream?.()?.peerId===epoch.peerId,()=>{
+      revealingPeer.current='';clearNativeTransition();if(link.presentedRtcView?.(epoch.peerId,video))presentedPeer.current=epoch.peerId;
+    });
+    setNativeRetained(false);
+  };
+  useEffect(()=>()=>{transitionPicture.current?.dispose();clearNativeTransition();},[]);
+  useLayoutEffect(()=>{reportRemoteViewport();},[appliedView,selectedDisplay,zoom,pan,pipView,immersive,topCollapsed,dockCollapsed,kbInset]);
+  useLayoutEffect(()=>{
+    const v=videoRef.current;if(!epochStream||!v)return;let retired=false,callback=0;
+    pendingStreamRef.current=epochStream.stream;v.srcObject=epochStream.stream;v.muted=true;void v.play().catch(()=>{});
+    if(v.requestVideoFrameCallback)callback=v.requestVideoFrameCallback(()=>{
+      if(retired||v.srcObject!==epochStream.stream||link.epochStream?.()?.peerId!==epochStream.peerId)return;
+      onVideoSized();setHasFrame(true);
+      finishRtcPicture(epochStream,v);
+    });
+    return()=>{retired=true;if(callback)v.cancelVideoFrameCallback?.(callback);};
+  },[epochStream?.peerId]);
 
   // Controller mode: forward a physical gamepad attached to the phone to a virtual
   // Xbox pad on the PC so games are playable. `padAvailable` reflects whether the
@@ -1340,7 +1427,7 @@ export function ControlScreen({
       // Picture-in-picture: the window is a few hundred px wide, so ask for a light
       // stream instead of decoding (and sending) 1080p60 into it. Resolution and
       // fps changes rebuild the PC encoder and our decoder (one keyframe each way).
-      ...(pipView && tune.pipLite
+      ...((pipView||pipOn) && tune.pipLite
         ? {
             maxW: Math.min(tune.maxW, PIP_MAX_W),
             fps: Math.min(tune.fps, PIP_MAX_FPS),
@@ -1348,7 +1435,7 @@ export function ControlScreen({
           }
         : {}),
     }),
-    [tune, pipView],
+    [tune, pipView,pipOn],
   );
 
   // Push guest-side JB / preferDirect as soon as the link is up.
@@ -1374,6 +1461,7 @@ export function ControlScreen({
     const unsubProgress = link.onProgress?.(setProgress);
     const bindStream = (stream: MediaStream, force = false) => {
       pendingStreamRef.current = stream;
+      const epoch=link.epochStream?.();if(epoch&&epoch.stream===stream){retainPicture();revealingPeer.current='';setEpochStream(epoch);setHasStream(true);return;}
       const v = videoRef.current;
       if (!v) return;
       if (force || v.srcObject !== stream) v.srcObject = stream;
@@ -1402,10 +1490,35 @@ export function ControlScreen({
     });
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     const unsubEvent = link.onEvent((e) => {
+      if(e.event==='remote-capabilities'){
+        const handshake=link.remoteHandshake?.()??null;setRemoteHandshake(handshake);
+        if(handshake&&supportsRemote(handshake,'all-screens-v1')&&restoredViewSession.current!==handshake.sessionId){
+          restoredViewSession.current=handshake.sessionId;const saved=readView();const selected=handshake.layout.displays.some(d=>d.id===saved.selectedDisplayId)?saved.selectedDisplayId!:handshake.view.selectedDisplayId;
+          pendingViewportRef.current={mode:saved.mode,selected,zoom:saved.zoom,pan:{x:saved.panX,y:saved.panY}};
+          if(saved.mode!=='single'||selected!==handshake.view.selectedDisplayId)link.requestView?.(saved.mode,selected,streamQ.maxW);
+        }
+      }
+      else if(e.event==='remote-view'){
+        if(e.pending){rememberViewport();retainPicture();}
+        setViewChanging(!!e.changing);const identity=e.applied as CaptureIdentity|null;
+        if(identity){displayedViewRef.current=identity;setAppliedView(identity);
+          if(!identity.view.displays.some(d=>d.id===selectedDisplayRef.current)||identity.view.mode==='single'){selectedDisplayRef.current=identity.view.selectedDisplayId;setSelectedDisplay(identity.view.selectedDisplayId);}
+          const pending=pendingViewportRef.current;if(pending&&identity.view.mode===pending.mode&&(pending.mode==='all'||identity.view.selectedDisplayId===pending.selected)){zoomRef.current=pending.zoom;panRef.current={...pending.pan};pendingViewportRef.current=null;commitView();}
+          reportRemoteViewport();
+        }
+      }else if(e.event==='remote-view-applied'){setRemoteHandshake(link.remoteHandshake?.()??null);reportRemoteViewport();}
+      else if(e.event==='remote-view-error'){setDecoderMsg({text:String(e.message??'View change failed'),detail:''});}
+      else if(e.event==='native-view-frame'){
+        const identity=e.identity as CaptureIdentity;nativeViewRef.current=identity;natRef.current={w:identity.view.width,h:identity.view.height};stageViewport(identity);syncNativeSurface();
+      }else if(e.event==='native-view-visible'){
+        const identity=e.identity as CaptureIdentity;if(!sameCapture(nativeViewRef.current,identity))return;
+        syncNativeSurface(true);transitionPicture.current?.finish(()=>wcNativeRef.current&&sameCapture(nativeViewRef.current,identity),()=>link.presentedDirectView?.(identity));
+      }
       if (e.event === "focus") handleFocusEvent(!!(e as { textField?: boolean }).textField);
       else if (e.event === "cursor") {
-        const cur = e as { kind?: string; x?: number; y?: number; source?: "desktop" | "remote" };
+        const cur = e as { kind?: string; x?: number; y?: number; selectedDisplayId?:string; source?: "desktop" | "remote" };
         setCursorKind(String(cur.kind || "arrow"));
+        if(cur.selectedDisplayId&&displayedViewRef.current?.view.mode==='all')selectDisplayId(cur.selectedDisplayId);
         if (cur.source !== "remote" && Number.isFinite(cur.x) && Number.isFinite(cur.y)) {
           followHostCursor(cur.x!, cur.y!);
         }
@@ -1416,6 +1529,8 @@ export function ControlScreen({
         // `native` = MediaCodec → Surface (APK); canvas stays for hit-testing only.
         const active = !!(e as { active?: boolean }).active;
         const native = !!(e as { native?: boolean }).native;
+        retainPicture();
+        if(wcNativeRef.current&&!native){setNativeRetained(true);setCanvasReady(false);}
         setWcActive(active);
         setWcNative(active && native);
         if (active) setHasFrame(native); // Surface paints without a VideoFrame callback
@@ -1487,8 +1602,8 @@ export function ControlScreen({
         setHostStats({ ...cs, producedFps, rtc, wc, audio });
         // Native Surface path never gets VideoFrame sizes — seed letterbox from host out res.
         if (wcNativeRef.current && cs.outW > 0 && cs.outH > 0) {
-          const w = cs.outW;
-          const h = cs.outH;
+          const w = nativeViewRef.current?.view.width??cs.outW;
+          const h = nativeViewRef.current?.view.height??cs.outH;
           natRef.current = { w, h };
           const canvas = canvasRef.current;
           if (canvas && (canvas.width !== w || canvas.height !== h)) {
@@ -1590,7 +1705,7 @@ export function ControlScreen({
   // WebView accumulated semi-opaque chrome across redraws because nothing
   // opaque ever backed it.
   useEffect(() => {
-    if (!wcNative) {
+    if (!nativeBackdrop) {
       setPunchIfChanged(null);
       void setNativeDecoderBounds({ x: 0, y: 0, w: 0, h: 0, visible: false });
       return;
@@ -1635,7 +1750,7 @@ export function ControlScreen({
       window.visualViewport?.removeEventListener("resize", onResize);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wcNative, zoom, pan, immersive, topCollapsed, dockCollapsed, hasStream, kbInset]);
+  }, [nativeBackdrop, zoom, pan, immersive, topCollapsed, dockCollapsed, hasStream, kbInset]);
 
   // Direct-video render sink: decoded VideoFrames are painted straight onto the
   // canvas the instant they leave the decoder — no <video> element, no playout
@@ -1643,7 +1758,7 @@ export function ControlScreen({
   // (Skipped visually when MediaCodec Surface is live — canvas stays for hit-test.)
   useEffect(() => {
     if (!link.onWcFrame) return;
-    const un = link.onWcFrame((frame) => {
+    const un = link.onWcFrame((frame,identity) => {
       if (wcNativeRef.current) {
         frame.close();
         setHasFrame(true);
@@ -1669,8 +1784,9 @@ export function ControlScreen({
       // that blacks the MediaCodec SurfaceView hole punch even at opacity:0 on
       // several Android WebViews. WebCodecs paint doesn't need the opaque hint.
       if (!ctxRef.current) ctxRef.current = canvas.getContext("2d", { alpha: true, desynchronized: true });
+      let painted=false;
       try {
-        ctxRef.current?.drawImage(frame, 0, 0);
+        if(ctxRef.current){ctxRef.current.drawImage(frame, 0, 0);painted=true;}
       } catch {
         /* decoder handed us a closed frame — skip */
       } finally {
@@ -1680,7 +1796,16 @@ export function ControlScreen({
       const t = frameTimes.current;
       t.push(now);
       while (t.length && now - t[0] > 1000) t.shift();
-      setHasFrame(true);
+      setHasFrame(true);if(painted){setCanvasReady(true);setNativeRetained(false);}
+      if(painted&&identity){
+        paintedDirect.current=identity;stageViewport(identity);
+        if(transitionPicture.current?.visible||!sameCapture(displayedViewRef.current,identity)){
+          transitionPicture.current?.finish(()=>sameCapture(paintedDirect.current,identity)&&!wcNativeRef.current,()=>{clearNativeTransition();link.presentedDirectView?.(identity);});return false;
+        }
+      }else if(painted&&transitionPicture.current?.visible){
+        transitionPicture.current.finish(()=>!wcNativeRef.current,clearNativeTransition);
+      }
+      return painted;
     });
     return () => {
       un?.();
@@ -1871,11 +1996,13 @@ export function ControlScreen({
       }
       while (t.length && now - t[0] > 1000) t.shift();
       setHasFrame(true);
+      const epoch=link.epochStream?.();if(epoch&&v.srcObject===epoch.stream)finishRtcPicture(epoch,v);
+      else if(!epoch&&(nativeBackdropRef.current||transitionPicture.current?.visible)){setNativeRetained(false);transitionPicture.current?.finish(()=>videoRef.current===v&&!wcActiveRef.current,()=>{clearNativeTransition();link.presentedLegacyRtc?.();});}
       handle = v.requestVideoFrameCallback!(onVF);
     };
     handle = v.requestVideoFrameCallback(onVF);
     return () => v.cancelVideoFrameCallback?.(handle);
-  }, [hasStream, wcActive]);
+  }, [hasStream, wcActive,epochStream?.peerId]);
 
   // Load the monitor list once connected (for the display switcher). The data
   // channel can lag the "connected" signal, so retry until it answers — otherwise
@@ -1998,9 +2125,12 @@ export function ControlScreen({
 
   const selectMonitor = (i: number) => {
     if (popoutMonitor != null) return; // pop-out tabs are locked to one display
-    setMonitorIdx(i);
-    send({ type: "monitor", index: i });
-    resetView();
+    const display=remoteHandshake?.layout.displays.find(d=>d.index===i)??monitors.find(d=>d.index===i);
+    if(display?.id&&supportsRemote(remoteHandshake,'all-screens-v1')){
+      if(displayedViewRef.current?.view.mode==='all'){selectDisplayId(display.id);return;}
+      requestCaptureMode('single',display.id);return;
+    }
+    setMonitorIdx(i);send({type:'monitor',index:i});resetView();
   };
 
   const openMonitorPopout = (i: number) => {
@@ -2192,6 +2322,7 @@ export function ControlScreen({
       const z = zoomRef.current;
       const p = panRef.current;
       const c = committedView.current;
+      const identity=displayedViewRef.current;if(identity&&!pipActiveRef.current&&!link.viewChanging?.())saveView({version:1,mode:identity.view.mode,selectedDisplayId:selectedDisplayRef.current,zoom:z,panX:p.x,panY:p.y});
       if (z !== c.zoom || p.x !== c.x || p.y !== c.y) {
         // The view itself moved: render (transform) + re-place the native surface.
         committedView.current = { zoom: z, x: p.x, y: p.y };
@@ -2211,26 +2342,46 @@ export function ControlScreen({
   // crop makes it useless. Entering PiP stashes the current view and resets to
   // fit; leaving restores exactly what the user had. Runs here (after commitView
   // exists) rather than next to the pipView state.
-  const pipSavedView = useRef<{ zoom: number; pan: { x: number; y: number } } | null>(null);
+  const pipSavedView = useRef<ViewCamera|null>(null);
+  const paintPipFrame=()=>{
+    const target=pipCanvasRef.current,current=displayedViewRef.current;if(!target||!current||transitionPicture.current?.busy)return;
+    const source=wcActiveRef.current?canvasRef.current:videoRef.current;if(!source)return;
+    const width=source instanceof HTMLVideoElement?source.videoWidth:source.width,height=source instanceof HTMLVideoElement?source.videoHeight:source.height;
+    if(source instanceof HTMLVideoElement&&source.readyState<2)return;
+    const crop=pipCrop(current.view,selectedDisplayRef.current,width,height);if(!crop)return;const scale=Math.min(1,512/Math.max(crop.width,crop.height)),w=Math.max(1,Math.round(crop.width*scale)),h=Math.max(1,Math.round(crop.height*scale));
+    if(target.width!==w||target.height!==h){target.width=w;target.height=h;}
+    try{target.getContext('2d',{alpha:false})?.drawImage(source,crop.x,crop.y,crop.width,crop.height,0,0,w,h);(pipStreamRef.current?.getVideoTracks()[0] as MediaStreamTrack&{requestFrame?:()=>void})?.requestFrame?.();}catch{}
+  };
+  useEffect(()=>{if(!pipOn)return;let raf=0,last=0;const draw=(now:number)=>{if(now-last>=1000/PIP_MAX_FPS){last=now;paintPipFrame();}raf=requestAnimationFrame(draw);};raf=requestAnimationFrame(draw);return()=>cancelAnimationFrame(raf);},[pipOn]);
   useEffect(() => {
-    if (pipView) {
-      pipSavedView.current = { zoom: zoomRef.current, pan: { ...panRef.current } };
+    const active=pipView||pipOn,current=displayedViewRef.current;if(!current)return;
+    if (active&&!pipSavedView.current) {
+      const saved:ViewCamera={mode:current.view.mode,selected:selectedDisplayRef.current,zoom:zoomRef.current,pan:{...panRef.current}};pipSavedView.current=saved;rememberViewport(current);
+      if(current.view.mode==='all'&&link.requestView){pendingViewportRef.current={mode:'single',selected:saved.selected,zoom:1,pan:{x:0,y:0}};link.requestView('single',saved.selected,Math.min(streamQ.maxW,PIP_MAX_W));}
       zoomRef.current = 1;
       panRef.current = { x: 0, y: 0 };
-    } else if (pipSavedView.current) {
-      zoomRef.current = pipSavedView.current.zoom;
-      panRef.current = { ...pipSavedView.current.pan };
+      if(current.view.mode==='all'){const vp=viewportRef.current?.getBoundingClientRect();if(vp){const fit=pipFit(current.view,saved.selected,vp.width,vp.height);zoomRef.current=fit.zoom;panRef.current=fit.pan;}}
+    } else if (!active&&pipSavedView.current) {
+      const saved=pipSavedView.current;pendingViewportRef.current={...saved,pan:{...saved.pan}};
+      const available=link.remoteHandshake?.()?.layout.displays??[];const selected=available.some(d=>d.id===saved.selected)?saved.selected:current.view.selectedDisplayId;
+      if(link.requestView&&(current.view.mode!==saved.mode||current.view.selectedDisplayId!==selected||link.viewChanging?.()))link.requestView(saved.mode,selected,streamQ.maxW);
+      else{zoomRef.current=saved.zoom;panRef.current={...saved.pan};selectedDisplayRef.current=selected;setSelectedDisplay(selected);pendingViewportRef.current=null;}
       pipSavedView.current = null;
     } else {
       return;
     }
     commitView();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pipView]);
+  }, [pipView,pipOn,appliedView]);
+  useEffect(()=>{
+    const identity=displayedViewRef.current,display=identity?.view.displays.find(d=>d.id===selectedDisplayRef.current);if(!display)return;
+    setNativePipAspect(display.width,display.height);
+  },[appliedView,selectedDisplay]);
 
   /** Keep the MediaCodec SurfaceView aligned with the letterboxed video box. */
-  const syncNativeSurface = () => {
+  const syncNativeSurface = (reveal=false) => {
     if (!wcNativeRef.current) {
+      if(nativeBackdropRef.current)return;
       setPunchIfChanged(null);
       void setNativeDecoderBounds({ x: 0, y: 0, w: 0, h: 0, visible: false });
       return;
@@ -2239,6 +2390,7 @@ export function ControlScreen({
     const nat = natRef.current;
     if (!vp) return;
     const vr = vp.getBoundingClientRect();
+    const holdPunch=!reveal&&displayedViewRef.current&&nativeViewRef.current&&!sameCapture(displayedViewRef.current,nativeViewRef.current);
     // No natural size yet. Show the surface across the whole viewport rather
     // than returning: on the native path the size can only come FROM a decoded
     // frame, and no frame can decode until the SurfaceView is visible (a GONE
@@ -2247,8 +2399,8 @@ export function ControlScreen({
     // → no frames → no `nat`. The aspect corrects itself on the next sync, once
     // the codec reports a size (capstats seeds `nat` and re-syncs).
     if (!nat.w || !nat.h) {
-      setPunchIfChanged({ x: 0, y: 0, w: vr.width, h: vr.height });
-      void setNativeDecoderBounds({ x: vr.left, y: vr.top, w: vr.width, h: vr.height, visible: true });
+      if(!holdPunch)setPunchIfChanged({ x: 0, y: 0, w: vr.width, h: vr.height });
+      void setNativeDecoderBounds({ x: vr.left, y: vr.top, w: vr.width, h: vr.height, visible: true,viewEpoch:nativeViewRef.current?.view.epoch });
       return;
     }
     const l = measure(vp, nat.w, nat.h);
@@ -2259,8 +2411,8 @@ export function ControlScreen({
     const h = l.dispH * z;
     const x = vr.left + l.offX + (l.dispW - w) / 2 + p.x;
     const y = vr.top + l.offY + (l.dispH - h) / 2 + p.y;
-    setPunchIfChanged({ x: x - vr.left, y: y - vr.top, w, h });
-    void setNativeDecoderBounds({ x, y, w, h, visible: true });
+    if(!holdPunch)setPunchIfChanged({ x: x - vr.left, y: y - vr.top, w, h });
+    void setNativeDecoderBounds({ x, y, w, h, visible: true,viewEpoch:nativeViewRef.current?.view.epoch });
   };
 
   /** Always re-read the viewport box before mapping — never trust a stale Layout. */
@@ -2775,8 +2927,9 @@ export function ControlScreen({
   const tapKey = (name: string) => {
     const evs: ControlMsg[] = [{ type: "key", name }];
     mods.forEach((m) => evs.push({ type: "keyup", name: m }));
-    sendOrdered(evs);
+    if(!sendOrdered(evs))return false;
     if (mods.size > 0) setMods(new Set());
+    return true;
   };
 
   // Android soft keyboards report keyCode 229 / "Unidentified" on keydown, so we
@@ -2802,21 +2955,8 @@ export function ControlScreen({
     const val = el.value;
     const prev = prevVal.current;
     if (val === prev) return;
-    let i = 0;
-    const min = Math.min(val.length, prev.length);
-    while (i < min && val[i] === prev[i]) i++;
-    const removed = prev.length - i;
-    const added = val.slice(i);
-    for (let k = 0; k < removed; k++) send({ type: "key", name: "backspace" });
-    if (added) {
-      if (mods.size > 0 && added.length === 1) tapKey(added.toLowerCase());
-      else {
-        const evs: ControlMsg[] = [{ type: "text", value: added }];
-        mods.forEach((m) => evs.push({ type: "keyup", name: m }));
-        sendOrdered(evs);
-        if (mods.size > 0) setMods(new Set());
-      }
-    }
+    const events=foregroundEdit(prev,val,mods);if(!sendOrdered(events))return;
+    if(events.some(event=>event.type==='keyup')&&mods.size>0)setMods(new Set());
     prevVal.current = val;
     // Keep the field from growing unbounded; reset the base without emitting keys.
     if (val.length > 240) resetField();
@@ -2838,7 +2978,7 @@ export function ControlScreen({
     if (val) {
       const evs: ControlMsg[] = [{ type: "text", value: val }];
       mods.forEach((m) => evs.push({ type: "keyup", name: m }));
-      sendOrdered(evs);
+      if(!sendOrdered(evs))return;
       if (mods.size > 0) setMods(new Set());
     }
     resetField();
@@ -3282,6 +3422,11 @@ export function ControlScreen({
                   >
                     <Monitor className="h-3.5 w-3.5" /> {monitorIdx + 1}/{monitors.length}
                   </button>
+                  {supportsRemote(remoteHandshake,'all-screens-v1')&&appliedView&&<>
+                    <button type="button" onClick={()=>requestCaptureMode('all')} className={`rounded-lg px-2 py-1.5 text-xs font-700 ${appliedView.view.mode==='all'?'bg-accent-3/20 text-accent-3':'bg-white/[0.04] text-ink-soft'}`}>All screens</button>
+                    <span className="whitespace-nowrap text-[10px] text-ink-soft">Selected: {remoteHandshake?.layout.displays.find(d=>d.id===selectedDisplay)?.name??'display'}</span>
+                    {appliedView.view.mode==='all'?<button type="button" onClick={()=>requestCaptureMode('single')} className="whitespace-nowrap rounded-lg bg-white/[0.06] px-2 py-1.5 text-xs font-700">Focus selected</button>:allViewportRef.current&&<button type="button" onClick={()=>requestCaptureMode('all',allViewportRef.current!.selected)} className="whitespace-nowrap rounded-lg bg-white/[0.06] px-2 py-1.5 text-xs font-700">Return to All screens</button>}
+                  </>}
                   {!isApk &&
                     monitors
                       .filter((m) => m.index !== monitorIdx)
@@ -3391,6 +3536,7 @@ export function ControlScreen({
 
       {/* ==== viewport — video only; chrome above/below shrinks this, never overlays it ==== */}
       <div className="relative min-h-0 flex-1">
+      {viewChanging&&!pipView&&<div role="status" className="pointer-events-none absolute left-1/2 top-2 z-[46] -translate-x-1/2 rounded-full bg-black/80 px-3 py-1 text-xs text-white">Changing view…</div>}
       {decoderMsg && !pipView && (
         <div
           className={`absolute left-2 right-2 top-2 z-[45] rounded-lg border border-amber/40 px-3 py-2 text-[11px] text-amber shadow-float ${
@@ -3475,7 +3621,7 @@ export function ControlScreen({
             "Live / fps smudge"). Bars, not clip-path: evenodd polygon support
             is spotty across OEM WebViews. First children → everything else in
             the viewport (cursor, toasts, placeholders) still draws above. */}
-        {wcNative &&
+        {nativeBackdrop &&
           punch &&
           (
             [
@@ -3488,6 +3634,7 @@ export function ControlScreen({
             <div key={i} aria-hidden className="pointer-events-none absolute bg-black" style={s} />
           ))}
         <video
+          key={epochStream?.peerId??'legacy'}
           ref={videoRef}
           autoPlay
           muted
@@ -3541,11 +3688,12 @@ export function ControlScreen({
             // visibility:hidden removes the element from compositing entirely —
             // opacity:0 alone still left a layer over the hole punch on some
             // WebViews. Pointer events stay on the viewport parent.
-            ...(wcNative
+            ...(wcNative||!canvasReady
               ? { visibility: "hidden" as const, pointerEvents: "none" as const }
               : { opacity: 1 }),
           }}
         />
+        <canvas ref={transitionCanvasRef} hidden aria-hidden className="pointer-events-none absolute inset-0 h-full w-full" />
         {showRemoteCursor && connected && cursorScreen && !pipView && (
           <RemoteCursor elRef={cursorElRef} x={cursorScreen.x} y={cursorScreen.y} kind={cursorKind} dragging={dragging} fx={cursorFx} />
         )}
@@ -4206,6 +4354,7 @@ export function ControlScreen({
         onHints={setTuneHints}
         env={{ nativePossible: nativeDecoderPossible() }}
       />
+      <DesktopAppearanceSheet open={appearanceOpen&&!pipView&&!immersive} onClose={()=>setAppearanceOpen(false)} link={link}/>
 
       {/* ---- free-place pinned quick buttons (drag in Pin mode; positions + styles saved) ---- */}
       {pinnedDefs.length > 0 && !pipView && (
@@ -4789,15 +4938,18 @@ export function ControlScreen({
               <QSlider
                 icon={<RotateCcw className="h-3.5 w-3.5" />}
                 label="Rotate"
-                min={400}
-                max={3000}
-                step={100}
-                value={rotationHoldMs}
-                fmt={(v) => `${(v / 1000).toFixed(1)}s`}
-                onChange={setRotationHoldMs}
+                min={0}
+                max={27}
+                step={1}
+                value={rotationDetent(rotationHoldMs)}
+                fmt={(v) => v === 0 ? "Off" : `${(rotationFromDetent(v) / 1000).toFixed(1)}s`}
+                onChange={(v) => setRotationHoldMs(rotationFromDetent(v))}
               />
+              {rotationHoldMs === 0 && <span className="max-w-48 text-[11px] text-ink-dim">Off keeps the current orientation while controlling the PC.</span>}
+              {rotationError && <span role="status" className="max-w-48 text-[11px] text-amber-300">{rotationError}</span>}
               <Sep />
               <IcoBtn active={showStats} title="Performance stats" onClick={() => setShowStats((s) => !s)}><Gauge className="h-4 w-4" /></IcoBtn>
+              <IcoBtn active={appearanceOpen} title="Desktop appearance" onClick={()=>setAppearanceOpen(true)}><Palette className="h-4 w-4"/></IcoBtn>
               {/* Browser-only: the APK gets native auto-PiP from the Android shell. */}
               {pipSupported && (
                 <IcoBtn

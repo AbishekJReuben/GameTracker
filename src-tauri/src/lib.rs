@@ -360,6 +360,13 @@ macro_rules! app_commands {
             commands::remote_cursor_position,
             commands::remote_capture_stats,
             commands::remote_list_monitors,
+            commands::remote_presence_authorize,
+            commands::remote_presence_update,
+            commands::remote_presence_end,
+            commands::remote_view_request,
+            commands::remote_view_acknowledge,
+            commands::remote_view_status,
+            commands::remote_view_cancel,
             commands::remote_read_media,
             commands::remote_inject,
             commands::remote_inject_on,
@@ -735,6 +742,7 @@ fn run_remote_host(mut context: tauri::Context<tauri::Wry>) {
         .expect("error while building the remote host")
         .run(|_, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                remote::overlay::shutdown();
                 let _ = remote::uac::set_visible(false);
             }
         });

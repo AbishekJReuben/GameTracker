@@ -8,6 +8,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const WINDOW: usize = 2;
 const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 pub static DELIVERY: Gate = Gate::new();
+/// Validation precedes serialization/mark-sent. Dropping the lazy producer on
+/// supersession also drops its unsent permit and returns the delivery credit.
+pub fn emit_if(accepted:bool,packet:impl FnOnce()->Vec<u8>,emit:impl FnOnce(Vec<u8>)){
+    if accepted{emit(packet());}
+}
+/// The force-IDR flag has several consumers. Independently remember the source
+/// whose frame actually reached this chain's transport, including equal sizes.
+pub struct SourceChain<T>(Option<T>);
+impl<T:PartialEq+Clone> SourceChain<T>{
+    pub fn new()->Self{Self(None)}
+    pub fn needs_key(&self,source:&T)->bool{self.0.as_ref()!=Some(source)}
+    pub fn emitted(&mut self,source:&T){self.0=Some(source.clone());}
+}
 
 struct State {
     generation: u32,
@@ -214,6 +227,21 @@ mod tests {
         assert_eq!(g.stats().pending, 1, "previous generation cannot acknowledge this session");
         g.ack(2, 1);
         assert_eq!(g.stats().pending, 0);
+    }
+    #[test]fn retired_source_drops_return_unsent_credits_without_disabling_fast_delivery(){
+        let g=gate();for _ in 0..100{let permit=g.reserve(1).unwrap();emit_if(false,||permit.packet(frame()),|_|panic!("retired source emitted"));assert_eq!(g.stats().pending,0);}
+        assert!(g.stats().enabled);assert_eq!(g.stats().timeouts,0);
+        let mut sent=None;let permit=g.reserve(1).unwrap();emit_if(true,||permit.packet(frame()),|packet|sent=Some(packet));let packet=sent.unwrap();assert_eq!(g.stats().pending,1);
+        // A stale identity still returns credit after it reaches the frontend.
+        g.ack(u32::from_le_bytes(packet[8..12].try_into().unwrap()),u32::from_le_bytes(packet[12..16].try_into().unwrap()));assert_eq!(g.stats().pending,0);assert!(g.stats().enabled);
+    }
+    #[test]fn retired_inflight_frame_cannot_consume_the_next_sources_keyframe_boundary(){
+        let mut chain=SourceChain::new();let old=("session",1);let new=("session",2);chain.emitted(&old);
+        let mut global_force=true;let old_idr=std::mem::take(&mut global_force);assert!(old_idr);
+        // That old raw frame was encoded after replacement, then rejected. It
+        // never advances the last *emitted* chain even though it stole the flag.
+        assert!(!global_force);assert!(chain.needs_key(&new));assert!(chain.needs_key(&new));chain.emitted(&new);assert!(!chain.needs_key(&new));
+        let rollback=("session",3);assert!(chain.needs_key(&rollback));assert!(chain.needs_key(&("replacement-session",2)));
     }
     #[test]
     fn slow_consumer_never_accumulates_an_unbounded_ipc_queue() {

@@ -37,6 +37,8 @@ const MAGIC = [0x47, 0x54, 0x41, 0x55]; // "GTAU"
 
 export const REC_KEY = 1;
 export const REC_CONFIG = 2;
+/** Negotiated view epoch prefix (f64 safe integer) on video records only. */
+export const REC_VIEW = 4;
 
 export type CarrierRecord = {
   flags: number;

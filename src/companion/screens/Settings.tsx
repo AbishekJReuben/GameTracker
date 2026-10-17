@@ -33,8 +33,12 @@ import { deviceName } from "../device";
 import { getCompanionRuntime } from "../runtime";
 import { APP_VERSION } from "@/lib/version";
 import { isTauri } from "@/lib/tauri";
+import { RemoteIdentitySettings } from './RemoteIdentitySettings';
+import { DesktopAppearanceSettings } from './DesktopAppearanceSettings';
+import type { CloudConn } from '../cloud';
 
 interface SettingsProps {
+  connection?:CloudConn|null;
   /** The saved connection code (code 1). */
   code: string;
   /** Save a permanent key for this PC and reconnect so the host auto-grants us. */
@@ -45,11 +49,13 @@ interface SettingsProps {
   onForget: () => void;
 }
 
-export function SettingsScreen({ code, onSaveKey, onDisconnect, onForget }: SettingsProps) {
+export function SettingsScreen({ code, onSaveKey, onDisconnect, onForget,connection }: SettingsProps) {
   return (
     <div className="mx-auto max-w-xl space-y-4 p-4">
       {isTauri() ? <UpdateSection /> : <WebAboutSection />}
       <ConnectionSection code={code} onSaveKey={onSaveKey} onDisconnect={onDisconnect} onForget={onForget} />
+      <RemoteIdentitySettings />
+      <DesktopAppearanceSettings connection={connection}/>
       <VoiceKeySection />
       <div className="pb-2 text-center text-[11px] text-ink-faint">GameTracker Remote · companion</div>
     </div>

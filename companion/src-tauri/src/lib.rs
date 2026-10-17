@@ -27,6 +27,7 @@ pub fn run() {
             update::open_install_settings,
             pip::set_pip_enabled,
             pip::set_rotation_hold_ms,
+            pip::set_remote_rotation,
             decoder::decoder_probe,
             decoder::decoder_init,
             decoder::decoder_set_bounds,

@@ -1,0 +1,517 @@
+{
+  "recordedUtc": "2026-10-17T09:58:18.065Z",
+  "version": "3.9.112",
+  "head": "a81b8f25277afd8ed7826ebb338daec9977a98bc",
+  "sourceDigest": "873236f0e20897cb2c323ae0a008429309c901d947d60374b922d1c2a5675dbe",
+  "sourceFiles": [
+    {
+      "path": ".github/workflows/release.yml",
+      "sha256": "5eefe3bf57295feeef4f6f28f6806f7201d2a781ac952d00e090cf2a097d7a73"
+    },
+    {
+      "path": "companion/src-tauri/Cargo.lock",
+      "sha256": "0f86d95e6174110ee97cfcbb704f79cd45c07c22e61140a3eeb2a89ba2b9183b"
+    },
+    {
+      "path": "companion/src-tauri/Cargo.toml",
+      "sha256": "fc478f23cded53739ad3df64bff6c58ff879e4890c3946ca2ab014b52843c854"
+    },
+    {
+      "path": "companion/src-tauri/src/decoder.rs",
+      "sha256": "677d571ea32d93d3e7d12c9931caacbc9db544799fbe18b16fe4c12a22556425"
+    },
+    {
+      "path": "companion/src-tauri/src/lib.rs",
+      "sha256": "2eac4cd05e6544102c1715e6ec34fa9cf834f836ca3f28e3f13f138f26d9360c"
+    },
+    {
+      "path": "companion/src-tauri/src/pip.rs",
+      "sha256": "7611dbce8f8722536e8e78b6c0d466af77e48071c75bef675694b7d17843b86a"
+    },
+    {
+      "path": "companion/src-tauri/tauri.conf.json",
+      "sha256": "6917ff4d6831bf090af7053ce52b152b64cf954aa9cd1dcf2db3581489ea48bf"
+    },
+    {
+      "path": "package-lock.json",
+      "sha256": "829073f47b1f6c394e80f415515ba40c14915bd03e787a6d4c7bd140bbc25a5f"
+    },
+    {
+      "path": "package.json",
+      "sha256": "88e8e8bb1544fc05df0d9284e4f84cff0f86113e9a7a05781ebb2812def30f28"
+    },
+    {
+      "path": "scripts/android-templates/MainActivity.kt",
+      "sha256": "3228e50609804d66646551dc55885f7cf69ee1c261f1e7d32e9faed61c9ea76c"
+    },
+    {
+      "path": "scripts/android-templates/RemoteRotationPolicy.java",
+      "sha256": "7dfe68eae44256243041aba670f0af4cfd53a0eb66b83df214910554696d19b2"
+    },
+    {
+      "path": "scripts/android-templates/RenderedFrameProof.java",
+      "sha256": "6dc1e0eeeeab182ca2162806fddb7dfc712124212573389c54be93b4212b2681"
+    },
+    {
+      "path": "scripts/android-templates/TransitionOwnership.java",
+      "sha256": "b24fb62223099d92a74f406a60fc1132482aaadf0bcc1ecd7bdfc20d2fa72aec"
+    },
+    {
+      "path": "scripts/android-templates/WcDecoderBridge.java",
+      "sha256": "618e02dc150469f2cadd3a558dd8d8322d7998f8dc98927d8fb7b72410f29747"
+    },
+    {
+      "path": "scripts/android-tests/RemoteRotationPolicyTest.java",
+      "sha256": "d9a246ba7d9824f21a03591241e8361b27bd4d3bbfffbbea1812f254d5761df2"
+    },
+    {
+      "path": "scripts/android-tests/RenderedFrameProofTest.java",
+      "sha256": "ead8cb897375847a90ce3ce2c39bcdb889acd511e32a7f791c69567903ed1a58"
+    },
+    {
+      "path": "scripts/android-tests/TransitionOwnershipTest.java",
+      "sha256": "2b349939b219e8b5c2a8fe48c57d3c2b87cb5a07586ebe24be77a01414d19f53"
+    },
+    {
+      "path": "scripts/patch-android.mjs",
+      "sha256": "fb312cc6c1d4d6e6b0a32970eaf715064f7e0d313ca8729e173adf59c3aeda57"
+    },
+    {
+      "path": "scripts/test-android-patcher.mjs",
+      "sha256": "edc9c1fa35a0829d14d4d8d32863358e47f788af16c821b5a3d6053ddc0c4246"
+    },
+    {
+      "path": "scripts/test-remote-rotation.mjs",
+      "sha256": "a355337fad38118a5a6f54e8d707909aeb15724ef319895af7ff54b81164aa3d"
+    },
+    {
+      "path": "scripts/test-rendered-frame-proof.mjs",
+      "sha256": "9ca7bfbf019e6a6cc079842614ba170c34903de3f07caaaf2ca0511c7844993d"
+    },
+    {
+      "path": "src-tauri/Cargo.lock",
+      "sha256": "89c50fbc5f420e126e1f097479a65f5d78ed2144ad7b24e1fa769bed75bd5412"
+    },
+    {
+      "path": "src-tauri/Cargo.toml",
+      "sha256": "17e215b74ea7a77077853f27fed9ae2582e077a97977f5f051456a4d72d83fb6"
+    },
+    {
+      "path": "src-tauri/examples/remote_capture_probe.rs",
+      "sha256": "8ea2dd5498b30a1e4e79da2fac223efd8f6adfcf1544344d3a99394f7555f2ad"
+    },
+    {
+      "path": "src-tauri/examples/remote_combined_probe.rs",
+      "sha256": "445707a5cbf344f2ec4f891d4563053de59d518ef1d2cf50fc69f1d6ac0718f3"
+    },
+    {
+      "path": "src-tauri/examples/remote_input_model_probe.rs",
+      "sha256": "a369cdfa3107b71739cb6b45b2ce62c46d534cb72a4112438b2640ac238e0969"
+    },
+    {
+      "path": "src-tauri/examples/remote_overlay_lifecycle_probe.rs",
+      "sha256": "da113aebc1853ab187a3f227410c15c76bb569d366914c61c0b1cf288e5e3eba"
+    },
+    {
+      "path": "src-tauri/examples/remote_overlay_probe.rs",
+      "sha256": "b656a4a73d03997f41e051b8a2023ad26fe5f1ab7da2e9d110662e9bb8adba7a"
+    },
+    {
+      "path": "src-tauri/examples/remote_overlay_visual_probe.rs",
+      "sha256": "b99901eb54a55958182c14c8612e1a126269ed6fd88ffc7ee74c3e2f0a46e89c"
+    },
+    {
+      "path": "src-tauri/src/commands.rs",
+      "sha256": "bb8dac9a18c5d944ad96417b4bb7cd92a3b41cc73253fd67f4aaa4826ca46b35"
+    },
+    {
+      "path": "src-tauri/src/lib.rs",
+      "sha256": "03dd0d91a7c6f0aecb4ab7bcbd0bedae1a8602a519f34023b484b04ef0419906"
+    },
+    {
+      "path": "src-tauri/src/remote/appearance.rs",
+      "sha256": "f350e60e6ebea73b8ce943b36a6c19f7766325c9c3ba19e3d104db2ac5560c8d"
+    },
+    {
+      "path": "src-tauri/src/remote/capture.rs",
+      "sha256": "74be08d76386e2c0cba34daa85b7d107df593eea871efff7d18439d4bc26ff9f"
+    },
+    {
+      "path": "src-tauri/src/remote/capture_broker.rs",
+      "sha256": "3c7d20a6707380cc551bba61eff84b533cd6038d1f38509fed6e779da132146c"
+    },
+    {
+      "path": "src-tauri/src/remote/capture_surface.rs",
+      "sha256": "8ddb03c38f10ecac9b1652e565856e00712c7b5ea739dfaec39f7d5d59ca3ff7"
+    },
+    {
+      "path": "src-tauri/src/remote/delivery.rs",
+      "sha256": "88353c838eda0b5759ba542836a168eabbcc5a20d4da3d5ce092af328d82a9c5"
+    },
+    {
+      "path": "src-tauri/src/remote/display.rs",
+      "sha256": "2d78cf93f7b763f8a8699cba41c9f3f4b54465d9bf73d6788ecb2527d4ec801a"
+    },
+    {
+      "path": "src-tauri/src/remote/dxdupe.rs",
+      "sha256": "dcb38bbf9885d4da212e8e697df499965a23aea662b211163d3c17c4ee9523fb"
+    },
+    {
+      "path": "src-tauri/src/remote/focus.rs",
+      "sha256": "517db411b254b082b4ff9c80a9b8783b48dc960b65487db2d8fb3fece816dadd"
+    },
+    {
+      "path": "src-tauri/src/remote/gpu.rs",
+      "sha256": "a6f3de3e9aa26867520db7ae57267f1e29eb32ede7188709d9616a1ad52594c3"
+    },
+    {
+      "path": "src-tauri/src/remote/gpu_transfer.rs",
+      "sha256": "581750b7c2aed4df83ccce203c1eae970da7bb8c1e6d49180f77227f6aa1c512"
+    },
+    {
+      "path": "src-tauri/src/remote/input.rs",
+      "sha256": "4ce07bd8dec08213c24ddf1d54fb7ac6b344b19c16004c643d31d9a79b1fe25c"
+    },
+    {
+      "path": "src-tauri/src/remote/input_mapping.rs",
+      "sha256": "48955ede74657a43a3d61e1201088fba371d1556d2fb563d534de50030e59cc6"
+    },
+    {
+      "path": "src-tauri/src/remote/mod.rs",
+      "sha256": "96a7381806271c27260735ec37970dd5f0b059673bbe224a3e53861843ed62a3"
+    },
+    {
+      "path": "src-tauri/src/remote/overlay/aurora.hlsl",
+      "sha256": "3c19b65a3cb582c83cecb8900704bc1556364ef9a8664776f8e04228722ac3d3"
+    },
+    {
+      "path": "src-tauri/src/remote/overlay/aurora.rs",
+      "sha256": "a3297b3299c69b83485ccdd2aebcbd17fe170c86ddf28d23d8ea7a2e45e87c47"
+    },
+    {
+      "path": "src-tauri/src/remote/overlay/effects.rs",
+      "sha256": "100c14b9ab17b0639cb5954b1cf2148deb37ca05edd6ff67c9c1512f6cf8bf34"
+    },
+    {
+      "path": "src-tauri/src/remote/overlay/manager.rs",
+      "sha256": "7ff35eb2bdddcb137feae46256c31166a1ba842cfae2b63f02ae55539fcf98c5"
+    },
+    {
+      "path": "src-tauri/src/remote/overlay/mod.rs",
+      "sha256": "abb8c0674cb47f09c3e5c7a53b2d45a98cadee99061a89d595eb31f5d21f5634"
+    },
+    {
+      "path": "src-tauri/src/remote/overlay/windows.rs",
+      "sha256": "4a02cb9e89a0c47ef55eb3c543de5a4c6a7aa332d7e2fb2b3cfd8927d3ff6e3a"
+    },
+    {
+      "path": "src-tauri/src/remote/pipe.rs",
+      "sha256": "6f474cdd4062efcdcabc917a54ad4f494d5c34e313f85631b4d69dc54ceed53e"
+    },
+    {
+      "path": "src-tauri/src/remote/presence.rs",
+      "sha256": "257ad6fc43a7e5f937207987936c74367a2cff66dbe9e96186741142d60186b2"
+    },
+    {
+      "path": "src-tauri/src/remote/system_cursor.rs",
+      "sha256": "c0b71dcf8f95e3946cc1260558b40e8a43f9ac7a871ffd9e8dbcfe8da653e6f3"
+    },
+    {
+      "path": "src-tauri/src/remote/view.rs",
+      "sha256": "9804d5f0cd27c5d92508d860735f8f2b7fe872da4b87bf6b310e53b187faed3e"
+    },
+    {
+      "path": "src-tauri/src/remote/view_session.rs",
+      "sha256": "bb0b1ce9d704f8a6ca4c8f0d02e2f1b70b3fb775c52687733632d03796cd9508"
+    },
+    {
+      "path": "src-tauri/tauri.conf.json",
+      "sha256": "2c0ca2ec9c73dfe31e945e13b3a7f6c46339c6c0564d28113865c68359c9fc87"
+    },
+    {
+      "path": "src/companion/CompanionApp.tsx",
+      "sha256": "8bc13169bf0935ad7860d27ce937532fafa3796acd0c59026a204af7afd8df6a"
+    },
+    {
+      "path": "src/companion/appearancePreviewModel.test.ts",
+      "sha256": "f4375e735d216b59d36bc5ecad83cee783e239fd00b916c691deac5f327e5365"
+    },
+    {
+      "path": "src/companion/appearancePreviewModel.ts",
+      "sha256": "6f0fbcb27cc8418af9b99a5e49ca876a0215ee5f173a7e4a51e7b2bad05d0384"
+    },
+    {
+      "path": "src/companion/clientPresence.test.ts",
+      "sha256": "b6f8ee2972303637de9cde98a49f80d086bff02de0480e4722113617276a887f"
+    },
+    {
+      "path": "src/companion/clientPresence.ts",
+      "sha256": "5f82cc1974754714aced9c8157166a8eb6fb0ac5129901f464e5a9907f82d930"
+    },
+    {
+      "path": "src/companion/clientViewSession.ts",
+      "sha256": "71a1ba5ef4a5b9221515759158c2afb4baeb52fd4440ef097eb3f247b0362264"
+    },
+    {
+      "path": "src/companion/cloud.carrier.test.ts",
+      "sha256": "4d6e0f320b3c62a0df9e7c05c564060061fdfe861facda1affa6bf8319ad3d54"
+    },
+    {
+      "path": "src/companion/cloud.decoder.test.ts",
+      "sha256": "50a07c5495d288345984b7cdd74a1303e4bc26d5413a912296ee0c1294735810"
+    },
+    {
+      "path": "src/companion/cloud.high.test.ts",
+      "sha256": "979776c1b7bcea9554076e07daf2baa302ca8d48ccdba8b0ad8821fde3cc9829"
+    },
+    {
+      "path": "src/companion/cloud.power.test.ts",
+      "sha256": "af744282e942958b5ccceadf2692ae966ab7f1bb1e27d72082c4792f7e814c55"
+    },
+    {
+      "path": "src/companion/cloud.ts",
+      "sha256": "4a48fd707cd4cd508835c2837598403006796cb8dd1e9c280f1d924e88ce2f95"
+    },
+    {
+      "path": "src/companion/imeInput.ts",
+      "sha256": "c5f087e5f08bbd0c9f6186379545857013faf1b78b587e6ce3c20a8ab5811662"
+    },
+    {
+      "path": "src/companion/inputPolicy.test.ts",
+      "sha256": "4db33b8df7b2e94f7e24571b97d976cf6bf822326ba6d6f7c97894416573b825"
+    },
+    {
+      "path": "src/companion/inputPolicy.ts",
+      "sha256": "44c70404793d55b4fb4b436cbea80d1089716e2db22572b200bf9dfeb1fd2644"
+    },
+    {
+      "path": "src/companion/links.ts",
+      "sha256": "0f2237a7d8ab9aa335196e5f59fc8fc149b6199e6cc4d96b13c85cce3e175872"
+    },
+    {
+      "path": "src/companion/links.viewEpoch.test.ts",
+      "sha256": "cc72142b7e4ae25cbea5bdfd56e01188d6cb0272852edec613968186a0d16182"
+    },
+    {
+      "path": "src/companion/nativeDecoder.test.ts",
+      "sha256": "f4a84f5a47c08a59b0345991a323d20b5a7b141e8ee100367749136698b1a4b2"
+    },
+    {
+      "path": "src/companion/nativeDecoder.ts",
+      "sha256": "42cee70849c03e0515977f46b0714c36f106bf049a2eb0b48712d72c7b7ae45d"
+    },
+    {
+      "path": "src/companion/pipView.test.ts",
+      "sha256": "c6a90d951574d6ad88d2750326302690c34a9404fd3e5af5f4cf62a7a206ca0c"
+    },
+    {
+      "path": "src/companion/pipView.ts",
+      "sha256": "3edd7acc0e67fa6b007203bd32081ddabdb7a41cd55a338d44dfd5ad0d2ba71e"
+    },
+    {
+      "path": "src/companion/remotePreferences.test.ts",
+      "sha256": "3e3da44c297ae4ee6b407003424c243db69056baebbaa94706289bb9f2f8b819"
+    },
+    {
+      "path": "src/companion/remotePreferences.ts",
+      "sha256": "7f5794c86149a58e9c54d01af2f25f894a477f4e1961d00d24206573bfc45f8d"
+    },
+    {
+      "path": "src/companion/screens/Control.tsx",
+      "sha256": "d2128bed8f41c92881099b8aa0163133e48def7884489b0aa96c0ed2b608dd68"
+    },
+    {
+      "path": "src/companion/screens/DesktopAppearancePreview.tsx",
+      "sha256": "8e71af9e0498f092676c38c207b6b6e57ffb5f1e71e78cf7efe81e8b449f2f79"
+    },
+    {
+      "path": "src/companion/screens/DesktopAppearanceSettings.test.tsx",
+      "sha256": "58f878ab250b36759338170221b95f69f4383cf3e0378043652dd32f51173112"
+    },
+    {
+      "path": "src/companion/screens/DesktopAppearanceSettings.tsx",
+      "sha256": "8edabac265e4567cb45d14803157f93679a1875a93778d984a64bad1a9a27d07"
+    },
+    {
+      "path": "src/companion/screens/DesktopAppearanceSheet.tsx",
+      "sha256": "29388c1671ad9de072d62dd8496559107afa4bd4cf5a4cbaa19d66d27669a6e1"
+    },
+    {
+      "path": "src/companion/screens/RemoteIdentitySettings.tsx",
+      "sha256": "274da873f6c6a69e2e1f0a6fc124ad63a6069b65c6843445a6663012095e401f"
+    },
+    {
+      "path": "src/companion/screens/Settings.tsx",
+      "sha256": "4f4f79f0f76d131a8b60abe6dc5f02991bfb4ba07bc45c5aee81050eabd827c2"
+    },
+    {
+      "path": "src/companion/transitionPicture.test.ts",
+      "sha256": "0a3d4937470eadf652a960e285212c5cd72a96c925f224cd4bbe705ab941a044"
+    },
+    {
+      "path": "src/companion/transitionPicture.ts",
+      "sha256": "9c527558ee6cb2928df978206cb6c881a4be16235228423c1e6047585d8b2a56"
+    },
+    {
+      "path": "src/companion/useRemoteRotation.ts",
+      "sha256": "bc1cd3513abbd8e7327e533fc57312fa777ea01bab4d0be69d28820ac72984d3"
+    },
+    {
+      "path": "src/companion/videoReceive.ts",
+      "sha256": "133358afabd2c5f3c6c7f8a1e25224069d1f7e568769d908537ff79bf7f08490"
+    },
+    {
+      "path": "src/lib/api.ts",
+      "sha256": "765b9d4f0dc09d75a49b806881281a0316f5d93802a0443c66e22990c40cc973"
+    },
+    {
+      "path": "src/lib/captureVideoFeed.test.ts",
+      "sha256": "4341d15c6b63398dea410a161b35961147fc8043fdd1b2f1569ee5d9d43177f2"
+    },
+    {
+      "path": "src/lib/captureVideoFeed.ts",
+      "sha256": "1dcbc14957f5f0c1724b8067dad9a04d3fc8ad6b0dfa206b3893f47541ae0156"
+    },
+    {
+      "path": "src/lib/captureView.test.ts",
+      "sha256": "6f543e3e63cd69075caf2f9e27c8cd3f6fa038aff0f546bf9cf18f3144a096f7"
+    },
+    {
+      "path": "src/lib/captureView.ts",
+      "sha256": "df004be04225fa180b385390c2fdd8ce791cae35c7a212d528d4c67b1abc6f01"
+    },
+    {
+      "path": "src/lib/carrier.ts",
+      "sha256": "4cfb060ea71754956b7eaa56a8b06c124f06505e50590172817654e777a7c5c4"
+    },
+    {
+      "path": "src/lib/displayLayout.test.ts",
+      "sha256": "b70af218de53d326a8f00b354f6207fd4c9540d5d750f53b0b9d12e8d4ad405c"
+    },
+    {
+      "path": "src/lib/displayLayout.ts",
+      "sha256": "a73ef5de08555a2697ea127dd1e973d6a0758def00c3c87b8fc8f127dd7edaf9"
+    },
+    {
+      "path": "src/lib/epochVideo.ts",
+      "sha256": "3d970afd4b3e23945d37e28674e63c5a7ec088f8c9982429898a418ace901cdd"
+    },
+    {
+      "path": "src/lib/hostAuthorization.ts",
+      "sha256": "ddcdf7399cbab6dea351b61089ba3fc1a0d37b0acc6af52703744ec967ebffe8"
+    },
+    {
+      "path": "src/lib/hostPresenceSession.test.ts",
+      "sha256": "b686661047e42888cc5dab2b9bd6c2c4c155f25b7234df735dd2bfb815a27cc8"
+    },
+    {
+      "path": "src/lib/hostPresenceSession.ts",
+      "sha256": "5b62e2d77298ceadbcb5d8fd575f6da2f370da8a5d7866a99baf558080b16dda"
+    },
+    {
+      "path": "src/lib/hostViewSession.ts",
+      "sha256": "67f89fcc8787a6066b8738cc53504f28489d05ce0626831b74025fd5b8ae0e1e"
+    },
+    {
+      "path": "src/lib/mediaPipe.test.ts",
+      "sha256": "c66a1760c076e973adbadcee0cbdce57d60a64a2fba9bb5a38a443926acd9195"
+    },
+    {
+      "path": "src/lib/mediaPipe.ts",
+      "sha256": "572c71b95e361478c356f31cbf7660143ab775e33b8204d606e676fa164ca95e"
+    },
+    {
+      "path": "src/lib/mock.ts",
+      "sha256": "91f2f6d9e6f860fce322f869b147e15502fafeabdddde978abee8c3e376f066e"
+    },
+    {
+      "path": "src/lib/remoteProtocol.test.ts",
+      "sha256": "6944ec3868f8f4801b60994212b3d4f3cd56c421a1ff6af0e14925d740eb4df5"
+    },
+    {
+      "path": "src/lib/remoteProtocol.ts",
+      "sha256": "87ec42980f63c9b42d04198a6e0c7d981800f1b25e0591e8471329a3070f7933"
+    },
+    {
+      "path": "src/lib/rtcHost.authorization.test.ts",
+      "sha256": "88ba6f807cf246a547df63bfa6c194526f685f5308cd60fce30bdc8b781a7082"
+    },
+    {
+      "path": "src/lib/rtcHost.ts",
+      "sha256": "7716475342db36aff6d8dd084150ec9563c15846ec270510a3f6ac04d5a8d152"
+    },
+    {
+      "path": "src/shared/desktopAppearance.json",
+      "sha256": "67cd74cbb4f8b5b8e2d5a3b5d7742fef5cbebd6a995e6a603c091ae184b32d8e"
+    },
+    {
+      "path": "tools/remote-probes/.gitignore",
+      "sha256": "306fd52e74fca6746e12acc750f232de15e71da917756a1270d74c91f5eb7368"
+    },
+    {
+      "path": "tools/remote-probes/Cargo.lock",
+      "sha256": "c0de5a558cc24d677e73f68a2459e3b48eb780c8c71ee1c64fb6ed2e43afb932"
+    },
+    {
+      "path": "tools/remote-probes/Cargo.toml",
+      "sha256": "3370433c0a9bdce877a21ee45bd72f8e170ead6bab61a7b778ca92ff38d3c547"
+    }
+  ],
+  "protectedFiles": [
+    {
+      "path": ".gitignore",
+      "sha256": "50A579FC9210CDE6068BC04DD345FCDE1911954803FD70AE6C6F247BA6C27F53",
+      "currentSha256": "50a579fc9210cde6068bc04dd345fcde1911954803fd70ae6c6f247ba6c27f53",
+      "matches": true
+    },
+    {
+      "path": "scripts/Start-DiscoveryPublic.ps1",
+      "sha256": "84E17C90C719DF4D914977C0FC0521B40C57ECC5188AB0B79DE344EE1B499E84",
+      "currentSha256": "84e17c90c719df4d914977c0fc0521b40c57ecc5188ab0b79de344ee1b499e84",
+      "matches": true
+    },
+    {
+      "path": "signaling/src/main.rs",
+      "sha256": "92379656D9153FB79A307784FFA28F545E13ACC154C0C46685CEE16C28FD9DF1",
+      "currentSha256": "92379656d9153fb79a307784ffa28f545e13acc154c0c46685cee16c28fd9df1",
+      "matches": true
+    },
+    {
+      "path": "docs/ImplementationPlan.md",
+      "sha256": "0F824C7EBC665FB6671389A1A5035843B0C620474914C5FA990FBC7A39881C69",
+      "currentSha256": "0f824c7ebc665fb6671389a1a5035843b0c620474914c5fa990fbc7a39881c69",
+      "matches": true
+    },
+    {
+      "path": "signaling/OFFROADER.md",
+      "sha256": "0FD1E7C4EE8155DD7D4CD2C0D837606CEABA51FA8CB68796AA9A5D2717A11110",
+      "currentSha256": "0fd1e7c4ee8155dd7d4cd2c0d837606ceaba51fa8cb68796aa9a5d2717a11110",
+      "matches": true
+    },
+    {
+      "path": "signaling/activate-offroader-named-domain.ps1",
+      "sha256": "0BA7B23B4372D13453664D963A0BFCE89FA34269EB1039AC2409B12885DF0A3C",
+      "currentSha256": "0ba7b23b4372d13453664d963a0bfce89fa34269eb1039ac2409b12885df0a3c",
+      "matches": true
+    },
+    {
+      "path": "signaling/ensure-offroader-discovery.ps1",
+      "sha256": "C0BDDC429F2AB479B0F510118A88A4D88DA5A5CAA903B6800C696F2128769749",
+      "currentSha256": "c0bddc429f2ab479b0f510118a88a4d88da5a5caa903b6800c696f2128769749",
+      "matches": true
+    },
+    {
+      "path": "signaling/serve-offroader.ps1",
+      "sha256": "2972AE55C626C349BACA5FA42D6593A22D938655B4FC669CEEAC490CAC3214AC",
+      "currentSha256": "2972ae55c626c349baca5fa42d6593a22d938655b4fc669ceeac490cac3214ac",
+      "matches": true
+    },
+    {
+      "path": "signaling/src/offroader.rs",
+      "sha256": "DA10A21A141C3A5981177C45156BEAECA5C81AD992FFBB6EA9E4563524083A4F",
+      "currentSha256": "da10a21a141c3a5981177c45156beaeca5c81ad992ffbb6ea9e4563524083a4f",
+      "matches": true
+    }
+  ],
+  "limits": "Core local source/checks frozen. Physical/live/performance limits in checkpoint5. Signed packages pending parent-owned release CI. Child performed no publication/service operations."
+}

@@ -199,17 +199,17 @@ async fn serve_client(p: Arc<Pipe>, socket: WebSocket) {
 #[serde(tag = "t")]
 enum PipeMsg {
     #[serde(rename = "in")]
-    Inject { e: super::input::ControlEvent },
+    Inject { e: super::input::ControlEvent,#[serde(default)] s:Option<String> },
     #[serde(rename = "inm")]
-    InjectOn { m: usize, e: super::input::ControlEvent },
+    InjectOn { m: usize, e: super::input::ControlEvent,#[serde(default)] s:Option<String> },
     #[serde(rename = "ack")]
     Ack { g: u32, s: u32 },
 }
 
 fn handle_text(text: &str) {
     match serde_json::from_str::<PipeMsg>(text) {
-        Ok(PipeMsg::Inject { e }) => super::input::inject(e),
-        Ok(PipeMsg::InjectOn { m, e }) => super::input::inject_on_monitor(m, e),
+        Ok(PipeMsg::Inject { e,s }) => super::input::inject_session(s,None,e),
+        Ok(PipeMsg::InjectOn { m, e,s }) => super::input::inject_session(s,Some(m),e),
         Ok(PipeMsg::Ack { g, s }) => super::delivery::DELIVERY.ack(g, s),
         Err(_) => {} // malformed / unknown — ignore, like the invoke path did
     }

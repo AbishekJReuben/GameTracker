@@ -1,0 +1,7 @@
+import {describe,it,expect} from 'vitest';import {pipCrop,pipFit,restorePipCamera} from './pipView';import type {AppliedCaptureView} from '@/lib/displayLayout';
+const displays=[{id:'left',index:0,name:'left',x:-1920,y:0,width:1920,height:1080,rotation:0,isPrimary:false,selected:false,layoutRevision:1},{id:'portrait',index:1,name:'portrait',x:0,y:-400,width:1080,height:1920,rotation:90,isPrimary:true,selected:true,layoutRevision:1}];
+const view:AppliedCaptureView={epoch:1,layoutRevision:1,mode:'all',selectedDisplayId:'portrait',source:{x:-1920,y:-400,width:3000,height:1920},width:1500,height:960,displays};
+describe('selected-monitor PiP geometry',()=>{
+  it('crops the portrait output from the combined physical arrangement including negative/above origin',()=>{expect(pipCrop(view,'portrait',1500,960)).toEqual({x:960,y:0,width:540,height:960});const fit=pipFit(view,'portrait',270,480);expect(fit.zoom).toBeCloseTo(2.777777);expect(fit.pan.x).toBeCloseTo(-240);expect(fit.pan.y).toBe(0);expect(pipCrop(view,'removed',1500,960)).toBeNull();});
+  it('restores all-screen mode, selection and independent camera values, with a removed selection fallback',()=>{const saved={mode:'all' as const,selected:'left',zoom:2.1,pan:{x:33,y:-45}};expect(restorePipCamera(saved,view)).toEqual(saved);expect(restorePipCamera({...saved,selected:'removed'},view)).toEqual({...saved,selected:'portrait'});});
+});

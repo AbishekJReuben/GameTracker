@@ -100,4 +100,9 @@ describe("MediaPipe", () => {
     pipe2.close();
     expect(closed2).not.toHaveBeenCalled();
   });
+  it('preserves session identity on both ordered input paths without changing the event',async()=>{
+    const pending=MediaPipe.open(ep,()=>{},1000,Ctor);const ws=FakeWs.last!;ws.accept(9);const pipe=(await pending)!;
+    pipe.injectRaw('{"type":"down","button":"left"}','session-a');pipe.injectOnRaw(1,'{"type":"up","button":"left"}','session-a');
+    expect(ws.sent.map(s=>JSON.parse(s))).toEqual([{t:'in',s:'session-a',e:{type:'down',button:'left'}},{t:'inm',m:1,s:'session-a',e:{type:'up',button:'left'}}]);
+  });
 });

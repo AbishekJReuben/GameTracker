@@ -23,7 +23,7 @@
 //
 // Usage: node scripts/patch-android.mjs
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,7 +49,8 @@ const note = (msg) => {
 // Write only if content actually changed; preserve the file's EOL style.
 const save = (path, before, after, msg) => {
   if (after !== before) {
-    writeFileSync(path, after);
+    writeFileSync(path + '.tmp', after);
+    renameSync(path + '.tmp', path);
     note(msg);
     return true;
   }
@@ -316,6 +317,20 @@ const COMPOSE_BOM = "2025.08.00";
     "",
   );
 
+  // Boot receiver — restart the service after a reboot / app update.
+  if (!m.includes(".ClipboardBootReceiver")) {
+    const rec =
+      `        <receiver${eol}` +
+      `          android:name=".ClipboardBootReceiver"${eol}` +
+      `          android:exported="true">${eol}` +
+      `          <intent-filter>${eol}` +
+      `            <action android:name="android.intent.action.BOOT_COMPLETED" />${eol}` +
+      `            <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />${eol}` +
+      `          </intent-filter>${eol}` +
+      `        </receiver>${eol}`;
+    m = m.replace(/([ \t]*<\/application>)/, `${rec}$1`);
+  }
+
   // A normal launcher entry is more reliable than a RemoteViews widget for
   // this device. Keep the real activity private and expose the home-screen
   // entry through an explicit alias. Without the alias, launchers can collapse
@@ -416,20 +431,6 @@ const COMPOSE_BOM = "2025.08.00";
     `          </intent-filter>${eol}` +
     `        </activity-alias>${eol}`;
   m = m.replace(/([ \t]*<\/application>)/, `${volteShortcut}$1`);
-
-  // Boot receiver — restart the service after a reboot / app update.
-  if (!m.includes(".ClipboardBootReceiver")) {
-    const rec =
-      `        <receiver${eol}` +
-      `          android:name=".ClipboardBootReceiver"${eol}` +
-      `          android:exported="true">${eol}` +
-      `          <intent-filter>${eol}` +
-      `            <action android:name="android.intent.action.BOOT_COMPLETED" />${eol}` +
-      `            <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />${eol}` +
-      `          </intent-filter>${eol}` +
-      `        </receiver>${eol}`;
-    m = m.replace(/([ \t]*<\/application>)/, `${rec}$1`);
-  }
 
   // Share-sheet target: "Share → GameTracker" adds text/images to the clipboard.
   if (!m.includes("android.intent.action.SEND")) {
@@ -591,237 +592,7 @@ const COMPOSE_BOM = "2025.08.00";
     console.warn(`[patch-android] ${mainActivityPath} not found — skipping MainActivity patch.`);
   } else {
     const before = readFileSync(mainActivityPath, "utf8");
-    let content =
-      `package ${pkg}\n\n` +
-      `import android.app.PictureInPictureParams\n` +
-      `import android.content.pm.ActivityInfo\n` +
-      `import android.content.pm.PackageManager\n` +
-      `import android.content.res.Configuration\n` +
-      `import android.graphics.Rect\n` +
-      `import android.os.Build\n` +
-      `import android.os.Bundle\n` +
-      `import android.os.SystemClock\n` +
-      `import android.util.Rational\n` +
-      `import android.webkit.WebView\n` +
-      `import android.view.OrientationEventListener\n` +
-      `import android.view.WindowManager\n` +
-      `import androidx.activity.enableEdgeToEdge\n` +
-      `import androidx.annotation.RequiresApi\n` +
-      `import androidx.core.view.ViewCompat\n` +
-      `import androidx.core.view.WindowInsetsCompat\n` +
-      `import androidx.core.view.WindowInsetsControllerCompat\n` +
-      `import java.lang.ref.WeakReference\n\n` +
-      `class MainActivity : TauriActivity() {\n` +
-      `  companion object {\n` +
-      `    /** True while the webview has a live remote session (set over JNI by the\n` +
-      `     *  Rust \`set_pip_enabled\` command via [setPipWanted]) — leaving the app\n` +
-      `     *  then shrinks it into a floating 16:9 mini window (YouTube/AnyDesk\n` +
-      `     *  style) instead of plain backgrounding. */\n` +
-      `    @JvmField var pipWanted = false\n` +
-      `    @JvmField var rotationHoldMs = 1200L\n` +
-      `    private var current: WeakReference<MainActivity>? = null\n\n` +
-      `    /** JNI entry point: flips the gate AND refreshes the live activity's PiP\n` +
-      `     *  params, so Android 12+'s auto-enter (the SEAMLESS system-animated\n` +
-      `     *  transition on the home gesture) engages/disengages immediately. */\n` +
-      `    @JvmStatic\n` +
-      `    fun setPipWanted(enabled: Boolean) {\n` +
-      `      pipWanted = enabled\n` +
-      `      val act = current?.get() ?: return\n` +
-      `      act.runOnUiThread { act.updatePipParams() }\n` +
-      `    }\n` +
-      `    @JvmStatic\n` +
-      `    fun setRotationHoldMs(value: Long) {\n` +
-      `      rotationHoldMs = value.coerceIn(400L, 3000L)\n` +
-      `    }\n` +
-      `  }\n\n` +
-      `  private var appWebView: WebView? = null\n` +
-      `  private var imeVisible = false\n` +
-      `  private var lastImeBottom = -1\n` +
-      `  private var rotationCandidate = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED\n` +
-      `  private var rotationCandidateSince = 0L\n` +
-      `  private lateinit var orientationListener: OrientationEventListener\n\n` +
-      `  override fun onCreate(savedInstanceState: Bundle?) {\n` +
-      `    enableEdgeToEdge()\n` +
-      `    super.onCreate(savedInstanceState)\n` +
-      `    current = WeakReference(this)\n` +
-      `    // MediaCodec → Surface under the WebView (Moonlight/Chiaki-style\n` +
-      `    // low-latency decode). JavascriptInterface + SurfaceView live in\n` +
-      `    // WcDecoderBridge; frames arrive from cloud.ts via __GT_DECODER__.\n` +
-      `    WcDecoderBridge.attach(this)\n` +
-      `    // Follow the physical sensor in all four orientations, IGNORING the\n` +
-      `    // system auto-rotate lock — holding the phone sideways for a moment\n` +
-      `    // rotates the remote screen even with rotation lock on.\n` +
-      `    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED\n` +
-      `    orientationListener = object : OrientationEventListener(this) {\n` +
-      `      override fun onOrientationChanged(angle: Int) {\n` +
-      `        if (angle == ORIENTATION_UNKNOWN || isInPictureInPictureMode) return\n` +
-      `        // A narrow 25-degree cardinal window rejects shaky transition angles.\n` +
-      `        val next = when {\n` +
-      `          angle >= 335 || angle <= 25 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT\n` +
-      `          angle in 65..115 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE\n` +
-      `          angle in 155..205 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT\n` +
-      `          angle in 245..295 -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE\n` +
-      `          else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED\n` +
-      `        }\n` +
-      `        if (next == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {\n` +
-      `          rotationCandidate = next\n` +
-      `          return\n` +
-      `        }\n` +
-      `        val now = SystemClock.elapsedRealtime()\n` +
-      `        if (next != rotationCandidate) {\n` +
-      `          rotationCandidate = next\n` +
-      `          rotationCandidateSince = now\n` +
-      `        } else if (requestedOrientation != next && now - rotationCandidateSince >= rotationHoldMs) {\n` +
-      `          requestedOrientation = next\n` +
-      `        }\n` +
-      `      }\n` +
-      `    }\n` +
-      `    if (orientationListener.canDetectOrientation()) orientationListener.enable()\n` +
-      `    hideSystemBars()\n` +
-      `    updatePipParams()\n` +
-      `    // Keyboard must SHRINK the webview, never pan the window. With\n` +
-      `    // enableEdgeToEdge + hidden system bars the IME default degrades to\n` +
-      `    // adjustPan (fullscreen windows are exempt from adjustResize), which\n` +
-      `    // slides the whole surface up — the top of the remote viewport leaves\n` +
-      `    // the screen and JS cannot even see it (visualViewport doesn't change\n` +
-      `    // when the WINDOW moves). Requesting ADJUST_RESIZE plus applying the\n` +
-      `    // ime inset as bottom padding makes the content view physically\n` +
-      `    // shrink, so the page lays out inside the visible band like any\n` +
-      `    // normal resize.\n` +
-      `    @Suppress("DEPRECATION")\n` +
-      `    window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)\n` +
-      `    val content = findViewById<android.view.View>(android.R.id.content)\n` +
-      `    ViewCompat.setOnApplyWindowInsetsListener(content) { v, insets ->\n` +
-      `      val ime = insets.getInsets(WindowInsetsCompat.Type.ime())\n` +
-      `      imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())\n` +
-      `      if (ime.bottom != lastImeBottom) {\n` +
-      `        lastImeBottom = ime.bottom\n` +
-      `        v.setPadding(0, 0, 0, ime.bottom)\n` +
-      `      }\n` +
-      `      insets\n` +
-      `    }\n` +
-      `  }\n\n` +
-      `  /** Tauri fires this when the WebView is constructed, BEFORE it loads the\n` +
-      `   *  app URL — the only correct moment to inject a JavascriptInterface.\n` +
-      `   *  Android exposes injected objects to JS only on the NEXT page load, so\n` +
-      `   *  binding __GT_DECODER__ any later (it used to happen in the bridge's\n` +
-      `   *  init(), when a DIRECT session starts) leaves it undefined for the whole\n` +
-      `   *  session: MediaCodec is never fed and the screen stays blank while the\n` +
-      `   *  phone re-requests keyframes forever. */\n` +
-      `  override fun onWebViewCreate(webView: WebView) {\n` +
-      `    super.onWebViewCreate(webView)\n` +
-      `    appWebView = webView\n` +
-      `    WcDecoderBridge.installJsInterface(webView)\n` +
-      `  }\n\n` +
-      `  override fun onWindowFocusChanged(hasFocus: Boolean) {\n` +
-      `    super.onWindowFocusChanged(hasFocus)\n` +
-      `    // Re-hide after the bars are transiently shown (keyboard, app resume).\n` +
-      `    if (hasFocus && !imeVisible) hideSystemBars()\n` +
-      `  }\n\n` +
-      `  /** Does this device actually have PiP? (Go/TV/OEM builds may not.) NOTE: no\n` +
-      `   *  SDK_INT check in here — lint can't see version guards through a helper,\n` +
-      `   *  so every caller does its own inline check and minSdk 24 stays buildable. */\n` +
-      `  private fun hasPipFeature(): Boolean =\n` +
-      `    packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)\n\n` +
-      `  /** Shared 16:9 params. \`sourceRectHint\` tells the OS which on-screen rect\n` +
-      `   *  morphs into the mini window — without it the system falls back to a\n` +
-      `   *  content overlay and the shrink looks like a cross-fade rather than the\n` +
-      `   *  seamless YouTube move. */\n` +
-      `  @RequiresApi(Build.VERSION_CODES.O)\n` +
-      `  private fun pipParams(autoEnter: Boolean): PictureInPictureParams {\n` +
-      `    val b = PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9))\n` +
-      `    try {\n` +
-      `      val rect = Rect()\n` +
-      `      window.decorView.getGlobalVisibleRect(rect)\n` +
-      `      if (!rect.isEmpty) b.setSourceRectHint(rect)\n` +
-      `    } catch (_: Exception) {\n` +
-      `      // No layout yet — the OS just uses its default animation.\n` +
-      `    }\n` +
-      `    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {\n` +
-      `      b.setAutoEnterEnabled(autoEnter)\n` +
-      `      b.setSeamlessResizeEnabled(false)\n` +
-      `    }\n` +
-      `    return b.build()\n` +
-      `  }\n\n` +
-      `  /** Android 12+: arm auto-enter so the OS runs the shrink itself on the home\n` +
-      `   *  gesture. Params must be FRESH when the user leaves (the OS reads the last\n` +
-      `   *  snapshot), so this is re-applied when the gate flips and on resume. */\n` +
-      `  fun updatePipParams() {\n` +
-      `    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return\n` +
-      `    if (!hasPipFeature()) return\n` +
-      `    try {\n` +
-      `      setPictureInPictureParams(pipParams(pipWanted))\n` +
-      `    } catch (_: Exception) {\n` +
-      `      // PiP unavailable (device/settings) — the leave-hint path below still tries.\n` +
-      `    }\n` +
-      `  }\n\n` +
-      `  override fun onResume() {\n` +
-      `    super.onResume()\n` +
-      `    // Re-arm on every resume: auto-enter reads the most recent params, and a\n` +
-      `    // stale snapshot (set once at onCreate, before the session went live) is a\n` +
-      `    // documented way for auto-enter to quietly do nothing.\n` +
-      `    updatePipParams()\n` +
-      `  }\n\n` +
-      `  // WryActivity.onPause() calls WebView.onPause(), which stops the page\n` +
-      `  // painting and marks it hidden. In picture-in-picture the activity is\n` +
-      `  // paused but ON SCREEN, so the mini window froze on the last full-screen\n` +
-      `  // frame: the top bar stayed up, the video layer kept its full-screen\n` +
-      `  // rect (a sliver of picture over black) and nothing updated. Keep the\n` +
-      `  // WebView live while pinned; a real background (onStop) still pauses it.\n` +
-      `  override fun onPause() {\n` +
-      `    super.onPause()\n` +
-      `    if (isInPictureInPictureMode) appWebView?.onResume()\n` +
-      `  }\n\n` +
-      `  override fun onStop() {\n` +
-      `    super.onStop()\n` +
-      `    appWebView?.onPause()\n` +
-      `  }\n\n` +
-      `  // Home / recents while connected → floating 16:9 mini window.\n` +
-      `  //\n` +
-      `  // This runs on ALL API >= O, including 12+ where setAutoEnterEnabled is\n` +
-      `  // supposed to make it unnecessary. That is deliberate: auto-enter silently\n` +
-      `  // no-ops on a number of OEM builds (b/245392106 \"Inconsistent\n` +
-      `  // setAutoEnterEnabled behavior\"), and gating this to pre-S left those devices\n` +
-      `  // with NO picture-in-picture at all and no fallback. Google's wording is that\n` +
-      `  // with auto-enter you \"don't need to\" call this — not that you must not.\n` +
-      `  // The isInPictureInPictureMode guard makes the redundant call a no-op when\n` +
-      `  // auto-enter did fire first.\n` +
-      `  override fun onUserLeaveHint() {\n` +
-      `    super.onUserLeaveHint()\n` +
-      `    // Inline SDK check (not folded into hasPipFeature) so lint's NewApi can\n` +
-      `    // see it — minSdk is 24 and the PiP APIs below are 26.\n` +
-      `    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return\n` +
-      `    if (!pipWanted || !hasPipFeature()) return\n` +
-      `    if (isInPictureInPictureMode) return\n` +
-      `    try {\n` +
-      `      enterPictureInPictureMode(pipParams(pipWanted))\n` +
-      `    } catch (_: Exception) {\n` +
-      `      // PiP unavailable (device/settings) — plain backgrounding is fine.\n` +
-      `    }\n` +
-      `  }\n\n` +
-      `  override fun onPictureInPictureModeChanged(\n` +
-      `    isInPictureInPictureMode: Boolean,\n` +
-      `    newConfig: Configuration\n` +
-      `  ) {\n` +
-      `    super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)\n` +
-      `    // Entering PiP can land after onPause — keep the page painting here too.\n` +
-      `    if (isInPictureInPictureMode) appWebView?.onResume()\n` +
-      `    val active = if (isInPictureInPictureMode) "true" else "false"\n` +
-      `    appWebView?.evaluateJavascript("window.__GT_PIP_ACTIVE__=" + active + ";window.dispatchEvent(new CustomEvent('gt:pip',{detail:{active:" + active + "}}));", null)\n` +
-      `    if (!isInPictureInPictureMode) hideSystemBars()\n` +
-      `  }\n\n` +
-      `  override fun onDestroy() {\n` +
-      `    if (::orientationListener.isInitialized) orientationListener.disable()\n` +
-      `    appWebView = null\n` +
-      `    super.onDestroy()\n` +
-      `  }\n\n` +
-      `  private fun hideSystemBars() {\n` +
-      `    val controller = WindowInsetsControllerCompat(window, window.decorView)\n` +
-      `    controller.hide(WindowInsetsCompat.Type.systemBars())\n` +
-      `    controller.systemBarsBehavior =\n` +
-      `      WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE\n` +
-      `  }\n` +
-      `}\n`;
+    const content = readFileSync(join(root, "scripts", "android-templates", "MainActivity.kt"), "utf8").replaceAll("__PACKAGE__", pkg);
     save(mainActivityPath, before, content, "rewrote MainActivity.kt (immersive + sensor rotate + auto-enter PiP + MediaCodec attach)");
   }
 }
@@ -885,7 +656,30 @@ const COMPOSE_BOM = "2025.08.00";
   save(path, before, content, "updated DecoderInbox.java");
 }
 
+{
+  const conf=JSON.parse(readFileSync(join(root,"companion","src-tauri","tauri.conf.json"),"utf8"));
+  const pkg=String(conf.identifier||"");if(!pkg)throw new Error("No Android package for RenderedFrameProof");
+  const path=join(androidDir,"app","src","main","java",...pkg.split("."),"RenderedFrameProof.java");
+  const content=readFileSync(join(root,"scripts","android-templates","RenderedFrameProof.java"),"utf8").replaceAll("__PACKAGE__",pkg);
+  mkdirSync(dirname(path),{recursive:true});save(path,existsSync(path)?readFileSync(path,"utf8"):"",content,"updated RenderedFrameProof.java");
+}
+{
+  const conf=JSON.parse(readFileSync(join(root,"companion","src-tauri","tauri.conf.json"),"utf8"));
+  const pkg=String(conf.identifier||"");if(!pkg)throw new Error("No Android package for TransitionOwnership");
+  const path=join(androidDir,"app","src","main","java",...pkg.split("."),"TransitionOwnership.java");
+  const content=readFileSync(join(root,"scripts","android-templates","TransitionOwnership.java"),"utf8").replaceAll("__PACKAGE__",pkg);
+  mkdirSync(dirname(path),{recursive:true});save(path,existsSync(path)?readFileSync(path,"utf8"):"",content,"updated TransitionOwnership.java");
+}
 // --- 4c: proguard-gametracker.pro — keep JNI-facing symbols -----------------
+{
+  const conf = JSON.parse(readFileSync(join(root, "companion", "src-tauri", "tauri.conf.json"), "utf8"));
+  const pkg = String(conf.identifier || "");
+  if (!pkg) throw new Error("No Android package for RemoteRotationPolicy");
+  const path = join(androidDir, "app", "src", "main", "java", ...pkg.split("."), "RemoteRotationPolicy.java");
+  const content = readFileSync(join(root, "scripts", "android-templates", "RemoteRotationPolicy.java"), "utf8").replaceAll("__PACKAGE__", pkg);
+  mkdirSync(dirname(path), { recursive: true });
+  save(path, existsSync(path) ? readFileSync(path,"utf8") : "", content, "updated RemoteRotationPolicy.java");
+}
 // The release build type enables R8 minification and pulls in every *.pro under
 // app/ (fileTree include "**/*.pro"), so dropping this file next to the stock
 // proguard-rules.pro is enough — no gradle edit needed.
@@ -926,6 +720,8 @@ const COMPOSE_BOM = "2025.08.00";
       `# PiP gate (the class itself is kept by the manifest; its members are not).\n` +
       `-keepclassmembers class ${pkg}.MainActivity {\n` +
       `    public static void setPipWanted(boolean);\n` +
+      `    public static void setRotationHoldMs(long);\n` +
+      `    public static void setRemoteRotation(boolean, long, long);\n` +
       `    public static boolean pipWanted;\n` +
       `}\n` +
       `\n` +

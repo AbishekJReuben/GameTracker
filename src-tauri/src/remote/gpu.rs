@@ -52,7 +52,8 @@ cbuffer Params : register(b0) {
     float4 curRect;   // xy = top-left, zw = size, in [0,1] output space
     uint   curOn;     // 0 = no cursor this frame
     uint   curMasked; // 0 = alpha blend, 1 = masked (alpha 0 replace / 255 XOR)
-    float2 _pad;
+    uint srcRotation;
+    uint _pad;
     float4 srcInfo;   // x = mip level, y = 1 area filter / 0 plain sample, zw = tap offset (UV)
 };
 
@@ -88,7 +89,11 @@ float3 sampleSrc(float2 uv) {
 }
 
 float4 ps(VSOut i) : SV_TARGET {
-    float3 col = sampleSrc(i.uv);
+    float2 sourceUV=i.uv;
+    if(srcRotation==90)sourceUV=float2(i.uv.y,1-i.uv.x);
+    else if(srcRotation==180)sourceUV=1-i.uv;
+    else if(srcRotation==270)sourceUV=float2(1-i.uv.y,i.uv.x);
+    float3 col = sampleSrc(sourceUV);
     if (curOn != 0) {
         float2 c = (i.uv - curRect.xy) / max(curRect.zw, 1e-6);
         if (all(c >= 0.0) && all(c <= 1.0)) {
@@ -116,7 +121,8 @@ struct Params {
     cur_rect: [f32; 4],
     cur_on: u32,
     cur_masked: u32,
-    _pad: [f32; 2],
+    src_rotation: u32,
+    _pad: u32,
     /// x = mip level, y = 1 area filter / 0 plain sample, zw = tap offset (UV).
     src_info: [f32; 4],
 }
@@ -308,6 +314,12 @@ impl Compositor {
         &self.out_tex
     }
 
+    pub fn output_srv(&self)->Option<ID3D11ShaderResourceView> {
+        let mut srv=None;unsafe{self.device.CreateShaderResourceView(&self.out_tex,None,Some(&mut srv)).ok()?;}srv
+    }
+
+    pub fn clear(&self) {unsafe{self.context.ClearRenderTargetView(&self.out_rtv,&[0.,0.,0.,1.]);}}
+
     /// Re-upload the cursor shape if it changed. Cheap no-op while the shape is stable
     /// (which is almost always — the pointer moves far more often than it morphs).
     fn sync_cursor(&mut self, img: &CursorImage, seq: u64) -> bool {
@@ -379,22 +391,42 @@ impl Compositor {
         cursor: Option<(&CursorImage, u64)>,
         src_info: [f32; 4],
     ) -> bool {
+        self.render_region_with(src,native_w,native_h,src_mips,cursor,src_info,[0.,0.,self.w as f32,self.h as f32],0,None)
+    }
+
+    /// A tile samples only resources belonging to this device. Foreign-adapter
+    /// images must pass through the explicit bounded transfer/upload path.
+    pub fn render_region(&mut self,src:&ID3D11ShaderResourceView,raw_w:u32,raw_h:u32,src_mips:bool,cursor:Option<(&CursorImage,u64)>,region:[f32;4],rotation:u32)->bool {
+        let (w,h)=if rotation==90||rotation==270{(raw_h,raw_w)}else{(raw_w,raw_h)};
+        let mut info=downscale_params(w,h,region[2].round() as u32,region[3].round() as u32,src_mips);
+        if rotation==90||rotation==270{info.swap(2,3);}
+        self.render_region_with(src,w,h,src_mips,cursor,info,region,rotation,None)
+    }
+
+    pub fn render_scene_cursor(&mut self,src:&ID3D11ShaderResourceView,w:u32,h:u32,cursor:Option<(&CursorImage,u64,[f32;4])>)->bool {
+        let rect=cursor.as_ref().map(|(_,_,rect)|*rect);let image=cursor.map(|(image,sequence,_)|(image,sequence));
+        self.render_region_with(src,w,h,false,image,downscale_params(w,h,self.w,self.h,false),[0.,0.,self.w as f32,self.h as f32],0,rect)
+    }
+
+    fn render_region_with(&mut self,src:&ID3D11ShaderResourceView,native_w:u32,native_h:u32,src_mips:bool,cursor:Option<(&CursorImage,u64)>,src_info:[f32;4],region:[f32;4],rotation:u32,cursor_rect:Option<[f32;4]>)->bool {
         if native_w == 0 || native_h == 0 {
             return false;
         }
+        if unsafe{src.GetDevice()}.map_or(true,|device|device!=self.device){return false;}
         let mut p = Params::default();
         p.src_info = src_info;
+        p.src_rotation=rotation;
         if let Some((img, seq)) = cursor {
             if self.sync_cursor(img, seq) {
                 // Cursor rect in normalized OUTPUT space. Working in normalized coords
                 // means the shape scales with the stream exactly as the CPU path's
                 // native→stream ratio did, at any resolution.
-                p.cur_rect = [
+                p.cur_rect = cursor_rect.unwrap_or([
                     img.x as f32 / native_w as f32,
                     img.y as f32 / native_h as f32,
                     img.w as f32 / native_w as f32,
                     img.h as f32 / native_h as f32,
-                ];
+                ]);
                 p.cur_on = 1;
                 p.cur_masked = if self.cur_masked { 1 } else { 0 };
             }
@@ -412,10 +444,10 @@ impl Compositor {
             self.context.Unmap(&cb_res, 0);
 
             let vp = D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
-                Width: self.w as f32,
-                Height: self.h as f32,
+                TopLeftX: region[0],
+                TopLeftY: region[1],
+                Width: region[2],
+                Height: region[3],
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };

@@ -27,6 +27,7 @@ export type DecoderProbe = {
 };
 
 export type DecoderStats = {
+  rendered?:{version:number;feedSession:number;codecGeneration:number;ptsUs:number;frames:number;boundsSequence:number;visiblePtsUs?:number;visibleBoundsSequence?:number;layer:'texture'|'surface'|''}|null;
   decodeMs: number;
   queue: number;
   frames: number;
@@ -47,6 +48,11 @@ type GtDecoderJs = {
   feed: (tsUs: number, key: boolean, b64: string) => void;
   disableBinary?: () => void;
   beginFeed?: (session: number) => void;
+  frameProofVersion?:()=>number;
+  prepareTransition?:()=>boolean;
+  revealFrame?:(session:number,generation:number,pts:number,bounds:number)=>void;
+  clearTransition?:()=>void;
+  setPipAspect?:(width:number,height:number,revision:number)=>void;
 };
 
 declare global {
@@ -75,21 +81,28 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 let probeCache: DecoderProbe | null = null;
 let lifecycle: Promise<unknown> = Promise.resolve();
+let lifecycleEpoch=0;
 
 /** JNI commands run in independent blocking tasks. Serialize lifecycle only so
  * a slow init cannot reach Java after a later teardown or resolution change. */
-function lifecycleInvoke(cmd: string, args?: Record<string, unknown>) {
-  const next = lifecycle.then(() => {
+function lifecycleInvoke(cmd: string, args?: Record<string, unknown>,retainPicture=false) {
+  if(cmd==='decoder_teardown')++lifecycleEpoch;
+  const epoch=lifecycleEpoch,finalStop=cmd==='decoder_teardown'&&!retainPicture;
+  if(finalStop)clearNativeTransition();
+  const next = lifecycle.then(async() => {
+    if(cmd==='decoder_init'&&epoch!==lifecycleEpoch)throw new Error('Retired decoder initialization');
     if (cmd === "decoder_init" || cmd === "decoder_teardown") {
+      if((cmd==='decoder_init'||retainPicture)&&window.__GT_DECODER__?.frameProofVersion?.()===2&&window.__GT_DECODER__?.prepareTransition?.()===false)throw new Error('Unable to retain the last native picture for this view transition');
       // Java forgets its desired rect on init; make the next bounds call go out.
       lastBounds = null;
+      boundsViewEpoch=0;
       nativeFeedSession = (nativeFeedSession + 1) >>> 0;
       binaryPendingKeys.length = 0;
       binaryInFlight = 0;
       binaryNeedsKey = true;
       window.__GT_DECODER__?.beginFeed?.(nativeFeedSession);
     }
-    return invoke(cmd, args);
+    try{return await invoke(cmd,args);}finally{if(finalStop)clearNativeTransition();}
   });
   lifecycle = next.catch(() => {});
   return next;
@@ -157,6 +170,7 @@ let boundsSeq = 0;
  * rect then and needs the next call.
  */
 let lastBounds: { x: number; y: number; w: number; h: number } | null = null;
+let boundsViewEpoch=0;
 const q4 = (v: number) => Math.round(v * 4) / 4;
 
 /** True when this rect equals the last one sent (exported for tests). */
@@ -176,14 +190,17 @@ export async function setNativeDecoderBounds(opts: {
   w: number;
   h: number;
   visible: boolean;
+  viewEpoch?:number;
 }): Promise<void> {
   if (!nativeDecoderPossible()) return;
-  if (boundsUnchanged(opts)) return;
+  if (boundsUnchanged(opts)&&boundsViewEpoch===(opts.viewEpoch??0)) return;
   lastBounds = { x: q4(opts.x), y: q4(opts.y), w: q4(opts.w), h: q4(opts.h) };
+  boundsViewEpoch=opts.viewEpoch??0;
   boundsSeq += 1;
   try {
     await invoke("decoder_set_bounds", { ...opts, seq: boundsSeq });
   } catch {
+    lastBounds=null;
     /* surface not ready yet */
   }
 }
@@ -197,10 +214,10 @@ export async function resetNativeDecoder(): Promise<void> {
   }
 }
 
-export async function teardownNativeDecoder(): Promise<void> {
+export async function teardownNativeDecoder(retainPicture=false): Promise<void> {
   if (!nativeDecoderPossible()) return;
   try {
-    await lifecycleInvoke("decoder_teardown");
+    await lifecycleInvoke("decoder_teardown",undefined,retainPicture);
   } catch {
     /* ignore */
   }
@@ -253,6 +270,22 @@ export function nativeFeedReady(): boolean {
   return typeof window.__GT_DECODER_BINARY__?.postMessage === "function" ||
     typeof window.__GT_DECODER__?.feed === "function";
 }
+export function nativeFrameProofAvailable():boolean{return !!globalThis.crypto?.subtle&&typeof HTMLVideoElement.prototype.requestVideoFrameCallback==='function'&&(!nativeDecoderPossible()||window.__GT_DECODER__?.frameProofVersion?.()===2);}
+export function revealNativeFrame(proof:NonNullable<DecoderStats['rendered']>){window.__GT_DECODER__?.revealFrame?.(proof.feedSession,proof.codecGeneration,proof.ptsUs,proof.boundsSequence);}
+export function clearNativeTransition(){window.__GT_DECODER__?.clearTransition?.();}
+export function setNativePipAspect(width:number,height:number){window.__GT_DECODER__?.setPipAspect?.(width,height,Math.round((performance.timeOrigin+performance.now())*1000));}
+let pipGate=Promise.resolve();
+export function setNativePipEnabled(enabled:boolean){
+  if(!nativeDecoderPossible())return Promise.resolve();
+  pipGate=pipGate.catch(()=>{}).then(()=>invoke<void>('set_pip_enabled',{enabled}));return pipGate.catch(()=>{});
+}
+export function nativeFeedGeneration():number{return nativeFeedSession;}
+export function nativeBoundsSequence():number{return lastBounds?boundsSeq:0;}
+export function nativeBoundsViewEpoch():number{return lastBounds?boundsViewEpoch:0;}
+let lastPresentationUs=0;
+/** PTS is unique across decoder/feed generations. A delayed old TextureView
+ * update can never match a new feed's submitted picture by timestamp collision. */
+export function nativePresentationTimestamp():number{lastPresentationUs=Math.max(lastPresentationUs+1,Math.round((performance.timeOrigin+performance.now())*1000));return lastPresentationUs;}
 
 let binaryBridge: Window["__GT_DECODER_BINARY__"];
 let binaryInFlight = 0;

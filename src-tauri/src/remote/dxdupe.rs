@@ -139,69 +139,48 @@ pub struct Duplicator {
     last_native: (u32, u32),
 }
 
-impl Duplicator {
-    /// Build a duplication session for the output whose top-left desktop coordinate
-    /// matches `(target_x, target_y)`; falls back to the first output otherwise.
-    pub fn new_for(target_x: i32, target_y: i32) -> Option<Self> {
-        unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
 
-            let mut chosen: Option<(IDXGIAdapter, IDXGIOutput1, (i32, i32))> = None;
-            let mut first: Option<(IDXGIAdapter, IDXGIOutput1, (i32, i32))> = None;
-
-            let mut ai = 0u32;
-            while let Ok(adapter) = factory.EnumAdapters1(ai) {
-                ai += 1;
-                let adapter: IDXGIAdapter = adapter.cast().ok()?;
-                let mut oi = 0u32;
-                loop {
-                    let Ok(output) = adapter.EnumOutputs(oi) else { break };
-                    oi += 1;
-                    let Ok(desc) = output.GetDesc() else { continue };
-                    let Ok(o1) = output.cast::<IDXGIOutput1>() else { continue };
-                    let r = desc.DesktopCoordinates;
-                    let origin = (r.left, r.top);
-                    if first.is_none() {
-                        first = Some((adapter.clone(), o1.clone(), origin));
-                    }
-                    if r.left == target_x && r.top == target_y {
-                        chosen = Some((adapter.clone(), o1, origin));
-                        break;
-                    }
-                }
-                if chosen.is_some() {
-                    break;
+/// A physical output and its actual adapter. Never silently substitute a
+/// different output when a topology change removed the requested origin.
+#[derive(Clone)]
+pub(crate) struct OutputBinding {
+    pub adapter:IDXGIAdapter,pub output:IDXGIOutput1,pub origin:(i32,i32),
+    pub adapter_key:(i32,u32),pub rotation:u32,
+}
+impl OutputBinding {
+    pub fn find(x:i32,y:i32)->Option<Self> {unsafe {
+        let _dpi=super::display::DpiScope::physical();
+        let factory:IDXGIFactory1=CreateDXGIFactory1().ok()?;let mut ai=0;
+        while let Ok(a)=factory.EnumAdapters1(ai) {
+            ai+=1;let desc=a.GetDesc1().ok()?;let adapter:IDXGIAdapter=a.cast().ok()?;let mut oi=0;
+            while let Ok(output)=adapter.EnumOutputs(oi) {
+                oi+=1;let Ok(d)=output.GetDesc() else{continue;};
+                if d.AttachedToDesktop.as_bool()&&d.DesktopCoordinates.left==x&&d.DesktopCoordinates.top==y {
+                    return Some(Self{adapter:adapter.clone(),output:output.cast().ok()?,origin:(x,y),adapter_key:(desc.AdapterLuid.HighPart,desc.AdapterLuid.LowPart),rotation:match d.Rotation.0{2=>90,3=>180,4=>270,_=>0}});
                 }
             }
+        }None
+    }}
+    pub fn create_device(&self)->Option<(ID3D11Device,ID3D11DeviceContext)> {unsafe {
+        let levels=[D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0,D3D_FEATURE_LEVEL_10_1,D3D_FEATURE_LEVEL_10_0];
+        let mut device=None;let mut context=None;let mut level=D3D_FEATURE_LEVEL::default();
+        D3D11CreateDevice(&self.adapter,D3D_DRIVER_TYPE_UNKNOWN,HMODULE::default(),D3D11_CREATE_DEVICE_BGRA_SUPPORT,Some(&levels),D3D11_SDK_VERSION,Some(&mut device),Some(&mut level),Some(&mut context)).ok()?;
+        let device=device?;super::gpusched::raise_device(&device);Some((device,context?))
+    }}
+}
 
-            let (adapter, output1, origin) = chosen.or(first)?;
+impl Duplicator {
+    /// Standalone construction for isolated probes. Shipping capture leases this
+    /// same implementation through the process-local output broker.
+    pub fn new_for(target_x: i32, target_y: i32) -> Option<Self> {
+        let binding=OutputBinding::find(target_x,target_y)?;
+        let (device,context)=binding.create_device()?;
+        Self::on_device(&binding,&device,&context)
+    }
 
-            // A device on the SAME adapter as the output is required for duplication.
-            let feature_levels = [
-                D3D_FEATURE_LEVEL_11_1,
-                D3D_FEATURE_LEVEL_11_0,
-                D3D_FEATURE_LEVEL_10_1,
-                D3D_FEATURE_LEVEL_10_0,
-            ];
-            let mut device: Option<ID3D11Device> = None;
-            let mut context: Option<ID3D11DeviceContext> = None;
-            let mut level = D3D_FEATURE_LEVEL::default();
-            D3D11CreateDevice(
-                &adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&feature_levels),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                Some(&mut level),
-                Some(&mut context),
-            )
-            .ok()?;
-            let device = device?;
-            let context = context?;
-
-            let dup = output1.DuplicateOutput(&device).ok()?;
+    pub(crate) fn on_device(binding:&OutputBinding,device:&ID3D11Device,context:&ID3D11DeviceContext)->Option<Self> {
+        unsafe {
+            let dup = binding.output.DuplicateOutput(device).ok()?;
             // This device does the whole per-frame GPU job (copy, composite, NVENC);
             // let it jump ahead of a GPU-bound game's queue. Best-effort.
             super::gpusched::raise_device(&device);
@@ -214,8 +193,8 @@ impl Duplicator {
                 .unwrap_or(false);
 
             Some(Self {
-                device,
-                context,
+                device: device.clone(),
+                context: context.clone(),
                 dup,
                 staging: None,
                 stg_w: 0,
@@ -230,7 +209,7 @@ impl Duplicator {
                 cursor_cache_seq: u64::MAX,
                 gpu_scale,
                 readback: Vec::new(),
-                origin,
+                origin: binding.origin,
                 ptr_visible: false,
                 ptr_x: 0,
                 ptr_y: 0,
@@ -494,6 +473,23 @@ impl Duplicator {
             out.unwrap_or(Grab::Timeout)
         }
     }
+
+    pub(crate) fn ensure_current_mips(&mut self) {
+        if self.mip_valid&&!self.mips_fresh&&self.gpu_scale {if let Some(srv)=&self.mip_srv{unsafe{self.context.GenerateMips(srv);}self.mips_fresh=true;}}
+    }
+    pub(crate) fn readback_current(&mut self,max_w:u32)->Grab {unsafe {
+        if !self.mip_valid{return Grab::Timeout;}
+        let(nw,nh)=self.last_native;let mut level=0;
+        if self.gpu_scale&&max_w>0 {while (nw>>(level+1))>=max_w&&(nh>>(level+1))>=1{level+=1;}}
+        if level>0{self.ensure_current_mips();}
+        let Some(tex)=self.mip_tex.clone() else{return Grab::Lost;};let Ok(src)=tex.cast::<ID3D11Resource>() else{return Grab::Lost;};
+        let(w,h)=((nw>>level).max(1),(nh>>level).max(1));
+        if self.ensure_staging(w,h).is_none(){return Grab::Lost;}
+        let Some(staging)=self.staging.clone() else{return Grab::Lost;};let Ok(dst)=staging.cast::<ID3D11Resource>() else{return Grab::Lost;};
+        self.context.CopySubresourceRegion(&dst,0,0,0,0,&src,level,None);
+        if self.map_readback(&dst,w,h).is_none(){return Grab::Lost;}
+        Grab::Frame{w,h,native_w:nw,native_h:nh}
+    }}
 
     /// SRV over the last [`Duplicator::grab_gpu`] frame (full native resolution).
     /// Levels above 0 are only meaningful while [`Duplicator::mips_current`] is true.

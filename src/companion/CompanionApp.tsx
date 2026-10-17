@@ -1,6 +1,7 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { lazyRoute, preloadWhenIdle } from "@/lib/lazyRoute";
 import { invoke } from "@tauri-apps/api/core";
+import {setNativePipEnabled} from './nativeDecoder';
 import { motion } from "motion/react";
 import {
   LayoutDashboard,
@@ -212,8 +213,9 @@ function RemoteShell({ onHome }: { onHome?: () => void } = {}) {
   // that leaving the app (Home/recents) should enter 16:9 picture-in-picture.
   // Best-effort — rejects harmlessly on the web/discovery build (no Tauri).
   useEffect(() => {
-    invoke("set_pip_enabled", { enabled: phase === "connected" }).catch(() => {});
-  }, [phase]);
+    void setNativePipEnabled(phase==='connected'&&tab==='control');
+    return()=>{void setNativePipEnabled(false);};
+  }, [phase,tab]);
   // "Remote only" setup mode belongs to the PC — the companion mirrors it so the
   // phone, browser and Quest show the same tabs, and can't change it. Polled
   // rather than pushed: it flips at most a handful of times in a session, and a
@@ -474,7 +476,7 @@ function RemoteShell({ onHome }: { onHome?: () => void } = {}) {
           {tab === "clipboard" && <ClipboardScreen />}
           {tab === "system" && <SystemScreen />}
           {tab === "settings" && (
-            <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} />
+            <SettingsScreen code={activeCode} onSaveKey={applyKey} onDisconnect={disconnect} onForget={forget} connection={conn}/>
           )}
           {tab === "control" && (
             <ControlTab

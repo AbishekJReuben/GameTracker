@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "presets": {
+    "Subtle": {},
+    "Balanced": {"intensity":0.65,"border.opacity":0.58,"border.glow":0.5,"aurora.ribbons":0.55,"aurora.speed":0.4,"tint.strength":0.04,"halo.opacity":0.34,"ripples.strength":0.42},
+    "Expressive": {"intensity":0.85,"border.thickness":2,"border.opacity":0.72,"border.glow":0.65,"aurora.ribbons":0.75,"aurora.speed":0.55,"aurora.reaction":0.5,"tint.strength":0.055,"halo.radius":28,"halo.opacity":0.42,"ripples.strength":0.55}
+  },
+  "defaults": {
+    "intensity": 0.45,
+    "border": {
+      "thickness": 1.5,
+      "opacity": 0.42,
+      "glow": 0.3,
+      "fade": 48,
+      "cornerSoftness": 16
+    },
+    "aurora": {
+      "speed": 0.25,
+      "ribbons": 0.35,
+      "softness": 0.75,
+      "reaction": 0.25
+    },
+    "palette": {
+      "primary": "#20d9c6",
+      "secondary": "#329cec",
+      "accent": "#9372df"
+    },
+    "tint": {
+      "strength": 0.025,
+      "reach": 100
+    },
+    "halo": {
+      "enabled": true,
+      "radius": 22,
+      "opacity": 0.24,
+      "softness": 0.8,
+      "response": 0.25
+    },
+    "ripples": {
+      "enabled": true,
+      "size": 40,
+      "strength": 0.28,
+      "thickness": 1.5,
+      "duration": 0.65
+    },
+    "label": {
+      "size": 14,
+      "placement": "topCenter",
+      "backing": 0.72,
+      "announcementSeconds": 3
+    },
+    "motion": "system"
+  },
+  "ranges": {
+    "intensity": [
+      0,
+      1
+    ],
+    "border.thickness": [
+      0.5,
+      8
+    ],
+    "border.opacity": [
+      0,
+      1
+    ],
+    "border.glow": [
+      0,
+      1
+    ],
+    "border.fade": [
+      8,
+      240
+    ],
+    "border.cornerSoftness": [
+      0,
+      80
+    ],
+    "aurora.speed": [
+      0,
+      2
+    ],
+    "aurora.ribbons": [
+      0,
+      1
+    ],
+    "aurora.softness": [
+      0,
+      1
+    ],
+    "aurora.reaction": [
+      0,
+      1
+    ],
+    "tint.strength": [
+      0,
+      0.15
+    ],
+    "tint.reach": [
+      8,
+      360
+    ],
+    "halo.radius": [
+      6,
+      80
+    ],
+    "halo.opacity": [
+      0,
+      1
+    ],
+    "halo.softness": [
+      0,
+      1
+    ],
+    "halo.response": [
+      0,
+      1
+    ],
+    "ripples.size": [
+      12,
+      160
+    ],
+    "ripples.strength": [
+      0,
+      1
+    ],
+    "ripples.thickness": [
+      0.5,
+      8
+    ],
+    "ripples.duration": [
+      0.2,
+      2
+    ],
+    "label.size": [
+      11,
+      24
+    ],
+    "label.backing": [
+      0.25,
+      0.95
+    ],
+    "label.announcementSeconds": [
+      1,
+      8
+    ]
+  }
+}

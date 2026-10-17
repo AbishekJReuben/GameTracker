@@ -128,3 +128,12 @@ pub fn foreground_cursor_position() -> Option<[f32; 2]> {
 pub fn foreground_cursor_position() -> Option<[f32; 2]> {
     None
 }
+pub fn cursor_for_view(view:&super::view::AppliedView)->(Option<[f32;2]>,Option<String>){
+    #[cfg(windows)]unsafe{
+        let mut p=windows::Win32::Foundation::POINT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p).is_ok(){
+            let source=view.source;let display=view.displays.iter().find(|d|d.rect().contains(p.x,p.y));
+            return (Some([(p.x-source.x) as f32/source.width.saturating_sub(1).max(1) as f32,(p.y-source.y) as f32/source.height.saturating_sub(1).max(1) as f32]),display.map(|d|d.id.clone()));
+        }
+    }(None,None)
+}

@@ -211,26 +211,34 @@ static SELECTED_MONITOR: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_selected_monitor(i: usize) {
     SELECTED_MONITOR.store(i, Ordering::SeqCst);
+    #[cfg(windows)] if let Some(mut view)=super::capture_surface::requested() {
+        let snapshot=super::display::snapshot();
+        if let Some(display)=snapshot.displays.get(i){view.mode=super::view::ViewMode::Single;view.selected_display_id=display.id.clone();super::capture_surface::request(Some(view));}
+    }
 }
 pub fn selected_monitor() -> usize {
     SELECTED_MONITOR.load(Ordering::SeqCst)
 }
+#[cfg(windows)]
+pub(crate) fn set_view_identity(identity:Option<Arc<super::view::CaptureIdentity>>){
+    if super::capture_surface::requested_identity().as_deref()!=identity.as_deref(){if let Some(identity)=&identity{if let Some(d)=identity.view.displays.iter().find(|d|d.id==identity.view.selected_display_id){SELECTED_MONITOR.store(d.index,Ordering::SeqCst);}}super::capture_surface::request_identity(identity);}
+}
+/// Only a producing source may attach its immutable view. A failed All surface
+/// cannot label the legacy single-monitor fallback with the requested layout.
+fn emit_source(emit:&dyn Fn(Vec<u8>),identity:Option<&super::view::CaptureIdentity>,payload:impl FnOnce()->Vec<u8>)->bool{
+    if let Some(identity)=identity {
+        let accepted=super::view_session::produced(identity);super::delivery::emit_if(accepted,||identity.packet(payload()),emit);accepted
+    }else{emit(payload());true}
+}
+fn scale_exact(px4:&[u8],sw:u32,sh:u32,dw:u32,dh:u32,fast:bool)->Option<(Vec<u8>,u32,u32)>{
+    if (sw,sh)==(dw,dh){return Some((px4.to_vec(),dw,dh));}
+    let src=ImageRef::new(sw,sh,px4,PixelType::U8x4).ok()?;let mut dst=FirImage::new(dw,dh,PixelType::U8x4);
+    let alg=if fast{ResizeAlg::Nearest}else{ResizeAlg::Convolution(FirFilter::Bilinear)};
+    Resizer::new().resize(&src,&mut dst,&ResizeOptions::new().resize_alg(alg)).ok()?;Some((dst.into_vec(),dw,dh))
+}
 
 /// A display, as reported to the phone's monitor switcher.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct MonitorInfo {
-    pub index: usize,
-    pub name: String,
-    pub width: u32,
-    pub height: u32,
-    pub is_primary: bool,
-    /// True for the display the host is CURRENTLY capturing. `SELECTED_MONITOR` is a
-    /// process-global that persists across phone connections, so the phone can't
-    /// assume index 0 — it must read this to show the right screen number on connect
-    /// (otherwise the label is wrong until the user switches displays once).
-    pub selected: bool,
-}
+pub type MonitorInfo = super::display::DisplayInfo;
 
 /// All monitors in a **stable order** (left-to-right, then top-to-bottom) so an
 /// index means the same display across calls, capture, and input mapping.
@@ -256,25 +264,14 @@ fn monitor_at(index: usize) -> Option<Monitor> {
 /// Public list for the phone's monitor picker.
 pub fn list_monitors() -> Vec<MonitorInfo> {
     let sel = selected_monitor();
-    sorted_monitors()
-        .into_iter()
-        .enumerate()
-        .map(|(index, m)| MonitorInfo {
-            index,
-            name: m.name().unwrap_or_else(|_| format!("Display {}", index + 1)),
-            width: m.width().unwrap_or(0),
-            height: m.height().unwrap_or(0),
-            is_primary: m.is_primary().unwrap_or(false),
-            selected: index == sel,
-        })
-        .collect()
+    super::display::snapshot().displays.into_iter().map(|mut d| { d.selected = d.index == sel; d }).collect()
 }
 
 /// Virtual-desktop bounds `(x, y, w, h)` of a monitor, for mapping normalized
 /// touch coordinates to real cursor positions across a multi-monitor layout.
 pub fn monitor_bounds(index: usize) -> Option<(i32, i32, u32, u32)> {
-    let m = monitor_at(index)?;
-    Some((m.x().ok()?, m.y().ok()?, m.width().ok()?, m.height().ok()?))
+    let r = super::display::bounds(index)?;
+    Some((r.x,r.y,r.width,r.height))
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +604,7 @@ pub fn set_capture_quality(max_w: u32, fps: u32, quality: u32) {
     CAP_MAXW.store(max_w.clamp(320, 3840), Ordering::Relaxed);
     CAP_FPS.store(fps.clamp(1, 120), Ordering::Relaxed);
     CAP_QUALITY.store(quality.clamp(20, 95), Ordering::Relaxed);
+    super::view_session::retune(max_w.clamp(320,3840));
 }
 
 /// Set the content-optimization mode (0 auto / 1 text / 2 video). Affects the
@@ -619,6 +617,8 @@ pub fn set_capture_content(mode: u32) {
 pub fn stop_capture() {
     super::delivery::DELIVERY.enable(false);
     CAP_RUNNING.store(false, Ordering::SeqCst);
+    // Authorized view ownership outlives a capture restart. presence::end clears
+    // its request; a watchdog rebuild must keep the exact source identity.
     CAP_GEN.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -696,7 +696,9 @@ where
         let budget = Duration::from_millis(budget_ms as u64);
         // Persistent duplication session for THIS monitor (recreated if lost).
         #[cfg(windows)]
-        let mut dup: Option<super::dxdupe::Duplicator> = None;
+        let mut dup: Option<super::capture_surface::Surface> = None;
+        #[cfg(windows)] let mut aux_topology=0;
+        let mut source_identity:Option<Arc<super::view::CaptureIdentity>>=None;
         let mut last: Option<Arc<Vec<u8>>> = None;
         let mut last_wh = (0u32, 0u32);
         let mut last_color = JpegColor::Bgra;
@@ -714,21 +716,31 @@ where
 
             #[cfg(windows)]
             {
-                if dup.is_none() {
-                    let (tx, ty) = monitor_bounds(monitor).map(|(x, y, _, _)| (x, y)).unwrap_or((0, 0));
-                    dup = super::dxdupe::Duplicator::new_for(tx, ty);
+                let snapshot=super::display::snapshot();
+                let requested=snapshot.displays.get(monitor).and_then(|d|super::view_session::capture(&format!("aux:{}",d.id)));
+                if dup.is_none()||aux_topology!=super::display::revision()||source_identity!=requested {
+                    let snapshot=super::display::snapshot();
+                    let selected=dup.as_ref().map(|s|s.view.selected_display_id.as_str());
+                    let display=selected.and_then(|id|snapshot.by_id(id)).or_else(||snapshot.displays.get(monitor)).or_else(||snapshot.displays.iter().find(|d|d.is_primary));
+                    let view=requested.as_ref().map(|i|i.view.clone()).or_else(||display.and_then(|d|super::view::AppliedView::create(&snapshot,super::view::ViewMode::Single,&d.id,0,max_w,4096,8_294_400)));
+                    dup=view.and_then(super::capture_surface::Surface::new);source_identity=requested.clone().filter(|i|dup.as_ref().is_some_and(|d|d.view==i.view));
+                    if dup.is_none(){if let Some(identity)=&requested{super::view_session::capture_failed(identity);}}
+                    aux_topology=snapshot.revision;last=None;cached_jpg=None;
                 }
-                if let Some(d) = dup.as_mut() {
-                    match d.grab(budget_ms, max_w) {
+                if requested.is_some()&&source_identity.is_none(){std::thread::sleep(budget);continue;}
+                if let Some(source) = dup.as_mut() {
+                    let mut d=source.lock();
+                    match d.grab(0, max_w) {
                         super::dxdupe::Grab::Frame { w: gw, h: gh, .. } => {
-                            if let Some((mut px, ow, oh)) = scale_u8x4(d.buffer(), gw, gh, max_w, fast) {
+                            let pixels=source_identity.as_ref().map_or_else(||scale_u8x4(d.buffer(),gw,gh,max_w,fast),|i|scale_exact(d.buffer(),gw,gh,i.view.width,i.view.height,fast));
+                            if let Some((mut px, ow, oh)) = pixels {
                                 // Real system cursor into the frame (remote users need it).
                                 d.draw_cursor(&mut px, ow, oh);
                                 scaled = Some((px, ow, oh, JpegColor::Bgra, true));
                             }
                         }
-                        super::dxdupe::Grab::Timeout => timed_out = true,
-                        super::dxdupe::Grab::Lost => dup = None,
+                        super::dxdupe::Grab::Timeout => {},
+                        super::dxdupe::Grab::Lost => {},
                     }
                 } else if let Some(rgba) = monitor_at(monitor).and_then(|m| m.capture_image().ok()) {
                     let (sw, sh) = (rgba.width(), rgba.height());
@@ -757,7 +769,7 @@ where
                 let stale = last_emit.elapsed() >= Duration::from_millis(900);
                 if changed {
                     if let Some(jpg) = encode_frame(&px, w, h, quality, color) {
-                        emit(jpg);
+                        emit_source(&emit,source_identity.as_deref(),||jpg);
                         last_emit = Instant::now();
                         cached_jpg = None; // frame content moved on — drop the stale cache
                     }
@@ -769,7 +781,7 @@ where
                         cached_jpg = encode_frame(&px, w, h, quality, color);
                     }
                     if let Some(jpg) = cached_jpg.clone() {
-                        emit(jpg);
+                        emit_source(&emit,source_identity.as_deref(),||jpg);
                         last_emit = Instant::now();
                     }
                 }
@@ -784,7 +796,7 @@ where
                         cached_jpg = encode_frame(prev, last_wh.0, last_wh.1, quality, last_color);
                     }
                     if let Some(jpg) = cached_jpg.clone() {
-                        emit(jpg);
+                        emit_source(&emit,source_identity.as_deref(),||jpg);
                         last_emit = Instant::now();
                     }
                 }
@@ -804,6 +816,7 @@ where
 /// thread through a single-slot mailbox (latest-wins, so a slow encoder never
 /// backs up latency — it just skips stale frames).
 struct RawFrame {
+    identity:Option<Arc<super::view::CaptureIdentity>>,
     /// Shared so the capture thread can also retain it for keep-alive without a
     /// full-frame copy (a 4K frame is ~25 MB — cloning it every frame was pure
     /// memory-bandwidth waste). The encoder only reads it. Pixels are packed
@@ -870,7 +883,7 @@ where
         #[cfg(windows)]
         let _gpu = super::gpusched::ProcessGpuBoost::new();
         #[cfg(windows)]
-        let mut dup: Option<super::dxdupe::Duplicator> = None;
+        let mut dup: Option<super::capture_surface::Surface> = None;
         // ---- zero-copy state (Windows + NVIDIA + Desktop Duplication) ----
         // When all three line up the frame never leaves the GPU: duplication texture →
         // compositor (scale + cursor) → NVENC → data channel. `zc_off` latches after a
@@ -892,6 +905,9 @@ where
         #[cfg(windows)]
         let (mut refine_left, mut refine_small, mut ir_left, mut zc_moved) = (0u32, 0u32, 0u32, false);
         let mut cur_mon = usize::MAX;
+        #[cfg(windows)] let mut source_key=(0_u64,0_u64,0_u32);
+        let mut source_identity:Option<Arc<super::view::CaptureIdentity>>=None;
+        #[cfg(windows)]let mut zc_chain=super::delivery::SourceChain::new();
         // Last successfully scaled frame (shared), re-sent on idle so the encoder's
         // ~1s keep-alive still fires for a freshly attached decoder.
         let mut last: Option<(Arc<Vec<u8>>, u32, u32, u32, u32, JpegColor)> = None;
@@ -935,19 +951,28 @@ where
 
             #[cfg(windows)]
             {
-                if dup.is_none() || cur_mon != sel {
-                    let (tx, ty) = monitor_bounds(sel).map(|(x, y, _, _)| (x, y)).unwrap_or((0, 0));
-                    dup = super::dxdupe::Duplicator::new_for(tx, ty);
-                    cur_mon = sel;
-                    zc = None; // new device ⇒ the old compositor/encoder are dead
-                    ST_ZC_LIVE.store(false, Ordering::Relaxed);
+                let key=(super::capture_surface::request_revision(),super::display::revision(),max_w);
+                if dup.is_none() || cur_mon != sel || source_key!=key {
+                    dup=super::capture_surface::layout(sel,max_w).and_then(super::capture_surface::Surface::new);
+                    cur_mon=sel;source_key=key;zc=None;last=None;
+                    ST_ZC_LIVE.store(false,Ordering::Relaxed);
+                    source_identity=super::capture_surface::requested_identity().filter(|i|dup.as_ref().is_some_and(|d|d.view==i.view));
+                    NATIVE_FORCE_KEY.store(true,Ordering::Relaxed);
+                    // Any queued old-layout readback belongs to the old source.
+                    cap_mail.0.lock().take();
+                }
+                // No requested metadata is allowed on the unrelated legacy
+                // fallback. Leave the last good guest frame in place for rollback.
+                if super::capture_surface::requested_identity().is_some()&&source_identity.is_none(){
+                    if let Some(identity)=super::capture_surface::requested_identity(){super::view_session::capture_failed(&identity);}
+                    std::thread::sleep(Duration::from_millis(budget_ms.min(50) as u64));continue;
                 }
 
                 // ---- zero-copy: grab → GPU scale+cursor → NVENC, no readback -------
                 // Skips the staging Map that costs ~7ms/frame ("capture" in the HUD)
                 // and the CPU downscale + cursor paint that follow it.
                 if !zc_off && CAP_NATIVE_OK.load(Ordering::Relaxed) && dup.is_some() {
-                    let d = dup.as_mut().unwrap();
+                    let mut d = dup.as_mut().unwrap().lock();
                     let tuning = encoder_tuning();
                     // The compositor's area filter reads mip level floor(log2 ratio),
                     // so the chain is only needed at >= 2x downscale (4K -> 1080p);
@@ -959,7 +984,7 @@ where
                     match d.grab_gpu(budget_ms, want_mips) {
                         super::dxdupe::Grab::Frame { native_w, native_h, .. } => {
                             let cap_us = g0.elapsed().as_micros() as u32;
-                            let (ow, oh) = native_out_size(native_w, native_h, max_w);
+                            let (ow, oh) = source_identity.as_ref().map_or_else(||native_out_size(native_w,native_h,max_w),|i|(i.view.width,i.view.height));
                             // (Re)build on first use, a resolution change, or a new
                             // preset / pass mode. NVENC must sit on the DUPLICATOR's
                             // device to register its textures.
@@ -992,17 +1017,7 @@ where
                             if let Some((comp, enc)) = zc.as_mut() {
                                 let bps = native_bitrate_bps(ow, oh, fps, quality);
                                 enc.accepts(ow, oh, fps, bps, tuning);
-                                let srv = d.frame_srv();
-                                // Levels > 0 may be sampled only when the chain was rebuilt
-                                // from the current pixels (gpu::downscale_params falls back
-                                // to level 0 otherwise).
-                                let src_mips = d.mips_current();
-                                let seq = d.cursor_seq();
-                                let img = d.cursor_image_cached();
-                                let ok = match &srv {
-                                    Some(s) => comp.render(s, native_w, native_h, src_mips, img.map(|i| (i, seq))),
-                                    None => false,
-                                };
+                                let ok=d.render(comp);
                                 // Channel backpressure: skip BEFORE the encoder so the
                                 // reference chain stays intact (see NATIVE_ENCODE_PAUSED).
                                 // Keyframe requests bypass — an IDR needs no references
@@ -1014,7 +1029,7 @@ where
                                     ST_PAUSE_SKIPS.fetch_add(1, Ordering::Relaxed);
                                 } else if ok {
                                     if let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) {
-                                        let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed)||zc_chain.needs_key(&source_identity);
                                         force_key |= take_rfi(enc, force_key);
                                         let force_ir = !force_key && NATIVE_FORCE_IR.swap(false, Ordering::Relaxed);
                                         let ts_us = zc_started.elapsed().as_micros() as u64;
@@ -1042,7 +1057,7 @@ where
                                             ST_NATIVE.store(true, Ordering::Relaxed);
                                             ST_ZEROCOPY.store(true, Ordering::Relaxed);
                                             ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                                            cap_emit(permit.packet(pkt));
+                                            if emit_source(&*cap_emit,source_identity.as_deref(),||permit.packet(pkt)){zc_chain.emitted(&source_identity);}
                                             zc_last_emit = Instant::now();
                                         } else {
                                             // Encode faulted: drop the session (stays
@@ -1086,7 +1101,7 @@ where
                                             || zc_last_emit.elapsed() >= Duration::from_millis(700)))
                                 {
                                     if let Some(permit) = super::delivery::DELIVERY.reserve(my_gen) {
-                                        let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed);
+                                        let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed)||zc_chain.needs_key(&source_identity);
                                         force_key |= take_rfi(enc, force_key);
                                         let force_ir = !force_key && NATIVE_FORCE_IR.swap(false, Ordering::Relaxed);
                                         let ts_us = zc_started.elapsed().as_micros() as u64;
@@ -1094,7 +1109,7 @@ where
                                             let bytes = pkt.len();
                                             ST_BYTES.store(bytes as u32, Ordering::Relaxed);
                                             ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                                            cap_emit(permit.packet(pkt));
+                                            if emit_source(&*cap_emit,source_identity.as_deref(),||permit.packet(pkt)){zc_chain.emitted(&source_identity);}
                                             zc_last_emit = Instant::now();
                                             if force_key || force_ir {
                                                 // A fresh IDR / wave starts blurry by design —
@@ -1123,7 +1138,6 @@ where
                             }
                         }
                         super::dxdupe::Grab::Lost => {
-                            dup = None;
                             zc = None;
                             ST_ZC_LIVE.store(false, Ordering::Relaxed);
                         }
@@ -1136,6 +1150,7 @@ where
                     // stale — the screen only had to go briefly static (a grab_gpu
                     // timeout) for the second encoder to cut in.
                     if zc.is_some() {
+                        drop(d); // never hold the adapter/context lock while pacing
                         let elapsed = cap0.elapsed();
                         let target = Duration::from_millis(budget_ms as u64);
                         if elapsed < target {
@@ -1145,26 +1160,28 @@ where
                     }
                 }
 
-                if let Some(d) = dup.as_mut() {
+                if let Some(source) = dup.as_mut() {
+                    let mut d=source.lock();
                     // Grab downscales on the GPU toward max_w; time it on its own so
                     // capture vs scale telemetry stays honest.
                     let g0 = Instant::now();
-                    let grab = d.grab(budget_ms, max_w);
+                    let grab = d.grab(0, max_w);
                     cap_us = g0.elapsed().as_micros() as u32;
                     match grab {
                         super::dxdupe::Grab::Frame { w: gw, h: gh, native_w, native_h } => {
                             let s0 = Instant::now();
                             // BGRA source (already GPU-downscaled to ~max_w); the CPU
                             // resize just trims to the exact target across all cores.
-                            if let Some((mut px, ow, oh)) = scale_u8x4(d.buffer(), gw, gh, max_w, fast) {
+                            let pixels=source_identity.as_ref().map_or_else(||scale_u8x4(d.buffer(),gw,gh,max_w,fast),|i|scale_exact(d.buffer(),gw,gh,i.view.width,i.view.height,fast));
+                            if let Some((mut px, ow, oh)) = pixels {
                                 // Composite the real system cursor into the outgoing
                                 // frame (DD frames don't include the pointer).
                                 d.draw_cursor(&mut px, ow, oh);
                                 scaled = Some((px, ow, oh, native_w, native_h, s0.elapsed().as_micros() as u32, JpegColor::Bgra, true));
                             }
                         }
-                        super::dxdupe::Grab::Timeout => timed_out = true,
-                        super::dxdupe::Grab::Lost => dup = None,
+                        super::dxdupe::Grab::Timeout => {},
+                        super::dxdupe::Grab::Lost => {},
                     }
                 } else if let Some(rgba) = monitor_at(sel).and_then(|m| m.capture_image().ok()) {
                     cap_us = cap0.elapsed().as_micros() as u32;
@@ -1205,6 +1222,7 @@ where
                     // forward so coalescing can never swallow a real update.
                     let carried = slot.as_ref().map_or(false, |f| f.changed);
                     *slot = Some(RawFrame {
+                        identity:source_identity.clone(),
                         px: px.clone(),
                         w,
                         h,
@@ -1235,6 +1253,7 @@ where
                         let mut slot = lock.lock();
                         let carried = slot.as_ref().map_or(false, |f| f.changed);
                         *slot = Some(RawFrame {
+                            identity:source_identity.clone(),
                             px: px.clone(),
                             w: *w,
                             h: *h,
@@ -1277,6 +1296,7 @@ where
         let mut native_off = false;
         #[cfg(windows)]
         let started = Instant::now();
+        #[cfg(windows)]let mut native_chain=super::delivery::SourceChain::new();
         while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
             let frame = {
                 let (lock, cv) = &*enc_mail;
@@ -1358,7 +1378,7 @@ where
                     };
                     // First frame of a session, a guest keyframe request, or the ~1s
                     // keep-alive on a static screen all need a self-contained IDR.
-                    let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed) || stale;
+                    let mut force_key = NATIVE_FORCE_KEY.swap(false, Ordering::Relaxed) || stale || native_chain.needs_key(&frame.identity);
                     force_key |= take_rfi(n, force_key);
                     let ts_us = started.elapsed().as_micros() as u64;
                     if let Some(pkt) = n.encode_pixels(&frame.px, frame.w, frame.h, force_key, ts_us) {
@@ -1371,7 +1391,7 @@ where
                         // thread last claimed, this frame is not zero-copy.
                         ST_ZEROCOPY.store(false, Ordering::Relaxed);
                         ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                        emit(permit.packet(pkt));
+                        if emit_source(&*emit,frame.identity.as_deref(),||permit.packet(pkt)){native_chain.emitted(&frame.identity);}
                         last_emit = Instant::now();
                         cached = None;
                         continue;
@@ -1397,7 +1417,7 @@ where
                     ST_ENC_US.store(enc0.elapsed().as_micros() as u32, Ordering::Relaxed);
                     ST_BYTES.store(jpg.len() as u32, Ordering::Relaxed);
                     ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                    emit(jpg);
+                    emit_source(&*emit,frame.identity.as_deref(),||jpg);
                     last_emit = Instant::now();
                     cached = None; // content moved on — drop the stale keep-alive cache
                 }
@@ -1411,7 +1431,7 @@ where
                 if let Some((jpg, ..)) = &cached {
                     ST_BYTES.store(jpg.len() as u32, Ordering::Relaxed);
                     ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                    emit(jpg.clone());
+                    emit_source(&*emit,frame.identity.as_deref(),||jpg.clone());
                     last_emit = Instant::now();
                 }
             }

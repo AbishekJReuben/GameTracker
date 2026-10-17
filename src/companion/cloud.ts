@@ -28,7 +28,7 @@ import {
 } from "@/lib/audioWire";
 import audioFeederWorkletUrl from "@/lib/audioFeeder.worklet.js?url";
 import { SeqLossWindow } from "@/lib/lossCeiling";
-import { REC_CONFIG, REC_KEY, SeqOrderer } from "@/lib/carrier";
+import { REC_CONFIG, REC_KEY, REC_VIEW, SeqOrderer } from "@/lib/carrier";
 import { H264_HIGH_CODEC, HEVC_MAIN_CODEC, isHevcCodec } from "@/lib/nativeDelivery";
 import {
   dumpNativeDecoderDiag,
@@ -36,6 +36,8 @@ import {
   getNativeDecoderStats,
   initNativeDecoder,
   nativeDecoderPossible,
+  nativeFrameProofAvailable,nativeFeedGeneration,nativeBoundsSequence,nativeBoundsViewEpoch,nativePresentationTimestamp,
+  revealNativeFrame,clearNativeTransition,
   nativeFeedReady,
   probeNativeDecoder,
   setStreamPowerActive,
@@ -46,6 +48,13 @@ import { isImmersiveActive, onImmersiveActiveChange } from "./runtime";
 import { loadStreamTune, resetStreamTune, type StreamTune } from "./streamTune";
 import { DelayTrendline } from "../lib/trendline";
 import { VideoAssembler, decodeOverloaded, type VideoHeader } from "./videoReceive";
+import { ClientPresence } from './clientPresence';
+import { readControllerName } from './remotePreferences';
+import { REMOTE_CAPABILITIES, type ClientViewReport } from '@/lib/remoteProtocol';
+import { ClientViewSession } from './clientViewSession';
+import { parseCaptureIdentity,sameCapture,type CaptureIdentity } from '@/lib/captureView';
+import type { EpochStream } from '@/lib/epochVideo';
+import {coordinateIndependent,includesRelease} from './inputPolicy';
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 /** "pending" = link up, awaiting host approval; "denied" = host rejected us. */
@@ -441,6 +450,12 @@ export class CloudConn {
   // old blanket decode-stall reconnect was removed because framesDecoded also
   // stalls when the video simply isn't rendered, e.g. on the Stats tab).
   private sinkActive = false;
+  private remotePresence = new ClientPresence((message)=>this.sendControl(message),(remote)=>this.emitEvent({event:'remote-capabilities',remote}));
+  private views=new ClientViewSession(message=>this.sendControl(message),event=>this.emitEvent(event),()=>this.pc?.getConfiguration()??{},()=>!this.closed&&this.authed,
+    stream=>void this.showEpochStream(stream),
+    (identity,layout)=>{this.remotePresence.applyView(identity.view,layout);this.emitEvent({event:'remote-view-applied',identity});},
+    message=>this.emitEvent({event:'remote-view-error',message}));
+
   private winBytes = 0;
   private stallTicks = 0;
   // Freeze counter baseline — tracked for the HUD only (not used to inflate buffer).
@@ -497,6 +512,7 @@ export class CloudConn {
    * of WebCodecs → canvas. Web/Quest keep WebCodecs — browsers don't expose MediaCodec.
    */
   private wcNative = false;
+  private nativeTransitionPending=false;
   private wcNativeReady = false;
   private wcNativeFrames = 0;
   private wcNativePoll: number | null = null;
@@ -531,7 +547,10 @@ export class CloudConn {
   private wcHostArtifacts = -1;
   private wcHostRecovered = -1;
   private wcHostRecovering = false;
-  private wcFrameCb: ((f: VideoFrame) => void) | null = null;
+  private wcFrameCb: ((f: VideoFrame,identity?:CaptureIdentity|null) => boolean|void) | null = null;
+  private wcIdentity:CaptureIdentity|null=null;
+  private decodedViews=new WeakMap<VideoFrame,CaptureIdentity>();
+  private nativeFrameViews=new Map<number,{identity:CaptureIdentity;build:number;feed:number}>();
   private wcAssembler = new VideoAssembler(() => {
     this.wcAwaitKey = true;
     this.wcRequestKeyframe();
@@ -551,7 +570,7 @@ export class CloudConn {
   /** Which transport the host says carries DIRECT frames right now. */
   private wcTransport: "sctp" | "rtp" = "sctp";
   /** Per-frame bookkeeping keyed by chunk timestamp (µs) for latency stats. */
-  private wcMeta = new Map<number, { arrivedAt: number; submittedAt: number; tsMs: number; bytes: number }>();
+  private wcMeta = new Map<number, { arrivedAt: number; submittedAt: number; tsMs: number; bytes: number;identity?:CaptureIdentity|null }>();
   private wcFrames = 0;
   private wcKeys = 0;
   private wcBytes = 0;
@@ -876,8 +895,9 @@ export class CloudConn {
    * Immersive VR is not idle either — WebXR runs with the page hidden.
    */
   private syncPowerIdle(commit = false) {
+    this.syncRemotePresence();
     const w = window as Window & { __GT_PIP_ACTIVE__?: boolean };
-    const idle = document.hidden && !w.__GT_PIP_ACTIVE__ && !isImmersiveActive();
+    const idle = document.hidden && !w.__GT_PIP_ACTIVE__ && !document.pictureInPictureElement && !isImmersiveActive();
     // Going idle is DEBOUNCED; waking is immediate. Android reports the page
     // hidden a beat before the PiP flag lands (enter) and drops the flag a beat
     // before the page turns visible again (exit), so every PiP transition used
@@ -900,6 +920,7 @@ export class CloudConn {
       return;
     }
     this.powerIdle = idle;
+    this.syncRemotePresence();
     if (idle) this.wcFlushPaceQueue(false);
     // Resuming: the decoder threw away everything that arrived while hidden, so
     // ask for the IDR before the host's own resume keyframe races us.
@@ -1219,6 +1240,8 @@ export class CloudConn {
     this.videoReceiver = null;
     this.audioReceiver = null;
     this.authed = false; // every fresh peer requires re-authorization by the host
+    this.remotePresence.reset();
+    this.views.accept(null);
     this.authState = "none";
     this.authSentCount = 0;
     this.lastAuthSentAt = 0;
@@ -1311,6 +1334,9 @@ export class CloudConn {
         return;
       }
       if (e.track.kind === "video" && this.videoMid === null) this.videoMid = mid;
+      // A negotiated screen is bound to its own immutable epoch peer. The base
+      // peer retains audio/control and its separately classified RTP carrier.
+      if(e.track.kind==='video'&&this.views.enabled)return;
       if (!this.stream) this.stream = new MediaStream();
       // Video only — never add audio here.
       for (const t of this.stream.getVideoTracks()) this.stream.removeTrack(t);
@@ -1470,6 +1496,8 @@ export class CloudConn {
           // Lets the companion derive its clip key without the user typing the
           // permanent key by hand. The host only honors this AFTER approving us.
           wantSecret: true,
+          displayName: readControllerName(),
+          capabilities: nativeFrameProofAvailable()?REMOTE_CAPABILITIES:REMOTE_CAPABILITIES.filter(c=>c!=='all-screens-v1'&&c!=='view-epoch-input-v1'),
         }),
       );
       this.authSentCount++;
@@ -1488,6 +1516,7 @@ export class CloudConn {
    */
   setVideoSink(active: boolean) {
     this.sinkActive = active;
+    this.syncRemotePresence();
     if (!active) this.stallTicks = 0;
     if (!active) this.wcStallTicks = 0;
     if (active) {
@@ -1505,11 +1534,44 @@ export class CloudConn {
     }
   }
 
+  private syncRemotePresence() {
+    this.remotePresence.setScope({sink:this.sinkActive,idle:this.powerIdle,pip:!!(window as Window & {__GT_PIP_ACTIVE__?:boolean}).__GT_PIP_ACTIVE__||!!document.pictureInPictureElement,immersive:isImmersiveActive()});
+  }
+  get remoteHandshake(){return this.remotePresence.negotiated;}
+  get remoteOverlayStatus(){return this.remotePresence.overlayStatus;}
+  reportRemoteView(view:ClientViewReport){this.remotePresence.setView(view);}
+  get displayedView(){return this.views.current;}
+  get viewChanging(){return this.views.enabled&&(!this.views.current||this.views.changing);}
+  get epochStream(){return this.views.rtc;}
+  get epochSurfaceStage(){return this.views.surfaceStage;}
+  requestRemoteView(mode:'single'|'all',selectedDisplayId:string,maxWidth:number){return this.views.request(mode,selectedDisplayId,maxWidth);}
+  presentedRtcView(peerId:string,element:HTMLVideoElement){if(this.wcActive)return false;const accepted=this.views.rtcPresented(peerId,element);if(accepted)this.finishNativeTransition();return accepted;}
+  presentedDirectView(identity:CaptureIdentity){const accepted=this.views.directPresented(identity);if(accepted){if(this.wcNative)this.nativeTransitionPending=false;else this.finishNativeTransition();}return accepted;}
+  presentedLegacyRtc(){if(!this.views.enabled&&!this.wcActive)this.finishNativeTransition();}
+  private finishNativeTransition(){if(this.nativeTransitionPending){this.nativeTransitionPending=false;void teardownNativeDecoder();}}
+  sendViewInput(message:Record<string,unknown>,lossy=false,anchor?:[number,number]):boolean{
+    if(!this.views.enabled)return lossy?this.sendMove(message):this.sendControl(message);
+    if(this.viewChanging&&!coordinateIndependent(message)&&!includesRelease(message))return false;
+    const wrapped={type:'viewinput',epoch:this.views.current?.view.epoch??0,event:message,...(anchor?{anchor}:{})};
+    return lossy?this.sendMove(wrapped):this.sendControl(wrapped);
+  }
+  private async showEpochStream(stream:EpochStream){
+    if(this.closed||!this.authed||!this.views.accepts(stream.identity))return;
+    const generation=++this.wcBuildGeneration;this.wcFlushPaceQueue(false);this.wcStopNativePoll();
+    this.wcMeta.clear();this.nativeFrameViews.clear();try{this.wcDecoder?.close();}catch{}this.wcDecoder=null;
+    const wasNative=this.wcNative;this.wcNative=false;this.wcNativeReady=false;
+    if(wasNative){this.nativeTransitionPending=true;await teardownNativeDecoder(true);}
+    if(this.closed||!this.authed||generation!==this.wcBuildGeneration||this.views.rtc?.peerId!==stream.peerId||!this.views.accepts(stream.identity))return;
+    this.wcActive=false;this.stream=stream.stream;this.jitterTarget=this.jbBase;this.jitterFloor=this.jbBase;this.jitterCleanTicks=0;this.winDecoded=0;this.winDropped=0;this.winBytes=0;this.stallTicks=0;this.applyJitter();this.startJitterHold();this.emitEvent({event:'wc',active:false,native:false});this.emitStream();
+  }
+
   // ---- WebCodecs direct-video path ------------------------------------------
 
   /** Reset all wc state (new session / teardown). `reprobe` re-allows opt-in. */
   private wcReset(reprobe: boolean) {
+    this.nativeTransitionPending=false;
     this.wcBuildGeneration++;
+    this.wcIdentity=null;this.nativeFrameViews.clear();
     const wasActive = this.wcActive;
     this.wcActive = false;
     this.stopLinkReports();
@@ -2285,7 +2347,8 @@ export class CloudConn {
     this.wcOrderReset();
     this.wcStopNativePoll();
     if (this.wcNative) {
-      void teardownNativeDecoder();
+      void teardownNativeDecoder(true);
+      this.nativeTransitionPending=true;
       this.wcNative = false;
     }
     try {
@@ -2311,7 +2374,7 @@ export class CloudConn {
   /** Build (or rebuild) the VideoDecoder / native MediaCodec for the host codec. */
   private wcBuildDecoder(): boolean {
     const generation = ++this.wcBuildGeneration;
-    this.wcMeta.clear();
+    this.wcMeta.clear();this.nativeFrameViews.clear();
     this.wcFlushPaceQueue(false);
     // Safety net for hosts that ship NVENC frames without a prior codec JSON
     // (pre-announce bug): Constrained Baseline matches what NVENC emits; the
@@ -2416,10 +2479,11 @@ export class CloudConn {
     // switches decoders live.
     if (this.wcNative) {
       this.wcNative = false;
+      this.nativeTransitionPending=true;
       this.wcNativeFrames = 0;
       this.wcNativeStallAt = 0;
       this.wcStopNativePoll();
-      void teardownNativeDecoder();
+      void teardownNativeDecoder(true);
       if (this.wcActive) this.emitEvent({ event: "wc", active: true, native: false });
     }
     if (typeof VideoDecoder === "undefined") {
@@ -2558,6 +2622,24 @@ export class CloudConn {
     try { st = await getNativeDecoderStats(); }
     finally { this.wcNativePollBusy = false; }
     if (!st || generation !== this.wcBuildGeneration || !this.wcNative) return;
+    if(this.views.enabled&&st.rendered?.version===2){
+      const proof=st.rendered,submitted=this.nativeFrameViews.get(proof.ptsUs),bounds=nativeBoundsSequence();
+      if(submitted&&submitted.build===generation&&submitted.feed===proof.feedSession&&proof.feedSession===nativeFeedGeneration()&&this.views.accepts(submitted.identity))this.emitEvent({event:'native-view-frame',identity:submitted.identity});
+      if(submitted&&submitted.build===generation&&submitted.feed===proof.feedSession&&proof.feedSession===nativeFeedGeneration()
+        &&proof.codecGeneration>=0&&proof.frames>0&&bounds>0&&proof.boundsSequence===bounds&&nativeBoundsViewEpoch()===submitted.identity.view.epoch&&this.views.accepts(submitted.identity)){
+        revealNativeFrame(proof);
+        const visible=this.nativeFrameViews.get(proof.visiblePtsUs??0);
+        if(visible&&visible.build===generation&&visible.feed===proof.feedSession&&proof.visibleBoundsSequence===bounds&&this.views.accepts(visible.identity)){
+          this.emitEvent({event:'native-view-visible',identity:visible.identity});
+          for(const pts of this.nativeFrameViews.keys())if(pts<=(proof.visiblePtsUs??0))this.nativeFrameViews.delete(pts);
+        }
+      }
+    }else if(!this.views.enabled&&st.rendered?.version===2){
+      const proof=st.rendered,bounds=nativeBoundsSequence();
+      // A new APK connected to an old host still reveals resized native video.
+      // No epoch acknowledgment is inferred on that compatibility path.
+      if(proof.feedSession===nativeFeedGeneration()&&proof.codecGeneration>=0&&proof.frames>0&&bounds>0&&proof.boundsSequence===bounds)revealNativeFrame(proof);
+    }
     this.wcNativeQueue = st.queue;
     if (st.awaitKey) this.wcRequestKeyframe();
     // Detect initial AND mid-session stalls, but never penalize a static
@@ -2655,12 +2737,14 @@ export class CloudConn {
     // Config (string JSON): sent on activation and every encoder reconfigure.
     if (typeof data === "string") {
       try {
-        const cfg = JSON.parse(data) as { codec?: string; w?: number; h?: number };
+        const cfg = JSON.parse(data) as { codec?: string; w?: number; h?: number;identity?:unknown };
         if (cfg && typeof cfg.codec === "string" && cfg.codec) {
+          let epochChanged=false;
+          if(this.views.enabled){const identity=this.views.observe(cfg.identity);if(!identity||cfg.w!==identity.view.width||cfg.h!==identity.view.height)return;epochChanged=!sameCapture(this.wcIdentity,identity);if(epochChanged){this.wcIdentity=identity;this.wcOrderReset();this.wcAssembler.reset();this.nativeFrameViews.clear();}}
           const w = typeof cfg.w === "number" && cfg.w > 0 ? Math.round(cfg.w) : this.wcCodedW;
           const h = typeof cfg.h === "number" && cfg.h > 0 ? Math.round(cfg.h) : this.wcCodedH;
           const sizeChanged = w !== this.wcCodedW || h !== this.wcCodedH;
-          if (cfg.codec !== this.wcCodec || (!this.wcDecoder && !this.wcNative) || sizeChanged) {
+          if (cfg.codec !== this.wcCodec || (!this.wcDecoder && !this.wcNative) || sizeChanged || epochChanged) {
             this.wcCodec = cfg.codec;
             this.wcCodedW = w;
             this.wcCodedH = h;
@@ -2687,6 +2771,7 @@ export class CloudConn {
 
   /** Every DIRECT frame, from either transport, goes through the orderer. */
   private wcIngest(head: VideoHeader, bytes: Uint8Array<ArrayBuffer>) {
+    if(this.views.enabled&&(!this.wcIdentity||head.epoch!==this.wcIdentity.view.epoch||!this.views.accepts(this.wcIdentity)))return;
     this.wcRelease(this.wcOrder.push(head.seq, head.key, { head, bytes }, performance.now()));
   }
 
@@ -2741,8 +2826,9 @@ export class CloudConn {
             continue;
           }
           this.carrierFrames++;
-          const bytes = new Uint8Array(r.data);
-          this.wcIngest({ key: (r.flags & REC_KEY) !== 0, seq: r.seq, tsMs: r.tsMs, len: bytes.byteLength }, bytes);
+          let bytes = new Uint8Array(r.data);let epoch:number|undefined;
+          if(r.flags&REC_VIEW){if(bytes.length<=8)continue;epoch=new DataView(r.data).getFloat64(0,true);if(!Number.isSafeInteger(epoch)||epoch<1)continue;bytes=bytes.subarray(8);}
+          this.wcIngest({ ...(epoch!==undefined?{epoch}:{}), key: (r.flags & REC_KEY) !== 0, seq: r.seq, tsMs: r.tsMs, len: bytes.byteLength }, bytes);
         }
       };
       const Transform = (globalThis as unknown as { RTCRtpScriptTransform: new (w: Worker, o: unknown) => unknown })
@@ -2798,7 +2884,7 @@ export class CloudConn {
         return;
       }
       if (head.key) this.wcAwaitKey = false;
-      const tsUs = Math.round(head.tsMs * 1000);
+      const tsUs = nativePresentationTimestamp();
       // Net+enc at arrival; e2e ≈ net + native decode (updated again in the poll).
       const clk = this.bestClock();
       if (clk) {
@@ -2818,6 +2904,7 @@ export class CloudConn {
         this.wcRequestKeyframe();
         return;
       }
+      if(this.wcIdentity){this.nativeFrameViews.set(tsUs,{identity:this.wcIdentity,build:this.wcBuildGeneration,feed:nativeFeedGeneration()});while(this.nativeFrameViews.size>64)this.nativeFrameViews.delete(this.nativeFrameViews.keys().next().value!);}
       this.wcFrames++;
       return;
     }
@@ -2844,7 +2931,7 @@ export class CloudConn {
     }
     if (head.key) this.wcAwaitKey = false;
     const tsUs = Math.round(head.tsMs * 1000);
-    this.wcMeta.set(tsUs, { arrivedAt: monoNow(), submittedAt: perfNow, tsMs: head.tsMs, bytes: head.len });
+    this.wcMeta.set(tsUs, { arrivedAt: monoNow(), submittedAt: perfNow, tsMs: head.tsMs, bytes: head.len,identity:this.wcIdentity });
     try {
       // These bytes belong exclusively to this AU. Chrome 120+ can adopt their
       // buffer; older WebCodecs implementations ignore the optional dictionary
@@ -2867,6 +2954,8 @@ export class CloudConn {
     // Monotonic: compared with clock-synced capture times and pacing deadlines.
     const now = monoNow();
     const meta = this.wcMeta.get(frame.timestamp);
+    if(this.views.enabled&&(!meta?.identity||!this.views.accepts(meta.identity))){this.wcMeta.delete(frame.timestamp);frame.close();return;}
+    if(meta?.identity)this.decodedViews.set(frame,meta.identity);
     let capturedAtGuest = 0;
     if (meta) {
       this.wcMeta.delete(frame.timestamp);
@@ -2939,7 +3028,10 @@ export class CloudConn {
   private wcDeliver(frame: VideoFrame) {
     if (this.wcFrameCb) {
       try {
-        this.wcFrameCb(frame);
+        const identity=this.decodedViews.get(frame)??null;
+        if(this.views.enabled&&(!identity||!this.views.accepts(identity))){frame.close();return;}
+        const painted=identity?this.wcFrameCb(frame,identity):this.wcFrameCb(frame);
+        if(painted){if(identity)this.presentedDirectView(identity);else this.finishNativeTransition();}
         return;
       } catch {
         /* fall through to close */
@@ -3010,7 +3102,7 @@ export class CloudConn {
    * Register the render sink for direct-video frames (Control's canvas). The
    * sink takes ownership of each VideoFrame and must close() it after drawing.
    */
-  onWcFrame(cb: ((f: VideoFrame) => void) | null): () => void {
+  onWcFrame(cb: ((f: VideoFrame,identity?:CaptureIdentity|null) => boolean|void) | null): () => void {
     this.wcFrameCb = cb;
     return () => {
       if (this.wcFrameCb === cb) this.wcFrameCb = null;
@@ -3133,7 +3225,7 @@ export class CloudConn {
 
   /** Apply the current jitter-buffer target to the inbound video receiver. */
   private applyJitter() {
-    const rx = this.videoReceiver as unknown as {
+    const rx = (this.views.receiver??this.videoReceiver) as unknown as {
       jitterBufferTarget?: number;
       playoutDelayHint?: number;
       jitterBufferDelayHint?: number;
@@ -3199,7 +3291,7 @@ export class CloudConn {
       // On DIRECT the RTC track carries nothing, so re-asserting its jitter-buffer
       // hint 4×/s was pure overhead (each write posts to the WebRTC worker thread).
       // Falling back to RTC re-applies it on the very next tick.
-      if (this.closed || !this.videoReceiver || this.wcActive) return;
+      if (this.closed || !(this.views.receiver??this.videoReceiver) || this.wcActive) return;
       this.applyJitter();
     }, 250);
   }
@@ -3472,6 +3564,8 @@ export class CloudConn {
       return;
     }
     if (typeof msg.event === "string") {
+      if(this.views.handle(msg as Record<string,unknown>))return;
+      if(msg.event==='remote-overlay-status'&&(msg as {sessionId?:string}).sessionId===this.remotePresence.negotiated?.sessionId)this.remotePresence.setOverlayStatus((msg as {overlay?:unknown}).overlay);
       // Auth handshake result from the host gates the "connected" status.
       if (msg.event === "auth") {
         const state = (msg as { state?: string }).state;
@@ -3481,6 +3575,9 @@ export class CloudConn {
           this.rebuildStrikes = 0; // healthy handshake — the tune wasn't the problem
           this.noteEvent("auth ok");
           this.authed = true;
+          this.remotePresence.accept((msg as {remote?:unknown}).remote);
+          this.views.accept(this.remotePresence.negotiated);
+          this.syncRemotePresence();
           this.emit("connected");
           // Host just started capture on the existing track — nudge subscribers to
           // re-attach so the first-approval path doesn't stick on "Waking…".
@@ -3718,7 +3815,7 @@ export class CloudConn {
     if (!this.pc) return null;
     let report: RTCStatsReport;
     try {
-      report = await this.pc.getStats();
+      report = await (!this.wcActive&&this.views.peer?this.views.peer:this.pc).getStats();
     } catch {
       return null;
     }
@@ -3790,6 +3887,9 @@ export class CloudConn {
     if (this.denied) cb();
   }
   close() {
+    clearNativeTransition();
+    this.remotePresence.close();
+    this.views.close();
     this.closed = true;
     if (this.powerIdleTimer !== null) {
       window.clearTimeout(this.powerIdleTimer);
