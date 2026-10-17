@@ -600,6 +600,7 @@ export function ControlScreen({
   const pendingViewportRef=useRef<{mode:'single'|'all';selected:string;zoom:number;pan:{x:number;y:number}}|null>(null);
   const lastViewportReport=useRef('');const presentedPeer=useRef('');
   const restoredViewSession=useRef('');
+  const restoreViewRef=useRef<(()=>void)|null>(null);
 
   /** Separate from <video> — sharing a MediaStream with audio triggers A/V sync lag. */
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -824,13 +825,11 @@ export function ControlScreen({
   // Android PiP: the OS shrinks the whole webview into a mini floating window.
   // There is no direct signal inside the webview, but the PiP window is far
   // smaller than any phone layout — hide ALL chrome and show pure video there.
-  const [pipView, setPipView] = useState(false);
+  const pipWindow=()=>(window as Window & {__GT_PIP_ACTIVE__?:boolean}).__GT_PIP_ACTIVE__===true||(window.innerWidth<=550&&window.innerHeight<=350);
+  const [pipView, setPipView] = useState(pipWindow);
   const pipActiveRef=useRef(false);pipActiveRef.current=pipView||pipOn;
   useEffect(() => {
-    const check = () => setPipView(
-      (window as Window & { __GT_PIP_ACTIVE__?: boolean }).__GT_PIP_ACTIVE__ === true ||
-      (window.innerWidth <= 550 && window.innerHeight <= 350),
-    );
+    const check = () => setPipView(pipWindow());
     const onPip = (event: Event) => {const detail=(event as CustomEvent<{active?:boolean;browser?:boolean}>).detail;if(!detail?.browser)setPipView(!!detail?.active);};
     check();
     window.addEventListener("resize", check);
@@ -1335,12 +1334,22 @@ export function ControlScreen({
   const audioUnderrunRef = useRef(0);
 
   // Multi-monitor.
-  const [monitors, setMonitors] = useState<RemoteMonitor[]>([]);
-  const [monitorIdx, setMonitorIdx] = useState(0);
+  const [discoveredMonitors, setMonitors] = useState<RemoteMonitor[]>([]);
+  const monitors=remoteHandshake?.layout.displays??discoveredMonitors;
+  const [legacyMonitorIdx, setMonitorIdx] = useState(0);
+  // Epoch-based switches commit a display ID, not a legacy monitor event. The
+  // button must follow that displayed ID on every switch, including rollback.
+  const monitorIdx=monitors.find(d=>d.id===selectedDisplay)?.index??legacyMonitorIdx;
+  const persistCurrentView=()=>{
+    const identity=displayedViewRef.current;
+    if(!identity||popoutMonitor!=null||pipActiveRef.current||link.viewChanging?.()||restoredViewSession.current!==identity.sessionId)return;
+    saveView({version:1,mode:identity.view.mode,selectedDisplayId:selectedDisplayRef.current,zoom:zoomRef.current,panX:panRef.current.x,panY:panRef.current.y});
+  };
   const selectDisplayId=(id:string)=>{
     const view=displayedViewRef.current?.view;if(!view?.displays.some(d=>d.id===id)||selectedDisplayRef.current===id)return;
     selectedDisplayRef.current=id;setSelectedDisplay(id);const display=view.displays.find(d=>d.id===id);if(display)setMonitorIdx(display.index);
     reportRemoteViewport();
+    persistCurrentView();
   };
   const identifyDisplay=(x:number,y:number)=>{
     const view=displayedViewRef.current?.view;if(view?.mode!=='all')return;
@@ -1357,7 +1366,7 @@ export function ControlScreen({
     if(current.view.mode==='all'&&mode==='single')allViewportRef.current={zoom:zoomRef.current,pan:{...panRef.current},selected:selectedDisplayRef.current};
     const saved=mode==='all'?allViewportRef.current:null;
     pendingViewportRef.current={mode,selected:id,zoom:saved?.zoom??1,pan:saved?{...saved.pan}:{x:0,y:0}};
-    rememberViewport(current);const sent=link.requestView?.(mode,id,streamQ.maxW)??false;if(!sent)pendingViewportRef.current=null;return sent;
+    rememberViewport(current);const sent=link.requestView?.(mode,id,streamQ.maxW)??false;if(sent)restoredViewSession.current=current.sessionId;else pendingViewportRef.current=null;return sent;
   };
   const cameraKey=(identity:CaptureIdentity)=>{const v=identity.view;return JSON.stringify([v.layoutRevision,v.mode,v.source,v.mode==='single'?v.selectedDisplayId:'']);};
   const rememberViewport=(identity=displayedViewRef.current)=>{if(!identity)return;const cache=viewportCache.current;cache.set(cameraKey(identity),{zoom:zoomRef.current,pan:{...panRef.current},selected:selectedDisplayRef.current});while(cache.size>8)cache.delete(cache.keys().next().value!);};
@@ -1491,25 +1500,39 @@ export function ControlScreen({
       a.muted = !soundOnRef.current || isImmersiveActive();
       if (soundOnRef.current && !isImmersiveActive()) a.play?.().catch(() => retryAudioOnGesture(a));
     });
+    const restoreRemoteView=()=>{
+      const handshake=link.remoteHandshake?.()??null;setRemoteHandshake(handshake);
+      if(!handshake||popoutMonitor!=null||pipActiveRef.current||!supportsRemote(handshake,'all-screens-v1')||restoredViewSession.current===handshake.sessionId)return;
+      const saved=readView();
+      const available=handshake.layout.displays.some(d=>d.id===saved.selectedDisplayId);
+      const selected=available?saved.selectedDisplayId!:handshake.view.selectedDisplayId;
+      pendingViewportRef.current={mode:saved.mode,selected,zoom:available?saved.zoom:1,pan:available?{x:saved.panX,y:saved.panY}:{x:0,y:0}};
+      const current=link.appliedView?.();
+      if(current&&current.view.mode===saved.mode&&current.view.selectedDisplayId===selected&&!link.viewChanging?.()){
+        restoredViewSession.current=handshake.sessionId;stagedViewport.current='';stageViewport(current);persistCurrentView();return;
+      }
+      if(saved.mode!==handshake.view.mode||selected!==handshake.view.selectedDisplayId){
+        // A refused send synchronously republishes the old displayed view. Do
+        // not allow that callback to overwrite the saved monitor being restored.
+        if(link.requestView?.(saved.mode,selected,streamQ.maxW))restoredViewSession.current=handshake.sessionId;
+        else pendingViewportRef.current=null;
+      }else restoredViewSession.current=handshake.sessionId;
+    };
     // Host events: auto-pop the keyboard on PC text-field focus + capture telemetry.
     const unsubEvent = link.onEvent((e) => {
       if(e.event==='remote-capabilities'){
-        const handshake=link.remoteHandshake?.()??null;setRemoteHandshake(handshake);
-        if(handshake&&supportsRemote(handshake,'all-screens-v1')&&restoredViewSession.current!==handshake.sessionId){
-          restoredViewSession.current=handshake.sessionId;const saved=readView();const selected=handshake.layout.displays.some(d=>d.id===saved.selectedDisplayId)?saved.selectedDisplayId!:handshake.view.selectedDisplayId;
-          pendingViewportRef.current={mode:saved.mode,selected,zoom:saved.zoom,pan:{x:saved.panX,y:saved.panY}};
-          if(saved.mode!=='single'||selected!==handshake.view.selectedDisplayId)link.requestView?.(saved.mode,selected,streamQ.maxW);
-        }
+        restoreRemoteView();
       }
       else if(e.event==='remote-view'){
         if(e.pending){rememberViewport();retainPicture();}
         setViewChanging(!!e.changing);const identity=e.applied as CaptureIdentity|null;
         if(identity){displayedViewRef.current=identity;setAppliedView(identity);
           if(!identity.view.displays.some(d=>d.id===selectedDisplayRef.current)||identity.view.mode==='single'){selectedDisplayRef.current=identity.view.selectedDisplayId;setSelectedDisplay(identity.view.selectedDisplayId);}
-          const pending=pendingViewportRef.current;if(pending&&identity.view.mode===pending.mode&&(pending.mode==='all'||identity.view.selectedDisplayId===pending.selected)){zoomRef.current=pending.zoom;panRef.current={...pending.pan};pendingViewportRef.current=null;commitView();}
+          const pending=pendingViewportRef.current;if(pending&&identity.view.mode===pending.mode&&(pending.mode==='all'||identity.view.selectedDisplayId===pending.selected)){zoomRef.current=pending.zoom;panRef.current={...pending.pan};if(identity.view.displays.some(d=>d.id===pending.selected)){selectedDisplayRef.current=pending.selected;setSelectedDisplay(pending.selected);}pendingViewportRef.current=null;commitView();}
           reportRemoteViewport();
+          if(!e.changing)persistCurrentView();
         }
-      }else if(e.event==='remote-view-applied'){setRemoteHandshake(link.remoteHandshake?.()??null);reportRemoteViewport();}
+      }else if(e.event==='remote-view-applied'){restoreRemoteView();reportRemoteViewport();persistCurrentView();}
       else if(e.event==='remote-view-error'){setDecoderMsg({text:String(e.message??'View change failed'),detail:''});}
       else if(e.event==='native-view-frame'){
         const identity=e.identity as CaptureIdentity;nativeViewRef.current=identity;natRef.current={w:identity.view.width,h:identity.view.height};stageViewport(identity);syncNativeSurface();
@@ -1627,7 +1650,12 @@ export function ControlScreen({
         }
       }
     });
+    // The handshake may precede mounting Control; onEvent does not replay it.
+    restoreViewRef.current=restoreRemoteView;
+    restoreRemoteView();
     return () => {
+      if(restoreViewRef.current===restoreRemoteView)restoreViewRef.current=null;
+      if(viewRaf.current!=null){cancelAnimationFrame(viewRaf.current);viewRaf.current=null;}
       unsubProgress?.();
       unsubStream?.();
       unsubAudio?.();
@@ -2023,8 +2051,13 @@ export function ControlScreen({
           // Sync the switcher to the display the host is ACTUALLY capturing — the
           // selection persists on the host across connections, so assuming index 0
           // showed the wrong screen number until the user switched once.
-          const sel = m.findIndex((x) => x.selected);
-          setMonitorIdx(sel >= 0 ? sel : 0);
+          const selected=m.find(x=>x.selected)??m[0];setMonitorIdx(selected.index);
+          if(popoutMonitor==null&&!supportsRemote(link.remoteHandshake?.()??null,'view-epoch-input-v1')){
+            const saved=m.find(d=>d.id===readView().selectedDisplayId);
+            if(saved?.id&&saved.index!==selected.index&&send({type:'monitor',index:saved.index})){
+              setMonitorIdx(saved.index);selectedDisplayRef.current=saved.id;setSelectedDisplay(saved.id);
+            }
+          }
           return;
         }
       } catch {
@@ -2133,7 +2166,18 @@ export function ControlScreen({
       if(displayedViewRef.current?.view.mode==='all'){selectDisplayId(display.id);return;}
       requestCaptureMode('single',display.id);return;
     }
-    setMonitorIdx(i);send({type:'monitor',index:i});resetView();
+    if(!send({type:'monitor',index:i}))return;
+    setMonitorIdx(i);resetView();
+    if(display?.id){selectedDisplayRef.current=display.id;setSelectedDisplay(display.id);saveView({version:1,mode:'single',selectedDisplayId:display.id,zoom:1,panX:0,panY:0});}
+  };
+  const cycleMonitor=()=>{
+    const position=monitors.findIndex(d=>d.index===monitorIdx),next=monitors[(position+1)%monitors.length];if(next)selectMonitor(next.index);
+  };
+  const splitScreenLabel=appliedView?.view.mode==='all'?'Focus selected display':allViewportRef.current?'Return to all screens':'All screens';
+  const toggleSplitScreen=()=>{
+    if(appliedView?.view.mode==='all'){requestCaptureMode('single');return;}
+    const previous=allViewportRef.current?.selected;
+    requestCaptureMode('all',previous&&monitors.some(d=>d.id===previous)?previous:selectedDisplayRef.current);
   };
 
   const openMonitorPopout = (i: number) => {
@@ -2325,7 +2369,7 @@ export function ControlScreen({
       const z = zoomRef.current;
       const p = panRef.current;
       const c = committedView.current;
-      const identity=displayedViewRef.current;if(identity&&!pipActiveRef.current&&!link.viewChanging?.())saveView({version:1,mode:identity.view.mode,selectedDisplayId:selectedDisplayRef.current,zoom:z,panX:p.x,panY:p.y});
+      persistCurrentView();
       if (z !== c.zoom || p.x !== c.x || p.y !== c.y) {
         // The view itself moved: render (transform) + re-place the native surface.
         committedView.current = { zoom: z, x: p.x, y: p.y };
@@ -2376,6 +2420,12 @@ export function ControlScreen({
     commitView();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pipView,pipOn,appliedView]);
+  const previouslyPip=useRef(pipView||pipOn);
+  useEffect(()=>{
+    const active=pipView||pipOn;
+    if(previouslyPip.current&&!active)restoreViewRef.current?.();
+    previouslyPip.current=active;
+  },[pipView,pipOn]);
   useEffect(()=>{
     const identity=displayedViewRef.current,display=identity?.view.displays.find(d=>d.id===selectedDisplayRef.current);if(!display)return;
     setNativePipAspect(display.width,display.height);
@@ -3422,17 +3472,18 @@ export function ControlScreen({
               monitors.length > 1 && (
                 <>
                   <button
-                    onClick={() => selectMonitor((monitorIdx + 1) % monitors.length)}
+                    onClick={cycleMonitor}
                     className="flex h-8 items-center gap-1 rounded-lg bg-white/[0.04] px-1.5 text-[10px] font-700 text-ink-soft active:scale-95"
                     title={`Switch display — ${remoteHandshake?.layout.displays.find(d=>d.id===selectedDisplay)?.name??monitors.find(d=>d.index===monitorIdx)?.name??`Display ${monitorIdx+1}`}`}
                     aria-label={`Switch display (${monitorIdx+1} of ${monitors.length})`}
                   >
                     <Monitor className="h-3.5 w-3.5" /> {monitorIdx + 1}/{monitors.length}
                   </button>
-                  {supportsRemote(remoteHandshake,'all-screens-v1')&&appliedView&&<>
-                    <button type="button" onClick={()=>requestCaptureMode('all')} title="All screens" aria-label="All screens" aria-pressed={appliedView.view.mode==='all'} className={`grid h-8 w-8 place-items-center rounded-lg active:scale-95 ${appliedView.view.mode==='all'?'bg-accent-3/20 text-accent-3':'bg-white/[0.04] text-ink-soft'}`}><PanelsTopLeft className="h-4 w-4" /></button>
-                    {appliedView.view.mode==='all'?<button type="button" onClick={()=>requestCaptureMode('single')} title="Focus selected display" aria-label="Focus selected display" className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.06] text-ink-soft active:scale-95"><Scan className="h-4 w-4" /></button>:allViewportRef.current&&<button type="button" onClick={()=>requestCaptureMode('all',allViewportRef.current!.selected)} title="Return to all screens" aria-label="Return to all screens" className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.06] text-ink-soft active:scale-95"><Undo2 className="h-4 w-4" /></button>}
-                  </>}
+                  {supportsRemote(remoteHandshake,'all-screens-v1')&&appliedView&&(
+                    <button type="button" onClick={toggleSplitScreen} title={splitScreenLabel} aria-label={splitScreenLabel} aria-pressed={appliedView.view.mode==='all'} className={`grid h-8 w-8 place-items-center rounded-lg active:scale-95 ${appliedView.view.mode==='all'?'bg-accent-3/20 text-accent-3':'bg-white/[0.04] text-ink-soft'}`}>
+                      {appliedView.view.mode==='all'?<Scan className="h-4 w-4" />:allViewportRef.current?<Undo2 className="h-4 w-4" />:<PanelsTopLeft className="h-4 w-4" />}
+                    </button>
+                  )}
                   {!isApk &&
                     monitors
                       .filter((m) => m.index !== monitorIdx)

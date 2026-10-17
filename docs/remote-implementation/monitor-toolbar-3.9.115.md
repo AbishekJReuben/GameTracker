@@ -1,0 +1,9 @@
+# Monitor selection and split-screen toolbar — 3.9.115
+
+The quick switcher calculated its next monitor from a legacy index that epoch-based single-display switches never updated. The first switch could succeed, while later taps kept requesting the same monitor. The switcher now derives its current index from the displayed stable display ID and the latest negotiated topology, and cycles through that topology.
+
+Last-view preferences were saved from a camera animation callback, which could run before the displayed view was confirmed. The confirmation path did not save again. Selection now saves when the view is confirmed, including selection changes within All screens. Restoration also runs when Control mounts with an already-cached handshake. A refused restoration cannot overwrite the stored choice, a missing monitor falls back to the available host display, and fixed pop-outs and temporary PiP views cannot overwrite the main view preference. PiP keeps its current single-display view and defers saved All-screens restoration until returning.
+
+The split-screen controls are one state-dependent button: All screens to enter, Focus selected display while viewing all monitors, and Return to all screens after focusing. It retains the previous All-screens camera and selection.
+
+Validation: the actual Control component's regression tests reproduced the stale switcher, missed confirmation save and cached-handshake restoration failures before the fix. All 11 component regressions now pass, including repeated switching, refused sends, disconnected monitors, legacy switching, pop-out isolation and PiP return. The full frontend suite passes 345 tests; TypeScript and desktop/companion and isolated discovery Vite builds pass. The nine existing host/client transaction checks passed; the video acknowledgment protocol was not changed. Component transport and frame events are synthetic; no physical-phone or newly signed APK result is claimed.
