@@ -39,6 +39,7 @@ import { EpochVideoHost } from './epochVideo';
 import { parseCapturePacket, sameCapture, type CaptureIdentity } from './captureView';
 import { supportsRemote } from './remoteProtocol';
 import { onlyLiveSession, runAuthorizedStartup } from './hostAuthorization';
+import { CaptureStallWatchdog, HostCaptureRecovery } from './hostCaptureRecovery';
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
 /**
@@ -1327,15 +1328,18 @@ export function startHost(opts: HostOptions): () => void {
   let nativeActive = false;
   let nativeDeliveryMs = 0;
   let captureEpoch = 0;
+  let captureGeneration:number|undefined;
   let restoreCaptureMode: (() => Promise<void>) | null = null;
 
-  const stopCapture = () => {
+  const stopCapture = (): Promise<void> => {
     captureEpoch++;
+    const generation=captureGeneration;captureGeneration=undefined;
     try {
-      if (opts.fixedMonitor != null) api.remoteStopAuxCapture(opts.fixedMonitor);
-      else api.remoteStopCapture();
+      if(opts.fixedMonitor==null&&generation===undefined)return Promise.resolve();
+      return (opts.fixedMonitor != null ? api.remoteStopAuxCapture(opts.fixedMonitor) : api.remoteStopCapture(generation)).catch(() => {});
     } catch {
       /* not on desktop / already stopped */
+      return Promise.resolve();
     }
   };
 
@@ -1555,10 +1559,14 @@ export function startHost(opts: HostOptions): () => void {
     let feedEpoch = -1;
     let feedGeneration: number | null = null;
     const owner=currentViewHost;
+    const ownsCapture=()=>!stopped&&currentViewHost===owner;
     const feeds=new CaptureVideoFeed(()=>quality.fps,()=>!stopped&&feedEpoch===captureEpoch&&currentViewHost===owner,(canvas,identity)=>{
       if(!wcSink)return false;if(!nativeActive)wcSink(canvas,identity);return true;
     },(identity,track)=>{if(currentViewHost===owner&&feedEpoch===captureEpoch)void epochVideoHost?.stage(identity,track);});
     captureFeeds?.close();captureFeeds=feeds;
+    // A pipe callback belongs to the feed that opened it. A track rebuild must
+    // not reuse a socket still dispatching into the retired feed's epoch gate.
+    videoPipe?.close();videoPipe=null;
     const ch=new Channel<ArrayBuffer>();
     const onFrameBytes=(bytes:ArrayBuffer)=>{
       const packet=parseCapturePacket(bytes);if(!packet)return;
@@ -1595,18 +1603,19 @@ export function startHost(opts: HostOptions): () => void {
     // connection. The Rust DXGI pipeline (persistent duplication + GPU downscale +
     // parallel encode) needs no picker and is already heavily optimized.
     const start = async (): Promise<void> => {
+      if(!ownsCapture())return;
       const startedEpoch = ++captureEpoch;
       feedEpoch = startedEpoch;
       // Reuse a live pipe across capture restarts; open one if we have none.
       if (videoPipe && !videoPipe.open) videoPipe = null;
       if (!videoPipe) {
         const ep = await pipeEndpointOnce();
-        if (stopped || startedEpoch !== captureEpoch) return;
+        if (!ownsCapture() || startedEpoch !== captureEpoch) return;
         if (ep) {
           const pipe = await MediaPipe.open(ep, (buf) => {
             if (videoPipe === pipe) onFrameBytes(buf);
           });
-          if (startedEpoch !== captureEpoch) {
+          if (!ownsCapture() || startedEpoch !== captureEpoch) {
             pipe?.close();
             return;
           }
@@ -1618,18 +1627,19 @@ export function startHost(opts: HostOptions): () => void {
               pipeBroken = true;
               slog("pipe", "media pipe closed mid-stream — restarting capture on the Tauri channel");
               // Only if this capture is still the live one (not torn down/replaced).
-              if (!stopped && feedEpoch === captureEpoch) void start().catch(() => {});
+              if (ownsCapture() && feedEpoch === captureEpoch) void start().catch(() => {});
             });
           }
         }
       }
-      if (stopped || startedEpoch !== captureEpoch) return;
+      if (!ownsCapture() || startedEpoch !== captureEpoch) return;
       const pipeId = videoPipe?.id;
       if (opts.fixedMonitor != null) {
         await api.remoteStartAuxCapture(opts.fixedMonitor, ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap), pipeId);
       } else {
         const generation = await api.remoteStartCapture(ch, quality.maxW, quality.fps, jpegForRtc(quality.jpeg, quality.jpegCap), pipeId);
-        if (startedEpoch !== captureEpoch) return;
+        if (!ownsCapture() || startedEpoch !== captureEpoch) {await api.remoteStopCapture(generation).catch(()=>{});return;}
+        captureGeneration=generation;
         feedGeneration = generation;
         // Restart resets Rust to JPEG. Restore the negotiated DIRECT/fast mode
         // and both pause owners after focus recovery, resize rebuild, or watchdog.
@@ -2243,9 +2253,6 @@ export function startHost(opts: HostOptions): () => void {
      *  (a framing change makes the worklet drop its buffer and re-prime). */
     let audioFormat: (() => { sampleRate: number; channels: number } | null) | null = null;
     let audioDirect = false;
-    // Capture-stall watchdog bookkeeping (restart capture if it wedges).
-    let lastProduced = -1;
-    let zeroSince = 0;
     // Encoder-stall watchdog bookkeeping (see below): counts consecutive 500ms
     // ticks where Rust produces frames but the WebRTC encoder sends none.
     let encStallTicks = 0;
@@ -2269,7 +2276,8 @@ export function startHost(opts: HostOptions): () => void {
       if(supportsRemote(presenceSession?.negotiated??null,'view-epoch-input-v1')){
         const identity=viewHost.identity;if(identity)captureFeeds?.rebuild(identity);return;
       }
-      stopCapture();
+      await stopCapture();
+      if (!sessionAlive || pc !== myPc || !authorized) return;
       videoWriter?.close().catch(() => {});
       videoWriter = null;
       try {
@@ -2302,6 +2310,12 @@ export function startHost(opts: HostOptions): () => void {
     // keyframe immediately when the page returns instead of waiting for the
     // periodic watchdog (or making the user reconnect/restart the app).
     let lastVisibilityRecovery = 0;
+    const recovery=new HostCaptureRecovery(
+      ()=>sessionAlive&&pc===myPc&&activeSessionId===sessionId&&!stopped&&authorized,
+      stopCapture,
+      ()=>startVideoCapture?.(),
+      error=>console.warn('[remote] capture recovery failed:',error),
+    );
     const recoverAfterVisibility = () => {
       if (document.visibilityState !== "visible" || !authorized || pc !== myPc) return;
       const now = Date.now();
@@ -2309,9 +2323,8 @@ export function startHost(opts: HostOptions): () => void {
       lastVisibilityRecovery = now;
       void (async () => {
         try {
-          stopCapture();
-          await startVideoCapture?.();
-          await api.remoteRequestKeyframe();
+          await recovery.restart();
+          if(sessionAlive&&pc===myPc&&!stopped)await api.remoteRequestKeyframe();
         } catch (e) {
           console.warn("[remote] visibility recovery failed:", e);
         }
@@ -2904,6 +2917,18 @@ export function startHost(opts: HostOptions): () => void {
     };
     restoreCaptureMode = restoreMode;
     sessionCleanups.add(() => { if (restoreCaptureMode === restoreMode) restoreCaptureMode = null; });
+    // Do not put capture recovery behind focus/UI Automation or getStats(): an
+    // unrelated hung poll used to prevent the only capture watchdog from running.
+    if(opts.fixedMonitor==null){
+      const captureWatchdog=new CaptureStallWatchdog(
+        ()=>sessionAlive&&pc===myPc&&activeSessionId===sessionId&&!stopped&&authorized&&myPc.connectionState==='connected',
+        ()=>guestIdle||encodePaused,
+        ()=>api.remoteCaptureStats(),
+        ()=>{slog('capture','no frame delivery for 5s; restarting capture');return recovery.restart();},
+      );
+      const timer=window.setInterval(()=>void captureWatchdog.poll(),1000);
+      sessionCleanups.add(()=>window.clearInterval(timer));
+    }
     const applyEncodePause = () => {
       const want = encodePaused || guestIdle;
       if (want === encodePauseWire) return;
@@ -3529,6 +3554,7 @@ export function startHost(opts: HostOptions): () => void {
     // video wait for the audio jitter buffer. For screen control the freshest
     // frame beats A/V alignment; the phone re-merges them locally for playback.
     const v = await buildVideoTrack();
+    if(!sessionAlive||pc!==myPc||stopped){v?.track.stop();return;}
     if (v) {
       videoTrack = v.track;
       videoSender = pc.addTrack(videoTrack, new MediaStream([videoTrack]));
@@ -3538,6 +3564,7 @@ export function startHost(opts: HostOptions): () => void {
     // Aux pop-out hosts skip desktop audio — the primary session already carries it.
     if (opts.fixedMonitor == null) {
       const a = await buildAudioTrack();
+      if(!sessionAlive||pc!==myPc||stopped){a?.track.stop();return;}
       if (a) {
         audioTrack = a.track;
         pc.addTrack(audioTrack, new MediaStream([audioTrack]));
@@ -4147,6 +4174,7 @@ export function startHost(opts: HostOptions): () => void {
         } catch {
           /* ignore */
         }
+        if(!sessionAlive||pc!==myPc||stopped)return;
         // Every ~500ms, forward host capture stats (produced fps, capture/scale/
         // encode ms, frame bytes, native/out resolution) to both the phone HUD and
         // the desktop Remote page's live session panel.
@@ -4162,6 +4190,7 @@ export function startHost(opts: HostOptions): () => void {
               /* ignore */
             }
           }
+          if(!sessionAlive||pc!==myPc||stopped)return;
           // Primary hosts read the outbound link stats — the encoder-stall
           // watchdog needs them even when no desktop UI is subscribed. One read
           // feeds the phone HUD, the stall watchdog, and the desktop panel.
@@ -4188,6 +4217,7 @@ export function startHost(opts: HostOptions): () => void {
                   codec: "",
                   bytesSent: 0,
                 };
+          if(!sessionAlive||pc!==myPc||stopped)return;
           if (cs && opts.fixedMonitor == null && data.readyState === "open") {
             // Periodic adapt even when no frames were skipped this tick — a slow
             // drain (fill 0.2–0.5) still wants a gentle shed before it hits the wall.
@@ -4307,32 +4337,6 @@ export function startHost(opts: HostOptions): () => void {
               );
             } catch {
               /* ignore */
-            }
-          }
-          // Capture-stall watchdog: if we're authorized and connected but the Rust
-          // capture stops producing frames (internal error / device change), restart
-          // it in place so the session self-heals without a full rebuild.
-          // PRIMARY host only: `remote_capture_stats` reports the primary pipeline
-          // (aux pipelines don't write those counters), so an aux host watching it
-          // would misread the primary's idle counter as "my capture wedged" and
-          // call remoteStopCapture() — killing the PRIMARY session's screen from a
-          // pop-out tab, over and over.
-          if (cs && authorized && opts.fixedMonitor == null && pc?.connectionState === "connected") {
-            if (cs.producedFrames === lastProduced) {
-              if (!zeroSince) zeroSince = Date.now();
-              else if (Date.now() - zeroSince > 5000) {
-                zeroSince = 0;
-                lastProduced = -1;
-                try {
-                  api.remoteStopCapture();
-                  await startVideoCapture?.();
-                } catch {
-                  /* retry next tick */
-                }
-              }
-            } else {
-              lastProduced = cs.producedFrames;
-              zeroSince = 0;
             }
           }
           // Encoder-stall watchdog: Rust producing frames at a real rate while the

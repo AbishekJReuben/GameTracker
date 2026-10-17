@@ -18,6 +18,8 @@ pub enum ControlEvent {
     Epoch { epoch:u64,#[serde(default)] anchor:Option<[f32;2]>,event:Box<ControlEvent> },
     #[serde(skip)]
     ReleaseSession {session_id:String},
+    #[serde(skip)]
+    ReleaseForRecovery {done:std::sync::mpsc::SyncSender<()>},
     /// Move the cursor to a normalized position.
     Move { x: f32, y: f32 },
     /// Move relatively (like trackpad).
@@ -301,6 +303,13 @@ impl Controller {
             },
             ControlEvent::Epoch{..}=>Ok(()), // no unowned epoch messages
             ControlEvent::ReleaseSession{session_id}=>{self.release_owned(&session_id);Ok(())},
+            ControlEvent::ReleaseForRecovery{done}=>{
+                for (button,_) in self.held_buttons.0.drain(){let _=self.enigo.button(button,Direction::Release);}
+                for (key,_) in self.held_keys.0.drain(){let _=self.enigo.key(key,Direction::Release);}
+                self.anchors.clear();
+                if self.gamepad_owner.take().is_some(){super::gamepad::stop();}
+                let _=done.send(());Ok(())
+            },
             ControlEvent::Move { x, y } => {
                 let Some((px,py))=self.mapped_point(x,y)else{return;};
                 self.move_abs(px, py);
@@ -468,7 +477,30 @@ pub fn inject_session(session_id:Option<String>,monitor:Option<usize>,event:Cont
     if let Some(monitor)=monitor{inject_on_monitor(monitor,event);}else{inject(event);}
 }
 pub fn release_session(sid:&str){if let Some(tx)=CONTROLLER.lock().as_ref(){let _=tx.send(ControlEvent::ReleaseSession{session_id:sid.into()});}}
+
+/// Best effort before the isolated host exits. Only release remote-owned holds;
+/// never wait on a potentially wedged injector lock or event indefinitely.
+pub fn release_for_recovery()->bool {
+    let Some(guard)=CONTROLLER.try_lock()else{return false;};
+    let Some(tx)=guard.as_ref().cloned()else{return true;};drop(guard);
+    request_recovery_release(&tx)
+}
+fn request_recovery_release(tx:&std::sync::mpsc::Sender<ControlEvent>)->bool {
+    let(done,reply)=std::sync::mpsc::sync_channel(1);
+    tx.send(ControlEvent::ReleaseForRecovery{done}).is_ok()
+        &&reply.recv_timeout(std::time::Duration::from_millis(200)).is_ok()
+}
 #[cfg(test)]mod tests{
+    #[test]fn recovery_cleanup_is_internal_and_cannot_be_requested_by_a_guest(){
+        assert!(serde_json::from_str::<super::ControlEvent>(r#"{"type":"releaseforrecovery"}"#).is_err());
+    }
+    #[test]fn recovery_cleanup_waits_for_ack_but_never_hangs_on_a_stalled_injector(){
+        let(tx,rx)=std::sync::mpsc::channel();
+        let worker=std::thread::spawn(move||{if let super::ControlEvent::ReleaseForRecovery{done}=rx.recv().unwrap(){let _=done.send(());}});
+        assert!(super::request_recovery_release(&tx));worker.join().unwrap();
+        let(tx,_stalled)=std::sync::mpsc::channel();let started=std::time::Instant::now();
+        assert!(!super::request_recovery_release(&tx));assert!(started.elapsed()<std::time::Duration::from_secs(1));
+    }
     use super::*;
     #[test]fn pending_view_preserves_authorized_foreground_input_and_atomic_mixed_sequences(){
         let event=ControlEvent::Seq{events:vec![ControlEvent::Keydown{name:"ctrl".into()},ControlEvent::Text{value:"日本語😀".into()},ControlEvent::Keyup{name:"ctrl".into()},ControlEvent::Gamepadstop]};

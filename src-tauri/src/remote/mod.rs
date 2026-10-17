@@ -16,6 +16,7 @@
 pub(crate) mod adb;
 pub(crate) mod audio;
 pub(crate) mod capture;
+pub(crate) mod capture_health;
 #[cfg(windows)]
 pub(crate) mod capture_broker;
 #[cfg(windows)]

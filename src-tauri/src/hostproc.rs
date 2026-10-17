@@ -354,6 +354,31 @@ pub fn host_started() -> bool {
     ok
 }
 
+/// Capture workers can wedge while the process and renderer remain alive. A
+/// WebView-only restart then keeps reusing the same stuck native graphics state.
+/// Exit this isolated host after a bounded lack of real frame deliveries; the
+/// main app's existing mutex supervisor respawns it and phones auto-reconnect.
+pub fn watch_capture() {
+    if !is_remote_host() { return; }
+    if let Err(error)=crate::remote::capture_health::supervise(
+        || {
+            let mut sample=crate::remote::capture::health_sample();
+            if flag("quit.flag").exists() || flag_age("updating.flag").is_some_and(|age|age<UPDATE_GRACE) {
+                sample.running=false;
+            }
+            sample
+        },
+        |sample| {
+            trace(&format!("capture made no delivery for 20s; restarting isolated remote host; sample={sample:?}; stats={}",serde_json::to_string(&crate::remote::capture::capture_stats()).unwrap_or_default()));
+            let released=crate::remote::input::release_for_recovery();
+            trace(&format!("remote-owned input released before recovery: {released}"));
+            // app.exit() depends on the UI event loop, which may itself be stuck.
+            // This process owns no tracker, updater, Notes, Voice or discovery.
+            std::process::exit(75);
+        },
+    ) {trace(&format!("could not start capture-health watchdog: {error}"));}
+}
+
 /// In the host: exit when the user quits; bring the main app back if it crashes.
 pub fn watch_main(on_quit: impl Fn() + Send + 'static) {
     std::thread::Builder::new()

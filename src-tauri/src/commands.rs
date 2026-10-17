@@ -2459,8 +2459,9 @@ pub fn remote_set_capture_native(on: bool, fast_delivery: Option<bool>) -> bool 
 
 /// Stop the streaming screen capture (on disconnect / teardown).
 #[tauri::command]
-pub fn remote_stop_capture() {
-    crate::remote::capture::stop_capture();
+pub fn remote_stop_capture(generation:Option<u32>) {
+    if let Some(generation)=generation {crate::remote::capture::stop_capture_generation(generation);}
+    else {crate::remote::capture::stop_capture();}
 }
 
 /// Start a lightweight aux capture pipeline for a fixed monitor (pop-out tab).

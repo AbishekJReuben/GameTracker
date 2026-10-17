@@ -1315,7 +1315,7 @@ export const api = {
   remoteSetCaptureNative: (on: boolean, fastDelivery = false) => call<boolean>("remote_set_capture_native", { on, fastDelivery }),
   remoteAckNativeFrame: (generation: number, sequence: number) =>
     call<void>("remote_ack_native_frame", { generation, sequence }),
-  remoteStopCapture: () => call<void>("remote_stop_capture"),
+  remoteStopCapture: (generation?: number) => call<void>("remote_stop_capture", { generation }),
   remoteStopAuxCapture: (monitor?: number) => call<void>("remote_stop_aux_capture", { monitor }),
   // Desktop-audio (WASAPI loopback) for the WebRTC audio track. PCM float32 frames
   // arrive as ArrayBuffers; returns the mix format to decode them with.
@@ -1401,6 +1401,8 @@ export interface RemoteCaptureStats {
   outW: number;
   outH: number;
   producedFrames: number;
+  /** Lifetime primary deliveries, unchanged by a capture-generation restart. */
+  emittedFrames?: number;
   maxW: number;
   fps: number;
   quality: number;

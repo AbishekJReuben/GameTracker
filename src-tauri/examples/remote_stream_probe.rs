@@ -4,6 +4,8 @@
 mod capture;
 #[path = "../src/remote/capture_broker.rs"]
 mod capture_broker;
+#[path = "../src/remote/capture_health.rs"]
+mod capture_health;
 #[path = "../src/remote/capture_surface.rs"]
 mod capture_surface;
 #[path = "../src/remote/delivery.rs"]
@@ -44,6 +46,34 @@ mod input {
 }
 #[cfg(windows)]
 fn main() {
+    if std::env::args().any(|a| a == "--recover-stalled-child") {
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(&exe)
+            .arg("--stalled-child")
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(75),
+            "stalled child must exit through the shipping native watchdog"
+        );
+        let fresh = std::process::Command::new(exe).status().unwrap();
+        assert!(fresh.success(), "a fresh process must deliver again");
+        println!("isolated stalled worker exited and a fresh capture child delivered again");
+        return;
+    }
+    let stalled = std::env::args().any(|a| a == "--stalled-child");
+    #[cfg(feature = "capture-probes")]
+    if stalled {
+        capture::probe_stall(true);
+    }
+    if stalled {
+        capture_health::supervise(capture::health_sample, |sample| {
+            eprintln!("native watchdog recovered stalled capture: {sample:?}");
+            std::process::exit(75);
+        })
+        .unwrap();
+    }
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -72,12 +102,26 @@ fn main() {
         }
     });
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(4) {
+    let mut restarted = Instant::now();
+    while start.elapsed() < Duration::from_secs(if stalled { 30 } else { 4 }) {
         std::thread::sleep(Duration::from_millis(500));
-        eprintln!(
-            "{}",
-            serde_json::to_string(&capture::capture_stats()).unwrap()
-        );
+        if stalled && restarted.elapsed() >= Duration::from_secs(5) {
+            // Repeated soft restarts reset producedFrames but cannot make this
+            // injected native stall produce. The backstop must still expire.
+            capture::start_capture(2160, 30, 72, |_| {});
+            restarted = Instant::now();
+            eprintln!(
+                "soft capture restart: produced={} emitted={}",
+                capture::capture_stats().produced_frames,
+                capture::health_sample().emitted
+            );
+        }
+        if !stalled {
+            eprintln!(
+                "{}",
+                serde_json::to_string(&capture::capture_stats()).unwrap()
+            );
+        }
     }
     capture::stop_capture();
     println!(

@@ -17,7 +17,7 @@ use jpeg_encoder::{ColorType as JpegColor, Encoder as JpegEnc, SamplingFactor};
 use parking_lot::{Condvar, Mutex as PlMutex};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xcap::image::codecs::jpeg::JpegEncoder;
@@ -230,6 +230,26 @@ fn emit_source(emit:&dyn Fn(Vec<u8>),identity:Option<&super::view::CaptureIdenti
         let accepted=super::view_session::produced(identity);super::delivery::emit_if(accepted,||identity.packet(payload()),emit);accepted
     }else{emit(payload());true}
 }
+// Unlike ST_PRODUCED, this survives capture-generation resets. Otherwise the
+// WebView's repeated restart attempts can disguise a permanently stalled source.
+static ST_EMITTED: AtomicU64 = AtomicU64::new(0);
+fn emit_primary(generation:u32,emit:&dyn Fn(Vec<u8>),identity:Option<&super::view::CaptureIdentity>,payload:impl FnOnce()->Vec<u8>)->bool {
+    if CAP_GEN.load(Ordering::SeqCst)!=generation || !CAP_RUNNING.load(Ordering::SeqCst){return false;}
+    let accepted=emit_source(emit,identity,payload);
+    if accepted {ST_EMITTED.fetch_add(1,Ordering::Relaxed);}
+    accepted
+}
+pub fn health_sample()->super::capture_health::Sample {
+    super::capture_health::Sample {
+        running:CAP_RUNNING.load(Ordering::SeqCst),
+        paused:CAP_NATIVE_OK.load(Ordering::Relaxed)&&NATIVE_ENCODE_PAUSED.load(Ordering::Relaxed),
+        emitted:ST_EMITTED.load(Ordering::Relaxed),
+    }
+}
+#[cfg(feature="capture-probes")]
+static PROBE_STALL: AtomicBool = AtomicBool::new(false);
+#[cfg(feature="capture-probes")]
+pub fn probe_stall(stalled:bool){PROBE_STALL.store(stalled,Ordering::Relaxed);}
 fn scale_exact(px4:&[u8],sw:u32,sh:u32,dw:u32,dh:u32,fast:bool)->Option<(Vec<u8>,u32,u32)>{
     if (sw,sh)==(dw,dh){return Some((px4.to_vec(),dw,dh));}
     let src=ImageRef::new(sw,sh,px4,PixelType::U8x4).ok()?;let mut dst=FirImage::new(dw,dh,PixelType::U8x4);
@@ -549,6 +569,7 @@ pub struct CaptureStats {
     pub out_w: u32,
     pub out_h: u32,
     pub produced_frames: u32,
+    pub emitted_frames: u64,
     pub max_w: u32,
     pub fps: u32,
     pub quality: u32,
@@ -584,6 +605,7 @@ pub fn capture_stats() -> CaptureStats {
         out_w: ST_OUT_W.load(Ordering::Relaxed),
         out_h: ST_OUT_H.load(Ordering::Relaxed),
         produced_frames: ST_PRODUCED.load(Ordering::Relaxed),
+        emitted_frames: ST_EMITTED.load(Ordering::Relaxed),
         max_w: CAP_MAXW.load(Ordering::Relaxed),
         fps: CAP_FPS.load(Ordering::Relaxed),
         quality: CAP_QUALITY.load(Ordering::Relaxed),
@@ -620,6 +642,29 @@ pub fn stop_capture() {
     // Authorized view ownership outlives a capture restart. presence::end clears
     // its request; a watchdog rebuild must keep the exact source identity.
     CAP_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// An old WebView callback may finish after a successor started. It can stop
+/// only its own generation, never that successor. Commands run serially on the
+/// UI thread; the CAS also rejects a generation superseded by another caller.
+pub fn stop_capture_generation(generation:u32) {
+    if claim_stop(&CAP_GEN,generation) {
+        super::delivery::DELIVERY.enable(false);
+        CAP_RUNNING.store(false,Ordering::SeqCst);
+    }
+}
+fn claim_stop(current:&AtomicU32,expected:u32)->bool {
+    current.compare_exchange(expected,expected.wrapping_add(1),Ordering::SeqCst,Ordering::SeqCst).is_ok()
+}
+
+#[cfg(test)]mod recovery_tests {
+    use super::*;
+    #[test]fn a_delayed_stop_cannot_cancel_a_new_capture_generation(){
+        let generation=AtomicU32::new(42);
+        assert!(!claim_stop(&generation,41));assert_eq!(generation.load(Ordering::SeqCst),42);
+        assert!(claim_stop(&generation,42));assert_eq!(generation.load(Ordering::SeqCst),43);
+        assert!(!claim_stop(&generation,42));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +959,8 @@ where
         let mut last_push = Instant::now() - Duration::from_secs(2);
 
         while CAP_RUNNING.load(Ordering::SeqCst) && CAP_GEN.load(Ordering::SeqCst) == my_gen {
+            #[cfg(feature="capture-probes")]
+            if PROBE_STALL.load(Ordering::Relaxed){std::thread::sleep(Duration::from_millis(50));continue;}
             let max_w = CAP_MAXW.load(Ordering::Relaxed);
             let quality = CAP_QUALITY.load(Ordering::Relaxed);
             let fps = CAP_FPS.load(Ordering::Relaxed).max(1);
@@ -1057,7 +1104,7 @@ where
                                             ST_NATIVE.store(true, Ordering::Relaxed);
                                             ST_ZEROCOPY.store(true, Ordering::Relaxed);
                                             ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                                            if emit_source(&*cap_emit,source_identity.as_deref(),||permit.packet(pkt)){zc_chain.emitted(&source_identity);}
+                                            if emit_primary(my_gen,&*cap_emit,source_identity.as_deref(),||permit.packet(pkt)){zc_chain.emitted(&source_identity);}
                                             zc_last_emit = Instant::now();
                                         } else {
                                             // Encode faulted: drop the session (stays
@@ -1109,7 +1156,7 @@ where
                                             let bytes = pkt.len();
                                             ST_BYTES.store(bytes as u32, Ordering::Relaxed);
                                             ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                                            if emit_source(&*cap_emit,source_identity.as_deref(),||permit.packet(pkt)){zc_chain.emitted(&source_identity);}
+                                            if emit_primary(my_gen,&*cap_emit,source_identity.as_deref(),||permit.packet(pkt)){zc_chain.emitted(&source_identity);}
                                             zc_last_emit = Instant::now();
                                             if force_key || force_ir {
                                                 // A fresh IDR / wave starts blurry by design —
@@ -1391,7 +1438,7 @@ where
                         // thread last claimed, this frame is not zero-copy.
                         ST_ZEROCOPY.store(false, Ordering::Relaxed);
                         ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                        if emit_source(&*emit,frame.identity.as_deref(),||permit.packet(pkt)){native_chain.emitted(&frame.identity);}
+                        if emit_primary(my_gen,&*emit,frame.identity.as_deref(),||permit.packet(pkt)){native_chain.emitted(&frame.identity);}
                         last_emit = Instant::now();
                         cached = None;
                         continue;
@@ -1417,7 +1464,7 @@ where
                     ST_ENC_US.store(enc0.elapsed().as_micros() as u32, Ordering::Relaxed);
                     ST_BYTES.store(jpg.len() as u32, Ordering::Relaxed);
                     ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                    emit_source(&*emit,frame.identity.as_deref(),||jpg);
+                    emit_primary(my_gen,&*emit,frame.identity.as_deref(),||jpg);
                     last_emit = Instant::now();
                     cached = None; // content moved on — drop the stale keep-alive cache
                 }
@@ -1431,7 +1478,7 @@ where
                 if let Some((jpg, ..)) = &cached {
                     ST_BYTES.store(jpg.len() as u32, Ordering::Relaxed);
                     ST_PRODUCED.fetch_add(1, Ordering::Relaxed);
-                    emit_source(&*emit,frame.identity.as_deref(),||jpg.clone());
+                    emit_primary(my_gen,&*emit,frame.identity.as_deref(),||jpg.clone());
                     last_emit = Instant::now();
                 }
             }

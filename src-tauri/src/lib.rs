@@ -648,6 +648,7 @@ fn run_remote_host(mut context: tauri::Context<tauri::Wry>) {
         return; // another host already serves remote access
     }
     hostproc::trace("host: building");
+    hostproc::watch_capture();
     // The main window from the config belongs to the main app.
     context.config_mut().app.windows.clear();
     tauri::Builder::default()

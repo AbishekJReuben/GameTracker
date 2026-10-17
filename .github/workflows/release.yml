@@ -171,6 +171,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Check independent capture watchdog
+        run: |
+          rustc --edition=2021 --test src-tauri/src/remote/capture_health.rs -o capture-health-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./capture-health-tests.exe
+
       - name: Build and publish desktop release
         uses: tauri-apps/tauri-action@v0
         env:
