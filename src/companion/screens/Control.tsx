@@ -53,6 +53,9 @@ import {
   SkipBack,
   Wifi,
   Monitor,
+  PanelsTopLeft,
+  Scan,
+  Undo2,
   Menu,
   BarChart3,
   Library as LibraryIcon,
@@ -3329,10 +3332,11 @@ export function ControlScreen({
       {/* ==== top toolbar — flex sibling (shrinks video); collapsible like the bottom dock ==== */}
       {!immersive && !topCollapsed && !pipView && (
         <div
+          data-remote-topbar
           className="relative z-40 flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-base px-2 py-1.5"
           style={{ paddingTop: "max(0.35rem, env(safe-area-inset-top))" }}
         >
-          <div className="relative flex min-w-0 items-center gap-2 rounded-xl bg-[#12141c] px-2 py-1">
+          <div className="relative flex shrink-0 items-center gap-1.5 rounded-xl bg-[#12141c] px-1.5 py-1">
             {onNavigate && (
               <button
                 onClick={() => setNavOpen((o) => !o)}
@@ -3386,46 +3390,48 @@ export function ControlScreen({
               </>
             )}
             {connected ? (
-              <span className="flex items-center gap-1.5 text-xs font-700 text-green">
-                <span className="h-2 w-2 rounded-full bg-green" style={{ boxShadow: "0 0 8px #34d399" }} />
-                Live
+              <span className="flex shrink-0 items-center gap-1.5 text-xs font-700 text-green" title="Live">
+                <span className="h-2 w-2 shrink-0 rounded-full bg-green" style={{ boxShadow: "0 0 8px #34d399" }} />
+                <span className="sr-only sm:not-sr-only">Live</span>
               </span>
             ) : (
-              <span className="flex items-center gap-1.5 text-xs font-700 text-ink-dim">
-                <Loader2 className="h-3 w-3 animate-spin" /> {progress ? statusLabel(progress) : "Connecting"}
+              <span className="flex shrink-0 items-center gap-1.5 text-xs font-700 text-ink-dim" title={progress ? statusLabel(progress) : "Connecting"}>
+                <Loader2 className="h-3 w-3 animate-spin" />
+                <span className="sr-only sm:not-sr-only sm:max-w-36 sm:truncate">{progress ? statusLabel(progress) : "Connecting"}</span>
               </span>
             )}
             {connected && <FpsLatencyPill fps={fps} wcStats={wcStats} net={net} variant="compact" />}
             {pcTextField && (
               <button
                 onClick={() => kbdRef.current?.focus()}
-                className="flex items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-accent-3 active:scale-95"
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-accent-3 active:bg-white/[0.08]"
                 title="A PC text field is focused — tap to type"
+                aria-label="Type in the focused PC text field"
               >
-                <Keyboard className="h-3 w-3" /> Typing on PC
+                <Keyboard className="h-3.5 w-3.5" />
               </button>
             )}
           </div>
 
-          <div className="flex shrink-0 items-center gap-1 overflow-x-auto" style={{ scrollbarWidth: "none" }}>
+          <div role="group" aria-label="Remote display controls" className="flex min-w-0 items-center gap-1 overflow-x-auto [&>*]:shrink-0" style={{ scrollbarWidth: "none" }}>
             {popoutMonitor != null ? (
-              <span className="flex items-center gap-1 rounded-lg bg-accent-3/15 px-2 py-1.5 text-xs font-700 text-accent-3">
-                <Monitor className="h-3.5 w-3.5" /> Display {popoutMonitor + 1}
+              <span className="flex h-8 items-center gap-1 rounded-lg bg-accent-3/15 px-2 text-xs font-700 text-accent-3" title={`Display ${popoutMonitor + 1}`} aria-label={`Display ${popoutMonitor + 1}`}>
+                <Monitor className="h-3.5 w-3.5" /> {popoutMonitor + 1}
               </span>
             ) : (
               monitors.length > 1 && (
                 <>
                   <button
                     onClick={() => selectMonitor((monitorIdx + 1) % monitors.length)}
-                    className="flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1.5 text-xs font-700 text-ink-soft active:scale-95"
-                    title="Switch display in this tab"
+                    className="flex h-8 items-center gap-1 rounded-lg bg-white/[0.04] px-1.5 text-[10px] font-700 text-ink-soft active:scale-95"
+                    title={`Switch display — ${remoteHandshake?.layout.displays.find(d=>d.id===selectedDisplay)?.name??monitors.find(d=>d.index===monitorIdx)?.name??`Display ${monitorIdx+1}`}`}
+                    aria-label={`Switch display (${monitorIdx+1} of ${monitors.length})`}
                   >
                     <Monitor className="h-3.5 w-3.5" /> {monitorIdx + 1}/{monitors.length}
                   </button>
                   {supportsRemote(remoteHandshake,'all-screens-v1')&&appliedView&&<>
-                    <button type="button" onClick={()=>requestCaptureMode('all')} className={`rounded-lg px-2 py-1.5 text-xs font-700 ${appliedView.view.mode==='all'?'bg-accent-3/20 text-accent-3':'bg-white/[0.04] text-ink-soft'}`}>All screens</button>
-                    <span className="whitespace-nowrap text-[10px] text-ink-soft">Selected: {remoteHandshake?.layout.displays.find(d=>d.id===selectedDisplay)?.name??'display'}</span>
-                    {appliedView.view.mode==='all'?<button type="button" onClick={()=>requestCaptureMode('single')} className="whitespace-nowrap rounded-lg bg-white/[0.06] px-2 py-1.5 text-xs font-700">Focus selected</button>:allViewportRef.current&&<button type="button" onClick={()=>requestCaptureMode('all',allViewportRef.current!.selected)} className="whitespace-nowrap rounded-lg bg-white/[0.06] px-2 py-1.5 text-xs font-700">Return to All screens</button>}
+                    <button type="button" onClick={()=>requestCaptureMode('all')} title="All screens" aria-label="All screens" aria-pressed={appliedView.view.mode==='all'} className={`grid h-8 w-8 place-items-center rounded-lg active:scale-95 ${appliedView.view.mode==='all'?'bg-accent-3/20 text-accent-3':'bg-white/[0.04] text-ink-soft'}`}><PanelsTopLeft className="h-4 w-4" /></button>
+                    {appliedView.view.mode==='all'?<button type="button" onClick={()=>requestCaptureMode('single')} title="Focus selected display" aria-label="Focus selected display" className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.06] text-ink-soft active:scale-95"><Scan className="h-4 w-4" /></button>:allViewportRef.current&&<button type="button" onClick={()=>requestCaptureMode('all',allViewportRef.current!.selected)} title="Return to all screens" aria-label="Return to all screens" className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.06] text-ink-soft active:scale-95"><Undo2 className="h-4 w-4" /></button>}
                   </>}
                   {!isApk &&
                     monitors
@@ -5676,7 +5682,7 @@ function FpsLatencyPill({
     );
   }
   return (
-    <span className="flex items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-ink-faint">
+    <span className="flex shrink-0 items-center gap-1.5 border-l border-white/10 pl-2 text-[10px] font-700 text-ink-faint">
       <Wifi className="h-3 w-3 shrink-0" />
       <span className="flex flex-col items-start leading-none">
         <span className="whitespace-nowrap tabular-nums">{fps} fps</span>

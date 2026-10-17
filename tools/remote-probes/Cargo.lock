@@ -285,6 +285,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -914,12 +920,15 @@ name = "gametracker-remote-probes"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "base64",
  "enigo",
  "fast_image_resize",
  "image",
+ "jpeg-encoder",
  "libloading",
  "once_cell",
  "parking_lot",
+ "rayon",
  "serde",
  "serde_json",
  "windows 0.58.0",
@@ -1217,6 +1226,12 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
 ]
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f"
 
 [[package]]
 name = "js-sys"
