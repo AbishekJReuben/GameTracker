@@ -736,7 +736,7 @@ export function ControlScreen({
    *  `detail` carries the full diagnostic (Java throwable + stack from the
    *  native bridge) — rendered scrollable with a copy-to-clipboard button so a
    *  device-specific failure can be pasted into a bug report verbatim. */
-  const [decoderMsg, setDecoderMsg] = useState<{ text: string; detail: string } | null>(null);
+  const [decoderMsg, setDecoderMsg] = useState<{ text: string; detail: string; source?:'decoder' } | null>(null);
   const decoderMsgTimer = useRef<number | null>(null);
   const [decoderCopied, setDecoderCopied] = useState(false);
 
@@ -1458,8 +1458,13 @@ export function ControlScreen({
 
   // ----- frame + status lifecycle -----
   useEffect(() => {
+    const clearDecoderMessage=()=>{
+      if(decoderMsgTimer.current!==null){window.clearTimeout(decoderMsgTimer.current);decoderMsgTimer.current=null;}
+      setDecoderMsg(msg=>msg?.source==='decoder'?null:msg);
+    };
     link.onStatus((c) => {
       setConnected(c);
+      if(!c)clearDecoderMessage();
       if (c) {
         hitchReset();
         hostSkipRef.current = -1;
@@ -1566,12 +1571,12 @@ export function ControlScreen({
         const reason = String((e as { reason?: string }).reason || "");
         const detail = String((e as { detail?: string }).detail || "");
         if (state === "fallback" || state === "error") {
-          setDecoderMsg({ text: reason || "Decoder issue — check Tune → Phone decoder", detail });
+          setDecoderMsg({ text: reason || "Decoder issue — check Tune → Phone decoder", detail,source:'decoder' });
           if (decoderMsgTimer.current) window.clearTimeout(decoderMsgTimer.current);
           // With a diagnostic attached, linger long enough to read/copy it.
-          decoderMsgTimer.current = window.setTimeout(() => setDecoderMsg(null), detail ? 20000 : 6000);
-        } else if (state === "native") {
-          setDecoderMsg(null);
+          decoderMsgTimer.current = window.setTimeout(() => {decoderMsgTimer.current=null;setDecoderMsg(msg=>msg?.source==='decoder'?null:msg);}, detail ? 20000 : 6000);
+        } else if (state === "recovered") {
+          clearDecoderMessage();
         }
       } else if (e.event === "amode") {
         // DIRECT audio owns playback — mute the RTC <audio> so we don't double.
@@ -1660,6 +1665,7 @@ export function ControlScreen({
       unsubStream?.();
       unsubAudio?.();
       unsubEvent?.();
+      clearDecoderMessage();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);

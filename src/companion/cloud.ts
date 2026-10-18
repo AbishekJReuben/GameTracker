@@ -1545,9 +1545,9 @@ export class CloudConn {
   get epochStream(){return this.views.rtc;}
   get epochSurfaceStage(){return this.views.surfaceStage;}
   requestRemoteView(mode:'single'|'all',selectedDisplayId:string,maxWidth:number){return this.views.request(mode,selectedDisplayId,maxWidth);}
-  presentedRtcView(peerId:string,element:HTMLVideoElement){if(this.wcActive)return false;const accepted=this.views.rtcPresented(peerId,element);if(accepted)this.finishNativeTransition();return accepted;}
-  presentedDirectView(identity:CaptureIdentity){const accepted=this.views.directPresented(identity);if(accepted){if(this.wcNative)this.nativeTransitionPending=false;else this.finishNativeTransition();}return accepted;}
-  presentedLegacyRtc(){if(!this.views.enabled&&!this.wcActive)this.finishNativeTransition();}
+  presentedRtcView(peerId:string,element:HTMLVideoElement){if(this.wcActive)return false;const accepted=this.views.rtcPresented(peerId,element);if(accepted){this.finishNativeTransition();this.decoderPresented();}return accepted;}
+  presentedDirectView(identity:CaptureIdentity){const accepted=this.views.directPresented(identity);if(accepted){if(this.wcNative)this.nativeTransitionPending=false;else this.finishNativeTransition();this.decoderPresented();}return accepted;}
+  presentedLegacyRtc(){if(!this.views.enabled&&!this.wcActive){this.finishNativeTransition();this.decoderPresented();}}
   private finishNativeTransition(){if(this.nativeTransitionPending){this.nativeTransitionPending=false;void teardownNativeDecoder();}}
   sendViewInput(message:Record<string,unknown>,lossy=false,anchor?:[number,number]):boolean{
     if(!this.views.enabled)return lossy?this.sendMove(message):this.sendControl(message);
@@ -1569,6 +1569,8 @@ export class CloudConn {
 
   /** Reset all wc state (new session / teardown). `reprobe` re-allows opt-in. */
   private wcReset(reprobe: boolean) {
+    this.decoderNoticeRevision++;this.decoderNoticePending=false;
+    this.wcNativeErrorSince=null;this.wcNativeErrorAnnounced=false;this.wcNativePresentedStamp='';
     this.nativeRecovery.reset();
     this.nativeTransitionPending=false;
     this.wcBuildGeneration++;
@@ -2614,10 +2616,21 @@ export class CloudConn {
     this.wcRequestKeyframe();
   }
 
-  /** Last native-decoder error string we surfaced as a toast — used to dedupe
-   *  the poll so a sticky `lastError` from a recovered configure attempt can't
-   *  spam the "decoder error" message every tick. */
-  private wcLastNativeError = "";
+  /** One warning per interrupted picture stream, cleared by presentation. */
+  private wcNativeErrorSince:number|null=null;
+  private wcNativeErrorAnnounced=false;
+  private wcNativePresentedStamp='';
+  private decoderNoticeRevision=0;
+  private decoderNoticePending=false;
+
+  /** Configuration success alone cannot dismiss a warning: a fresh picture
+   * must cross the existing presentation boundary first. */
+  private decoderPresented(){
+    this.wcNativeErrorSince=null;this.wcNativeErrorAnnounced=false;
+    if(!this.decoderNoticePending)return;
+    this.decoderNoticePending=false;this.decoderNoticeRevision++;
+    this.emitEvent({event:'decoder',state:'recovered'});
+  }
 
   /**
    * Native-decode fallback toast with the FULL Java-side diagnostics attached:
@@ -2627,7 +2640,9 @@ export class CloudConn {
    * fallback pays the (one-off, off-hot-path) cost of the dump.
    */
   private async emitDecoderFallback(reason: string, detail: string) {
+    const revision=++this.decoderNoticeRevision;this.decoderNoticePending=true;
     const diag = await dumpNativeDecoderDiag();
+    if(this.closed||revision!==this.decoderNoticeRevision||!this.decoderNoticePending)return;
     this.emitEvent({
       event: "decoder",
       state: "fallback",
@@ -2645,6 +2660,7 @@ export class CloudConn {
     try { st = await getNativeDecoderStats(); }
     finally { this.wcNativePollBusy = false; }
     if (!st || generation !== this.wcBuildGeneration || !this.wcNative) return;
+    let presentedStamp='';
     if(this.views.enabled&&st.rendered?.version===2){
       const proof=st.rendered,submitted=this.nativeFrameViews.get(proof.ptsUs),bounds=nativeBoundsSequence();
       if(submitted&&submitted.build===generation&&submitted.feed===proof.feedSession&&proof.feedSession===nativeFeedGeneration()&&this.views.accepts(submitted.identity))this.emitEvent({event:'native-view-frame',identity:submitted.identity});
@@ -2653,6 +2669,7 @@ export class CloudConn {
         revealNativeFrame(proof);
         const visible=this.nativeFrameViews.get(proof.visiblePtsUs??0);
         if(visible&&visible.build===generation&&visible.feed===proof.feedSession&&proof.visibleBoundsSequence===bounds&&this.views.accepts(visible.identity)){
+          presentedStamp=`${proof.feedSession}:${proof.codecGeneration}:${proof.visiblePtsUs}:${bounds}`;
           this.emitEvent({event:'native-view-visible',identity:visible.identity});
           for(const pts of this.nativeFrameViews.keys())if(pts<=(proof.visiblePtsUs??0))this.nativeFrameViews.delete(pts);
         }
@@ -2662,7 +2679,10 @@ export class CloudConn {
       // A new APK connected to an old host still reveals resized native video.
       // No epoch acknowledgment is inferred on that compatibility path.
       if(proof.feedSession===nativeFeedGeneration()&&proof.codecGeneration>=0&&proof.frames>0&&bounds>0&&proof.boundsSequence===bounds)revealNativeFrame(proof);
+      if(proof.feedSession===nativeFeedGeneration()&&proof.codecGeneration>=0&&(proof.visiblePtsUs??0)>0&&bounds>0&&proof.visibleBoundsSequence===bounds)presentedStamp=`${proof.feedSession}:${proof.codecGeneration}:${proof.visiblePtsUs}:${bounds}`;
     }
+    if(!st.rendered&&st.active&&!st.error&&st.frames>0&&st.frames!==this.wcNativeFrames)presentedStamp=`legacy:${st.frames}`;
+    if(st.active&&presentedStamp&&presentedStamp!==this.wcNativePresentedStamp){this.wcNativePresentedStamp=presentedStamp;this.decoderPresented();}
     this.wcNativeQueue = st.queue;
     if (st.awaitKey) this.wcRequestKeyframe();
     // A releaseOutputBuffer counter is not proof that the TextureView rendered.
@@ -2739,19 +2759,18 @@ export class CloudConn {
     // Only surface a decoder error when the codec is NOT producing frames. The
     // Java bridge's `lastError` is sticky across the progressive-configure
     // ladder: attempt 0 may log a configure failure that attempt 1 recovered
-    // from, and that stale string would otherwise re-toast every poll tick
-    // even though frames are decoding fine on the Surface. Dedupe by string so
-    // a genuine persistent fault is announced once, not every 500ms.
-    if (st.error && st.error !== this.wcLastNativeError) {
-      this.wcLastNativeError = st.error;
-      if (st.frames === 0) {
+    // from. A sustained fault is announced once until fresh pictures resume.
+    if (st.error && st.frames === 0) {
+      this.wcNativeErrorSince??=performance.now();
+      // Android can replace a faulted codec within one or two polls. Only
+      // persistent failure needs a banner, and only real presentation clears it.
+      if(!this.wcNativeErrorAnnounced&&performance.now()-this.wcNativeErrorSince>=750){
+        this.wcNativeErrorAnnounced=true;this.decoderNoticePending=true;this.decoderNoticeRevision++;
         console.warn("[remote] native decoder:", st.error);
         this.emitEvent({ event: "decoder", state: "error", reason: "Phone decoder error", detail: st.error });
       }
-    } else if (!st.error) {
-      // Codec cleared its error (healthy) — allow a future different error to
-      // re-announce.
-      this.wcLastNativeError = "";
+    } else {
+      this.wcNativeErrorSince=null;
     }
   }
 
@@ -3061,7 +3080,7 @@ export class CloudConn {
         const identity=this.decodedViews.get(frame)??null;
         if(this.views.enabled&&(!identity||!this.views.accepts(identity))){frame.close();return;}
         const painted=identity?this.wcFrameCb(frame,identity):this.wcFrameCb(frame);
-        if(painted){if(identity)this.presentedDirectView(identity);else this.finishNativeTransition();}
+        if(painted){if(identity)this.presentedDirectView(identity);else{this.finishNativeTransition();this.decoderPresented();}}
         return;
       } catch {
         /* fall through to close */

@@ -36,6 +36,23 @@ beforeEach(()=>{
   vi.spyOn(HTMLMediaElement.prototype,'load').mockImplementation(()=>{});
 });
 afterEach(()=>{cleanup();vi.restoreAllMocks();delete (window as Window & {__GT_PIP_ACTIVE__?:boolean}).__GT_PIP_ACTIVE__;});
+it('clears the decoder banner on picture recovery rather than codec initialization',()=>{
+  const f=fixture();let notify!:(event:{event:string;[key:string]:unknown})=>void;
+  const timers=vi.spyOn(window,'setTimeout'),cancel=vi.spyOn(window,'clearTimeout');
+  const subscribe=f.link.onEvent;f.link.onEvent=cb=>{notify=cb;return subscribe(cb);};render(<ControlScreen link={f.link}/>);
+  act(()=>notify({event:'decoder',state:'error',reason:'Phone decoder error',detail:'CodecException'}));
+  const noticeTimer=timers.mock.results[timers.mock.calls.findIndex(call=>call[1]===20000)].value;
+  expect(screen.getByText('Phone decoder error')).toBeInTheDocument();
+  act(()=>notify({event:'decoder',state:'native'}));expect(screen.getByText('Phone decoder error')).toBeInTheDocument();
+  act(()=>notify({event:'decoder',state:'recovered'}));expect(screen.queryByText('Phone decoder error')).not.toBeInTheDocument();
+  expect(cancel).toHaveBeenCalledWith(noticeTimer);
+});
+it('keeps a monitor-switch warning when the decoder reports picture recovery',()=>{
+  const f=fixture();let notify!:(event:{event:string;[key:string]:unknown})=>void;
+  const subscribe=f.link.onEvent;f.link.onEvent=cb=>{notify=cb;return subscribe(cb);};render(<ControlScreen link={f.link}/>);
+  act(()=>notify({event:'remote-view-error',message:'Selected display disconnected'}));
+  act(()=>notify({event:'decoder',state:'recovered'}));expect(screen.getByText('Selected display disconnected')).toBeInTheDocument();
+});
 it('cycles the quick monitor button repeatedly using the last displayed selection',async()=>{
   const f=fixture();render(<ControlScreen link={f.link}/>);
   for(const id of ['right','left','right','left']){

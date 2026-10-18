@@ -28,6 +28,7 @@ type Internals = {
   wcFeedFrame(h: VideoHeader, data: Uint8Array<ArrayBuffer>): void;
   wcReset(reprobe: boolean): void; wcPlayDrain(): void; wcFlushPaceQueue(present?: boolean): void;
   wcPollNativeStats(): Promise<void>;
+  emitDecoderFallback(reason:string,detail:string):Promise<void>;
   wcMeta: Map<number, unknown>; wcAwaitKey: boolean; wcFrameCb: (f: VideoFrame) => void;
   wcPlayQ: { frame: VideoFrame; showAt: number }[];
   wcNative: boolean; wcActive: boolean; wcNativeFrames: number; wcNativePollAt: number;
@@ -56,6 +57,35 @@ beforeEach(() => {
 afterEach(() => { conn.close(); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
 describe("phone decoder lifecycle (no visual testing)", () => {
+  it('does not flash a warning for a native error that recovers within one poll',async()=>{
+    const events:Record<string,unknown>[]=[];conn.onEvent(e=>events.push(e));c.wcNative=true;c.wcActive=true;
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue({frames:0,queue:0,decodeMs:0,active:false,width:2160,height:1214,error:'CodecException'});
+    await c.wcPollNativeStats();await vi.advanceTimersByTimeAsync(250);
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue({frames:1,queue:0,decodeMs:9,active:true,width:2160,height:1214,error:''});await c.wcPollNativeStats();
+    expect(events.filter(e=>e.event==='decoder'&&e.state==='error')).toHaveLength(0);
+  });
+  it('clears a persistent native error only after fresh surface presentation',async()=>{
+    const events:Record<string,unknown>[]=[];conn.onEvent(e=>events.push(e));c.wcNative=true;c.wcActive=true;
+    const stats={frames:0,queue:0,decodeMs:0,active:false,width:2160,height:1214,error:'CodecException'};
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue(stats);
+    for(let i=0;i<4;i++){await c.wcPollNativeStats();await vi.advanceTimersByTimeAsync(250);}
+    expect(events.filter(e=>e.event==='decoder'&&e.state==='error')).toHaveLength(1);
+    const rendered={version:2,feedSession:4,codecGeneration:7,ptsUs:100,frames:1,boundsSequence:8,visiblePtsUs:0,visibleBoundsSequence:0,layer:'texture' as const};
+    vi.mocked(native.nativeFeedGeneration).mockReturnValue(4);vi.mocked(native.nativeBoundsSequence).mockReturnValue(8);
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue({...stats,active:true,error:'',frames:1,rendered});await c.wcPollNativeStats();
+    expect(events.filter(e=>e.state==='recovered')).toHaveLength(0);
+    vi.mocked(native.getNativeDecoderStats).mockResolvedValue({...stats,active:true,error:'',frames:1,rendered:{...rendered,visiblePtsUs:100,visibleBoundsSequence:8}});
+    await c.wcPollNativeStats();await c.wcPollNativeStats();expect(events.filter(e=>e.state==='recovered')).toHaveLength(1);
+    vi.mocked(native.nativeFeedGeneration).mockReturnValue(0);vi.mocked(native.nativeBoundsSequence).mockReturnValue(0);
+  });
+  it('cannot restore an old fallback warning when its diagnostics arrive after a good picture',async()=>{
+    const events:Record<string,unknown>[]=[];conn.onEvent(e=>events.push(e));
+    let resolve!:(value:string)=>void;vi.mocked(native.dumpNativeDecoderDiag).mockReturnValue(new Promise(r=>{resolve=r;}));
+    const warning=c.emitDecoderFallback('Phone decoder fallback','old failure');
+    c.wcBuildWebCodecsDecoder();c.wcFrameCb=()=>true;feed(true);Decoder.all[0].init.output(frame());await Promise.resolve();
+    resolve('late dump');await warning;
+    expect(events.filter(e=>e.event==='decoder'&&e.state==='fallback')).toHaveLength(0);
+  });
   it("recovers a silent mid-session native stall before abandoning the phone decoder", async () => {
     c.wcNative = true; c.wcNativeReady = true; c.wcActive = true; c.wcFrames = 48256;
     vi.mocked(native.getNativeDecoderStats).mockResolvedValue({
