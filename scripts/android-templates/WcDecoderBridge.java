@@ -190,22 +190,37 @@ public final class WcDecoderBridge {
   }
   private static boolean prepareTransition(){
     Activity act=activity();if(act==null)return false;
-    final long ticket=transitionOwnership.begin();if(ticket==0)return false;final CountDownLatch done=new CountDownLatch(1);final AtomicBoolean okay=new AtomicBoolean(false);
+    // A stopped decoder has no live picture to retain. Do not let an older
+    // outstanding PixelCopy block reconnect before even inspecting that state.
+    if(!wanted.get()||!started.get()||!renderedProof.hasFrame())return true;
+    final int generation=initGen.get();final long session=feedSession;
+    final long ticket=transitionOwnership.begin();if(ticket==0){jlog("transition snapshot busy; continuing without another copy");return false;}
+    final CountDownLatch done=new CountDownLatch(1);final AtomicBoolean okay=new AtomicBoolean(false);
     act.runOnUiThread(()->{
-      if(!transitionOwnership.current(ticket)){transitionOwnership.complete(ticket);done.countDown();return;}
+      if(!transitionOwnership.current(ticket)||generation!=initGen.get()||session!=feedSession){transitionOwnership.complete(ticket);done.countDown();return;}
       View view=videoView();
-      if(transitionCover!=null||view==null||!started.get()||!renderedProof.hasFrame()){okay.set(true);transitionOwnership.complete(ticket);done.countDown();return;}
+      if(transitionCover!=null||view==null||!wanted.get()||!started.get()||!renderedProof.hasFrame()||!view.isShown()){okay.set(true);transitionOwnership.complete(ticket);done.countDown();return;}
       if(view.getWidth()<1||view.getHeight()<1||!(view.getParent() instanceof ViewGroup)){transitionOwnership.complete(ticket);done.countDown();return;}
       // A bounded 4 Mi-pixel maximum, allocated once per pending transaction.
       double scale=Math.min(1.0,Math.sqrt(4194304.0/((double)view.getWidth()*view.getHeight())));
       final android.graphics.Bitmap bitmap;
       try{bitmap=android.graphics.Bitmap.createBitmap(Math.max(1,(int)(view.getWidth()*scale)),Math.max(1,(int)(view.getHeight()*scale)),android.graphics.Bitmap.Config.ARGB_8888);}catch(Throwable error){transitionOwnership.complete(ticket);done.countDown();return;}
+      final AtomicBoolean finished=new AtomicBoolean(false);
       java.util.function.Consumer<Boolean> finish=success->{
-        if(success&&transitionOwnership.current(ticket)&&view==videoView()&&transitionCover==null){
-          android.widget.ImageView image=new android.widget.ImageView(act);image.setScaleType(android.widget.ImageView.ScaleType.FIT_XY);image.setImageBitmap(bitmap);image.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);image.setClickable(false);image.setFocusable(false);
-          FrameLayout.LayoutParams lp=new FrameLayout.LayoutParams(view.getWidth(),view.getHeight());lp.leftMargin=view.getLeft();lp.topMargin=view.getTop();lp.gravity=Gravity.TOP|Gravity.START;
-          transitionBitmap=bitmap;transitionCover=image;((ViewGroup)view.getParent()).addView(image,((ViewGroup)view.getParent()).indexOfChild(view)+1,lp);okay.set(true);
-        }else bitmap.recycle();transitionOwnership.complete(ticket);done.countDown();
+        if(!finished.compareAndSet(false,true))return;
+        boolean installed=false;
+        try{
+          if(success&&transitionOwnership.current(ticket)&&generation==initGen.get()&&session==feedSession&&wanted.get()&&view==videoView()&&view.isShown()&&transitionCover==null&&view.getParent() instanceof ViewGroup){
+            android.widget.ImageView image=new android.widget.ImageView(act);image.setScaleType(android.widget.ImageView.ScaleType.FIT_XY);image.setImageBitmap(bitmap);image.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);image.setClickable(false);image.setFocusable(false);
+            FrameLayout.LayoutParams lp=new FrameLayout.LayoutParams(view.getWidth(),view.getHeight());lp.leftMargin=view.getLeft();lp.topMargin=view.getTop();lp.gravity=Gravity.TOP|Gravity.START;
+            ViewGroup parent=(ViewGroup)view.getParent();parent.addView(image,parent.indexOfChild(view)+1,lp);
+            transitionBitmap=bitmap;transitionCover=image;installed=true;okay.set(true);
+          }
+        }catch(Throwable error){jlog("transition snapshot attachment failed: "+error);}
+        finally{
+          if(!installed&&!bitmap.isRecycled())bitmap.recycle();
+          transitionOwnership.complete(ticket);done.countDown();
+        }
       };
       try{
         if(view instanceof TextureView){android.graphics.Bitmap copied=((TextureView)view).isAvailable()?((TextureView)view).getBitmap(bitmap):null;finish.accept(copied!=null);}
@@ -213,7 +228,7 @@ public final class WcDecoderBridge {
         else finish.accept(false);
       }catch(Throwable error){finish.accept(false);}
     });
-    try{if(!done.await(450,TimeUnit.MILLISECONDS)){transitionOwnership.invalidate(ticket);return false;}}catch(InterruptedException interrupted){Thread.currentThread().interrupt();transitionOwnership.invalidate(ticket);return false;}
+    try{if(!done.await(450,TimeUnit.MILLISECONDS)){transitionOwnership.invalidate(ticket);jlog("transition snapshot timed out; continuing native startup");return false;}}catch(InterruptedException interrupted){Thread.currentThread().interrupt();transitionOwnership.invalidate(ticket);return false;}
     return okay.get();
   }
   private static void revealFrame(long session,int generation,long pts,long bounds){
@@ -1475,6 +1490,9 @@ public final class WcDecoderBridge {
   public static final class JsApi {
     @JavascriptInterface
     public void beginFeed(double session) {
+      // An old PixelCopy keeps ownership of its destination until its callback,
+      // but must never place that old picture over a new feed's rendered frame.
+      transitionOwnership.invalidate();
       synchronized (backlog) {
         feedSession = Math.round(session);
         renderedProof.beginFeed(feedSession);
@@ -2213,6 +2231,7 @@ public final class WcDecoderBridge {
         // codec is now running fine.
         lastError.set("");
         lastStartFailAt = 0L;
+        lastProbeDetail.set("started=" + name + " fmtTry=" + i);
         jlog(
             "MediaCodec started name="
                 + name
@@ -2229,7 +2248,7 @@ public final class WcDecoderBridge {
         codec = null;
         started.set(false);
         lastEx = e;
-        jlog("configure/start attempt " + i + " failed: " + e.getMessage());
+        jlog("configure/start attempt " + i + " failed: " + e);
         if (c != null) {
           try {
             c.release();
@@ -2239,10 +2258,10 @@ public final class WcDecoderBridge {
         }
       }
     }
-    lastError.set(lastEx == null ? "all configure attempts failed" : String.valueOf(lastEx.getMessage()));
+    lastError.set(lastEx == null ? "all configure attempts failed" : lastEx.toString());
     lastProbeDetail.set("startCodec: all attempts failed (" + attempts.size() + ")");
     lastStartFailAt = SystemClock.elapsedRealtime();
-    jlog("all codec configure attempts failed: " + (lastEx == null ? "?" : lastEx.getMessage()));
+    jlog("all codec configure attempts failed: " + (lastEx == null ? "?" : lastEx.toString()));
   }
 
   private static MediaCodec createCodecByName(String name) {
@@ -2271,6 +2290,7 @@ public final class WcDecoderBridge {
   }
 
   private static void stopCodecOnThread() {
+    transitionOwnership.invalidate();
     renderedProof.stopCodec();
     started.set(false);
     MediaCodec c = codec;

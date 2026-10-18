@@ -80,6 +80,43 @@ describe("binary native decoder feed", () => {
 });
 
 describe("native surface bounds", () => {
+  it.each(['refused', 'threw'] as const)('starts native decoding when the optional transition snapshot %s',async failure=>{
+    const invoke=vi.fn().mockResolvedValue(undefined);vi.doMock('@tauri-apps/api/core',()=>({invoke}));vi.doMock('@/lib/tauri',()=>({isTauri:()=>true}));(window as any).__GT_COMPANION__=true;
+    const begin=vi.fn(),clear=vi.fn();window.__GT_DECODER__={feed:vi.fn(),beginFeed:begin,frameProofVersion:()=>2,
+      prepareTransition:()=>{if(failure==='threw')throw new Error('snapshot surface unavailable');return false;},clearTransition:clear};
+    try{
+      const decoder=await import('./nativeDecoder');
+      expect(await decoder.initNativeDecoder(2160,1214)).toBeNull();
+      expect(invoke).toHaveBeenCalledExactlyOnceWith('decoder_init',{width:2160,height:1214,codec:'avc',layer:'texture'});
+      expect(begin).toHaveBeenCalledOnce();expect(decoder.nativeFeedGeneration()).toBe(1);
+      // A missing decorative snapshot must not acknowledge a frame or discard
+      // any previously retained picture before a fresh rendered frame arrives.
+      expect(clear).not.toHaveBeenCalled();
+    }finally{delete (window as any).__GT_COMPANION__;vi.doUnmock('@tauri-apps/api/core');vi.doUnmock('@/lib/tauri');}
+  });
+  it('reconnects even when the old snapshot owner stays busy across final teardown',async()=>{
+    const invoke=vi.fn().mockResolvedValue(undefined);vi.doMock('@tauri-apps/api/core',()=>({invoke}));vi.doMock('@/lib/tauri',()=>({isTauri:()=>true}));(window as any).__GT_COMPANION__=true;
+    const begin=vi.fn(),prepare=vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+    window.__GT_DECODER__={feed:vi.fn(),beginFeed:begin,frameProofVersion:()=>2,prepareTransition:prepare,clearTransition:vi.fn()};
+    try{
+      const decoder=await import('./nativeDecoder');expect(await decoder.initNativeDecoder(2160,1214)).toBeNull();
+      await decoder.teardownNativeDecoder();
+      expect(await decoder.initNativeDecoder(2160,1214)).toBeNull();
+      expect(await decoder.initNativeDecoder(2160,1214)).toBeNull();
+      expect(invoke.mock.calls.map(call=>call[0])).toEqual(['decoder_init','decoder_teardown','decoder_init','decoder_init']);
+      expect(begin.mock.calls.map(call=>call[0])).toEqual([1,2,3,4]);
+    }finally{delete (window as any).__GT_COMPANION__;vi.doUnmock('@tauri-apps/api/core');vi.doUnmock('@/lib/tauri');}
+  });
+  it('still reports real native initialization errors and allows a later retry',async()=>{
+    const invoke=vi.fn().mockRejectedValueOnce(new Error('codec resource unavailable')).mockResolvedValue(undefined);
+    vi.doMock('@tauri-apps/api/core',()=>({invoke}));vi.doMock('@/lib/tauri',()=>({isTauri:()=>true}));(window as any).__GT_COMPANION__=true;
+    window.__GT_DECODER__={feed:vi.fn(),frameProofVersion:()=>2,prepareTransition:()=>false};
+    try{
+      const decoder=await import('./nativeDecoder');
+      expect(await decoder.initNativeDecoder(2160,1214)).toContain('codec resource unavailable');
+      expect(await decoder.initNativeDecoder(2160,1214)).toBeNull();expect(invoke).toHaveBeenCalledTimes(2);
+    }finally{delete (window as any).__GT_COMPANION__;vi.doUnmock('@tauri-apps/api/core');vi.doUnmock('@/lib/tauri');}
+  });
   it('recovery rotates feed identity, preserves geometry and survives snapshot failure',async()=>{
     const invoke=vi.fn().mockResolvedValue(undefined);vi.doMock('@tauri-apps/api/core',()=>({invoke}));vi.doMock('@/lib/tauri',()=>({isTauri:()=>true}));(window as any).__GT_COMPANION__=true;
     const begin=vi.fn();window.__GT_DECODER__={feed:vi.fn(),beginFeed:begin,frameProofVersion:()=>2,prepareTransition:()=>{throw new Error('surface unavailable');}};

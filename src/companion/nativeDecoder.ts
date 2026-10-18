@@ -93,11 +93,10 @@ function lifecycleInvoke(cmd: string, args?: Record<string, unknown>,retainPictu
     if((cmd==='decoder_init'||cmd==='decoder_reset')&&epoch!==lifecycleEpoch)throw new Error('Retired decoder initialization');
     if (cmd === "decoder_init" || cmd === "decoder_reset" || cmd === "decoder_teardown") {
       if((cmd==='decoder_init'||cmd==='decoder_reset'||retainPicture)&&window.__GT_DECODER__?.frameProofVersion?.()===2){
-        // A wedged/tiny TextureView can refuse getBitmap. That must never stop
-        // recovery or leave the native layer covering the fallback canvas.
-        let retained=false;
-        try{retained=window.__GT_DECODER__?.prepareTransition?.()!==false;}catch{/* broken surface */}
-        if(!retained&&cmd==='decoder_init')throw new Error('Unable to retain the last native picture for this view transition');
+        // Snapshot retention is cosmetic. A stopped/tiny surface, busy copy or
+        // Android UI timeout must not prevent initialization or reconnect.
+        // Existing covers remain until real rendered proof authorizes reveal.
+        try{window.__GT_DECODER__?.prepareTransition?.();}catch{/* best effort */}
       }
       // Java forgets its desired rect on init; make the next bounds call go out.
       if(cmd!=='decoder_reset'){lastBounds = null;boundsViewEpoch=0;}
