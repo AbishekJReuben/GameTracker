@@ -15,14 +15,14 @@ export class HostViewSession{
     if(this.latest&&identity.view.epoch<this.latest.view.epoch)return null;
     const prior=this.known.get(identity.view.epoch);if(prior&&!sameCapture(prior,identity))return null;
     this.known.set(identity.view.epoch,identity);while(this.known.size>4)this.known.delete(this.known.keys().next().value!);
-    if(!sameCapture(this.latest,identity)){this.latest=identity;this.captureChanged(identity);this.send({event:'view-capture',identity});}
+    if(!sameCapture(this.latest,identity)){++this.serial;this.latest=identity;this.captureChanged(identity);this.send({event:'view-capture',identity});}
     return identity;
   }
   async acknowledge(identity:CaptureIdentity,mode:'direct'|'rtc'='direct'):Promise<boolean>{
     if(!this.live()||!sameCapture(this.latest,identity))return false;
     const accepted=await api.remoteViewAcknowledge(this.sessionId,identity.view.epoch).catch(()=>false);
     if(!this.live()||!sameCapture(this.latest,identity)||!accepted)return false;
-    this.accepted=identity;this.expectedRequest=null;this.committed(identity,mode);this.send({event:'view-applied',identity});return true;
+    ++this.serial;this.accepted=identity;this.expectedRequest=null;this.committed(identity,mode);this.send({event:'view-applied',identity});return true;
   }
   async handle(message:Record<string,unknown>):Promise<boolean>{
     if(message.type==='view-request'){
@@ -44,7 +44,7 @@ export class HostViewSession{
   async fail(identity:CaptureIdentity,message:string){
     if(!this.live()||!sameCapture(this.latest,identity))return;
     const serial=this.serial;const status=await api.remoteViewCancel(this.sessionId,identity.view.epoch).catch(()=>null);
-    if(this.live()&&serial===this.serial&&status){this.sendStatus(status);this.send({event:'view-error',sessionId:this.sessionId,message});}
+    if(this.live()&&serial===this.serial&&sameCapture(this.latest,identity)&&status){this.sendStatus(status);this.send({event:'view-error',sessionId:this.sessionId,identity,message});}
   }
   start(){if(this.timer)return;this.timer=setInterval(()=>void this.poll(),500);}
   private async poll(){

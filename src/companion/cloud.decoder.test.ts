@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CloudConn } from "./cloud";
 import type { VideoHeader } from "./videoReceive";
 import * as native from "./nativeDecoder";
+import {hitchReset,hitchSnapshot} from './hitchLog';
 
 vi.mock("./nativeDecoder", () => ({
   nativeDecoderPossible: vi.fn(() => false), nativeFeedReady: vi.fn(() => true),
@@ -29,6 +30,8 @@ type Internals = {
   wcReset(reprobe: boolean): void; wcPlayDrain(): void; wcFlushPaceQueue(present?: boolean): void;
   wcPollNativeStats(): Promise<void>;
   emitDecoderFallback(reason:string,detail:string):Promise<void>;
+  onData(raw:string):void;
+  chControl:RTCDataChannel;
   wcMeta: Map<number, unknown>; wcAwaitKey: boolean; wcFrameCb: (f: VideoFrame) => void;
   wcPlayQ: { frame: VideoFrame; showAt: number }[];
   wcNative: boolean; wcActive: boolean; wcNativeFrames: number; wcNativePollAt: number;
@@ -57,6 +60,20 @@ beforeEach(() => {
 afterEach(() => { conn.close(); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
 describe("phone decoder lifecycle (no visual testing)", () => {
+  it('uses the requested cadence for hitch logging and still reports a real gap',()=>{
+    hitchReset();c.chControl={readyState:'open',send:vi.fn(),close:vi.fn()} as unknown as RTCDataChannel;
+    conn.sendControl({type:'quality',fps:10});c.wcBuildWebCodecsDecoder();
+    for(let i=0;i<12;i++){vi.advanceTimersByTime(100);feed(true);}
+    expect(hitchSnapshot().filter(e=>e.kind==='frame-gap')).toHaveLength(0);
+    vi.advanceTimersByTime(500);feed(true);expect(hitchSnapshot().filter(e=>e.kind==='frame-gap')).toEqual([expect.objectContaining({meta:{gapMs:500,expectMs:100}})]);
+  });
+  it('uses the host adapted fps without changing decoder behavior',()=>{
+    hitchReset();c.onData(JSON.stringify({event:'capstats',streamFps:10}));c.wcBuildWebCodecsDecoder();
+    for(let i=0;i<12;i++){vi.advanceTimersByTime(100);feed(true);}
+    expect(hitchSnapshot().filter(e=>e.kind==='frame-gap')).toHaveLength(0);
+    c.onData(JSON.stringify({event:'capstats',streamFps:60}));vi.advanceTimersByTime(16);feed(true);vi.advanceTimersByTime(100);feed(true);
+    expect(hitchSnapshot().filter(e=>e.kind==='frame-gap')).toEqual([expect.objectContaining({meta:{gapMs:100,expectMs:17}})]);
+  });
   it('does not flash a warning for a native error that recovers within one poll',async()=>{
     const events:Record<string,unknown>[]=[];conn.onEvent(e=>events.push(e));c.wcNative=true;c.wcActive=true;
     vi.mocked(native.getNativeDecoderStats).mockResolvedValue({frames:0,queue:0,decodeMs:0,active:false,width:2160,height:1214,error:'CodecException'});

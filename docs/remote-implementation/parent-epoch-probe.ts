@@ -56,6 +56,13 @@ button.onclick=async()=>{
     status.textContent='Failed pending setup preserves the preceding picture';dropOffers=true;const failed=source('failed epoch 5',[15,160,170]);await stage(identity(5),failed);await until(()=>host.count===1,'failed pending retirement');dropOffers=false;assert(sameCapture(active,identity(4,'right')),'Failed setup retired the active host');assert(client.count===1&&visible?.readyState===4,'Failed setup lost the active client sink');log.push({check:'offer-send failure retains active source',pass:true});
     assert(failures.length===0,`Async failure: ${failures.join('; ')}`);assert(maxHostPeers<=2&&maxClientPeers<=2,'Peer bounds exceeded');
     log.push({check:'bounded active + pending peers',pass:true,maxHostPeers,maxClientPeers});status.textContent='Complete';
+    status.textContent='DIRECT ownership then explicit RTC fallback';
+    host.directCommit(identity(4,'right'));client.directCommit(identity(4,'right'));
+    const before=peers.length;await host.stage(identity(4,'right'),replacement);assert(peers.length===before,'DIRECT allowed a redundant RTC setup');
+    assert(host.resumeRtc(),'RTC fallback did not release DIRECT ownership');
+    const fallback=source('RTC resumed after DIRECT',[20,190,190]);const preceding=host.peer;await stage(identity(4,'right'),fallback);
+    await until(()=>host.peer!==preceding&&settled(identity(4,'right')),'RTC resume after DIRECT');
+    log.push({check:'DIRECT blocks redundant RTC; explicit fallback resumes real RTC',pass:true});status.textContent='Complete';
   }catch(error){failures.push(String(error));status.textContent='Failed';}
   finally{
     alive=false;host.close();client.close();visible?.pause();if(visible)visible.srcObject=null;

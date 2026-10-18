@@ -736,7 +736,7 @@ export function ControlScreen({
    *  `detail` carries the full diagnostic (Java throwable + stack from the
    *  native bridge) — rendered scrollable with a copy-to-clipboard button so a
    *  device-specific failure can be pasted into a bug report verbatim. */
-  const [decoderMsg, setDecoderMsg] = useState<{ text: string; detail: string; source?:'decoder' } | null>(null);
+  const [decoderMsg, setDecoderMsg] = useState<{ text: string; detail: string; source?:'decoder'|'view' } | null>(null);
   const decoderMsgTimer = useRef<number | null>(null);
   const [decoderCopied, setDecoderCopied] = useState(false);
 
@@ -1464,7 +1464,7 @@ export function ControlScreen({
     };
     link.onStatus((c) => {
       setConnected(c);
-      if(!c)clearDecoderMessage();
+      if(!c){clearDecoderMessage();setDecoderMsg(null);}
       if (c) {
         hitchReset();
         hostSkipRef.current = -1;
@@ -1538,7 +1538,8 @@ export function ControlScreen({
           if(!e.changing)persistCurrentView();
         }
       }else if(e.event==='remote-view-applied'){restoreRemoteView();reportRemoteViewport();persistCurrentView();}
-      else if(e.event==='remote-view-error'){setDecoderMsg({text:String(e.message??'View change failed'),detail:''});}
+      else if(e.event==='remote-view-error'){setDecoderMsg({text:String(e.message??'View change failed'),detail:'',source:'view'});}
+      else if(e.event==='remote-view-recovered'){setDecoderMsg(msg=>msg?.source==='view'?null:msg);}
       else if(e.event==='native-view-frame'){
         const identity=e.identity as CaptureIdentity;nativeViewRef.current=identity;natRef.current={w:identity.view.width,h:identity.view.height};stageViewport(identity);syncNativeSurface();
       }else if(e.event==='native-view-visible'){
@@ -1666,6 +1667,7 @@ export function ControlScreen({
       unsubAudio?.();
       unsubEvent?.();
       clearDecoderMessage();
+      setDecoderMsg(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);

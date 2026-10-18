@@ -2487,7 +2487,11 @@ export function startHost(opts: HostOptions): () => void {
     const sendView=(message:Record<string,unknown>)=>{if(!liveView()||data.readyState!=='open')return false;data.send(JSON.stringify(message));return true;};
     const viewHost=new HostViewSession(sessionId,()=>supportsRemote(presenceSession?.negotiated??null,'view-epoch-input-v1'),liveView,sendView,
       identity=>{captureFeeds?.select(identity);},
-      (identity,mode)=>{captureFeeds?.commit(identity);if(mode==='direct'){
+      (identity,mode)=>{
+        // A queued DIRECT acknowledgment may finish after an explicit RTC
+        // fallback. It cannot reclaim transport ownership or commit its new feed.
+        if(mode==='direct'&&!wcSink&&!nativeActive)return;
+        captureFeeds?.commit(identity);if(mode==='direct'){
         epochHost.directCommit(identity);activeVideoPc=null;videoSender=baseVideoSender;videoTrack=baseVideoSender?.track??null;
       }});
     const epochHost=new EpochVideoHost(sessionId,sendView,()=>myPc.getConfiguration(),liveView,
@@ -3312,6 +3316,7 @@ export function startHost(opts: HostOptions): () => void {
      */
     const wcTeardown = (notifyGuest: boolean, permanent = false) => {
       wcSink = null;
+      if(epochHost.resumeRtc()&&liveView()&&viewHost.identity)captureFeeds?.rebuild(viewHost.identity);
       // Rust must go back to JPEG: the RTC track we're falling back to composites a
       // canvas, and a canvas cannot be fed an H.264 bitstream. Keep `nativeSink`
       // installed — a later DIRECT re-opt-in (guest retry after RTC fallback) only
@@ -4228,6 +4233,7 @@ export function startHost(opts: HostOptions): () => void {
               data.send(
                 JSON.stringify({
                   event: "capstats",
+                  streamFps: Math.round(adaptFps),
                   stats: cs,
                   rtc: {
                     sendKbps: link.kbps,

@@ -52,6 +52,7 @@ it('keeps a monitor-switch warning when the decoder reports picture recovery',()
   const subscribe=f.link.onEvent;f.link.onEvent=cb=>{notify=cb;return subscribe(cb);};render(<ControlScreen link={f.link}/>);
   act(()=>notify({event:'remote-view-error',message:'Selected display disconnected'}));
   act(()=>notify({event:'decoder',state:'recovered'}));expect(screen.getByText('Selected display disconnected')).toBeInTheDocument();
+  act(()=>notify({event:'remote-view-recovered'}));expect(screen.queryByText('Selected display disconnected')).not.toBeInTheDocument();
 });
 it('cycles the quick monitor button repeatedly using the last displayed selection',async()=>{
   const f=fixture();render(<ControlScreen link={f.link}/>);

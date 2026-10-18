@@ -581,6 +581,7 @@ export class CloudConn {
   private wcStallTicks = 0;
   /** Hitch journal helpers — see hitchLog.ts. */
   private hitchLastFramePerf = 0;
+  private expectedStreamFps=60;
   private hitchLastE2e = 0;
   private hitchLastHostSkipped = -1;
   /** Playout pacing (Quality dock "Feel"): 0 = paint on decode, >0 = clock-paced. */
@@ -919,6 +920,7 @@ export class CloudConn {
       return;
     }
     this.powerIdle = idle;
+    this.hitchLastFramePerf=0;
     this.nativeRecovery.resetProgress();
     this.syncRemotePresence();
     if (idle) this.wcFlushPaceQueue(false);
@@ -1569,6 +1571,7 @@ export class CloudConn {
 
   /** Reset all wc state (new session / teardown). `reprobe` re-allows opt-in. */
   private wcReset(reprobe: boolean) {
+    this.views.useRtc();this.hitchLastFramePerf=0;
     this.decoderNoticeRevision++;this.decoderNoticePending=false;
     this.wcNativeErrorSince=null;this.wcNativeErrorAnnounced=false;this.wcNativePresentedStamp='';
     this.nativeRecovery.reset();
@@ -2335,6 +2338,7 @@ export class CloudConn {
    * used to cost the whole session its latency budget until an app restart.
    */
   private wcFallback(reason: string, hard = false) {
+    this.views.useRtc();
     if (!this.wcActive && !this.wcRequestedAt) return;
     // A decoder that fails on a High stream gets Baseline on the retry (R3).
     if (this.wcIsHigh() && /decoder|configure|native init/.test(reason)) this.wcDropHigh(reason);
@@ -2900,20 +2904,20 @@ export class CloudConn {
       this.emitEvent({ event: "wc", active: true, native: this.wcNative });
     }
     this.wcLastFrameAt = now;
-    // Hitch: arrival gap vs expected frame period (host fps target ~25ms @40).
+    // Use the requested/adapted cadence, never a fixed 40 fps assumption.
     const perfNow = performance.now();
-    const expectMs = this.wcPaceMs > 0 ? Math.max(16, 1000 / 40) : Math.max(16, 1000 / 40);
-    hitchMaybeFrameGap(this.hitchLastFramePerf, perfNow, expectMs);
-    this.hitchLastFramePerf = perfNow;
     // Backgrounded (NOT PiP — a PiP window counts as visible): skip decoding to
     // save battery; resync off a fresh keyframe when the app comes back. Gated on
     // the DEBOUNCED idle, not raw document.hidden: frames that land during a PiP
     // handoff must keep the reference chain alive, or the mini window (and the
     // full screen after it) freezes until the next IDR.
     if (this.powerIdle) {
+      this.hitchLastFramePerf=0;
       this.wcAwaitKey = true;
       return;
     }
+    hitchMaybeFrameGap(this.hitchLastFramePerf,perfNow,1000/this.expectedStreamFps);
+    this.hitchLastFramePerf=perfNow;
     this.wcBytes += head.len;
     this.wcByteWin.push({ at: now, bytes: head.len });
     while (this.wcByteWin.length && now - this.wcByteWin[0].at > 2000) this.wcByteWin.shift();
@@ -3613,6 +3617,7 @@ export class CloudConn {
       return;
     }
     if (typeof msg.event === "string") {
+      if(msg.event==='capstats')this.setExpectedStreamFps((msg as {streamFps?:unknown}).streamFps);
       if(this.views.handle(msg as Record<string,unknown>))return;
       if(msg.event==='remote-overlay-status'&&(msg as {sessionId?:string}).sessionId===this.remotePresence.negotiated?.sessionId)this.remotePresence.setOverlayStatus((msg as {overlay?:unknown}).overlay);
       // Auth handshake result from the host gates the "connected" status.
@@ -3829,11 +3834,17 @@ export class CloudConn {
       this.eventCbs.delete(cb);
     };
   }
+  private setExpectedStreamFps(value:unknown){
+    if(typeof value!=='number'||!Number.isFinite(value)||value<1||value>240)return;
+    if(value!==this.expectedStreamFps)this.hitchLastFramePerf=0;
+    this.expectedStreamFps=value;
+  }
   /** Returns true when the message was handed to the open control channel. */
   sendControl(msg: unknown): boolean {
     if (this.chControl?.readyState !== "open") return false;
     try {
       this.chControl.send(JSON.stringify(msg));
+      if(msg&&typeof msg==='object'&&(msg as {type?:string}).type==='quality')this.setExpectedStreamFps((msg as {fps?:unknown}).fps);
       return true;
     } catch {
       return false;

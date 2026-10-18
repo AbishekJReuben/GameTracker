@@ -19,11 +19,12 @@ function retire(peer:OwnedPeer|null){if(!peer||peer.disposed)return;peer.dispose
  * pending video peers coexist; the base authorized audio/control peer is external. */
 export class EpochVideoHost {
   private active:OwnedPeer|null=null;private pending:OwnedPeer|null=null;private closed=false;private serial=0;
+  private directOwnsVideo=false;
   constructor(private sessionId:string,private send:Send,private configuration:()=>RTCConfiguration,private alive:()=>boolean,private acknowledge:(identity:CaptureIdentity)=>Promise<boolean>,private changed:(sender:RTCRtpSender,pc:RTCPeerConnection,identity:CaptureIdentity)=>void,private failed:(identity:CaptureIdentity,message:string,track:MediaStreamTrack)=>void,private factory:Factory=create){}
   private owns(peer:OwnedPeer){return !this.closed&&this.alive()&&!peer.disposed&&(this.pending===peer||this.active===peer);}
   get peer(){return this.active?.pc??null;}get sender(){return this.active?.sender??null;}get count(){return Number(!!this.active)+Number(!!this.pending);}
   async stage(identity:CaptureIdentity,track:MediaStreamTrack):Promise<void>{
-    if(this.closed||!this.alive()||identity.sessionId!==this.sessionId||sameCapture(this.pending?.identity,identity)||(sameCapture(this.active?.identity,identity)&&this.active?.stream.getVideoTracks()[0]===track))return;
+    if(this.closed||!this.alive()||this.directOwnsVideo||identity.sessionId!==this.sessionId||sameCapture(this.pending?.identity,identity)||(sameCapture(this.active?.identity,identity)&&this.active?.stream.getVideoTracks()[0]===track))return;
     retire(this.pending);this.pending=null;
     let pc:RTCPeerConnection;try{pc=this.factory({...this.configuration(),bundlePolicy:'max-bundle',iceCandidatePoolSize:0});}catch(error){this.failed(identity,String(error),track);return;}const stream=new MediaStream([track]);
     const peer:OwnedPeer={pc,id:`${this.sessionId}-video-${++this.serial}`,identity,stream,timer:null,sent:false,ice:[],remoteIce:[],disposed:false};this.pending=peer;
@@ -67,14 +68,16 @@ export class EpochVideoHost {
   private retryCommit(peer:OwnedPeer,attempt:number){if(attempt>=16||peer.commitConfirmed||!this.owns(peer)||this.active!==peer)return;peer.timer=setTimeout(()=>{peer.timer=null;this.sendCommit(peer);this.retryCommit(peer,attempt+1);},400);}
   private fail(peer:OwnedPeer,message:string){if(this.pending!==peer)return;this.pending=null;retire(peer);this.failed(peer.identity,message,peer.stream.getVideoTracks()[0]);}
   cancelPending(){retire(this.pending);this.pending=null;}
-  directCommit(identity:CaptureIdentity){this.cancelPending();if(this.active&&!sameCapture(this.active.identity,identity)){retire(this.active);this.active=null;}}
+  directCommit(identity:CaptureIdentity){this.directOwnsVideo=true;this.cancelPending();if(this.active&&!sameCapture(this.active.identity,identity)){retire(this.active);this.active=null;}}
+  /** Explicit fallback re-enables RTC; a late capture callback cannot do so. */
+  resumeRtc(){const wasDirect=this.directOwnsVideo;this.directOwnsVideo=false;return wasDirect;}
   close(){this.closed=true;retire(this.pending);retire(this.active);this.pending=null;this.active=null;}
 }
 export interface EpochStream {identity:CaptureIdentity;stream:MediaStream;peerId:string}
 export interface EpochSurfaceStage extends EpochStream{element:HTMLVideoElement}
 export class EpochVideoClient {
   private active:OwnedPeer|null=null;private pending:OwnedPeer|null=null;private closed=false;
-  constructor(private sessionId:string,private send:Send,private configuration:()=>RTCConfiguration,private alive:()=>boolean,private stageView:(identity:CaptureIdentity)=>boolean,private display:(stream:EpochStream)=>void,private rendered:(identity:CaptureIdentity)=>boolean,private failed:(identity:CaptureIdentity,message:string)=>void,private factory:Factory=create,private element:()=>HTMLVideoElement=()=>document.createElement('video')){}
+  constructor(private sessionId:string,private send:Send,private configuration:()=>RTCConfiguration,private alive:()=>boolean,private stageView:(identity:CaptureIdentity)=>boolean,private display:(stream:EpochStream)=>void,private rendered:(identity:CaptureIdentity)=>boolean,private failed:(identity:CaptureIdentity,message:string,presented?:boolean)=>void,private factory:Factory=create,private element:()=>HTMLVideoElement=()=>document.createElement('video')){}
   private owns(peer:OwnedPeer){return !this.closed&&this.alive()&&!peer.disposed&&(this.pending===peer||this.active===peer);}
   get peer(){return (this.pending?.visibleConfirmed?this.pending:this.active)?.pc??null;}get receiver(){return (this.pending?.visibleConfirmed?this.pending:this.active)?.receiver??null;}get count(){return Number(!!this.active)+Number(!!this.pending);}
   get stagingIdentity(){return this.pending?.identity??null;}
@@ -107,7 +110,7 @@ export class EpochVideoClient {
         peer.frameCallback=sink.requestVideoFrameCallback(()=>{if(this.owns(peer)&&this.pending===peer&&sink.srcObject===peer.stream&&e.track.readyState==='live')this.announce(peer);});
         void sink.play().catch(()=>{});
       };
-      peer.timer=setTimeout(()=>{if(this.pending===peer&&this.owns(peer)){if(peer.visibleConfirmed){peer.timer=null;this.failed(peer.identity,'Waiting for host view confirmation');}else this.fail(peer,'RTC displayed-frame acknowledgment timed out');}},9500);
+      peer.timer=setTimeout(()=>{if(this.pending===peer&&this.owns(peer)){if(peer.visibleConfirmed){peer.timer=null;this.failed(peer.identity,'Waiting for host view confirmation',true);}else this.fail(peer,'RTC displayed-frame acknowledgment timed out');}},9500);
       try{
         const binding=await videoBinding(identity,id,streamId,trackId,sdp);if(!this.owns(peer)||this.pending!==peer)return true;if(binding!==message.binding)throw new Error('Video offer identity mismatch');
         await pc.setRemoteDescription({type:'offer',sdp});if(!this.owns(peer)||this.pending!==peer)return true;
