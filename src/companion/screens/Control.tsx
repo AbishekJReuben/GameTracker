@@ -88,8 +88,11 @@ import {
   Trash2,
   AppWindow,
   SlidersHorizontal,
+  LockKeyhole,
+  UnlockKeyhole,
 } from "lucide-react";
 import type { ContentMode, ControlMsg, QualitySettings, RemoteLink } from "../links";
+import {isControlInput} from '../links';
 import { startGamepadBridge } from "../gamepad";
 import { apiGet } from "../link";
 import type { AudioStats, ConnectSnapshot, WcStats } from "../cloud";
@@ -98,7 +101,7 @@ import { ConnectionProgress, statusLabel } from "../ConnectionProgress";
 import type { RemoteMonitor, RemoteCaptureStats } from "@/lib/api";
 import { tabAllowed } from "@/lib/setupMode";
 import { isTauri } from "@/lib/tauri";
-import { readView,saveView,rotationDetent, rotationFromDetent } from "../remotePreferences";
+import { readView,saveView,readInputLocked,saveInputLocked,rotationDetent, rotationFromDetent } from "../remotePreferences";
 import { useRemoteRotation } from "../useRemoteRotation";
 import { DesktopAppearanceSheet } from './DesktopAppearanceSheet';
 import { setNativePipAspect,clearNativeTransition,nativeDecoderPossible, setNativeDecoderBounds, setStreamPowerActive } from "../nativeDecoder";
@@ -606,6 +609,9 @@ export function ControlScreen({
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const kbdRef = useRef<HTMLInputElement | null>(null);
+  const [inputLocked,setInputLocked]=useState(()=>link.inputLocked?.()??readInputLocked());
+  const inputLockedRef=useRef(inputLocked);
+  useLayoutEffect(()=>{inputLockedRef.current=inputLocked;link.setInputLocked?.(inputLocked);},[inputLocked,link]);
   /** Last WebRTC stream — kept so we can rebind after auth when the track was empty. */
   const pendingStreamRef = useRef<MediaStream | null>(null);
 
@@ -969,6 +975,7 @@ export function ControlScreen({
   // Returns the link's delivery result so gesture feedback (vibration) can be
   // tied to the input actually reaching the PC.
   const send: RemoteLink["send"] = (msg) => {
+    if(inputLockedRef.current&&isControlInput(msg))return false;
     if(msg.type==='move')identifyDisplay(msg.x,msg.y);
     const accepted=link.send(msg);if(!accepted){if(msg.type==='up')setDragging(false);return false;}
     const m = msg as { type?: string; button?: string; dy?: number };
@@ -1106,8 +1113,8 @@ export function ControlScreen({
   }, [heldMouse]);
   const pressHold = (wire: string) => {
     if (heldKeysRef.current.has(wire)) return;
+    if(!send({ type: "keydown", name: wire }))return;
     navigator.vibrate?.(6);
-    send({ type: "keydown", name: wire });
     setHeldKeys((prev) => {
       const next = new Set(prev);
       next.add(wire);
@@ -1127,8 +1134,8 @@ export function ControlScreen({
     if (heldMouseRef.current.has(btn)) return;
     // Don't double-down if sticky drag-lock already has LMB down.
     if (btn === "left" && dragLock) return;
+    if(!send({ type: "down", button: btn }))return;
     navigator.vibrate?.(6);
-    send({ type: "down", button: btn });
     setHeldMouse((prev) => new Set(prev).add(btn));
   };
   const releaseMouseHold = (btn: "left" | "right" | "middle") => {
@@ -1922,7 +1929,7 @@ export function ControlScreen({
   // driver and stream the attached physical controller. Re-runs on reconnect so the
   // pad re-probes; cleanup stops polling and releases the virtual pad to neutral.
   useEffect(() => {
-    if (!controllerOn || !connected) return;
+    if (!controllerOn || !connected || inputLocked) return;
     setPadAvailable(null);
     link.send({ type: "gamepadprobe" }); // host answers via onEvent → setPadAvailable
     const stop = startGamepadBridge((msg) => link.send(msg), {
@@ -1936,7 +1943,7 @@ export function ControlScreen({
       setPadConnected(false);
       link.send({ type: "gamepadstop" });
     };
-  }, [controllerOn, connected, link]);
+  }, [controllerOn, connected, inputLocked, link]);
 
   const clearKbdTimers = () => {
     if (kbdBlurTimer.current != null) {
@@ -1952,6 +1959,7 @@ export function ControlScreen({
   // Capture Surface Keyboard / IME into our ghost field. Must run inside a user
   // gesture on Quest — a late WebRTC "focus" event alone cannot re-raise it.
   const captureKeyboard = () => {
+    if(inputLockedRef.current)return;
     const el = kbdRef.current;
     if (!el) return;
     if (document.activeElement === el) return; // already latched — don't refocus/flicker
@@ -1961,6 +1969,7 @@ export function ControlScreen({
 
   // Host says PC caret is in / out of a text field.
   const handleFocusEvent = (textField: boolean) => {
+    if(inputLockedRef.current)return;
     if (textField) {
       clearKbdTimers();
       questKbdArmedRef.current = false;
@@ -2542,7 +2551,7 @@ export function ControlScreen({
   const followHostCursor = (nx: number, ny: number) => {
     if (pts.current.size > 0) return; // local touch owns the cursor mid-gesture
     cursorRef.current = { x: clamp(nx, 0, 1), y: clamp(ny, 0, 1) };
-    followCursor(liveLayout());
+    if(!inputLockedRef.current)followCursor(liveLayout());
     commitView();
   };
 
@@ -2573,7 +2582,7 @@ export function ControlScreen({
   // ----- gesture state -----
   type P = { x: number; y: number; sx: number; sy: number };
   const pts = useRef<Map<number, P>>(new Map());
-  const gesture = useRef<"none" | "cursor" | "touchdrag" | "two" | "dragging">("none");
+  const gesture = useRef<"none" | "cursor" | "touchdrag" | "two" | "dragging" | "view">("none");
   const twoMode = useRef<"undecided" | "pinch" | "scroll">("undecided");
   const twoStart = useRef({ dist: 0, midX: 0, midY: 0, zoom: 1 });
   const prevMid = useRef<{ x: number; y: number } | null>(null);
@@ -2656,7 +2665,19 @@ export function ControlScreen({
   /** Mouse / pen / Quest surface touchpad — OS already moves an absolute cursor. */
   const isMouseLike = (e: React.PointerEvent) => e.pointerType === "mouse" || e.pointerType === "pen";
 
+  const panViewportBy=(dx:number,dy:number)=>{
+    const l=liveLayout();if(!l)return;
+    panRef.current=clampPan(l,zoomRef.current,panRef.current.x+dx,panRef.current.y+dy,viewportIme());commitView();
+  };
+  const beginLockedView=(e:React.PointerEvent)=>{
+    e.preventDefault();if(isMouseLike(e)&&e.button!==0)return;
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    pts.current.set(e.pointerId,{x:e.clientX,y:e.clientY,sx:e.clientX,sy:e.clientY});gesture.current='view';
+    if(pts.current.size>=2){const[a,b]=[...pts.current.values()];prevMid.current={x:(a.x+b.x)/2,y:(a.y+b.y)/2};twoStart.current={dist:Math.hypot(a.x-b.x,a.y-b.y),midX:prevMid.current.x,midY:prevMid.current.y,zoom:zoomRef.current};}
+  };
+
   const onPointerDown = (e: React.PointerEvent) => {
+    if(inputLockedRef.current){beginLockedView(e);return;}
     if (targetRightClick.onPointerDown(e)) return;
     // Mouse-like right / middle click (Quest surface touchpad two-finger = right).
     if (isMouseLike(e)) {
@@ -2763,6 +2784,14 @@ export function ControlScreen({
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
+    if(inputLockedRef.current){
+      const p=pts.current.get(e.pointerId);if(!p)return;
+      const dx=e.clientX-p.x,dy=e.clientY-p.y;p.x=e.clientX;p.y=e.clientY;
+      if(pts.current.size===1){panViewportBy(dx,dy);return;}
+      const[a,b]=[...pts.current.values()],midX=(a.x+b.x)/2,midY=(a.y+b.y)/2,r=rect();
+      applyZoom(twoStart.current.zoom*Math.hypot(a.x-b.x,a.y-b.y)/(twoStart.current.dist||1),midX-r.left,midY-r.top);
+      panViewportBy(midX-(prevMid.current?.x??midX),midY-(prevMid.current?.y??midY));prevMid.current={x:midX,y:midY};return;
+    }
     if (targetRightClick.onPointerMove(e)) return;
     const p = pts.current.get(e.pointerId);
     // Hover: Quest surface touchpad / mouse / laser-without-trigger send
@@ -2837,6 +2866,12 @@ export function ControlScreen({
   const onWheel = (e: WheelEvent) => {
     // Quest surface touchpad two-finger scroll + mouse wheel.
     e.preventDefault();
+    if(inputLockedRef.current){
+      const scale=e.deltaMode===1?16:e.deltaMode===2?400:1;
+      if(e.ctrlKey){const r=rect();applyZoom(zoomRef.current*Math.exp(-e.deltaY*scale*.002),e.clientX-r.left,e.clientY-r.top);}
+      else panViewportBy(-e.deltaX*scale,-e.deltaY*scale);
+      return;
+    }
     // One notch per EVENT is far too fast on Quest, where holding the thumbstick
     // emits a continuous wheel stream. Bank the raw delta and spend it in whole
     // notches instead, so both the Quest damping and the speed slider bite.
@@ -2863,6 +2898,7 @@ export function ControlScreen({
   }, [link]);
 
   const onPointerUp = (e: React.PointerEvent) => {
+    if(inputLockedRef.current){pts.current.delete(e.pointerId);try{(e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);}catch{}if(pts.current.size<2)prevMid.current=null;if(!pts.current.size)gesture.current='none';return;}
     if (targetRightClick.onPointerUp(e)) return;
     if (!pts.current.has(e.pointerId)) return;
     pts.current.delete(e.pointerId);
@@ -2971,6 +3007,7 @@ export function ControlScreen({
     setMods(new Set());
   };
   const toggleMod = (m: Mod) => {
+    if(inputLockedRef.current)return;
     setMods((prev) => {
       const next = new Set(prev);
       if (next.has(m)) {
@@ -3024,6 +3061,7 @@ export function ControlScreen({
   };
 
   const onKbdInput = () => {
+    if(inputLockedRef.current){resetField();return;}
     // Mirror the field into the compose bar on every input — including during
     // IME composition, so the preview always shows what's really been typed.
     setComposeText(kbdRef.current?.value ?? "");
@@ -3077,6 +3115,7 @@ export function ControlScreen({
   // A ref keeps the latest closures without re-binding the native listener each render.
   const beforeInputRef = useRef<(e: InputEvent) => void>(() => {});
   beforeInputRef.current = (e: InputEvent) => {
+    if(inputLockedRef.current){e.preventDefault();return;}
     if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") {
       e.preventDefault();
       sendPcEnter();
@@ -3093,6 +3132,7 @@ export function ControlScreen({
   }, []);
 
   const onKbdKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if(inputLockedRef.current){e.preventDefault();return;}
     if (e.key === "Enter") {
       e.preventDefault();
       sendPcEnter();
@@ -3171,12 +3211,13 @@ export function ControlScreen({
   // dock is open, collapsed, or immersive — the field is always mounted).
   // Clear before focus so Quest's overwrite-on-open can't look like "delete all".
   const startTyping = () => {
+    if(inputLockedRef.current)return;
     clearKbdTimers();
     questKbdLockedRef.current = true;
     questKbdArmedRef.current = false;
     setTyping(true);
     resetField();
-    window.setTimeout(() => kbdRef.current?.focus({ preventScroll: true }), 30);
+    window.setTimeout(() => {if(!inputLockedRef.current)kbdRef.current?.focus({ preventScroll: true });}, 30);
   };
   const stopTyping = () => {
     clearKbdTimers();
@@ -3187,6 +3228,21 @@ export function ControlScreen({
     setPcTextField(false);
     kbdRef.current?.blur();
     setTyping(false);
+  };
+
+  const toggleInputLock=()=>{
+    const locked=!inputLockedRef.current;
+    // Real transports track every accepted hold (including nested shortcuts).
+    // Keep the UI compatible with simpler links used by embedded clients.
+    if(locked&&!link.setInputLocked){const events:ControlMsg[]=[...[...heldKeysRef.current,...mods].map(name=>({type:'keyup' as const,name})),...[...heldMouseRef.current].map(button=>({type:'up' as const,button}))];if(touchPressed.current||dragLock)events.push({type:'up',button:'left'});if(events.length)link.send({type:'seq',events});}
+    inputLockedRef.current=locked;link.setInputLocked?.(locked);saveInputLocked(locked);setInputLocked(locked);
+    if(locked){setPanel(null);setPinMode(false);}
+    targetRightClick.cancel();clearLong();stopEdgePan();pendingMove.current=null;
+    if(rafId.current!==null){cancelAnimationFrame(rafId.current);rafId.current=null;}
+    for(const id of pts.current.keys())try{viewportRef.current?.releasePointerCapture?.(id);}catch{}
+    pts.current.clear();gesture.current='none';twoMode.current='undecided';prevMid.current=null;touchPressed.current=false;downCount.current=0;wheelAcc.current={x:0,y:0};scrollAcc.current={x:0,y:0};
+    heldKeysRef.current=new Set();heldMouseRef.current=new Set();setHeldKeys(new Set());setHeldMouse(new Set());setMods(new Set());setDragLock(false);setDragging(false);setCursorFx(null);
+    stopTyping();resetField();composing.current=false;
   };
 
   /** Apply zoom from the viewport center (slider / chip). */
@@ -3364,9 +3420,12 @@ export function ControlScreen({
   // Trackpad / Quest: hide the OS pointer and draw RemoteCursor (shape mirrors host).
   // Desktop web mouse/pen: live CSS cursor instead (no double-cursor).
   const showRemoteCursor = mode === "trackpad" || questBrowser;
-  const viewportCssCursor = showRemoteCursor
+  const viewportCssCursor = inputLocked ? 'grab' : showRemoteCursor
     ? "none"
     : cssCursorFor(dragging ? "grab" : cursorKind);
+  const inputLockButton=<button type="button" onClick={toggleInputLock} aria-label={inputLocked?'Unlock remote input':'Lock remote input'} aria-pressed={inputLocked} title={inputLocked?'Input locked — drag to pan, pinch to zoom. Tap to unlock.':'Lock remote input for viewing, panning and zooming'} className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg border active:scale-95 ${inputLocked?'border-amber/40 bg-amber/20 text-amber':'border-transparent bg-white/[0.04] text-ink-soft'}`}>
+    {inputLocked?<LockKeyhole className="h-4 w-4"/>:<UnlockKeyhole className="h-4 w-4"/>}
+  </button>;
 
   return (
     <div
@@ -3459,7 +3518,7 @@ export function ControlScreen({
               </span>
             )}
             {connected && <FpsLatencyPill fps={fps} wcStats={wcStats} net={net} variant="compact" />}
-            {pcTextField && (
+            {pcTextField && !inputLocked && (
               <button
                 onClick={() => kbdRef.current?.focus()}
                 className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-accent-3 active:bg-white/[0.08]"
@@ -3472,6 +3531,7 @@ export function ControlScreen({
           </div>
 
           <div role="group" aria-label="Remote display controls" className="flex min-w-0 items-center gap-1 overflow-x-auto [&>*]:shrink-0" style={{ scrollbarWidth: "none" }}>
+            {inputLockButton}
             {popoutMonitor != null ? (
               <span className="flex h-8 items-center gap-1 rounded-lg bg-accent-3/15 px-2 text-xs font-700 text-accent-3" title={`Display ${popoutMonitor + 1}`} aria-label={`Display ${popoutMonitor + 1}`}>
                 <Monitor className="h-3.5 w-3.5" /> {popoutMonitor + 1}
@@ -3601,6 +3661,7 @@ export function ControlScreen({
 
       {/* ==== viewport — video only; chrome above/below shrinks this, never overlays it ==== */}
       <div className="relative min-h-0 flex-1">
+      {inputLocked&&!pipView&&<div role="status" className="pointer-events-none absolute bottom-2 left-2 z-40 flex items-center gap-1.5 rounded-full border border-amber/25 bg-black/85 px-2 py-1 text-[10px] font-700 text-amber"><LockKeyhole className="h-3 w-3"/>Input locked</div>}
       {viewChanging&&!pipView&&<div role="status" className="pointer-events-none absolute left-1/2 top-2 z-[46] -translate-x-1/2 rounded-full bg-black/80 px-3 py-1 text-xs text-white">Changing view…</div>}
       {decoderMsg && !pipView && (
         <div
@@ -3660,7 +3721,7 @@ export function ControlScreen({
         <button
           type="button"
           aria-pressed={targetRightClick.armed}
-          disabled={!connected}
+          disabled={!connected || inputLocked}
           onClick={targetRightClick.toggle}
           title="Select Right click, then tap a target on the PC screen. Select again to cancel."
           className="absolute right-3 top-3 z-40 flex min-h-11 items-center gap-2 rounded-xl border border-white/20 bg-base px-3 text-sm font-700 text-ink disabled:opacity-50"
@@ -3671,6 +3732,7 @@ export function ControlScreen({
       )}
       <div
         ref={viewportRef}
+        data-testid="remote-viewport"
         className="absolute inset-0 flex items-center justify-center overflow-hidden touch-none"
         style={{ cursor: viewportCssCursor }}
         onPointerDown={onPointerDown}
@@ -3818,6 +3880,7 @@ export function ControlScreen({
             {connected && <FpsLatencyPill fps={fps} wcStats={wcStats} net={net} variant="floating" />}
           </div>
           <div className="pointer-events-auto flex items-center gap-1.5">
+            {inputLockButton}
             <ZoomChip
               zoom={zoom}
               open={zoomOpen}
@@ -4422,7 +4485,7 @@ export function ControlScreen({
       <DesktopAppearanceSheet open={appearanceOpen&&!pipView&&!immersive} onClose={()=>setAppearanceOpen(false)} link={link}/>
 
       {/* ---- free-place pinned quick buttons (drag in Pin mode; positions + styles saved) ---- */}
-      {pinnedDefs.length > 0 && !pipView && (
+      {pinnedDefs.length > 0 && !pipView && !inputLocked && (
         <div
           ref={pinLayerRef}
           className={`pointer-events-none absolute inset-0 z-30 ${pinMode ? "overflow-visible" : "overflow-hidden"}`}
@@ -4474,7 +4537,7 @@ export function ControlScreen({
       )}
 
       {/* ---- free-place scroll strip (one-handed scrolling; drag/resize in Pin mode) ---- */}
-      {scrollPad.on && !pipView && (
+      {scrollPad.on && !pipView && !inputLocked && (
         <div
           ref={scrollPadLayerRef}
           // Pin mode has to show the close/resize handles, which sit outside the
@@ -4526,7 +4589,7 @@ export function ControlScreen({
       </AnimatePresence>
 
       {/* ---- "tap to type" — phone fallback when auto-focus needs a gesture ---- */}
-      {!typing && pcTextField && !questBrowser && !pipView && (
+      {!typing && pcTextField && !questBrowser && !pipView && !inputLocked && (
         <motion.button
           initial={{ y: 20, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
@@ -4549,6 +4612,7 @@ export function ControlScreen({
             animate={{ scale: 1, opacity: 1 }}
             whileTap={{ scale: 0.9 }}
             onClick={() => (typing ? stopTyping() : startTyping())}
+            disabled={inputLocked}
             className={`pointer-events-auto grid h-11 w-11 place-items-center rounded-full border shadow-float backdrop-blur ${
               typing ? "border-accent-3/50 bg-accent-3/30 text-white" : "border-white/15 bg-black/45 text-white/90"
             }`}
@@ -4578,6 +4642,7 @@ export function ControlScreen({
           inside the pinned/shrunk screen stops that. */}
       <input
         ref={kbdRef}
+        disabled={inputLocked}
         onInput={onKbdInput}
         onKeyDown={onKbdKeyDown}
         onCompositionStart={() => (composing.current = true)}
@@ -4586,6 +4651,7 @@ export function ControlScreen({
           onKbdInput();
         }}
         onFocus={() => {
+          if(inputLockedRef.current){kbdRef.current?.blur();return;}
           // Reset diff base on each focus session (Quest overwrite-on-open).
           // Speculative click-capture must not flip phone chrome.
           resetField();
@@ -4744,6 +4810,7 @@ export function ControlScreen({
                   active={dragLock}
                   title={dragLock ? "Drag lock: ON" : "Drag lock (sticky)"}
                   onClick={() => {
+                    if(inputLockedRef.current)return;
                     if (dragLock) {
                       send({ type: "up", button: "left" });
                       setDragLock(false);

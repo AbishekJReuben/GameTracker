@@ -4,7 +4,7 @@ import {afterEach,beforeEach,expect,it,vi} from 'vitest';
 import type {RemoteLink} from '../links';
 import type {RemoteHandshake} from '@/lib/remoteProtocol';
 import type {CaptureIdentity} from '@/lib/captureView';
-import {readView,saveView} from '../remotePreferences';
+import {readView,saveView,readInputLocked} from '../remotePreferences';
 const api=vi.hoisted(()=>({get:vi.fn()}));
 vi.hoisted(()=>{vi.stubGlobal('__APP_VERSION__','test');});
 vi.mock('../link',()=>({apiGet:api.get}));
@@ -36,6 +36,35 @@ beforeEach(()=>{
   vi.spyOn(HTMLMediaElement.prototype,'load').mockImplementation(()=>{});
 });
 afterEach(()=>{cleanup();vi.restoreAllMocks();delete (window as Window & {__GT_PIP_ACTIVE__?:boolean}).__GT_PIP_ACTIVE__;});
+it('keeps the input lock visible with a collapsed toolbar and remembers it on remount',()=>{
+  const f=fixture(),view=render(<ControlScreen link={f.link}/>);
+  fireEvent.click(screen.getByRole('button',{name:'Lock remote input'}));
+  expect(readInputLocked()).toBe(true);expect(screen.getByRole('button',{name:'Unlock remote input'})).toHaveAttribute('aria-pressed','true');
+  fireEvent.click(screen.getByTitle('Hide toolbar'));expect(screen.getByRole('button',{name:'Unlock remote input'})).toBeInTheDocument();
+  view.unmount();render(<ControlScreen link={f.link}/>);expect(screen.getByRole('button',{name:'Unlock remote input'})).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button',{name:'Unlock remote input'}));expect(readInputLocked()).toBe(false);
+});
+it('blocks viewport and keyboard input while still allowing display selection and zoom controls',async()=>{
+  const f=fixture(),{container}=render(<ControlScreen link={f.link}/>);fireEvent.click(screen.getByRole('button',{name:'Lock remote input'}));vi.mocked(f.link.send).mockClear();
+  const viewport=screen.getByTestId('remote-viewport');
+  fireEvent.pointerMove(viewport,{pointerId:1,pointerType:'mouse',clientX:200,clientY:200,buttons:0});
+  fireEvent.pointerDown(viewport,{pointerId:1,pointerType:'mouse',clientX:200,clientY:200,button:0});fireEvent.pointerUp(viewport,{pointerId:1,pointerType:'mouse',button:0});
+  fireEvent.wheel(viewport,{deltaY:100});const input=container.querySelector('input[inputmode="text"]')!;expect(input).toBeDisabled();fireEvent.keyDown(input,{key:'Enter'});fireEvent.input(input,{target:{value:'oops'}});
+  expect(f.link.send).not.toHaveBeenCalled();fireEvent.click(screen.getByRole('button',{name:/Switch display/}));expect(f.request).toHaveBeenCalledWith('single','right',expect.any(Number));
+  fireEvent.click(screen.getByTitle('Zoom (25%–1000%)'));expect(screen.getByRole('slider',{name:'Zoom level'})).toBeEnabled();
+  await act(async()=>{});
+});
+it('pinches and pans the picture locally while the remote cursor stays untouched',async()=>{
+  const f=fixture(),{container}=render(<ControlScreen link={f.link}/>),viewport=screen.getByTestId('remote-viewport');
+  Object.defineProperties(viewport,{clientWidth:{value:1000},clientHeight:{value:600}});vi.spyOn(viewport,'getBoundingClientRect').mockReturnValue({x:0,y:0,left:0,top:0,right:1000,bottom:600,width:1000,height:600,toJSON(){}});
+  const video=container.querySelector('video')!;Object.defineProperties(video,{videoWidth:{value:1920},videoHeight:{value:1080}});fireEvent.loadedMetadata(video);
+  fireEvent.click(screen.getByRole('button',{name:'Lock remote input'}));vi.mocked(f.link.send).mockClear();
+  const pointer=(type:string,id:number,x:number,y:number)=>{const event=new MouseEvent(type,{bubbles:true,clientX:x,clientY:y,button:0,buttons:type==='pointerup'?0:1});Object.defineProperties(event,{pointerId:{value:id},pointerType:{value:'touch'}});fireEvent(viewport,event);};
+  pointer('pointerdown',1,300,300);pointer('pointerdown',2,500,300);pointer('pointermove',2,700,300);
+  await act(async()=>{await new Promise(r=>setTimeout(r,40));});expect(readView().zoom).toBe(2);
+  pointer('pointerup',2,700,300);const before=readView().panX;pointer('pointermove',1,400,300);pointer('pointerup',1,400,300);
+  await act(async()=>{await new Promise(r=>setTimeout(r,40));});expect(readView().panX).toBeGreaterThan(before);expect(f.link.send).not.toHaveBeenCalled();
+});
 it('clears the decoder banner on picture recovery rather than codec initialization',()=>{
   const f=fixture();let notify!:(event:{event:string;[key:string]:unknown})=>void;
   const timers=vi.spyOn(window,'setTimeout'),cancel=vi.spyOn(window,'clearTimeout');

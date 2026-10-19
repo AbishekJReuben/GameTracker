@@ -7,6 +7,7 @@ export const LEGACY_ROTATION_KEY = 'gt.remote.rotationHoldMs';
 export const IDENTITY_KEY = 'gt.remote.identity.v1';
 export const APPEARANCE_KEY = 'gt.remote.appearance.v1';
 export const VIEW_KEY = 'gt.remote.view.v1';
+export const INPUT_LOCK_KEY = 'gt.remote.inputLock.v1';
 export const DEFAULT_ROTATION_MS = 1200;
 export const ROTATION_DETENTS = [0, ...Array.from({ length: 27 }, (_, i) => 400 + i * 100)] as const;
 export const DEFAULT_CONTROLLER_NAME = 'Remote User';
@@ -26,6 +27,8 @@ function write(key: string, value: unknown, store = storage()) {
   if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(REMOTE_PREF_EVENT, { detail: { key } }));
 }
 const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {};
+export function readInputLocked(store = storage()): boolean { return read(INPUT_LOCK_KEY, store) === true; }
+export function saveInputLocked(locked: boolean, store = storage()) { write(INPUT_LOCK_KEY, locked, store); }
 export function validateRotation(value: unknown): number {
   return typeof value === 'number' && Number.isInteger(value) && (value === 0 || value >= 400 && value <= 3000) ? value : DEFAULT_ROTATION_MS;
 }

@@ -5,6 +5,7 @@
  */
 
 import type { CloudConn, ConnectSnapshot, RtcInboundVideoStats, WcStats } from "./cloud";
+import {readInputLocked} from './remotePreferences';
 
 export type ControlMsg =
   | { type: "move"; x: number; y: number }
@@ -46,6 +47,11 @@ export type ControlMsg =
 
 /** Content-optimization mode: tune the pipeline for crisp text or smooth video. */
 export type ContentMode = "auto" | "text" | "video";
+
+/** Viewing controls remain available; everything that can operate the PC is gated. */
+export function isControlInput(msg:ControlMsg):boolean {
+  return !['monitor','auxHost','auxStop','gamepadprobe','gamepadstop'].includes(msg.type);
+}
 
 /** Live stream-quality knobs the phone pushes to the desktop. `bitrate` (kbps) caps
  * the WebRTC encoder directly; 0/undefined means auto (derived from resolution/fps).
@@ -124,6 +130,9 @@ export interface RemoteLink {
    * this so the phone never confirms an action the PC will never receive.
    */
   send(msg: ControlMsg): boolean;
+  inputLocked?():boolean;
+  /** Releases held input before entering view-only mode. */
+  setInputLocked?(locked:boolean):void;
   /** Re-tune the live screen stream (resolution / JPEG quality / frame rate). */
   setQuality(q: QualitySettings): void;
   /**
@@ -165,6 +174,36 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
   // even if every lossy packet in between was dropped.
   let unanchoredMove: ControlMsg | null = null;
   let lastAbsolute:{point:[number,number];epoch:number;session:string}|undefined;let maxWidth=1920;
+  let inputLocked=readInputLocked(),padActive=false;
+  const heldKeys=new Set<string>(),heldButtons=new Set<string>();
+  const trackHeld=(msg:ControlMsg)=>{
+    if(msg.type==='seq'){msg.events.forEach(trackHeld);return;}
+    if(msg.type==='keydown')heldKeys.add(msg.name);
+    if(msg.type==='keyup')heldKeys.delete(msg.name);
+    if(msg.type==='down')heldButtons.add(msg.button??'left');
+    if(msg.type==='up')heldButtons.delete(msg.button??'left');
+    if(msg.type==='gamepad')padActive=true;
+    if(msg.type==='gamepadstop')padActive=false;
+  };
+  const transmit=(msg:ControlMsg):boolean=>{
+    if(conn.remoteHandshake?.capabilities.includes('view-epoch-input-v1')){
+      if(msg.type==='gamepadprobe'||msg.type==='auxHost'||msg.type==='auxStop')return conn.sendControl(msg);
+      if(msg.type==='monitor'){const display=conn.remoteHandshake.layout.displays.find(d=>d.index===msg.index);return !!display&&conn.requestRemoteView('single',display.id,maxWidth);}
+      if(msg.type==='move'){const accepted=conn.sendViewInput(msg,true),view=conn.displayedView;if(accepted&&view)lastAbsolute={point:[msg.x,msg.y],epoch:view.view.epoch,session:view.sessionId};return accepted;}
+      if(msg.type==='moverel')lastAbsolute=undefined;
+      const view=conn.displayedView,valid=lastAbsolute&&view&&lastAbsolute.epoch===view.view.epoch&&lastAbsolute.session===view.sessionId;
+      if(!valid)lastAbsolute=undefined;
+      const anchor=msg.type==='click'&&typeof msg.x==='number'&&typeof msg.y==='number'?[msg.x,msg.y] as [number,number]:msg.type==='click'||msg.type==='down'||msg.type==='up'?lastAbsolute?.point:undefined;
+      return conn.sendViewInput(msg,false,anchor);
+    }
+    // Absolute moves remain lossy; button events first anchor the last position
+    // on the reliable channel. Relative movement must never be replayed.
+    if(msg.type==='move'){unanchoredMove=msg;return conn.sendMove(msg);}
+    if(unanchoredMove&&(msg.type==='click'||msg.type==='down'||msg.type==='up')){
+      conn.sendControl(unanchoredMove);unanchoredMove=null;
+    }
+    return conn.sendControl(msg);
+  };
   return {
     onStream(cb) {
       return conn.onStream(cb);
@@ -182,31 +221,21 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
       return conn.onProgress(cb);
     },
     send(msg) {
-      if(conn.remoteHandshake?.capabilities.includes('view-epoch-input-v1')){
-        if(msg.type==='gamepadprobe'||msg.type==='auxHost'||msg.type==='auxStop')return conn.sendControl(msg);
-        if(msg.type==='monitor'){const display=conn.remoteHandshake.layout.displays.find(d=>d.index===msg.index);return !!display&&conn.requestRemoteView('single',display.id,maxWidth);}
-        if(msg.type==='move'){const accepted=conn.sendViewInput(msg,true),view=conn.displayedView;if(accepted&&view)lastAbsolute={point:[msg.x,msg.y],epoch:view.view.epoch,session:view.sessionId};return accepted;}
-        if(msg.type==='moverel')lastAbsolute=undefined;
-        const view=conn.displayedView,valid=lastAbsolute&&view&&lastAbsolute.epoch===view.view.epoch&&lastAbsolute.session===view.sessionId;
-        if(!valid)lastAbsolute=undefined;
-        const anchor=msg.type==='click'&&typeof msg.x==='number'&&typeof msg.y==='number'?[msg.x,msg.y] as [number,number]:msg.type==='click'||msg.type==='down'||msg.type==='up'?lastAbsolute?.point:undefined;
-        return conn.sendViewInput(msg,false,anchor);
-      }
-      // Absolute pointer moves are idempotent and superseded by the next one, so
-      // they ride the unordered/no-retransmit "move" channel: a dropped packet
-      // never delays fresher input, and a burst of moves can't head-of-line
-      // block clicks/keys behind a stale retransmit on the control stream.
-      // (Relative moves would double-apply if re-anchored — they stay reliable,
-      // as does everything else.)
-      if (msg.type === "move") {
-        unanchoredMove = msg;
-        return conn.sendMove(msg);
-      }
-      if (unanchoredMove && (msg.type === "click" || msg.type === "down" || msg.type === "up")) {
-        conn.sendControl(unanchoredMove);
-        unanchoredMove = null;
-      }
-      return conn.sendControl(msg);
+      if(inputLocked&&isControlInput(msg))return false;
+      const accepted=transmit(msg);if(accepted)trackHeld(msg);return accepted;
+    },
+    inputLocked(){return inputLocked;},
+    setInputLocked(locked){
+      if(inputLocked===locked)return;inputLocked=locked;
+      // Never move the cursor when releasing a held mouse button, nor replay an
+      // old lossy anchor on the first action after unlocking.
+      unanchoredMove=null;lastAbsolute=undefined;
+      if(!locked)return;
+      const releases:ControlMsg[]=[...heldButtons].map(button=>({type:'up',button}));
+      releases.push(...[...heldKeys].map(name=>({type:'keyup' as const,name})));
+      if(padActive)releases.push({type:'gamepadstop'});
+      if(releases.length)transmit({type:'seq',events:releases});
+      heldButtons.clear();heldKeys.clear();padActive=false;
     },
     setQuality(q) {
       maxWidth=q.maxW;
