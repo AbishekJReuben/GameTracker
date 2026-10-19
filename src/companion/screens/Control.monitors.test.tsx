@@ -36,6 +36,15 @@ beforeEach(()=>{
   vi.spyOn(HTMLMediaElement.prototype,'load').mockImplementation(()=>{});
 });
 afterEach(()=>{cleanup();vi.restoreAllMocks();delete (window as Window & {__GT_PIP_ACTIVE__?:boolean}).__GT_PIP_ACTIVE__;});
+it('opens browser Notes without remounting video, pauses input locally, then restores the lock choice',async()=>{
+  const f=fixture(),lock=vi.fn(),sink=vi.fn();f.link.setInputLocked=lock;f.link.noteVideoSink=sink;
+  const {container}=render(<ControlScreen link={f.link}/>),video=container.querySelector('video');
+  fireEvent.click(screen.getByRole('button',{name:'Open notes'}));await screen.findByRole('dialog',{name:'Notes'});
+  expect(lock).toHaveBeenLastCalledWith(true);expect(readInputLocked()).toBe(false);expect(container.querySelector('video')).toBe(video);expect(sink).toHaveBeenCalledExactlyOnceWith(true);
+  vi.mocked(f.link.send).mockClear();fireEvent.pointerMove(screen.getByTestId('remote-viewport'),{pointerType:'mouse',buttons:0});expect(f.link.send).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button',{name:'Close notes'}));expect(lock).toHaveBeenLastCalledWith(false);expect(container.querySelector('video')).toBe(video);
+  fireEvent.click(screen.getByRole('button',{name:'Lock remote input'}));fireEvent.click(screen.getByRole('button',{name:'Open notes'}));await screen.findByRole('dialog',{name:'Notes'});fireEvent.click(screen.getByRole('button',{name:'Close notes'}));expect(lock).toHaveBeenLastCalledWith(true);expect(readInputLocked()).toBe(true);
+});
 it('keeps the input lock visible with a collapsed toolbar and remembers it on remount',()=>{
   const f=fixture(),view=render(<ControlScreen link={f.link}/>);
   fireEvent.click(screen.getByRole('button',{name:'Lock remote input'}));

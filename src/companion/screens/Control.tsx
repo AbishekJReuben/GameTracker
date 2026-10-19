@@ -1,4 +1,5 @@
-import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createContext, Suspense, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {lazyRoute} from '@/lib/lazyRoute';
 import { frameToDesktop,displayAt,videoContentRect,visibleDisplayIds } from '@/lib/displayLayout';
 import type { CaptureIdentity } from '@/lib/captureView';
 import type { EpochStream } from '@/lib/epochVideo';
@@ -149,6 +150,7 @@ import {
   type ToolbarId,
 } from "../controlChrome";
 import { PinEditorSheet } from "../components/PinEditorSheet";
+const BrowserNotesPanel=lazyRoute(()=>import('./BrowserNotesPanel'));
 
 type HostRtcStats = {
   sendKbps: number;
@@ -610,8 +612,10 @@ export function ControlScreen({
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const kbdRef = useRef<HTMLInputElement | null>(null);
   const [inputLocked,setInputLocked]=useState(()=>link.inputLocked?.()??readInputLocked());
+  const [notesOpen,setNotesOpen]=useState(false);
   const inputLockedRef=useRef(inputLocked);
-  useLayoutEffect(()=>{inputLockedRef.current=inputLocked;link.setInputLocked?.(inputLocked);},[inputLocked,link]);
+  useLayoutEffect(()=>{const blocked=inputLocked||notesOpen;inputLockedRef.current=blocked;link.setInputLocked?.(blocked);},[inputLocked,notesOpen,link]);
+  useEffect(()=>()=>{link.setInputLocked?.(readInputLocked());},[link]);
   /** Last WebRTC stream — kept so we can rebind after auth when the track was empty. */
   const pendingStreamRef = useRef<MediaStream | null>(null);
 
@@ -1929,7 +1933,7 @@ export function ControlScreen({
   // driver and stream the attached physical controller. Re-runs on reconnect so the
   // pad re-probes; cleanup stops polling and releases the virtual pad to neutral.
   useEffect(() => {
-    if (!controllerOn || !connected || inputLocked) return;
+    if (!controllerOn || !connected || inputLocked || notesOpen) return;
     setPadAvailable(null);
     link.send({ type: "gamepadprobe" }); // host answers via onEvent → setPadAvailable
     const stop = startGamepadBridge((msg) => link.send(msg), {
@@ -1943,7 +1947,7 @@ export function ControlScreen({
       setPadConnected(false);
       link.send({ type: "gamepadstop" });
     };
-  }, [controllerOn, connected, inputLocked, link]);
+  }, [controllerOn, connected, inputLocked, notesOpen, link]);
 
   const clearKbdTimers = () => {
     if (kbdBlurTimer.current != null) {
@@ -3230,19 +3234,30 @@ export function ControlScreen({
     setTyping(false);
   };
 
-  const toggleInputLock=()=>{
-    const locked=!inputLockedRef.current;
+  const releaseSimpleHolds=()=>{
     // Real transports track every accepted hold (including nested shortcuts).
     // Keep the UI compatible with simpler links used by embedded clients.
-    if(locked&&!link.setInputLocked){const events:ControlMsg[]=[...[...heldKeysRef.current,...mods].map(name=>({type:'keyup' as const,name})),...[...heldMouseRef.current].map(button=>({type:'up' as const,button}))];if(touchPressed.current||dragLock)events.push({type:'up',button:'left'});if(events.length)link.send({type:'seq',events});}
-    inputLockedRef.current=locked;link.setInputLocked?.(locked);saveInputLocked(locked);setInputLocked(locked);
-    if(locked){setPanel(null);setPinMode(false);}
+    if(!link.setInputLocked){const events:ControlMsg[]=[...[...heldKeysRef.current,...mods].map(name=>({type:'keyup' as const,name})),...[...heldMouseRef.current].map(button=>({type:'up' as const,button}))];if(touchPressed.current||dragLock)events.push({type:'up',button:'left'});if(events.length)link.send({type:'seq',events});}
+  };
+  const clearLocalInput=()=>{
     targetRightClick.cancel();clearLong();stopEdgePan();pendingMove.current=null;
     if(rafId.current!==null){cancelAnimationFrame(rafId.current);rafId.current=null;}
     for(const id of pts.current.keys())try{viewportRef.current?.releasePointerCapture?.(id);}catch{}
     pts.current.clear();gesture.current='none';twoMode.current='undecided';prevMid.current=null;touchPressed.current=false;downCount.current=0;wheelAcc.current={x:0,y:0};scrollAcc.current={x:0,y:0};
     heldKeysRef.current=new Set();heldMouseRef.current=new Set();setHeldKeys(new Set());setHeldMouse(new Set());setMods(new Set());setDragLock(false);setDragging(false);setCursorFx(null);
     stopTyping();resetField();composing.current=false;
+  };
+  const toggleInputLock=()=>{
+    const locked=!inputLocked;if(locked)releaseSimpleHolds();
+    const blocked=locked||notesOpen;inputLockedRef.current=blocked;link.setInputLocked?.(blocked);saveInputLocked(locked);setInputLocked(locked);
+    if(locked){setPanel(null);setPinMode(false);}clearLocalInput();
+  };
+  const openBrowserNotes=()=>{
+    releaseSimpleHolds();inputLockedRef.current=true;link.setInputLocked?.(true);
+    clearLocalInput();setNotesOpen(true);
+  };
+  const closeBrowserNotes=()=>{
+    inputLockedRef.current=inputLocked;link.setInputLocked?.(inputLocked);setNotesOpen(false);
   };
 
   /** Apply zoom from the viewport center (slider / chip). */
@@ -3426,6 +3441,7 @@ export function ControlScreen({
   const inputLockButton=<button type="button" onClick={toggleInputLock} aria-label={inputLocked?'Unlock remote input':'Lock remote input'} aria-pressed={inputLocked} title={inputLocked?'Input locked — drag to pan, pinch to zoom. Tap to unlock.':'Lock remote input for viewing, panning and zooming'} className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg border active:scale-95 ${inputLocked?'border-amber/40 bg-amber/20 text-amber':'border-transparent bg-white/[0.04] text-ink-soft'}`}>
     {inputLocked?<LockKeyhole className="h-4 w-4"/>:<UnlockKeyhole className="h-4 w-4"/>}
   </button>;
+  const notesButton=!isTauri()&&<button type="button" onClick={openBrowserNotes} aria-label="Open notes" title="Notes — copy desktop clipboard items" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white/[0.04] text-ink-soft active:scale-95"><NotebookPen className="h-4 w-4"/></button>;
 
   return (
     <div
@@ -3474,7 +3490,7 @@ export function ControlScreen({
                   <button
                     onClick={() => {
                       setNavOpen(false);
-                      onNavigate("clipboard");
+                      if(!isTauri())openBrowserNotes();else onNavigate("clipboard");
                     }}
                     className="flex items-center gap-2 rounded-xl bg-accent-3/15 px-3 py-2 text-left text-sm font-700 text-accent-3 active:bg-accent-3/25"
                   >
@@ -3532,6 +3548,7 @@ export function ControlScreen({
 
           <div role="group" aria-label="Remote display controls" className="flex min-w-0 items-center gap-1 overflow-x-auto [&>*]:shrink-0" style={{ scrollbarWidth: "none" }}>
             {inputLockButton}
+            {notesButton}
             {popoutMonitor != null ? (
               <span className="flex h-8 items-center gap-1 rounded-lg bg-accent-3/15 px-2 text-xs font-700 text-accent-3" title={`Display ${popoutMonitor + 1}`} aria-label={`Display ${popoutMonitor + 1}`}>
                 <Monitor className="h-3.5 w-3.5" /> {popoutMonitor + 1}
@@ -3881,6 +3898,7 @@ export function ControlScreen({
           </div>
           <div className="pointer-events-auto flex items-center gap-1.5">
             {inputLockButton}
+            {notesButton}
             <ZoomChip
               zoom={zoom}
               open={zoomOpen}
@@ -4483,6 +4501,7 @@ export function ControlScreen({
         env={{ nativePossible: nativeDecoderPossible() }}
       />
       <DesktopAppearanceSheet open={appearanceOpen&&!pipView&&!immersive} onClose={()=>setAppearanceOpen(false)} link={link}/>
+      {notesOpen&&!pipView&&<Suspense fallback={<div role="status" className="fixed inset-0 z-[100] grid place-items-center bg-black/80 text-sm text-white">Opening Notes…<button type="button" onClick={closeBrowserNotes}>Close notes</button></div>}><BrowserNotesPanel onClose={closeBrowserNotes}/></Suspense>}
 
       {/* ---- free-place pinned quick buttons (drag in Pin mode; positions + styles saved) ---- */}
       {pinnedDefs.length > 0 && !pipView && !inputLocked && (
@@ -4642,7 +4661,7 @@ export function ControlScreen({
           inside the pinned/shrunk screen stops that. */}
       <input
         ref={kbdRef}
-        disabled={inputLocked}
+        disabled={inputLocked || notesOpen}
         onInput={onKbdInput}
         onKeyDown={onKbdKeyDown}
         onCompositionStart={() => (composing.current = true)}
