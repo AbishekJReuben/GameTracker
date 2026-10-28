@@ -15,7 +15,7 @@
 //! Panics are written to `crash.log` in the data folder (see `install_panic_log`).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 pub const HOST_ARG: &str = "--remote-host";
@@ -25,6 +25,22 @@ const HOST_MUTEX: &str = "Local\\GameTrackerRemoteHost-v1";
 const UPDATE_GRACE: Duration = Duration::from_secs(5 * 60);
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// A host whose page never loads (or stops) still holds its mutex, so the
+/// main app believes remote access is up while phones sit on "PC online".
+/// Seen 2026-10-28: WebView2 started its browser and GPU processes but never a
+/// renderer, `build()` blocked for 90 minutes, and nothing restarted it. Both
+/// sides now watch the page's 1 s heartbeat (`remote_host_publish`). Silence is
+/// counted in loop ticks, not wall time, so a PC asleep through the gap never
+/// reads as a hang on resume.
+static PUBLISHES: AtomicU64 = AtomicU64::new(0);
+/// Host: 5 s ticks without a heartbeat before it gives up on its own page.
+const HOST_START_TICKS: u32 = 12; // 60 s for the first page load
+const HOST_STALL_TICKS: u32 = 9; // 45 s once it has been running
+/// Main app: 3 s ticks of a stale status before ending the host from outside
+/// (the backstop for a host whose own threads are stuck too).
+const MAIN_STALE_TICKS: u32 = 40; // 120 s
+const STATUS_FRESH_MS: i64 = 20_000;
 
 /// One line per supervision event in `hostproc.log` (kept small): spawns,
 /// restarts and host startup stages, so a host that won't stay up is diagnosable.
@@ -264,6 +280,65 @@ pub fn host_running() -> bool {
     mutex::exists(HOST_MUTEX)
 }
 
+fn heartbeat_stalled(silent_ticks: u32, ever_published: bool) -> bool {
+    silent_ticks >= if ever_published { HOST_STALL_TICKS } else { HOST_START_TICKS }
+}
+
+/// Host: the page reported in.
+pub fn note_published() {
+    PUBLISHES.fetch_add(1, Ordering::Relaxed);
+}
+
+fn status_age_ms() -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(status_path()).ok()?).ok()?;
+    Some(chrono::Utc::now().timestamp_millis() - v.get("updatedMs")?.as_i64()?)
+}
+
+/// Main app: end a host that holds the mutex but whose page has gone silent.
+/// Only a process running this same exe is ever touched.
+#[cfg(windows)]
+fn end_stuck_host() -> bool {
+    use windows::core::{w, PWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
+    let own = std::process::id();
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let mut candidates: Vec<u32> = Vec::new();
+    if let Some(pid) = std::fs::read_to_string(flag("remote-host.pid")).ok().and_then(|s| s.trim().parse().ok()) {
+        candidates.push(pid);
+    }
+    // Hosts from before the pid file: their window is titled "Tracker Remote".
+    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("Tracker Remote")) } {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        candidates.push(pid);
+    }
+    for pid in candidates.into_iter().filter(|&p| p != 0 && p != own) {
+        let Ok(h) = (unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { continue };
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ours = unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) }.is_ok()
+            && String::from_utf16_lossy(&buf[..len as usize]).eq_ignore_ascii_case(&exe.to_string_lossy());
+        let ended = ours && unsafe { TerminateProcess(h, 77) }.is_ok();
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        trace(&format!("stuck host pid {pid}: ours={ours} ended={ended}"));
+        if ended {
+            return true;
+        }
+    }
+    false
+}
+#[cfg(not(windows))]
+fn end_stuck_host() -> bool {
+    false
+}
+
 // ---- shared remote state across the two processes ----------------------------
 
 /// The host process follows the Remote page through the database: the switch,
@@ -324,9 +399,23 @@ pub fn supervise_host() {
         .spawn(|| {
             let mut backoff = Duration::from_secs(5);
             let mut last_spawn: Option<Instant> = None;
+            let mut stale_ticks = 0u32;
             loop {
                 if QUITTING.load(Ordering::SeqCst) {
                     return;
+                }
+                let updating = flag_age("updating.flag").is_some_and(|a| a < UPDATE_GRACE);
+                if mutex::exists(HOST_MUTEX) && !updating && !status_age_ms().is_some_and(|a| a < STATUS_FRESH_MS) {
+                    stale_ticks += 1;
+                    if stale_ticks >= MAIN_STALE_TICKS {
+                        stale_ticks = 0;
+                        trace("remote host holds its mutex but its page is silent: ending it");
+                        if end_stuck_host() {
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                } else {
+                    stale_ticks = 0;
                 }
                 if !mutex::exists(HOST_MUTEX) && last_spawn.map_or(true, |t| t.elapsed() >= backoff) {
                     // Decided once per respawn (not per check): a host that died
@@ -352,7 +441,41 @@ pub fn supervise_host() {
 pub fn host_started() -> bool {
     let ok = mutex::claim(HOST_MUTEX);
     trace(&format!("host starting, claimed host mutex: {ok}"));
+    if ok {
+        let _ = std::fs::write(flag("remote-host.pid"), std::process::id().to_string());
+    }
     ok
+}
+
+/// Host: exit when the page never loads or stops reporting, so the main app's
+/// supervisor starts a fresh host (and phones reconnect) instead of waiting
+/// forever behind a mutex this process still holds.
+pub fn watch_host_page() {
+    std::thread::Builder::new()
+        .name("remote-host-heartbeat".into())
+        .spawn(|| {
+            let (mut seen, mut silent, mut ever) = (PUBLISHES.load(Ordering::Relaxed), 0u32, false);
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                if flag("quit.flag").exists() || flag_age("updating.flag").is_some_and(|a| a < UPDATE_GRACE) {
+                    silent = 0;
+                    continue;
+                }
+                let now = PUBLISHES.load(Ordering::Relaxed);
+                if now != seen {
+                    (seen, silent, ever) = (now, 0, true);
+                    continue;
+                }
+                silent += 1;
+                if heartbeat_stalled(silent, ever) {
+                    trace(&format!("host page silent for {}s (loaded before: {ever}); exiting for a fresh host", silent * 5));
+                    let released = crate::remote::input::release_for_recovery();
+                    trace(&format!("remote-owned input released before recovery: {released}"));
+                    std::process::exit(76);
+                }
+            }
+        })
+        .ok();
 }
 
 /// Capture workers can wedge while the process and renderer remain alive. A
@@ -440,6 +563,15 @@ mod tests {
         }
         std::panic::set_hook(prev);
         assert_eq!(runs.load(Ordering::SeqCst), 2, "ran again after the panic, then stopped");
+    }
+
+    #[test]
+    fn a_silent_host_page_is_given_up_on_only_after_its_grace() {
+        assert!(!heartbeat_stalled(HOST_START_TICKS - 1, false), "first load gets the long grace");
+        assert!(heartbeat_stalled(HOST_START_TICKS, false));
+        assert!(!heartbeat_stalled(HOST_STALL_TICKS - 1, true));
+        assert!(heartbeat_stalled(HOST_STALL_TICKS, true), "a page that stopped reporting");
+        assert!(HOST_START_TICKS * 5 < MAIN_STALE_TICKS * 3, "the host gives up before the main app steps in");
     }
 
     #[cfg(windows)]

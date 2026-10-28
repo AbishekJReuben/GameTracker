@@ -3143,6 +3143,7 @@ pub fn voice_test(kind: String) -> AppResult<()> {
 /// Host window → its live status (connected phones, stream stats, stream log).
 #[tauri::command]
 pub fn remote_host_publish(state: State<AppState>, info: serde_json::Value) {
+    crate::hostproc::note_published();
     crate::hostproc::write_status(info, &state.remote);
 }
 

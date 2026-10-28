@@ -2073,6 +2073,14 @@ single-instance). It owns the WebRTC host (`/remote-host` route → `RemoteHostA
   stream stats and (every 5 s) the stream log via `remote_host_publish`; the main app reads it
   with `remote_host_info` (fresh < 10 s and host mutex held) for the Remote page.
 - `hostproc.log` traces every spawn/restart and host startup stage.
+- **A live mutex is not a live host (3.9.123).** A host whose WebView2 never created its
+  renderer sat in `build()` for 90 min holding the mutex: the Remote page showed "Starting…",
+  phones stuck on "PC online", and nothing restarted it. The page's 1 s `remote_host_publish`
+  is now the heartbeat: the host exits (code 76) after 60 s with no first heartbeat or 45 s
+  of silence (`watch_host_page`), and the main app's supervisor ends a host whose
+  `remote-host.json` has been stale for 120 s (`end_stuck_host`: pid from `remote-host.pid`,
+  else the "Tracker Remote" window; only a process running this same exe). Silence is
+  counted in loop ticks, not wall time, so sleep/resume never reads as a hang.
 - Verified on this PC by killing processes (elevated script): main killed → host stayed up and
   kept publishing, relaunched main in ~18 s; host killed → respawned in ~3 s.
 
