@@ -31,7 +31,7 @@ mod input{pub fn release_session(_: &str){}}
         while Instant::now()<deadline {if overlay::snapshot().windows==windows{return true;}std::thread::sleep(Duration::from_millis(10));}false
     }
     fn update(h:&presence::Handshake,sequence:u64,visible:bool,name:&str)->presence::PresenceUpdate {
-        presence::PresenceUpdate{sequence,display_name:name.into(),control_visible:visible,pip_visible:false,immersive_visible:false,mode:h.view.mode,view_epoch:h.view.epoch,selected_display_id:h.view.selected_display_id.clone(),visible_display_ids:h.view.displays.iter().map(|d|d.id.clone()).collect(),appearance:serde_json::Value::Null}
+        presence::PresenceUpdate{sequence,display_name:name.into(),control_visible:visible,pip_visible:false,immersive_visible:false,mode:h.view.mode,view_epoch:h.view.epoch,selected_display_id:h.view.selected_display_id.clone(),visible_display_ids:h.view.displays.iter().map(|d|d.id.clone()).collect(),appearance:serde_json::Value::Null,view_rect:None}
     }
     let mut checks=Vec::new();
     let mut check=|name:&str,passed:bool| {checks.push(serde_json::json!({"name":name,"passed":passed}));};
@@ -103,12 +103,12 @@ mod input{pub fn release_session(_: &str){}}
     // An actual invalid swap-chain/window request must be hidden and publicly
     // reported per display, rather than leaving a stale green availability bit.
     let mut invalid=display::snapshot().displays[0].clone();invalid.id="invalid-probe-display".into();invalid.width=0;
-    overlay::refresh(vec![overlay::OverlayDisplay{display:invalid.clone(),names:vec!["Remote User".into()],appearance:Default::default(),session_ids:vec!["probe-fault".into()],announcement_at:None,announcement_seconds:3.}]);
+    overlay::refresh(vec![overlay::OverlayDisplay{display:invalid.clone(),names:vec!["Remote User".into()],appearance:Default::default(),session_ids:vec!["probe-fault".into()],announcement_at:None,announcement_seconds:3.,lenses:Vec::new()}]);
     let deadline=Instant::now()+Duration::from_millis(200);let mut failure=overlay::status();
     while !failure.degraded&&Instant::now()<deadline {std::thread::sleep(Duration::from_millis(2));failure=overlay::status();}
     check("real window failure is hidden and exposed per display",failure.degraded&&failure.failed_displays.contains_key("invalid-probe-display")&&failure.active_display_ids.is_empty()&&overlay::snapshot().windows==0);
     invalid.width=display::snapshot().displays[0].width;
-    overlay::refresh(vec![overlay::OverlayDisplay{display:invalid,names:vec!["Remote User".into()],appearance:Default::default(),session_ids:vec!["probe-fault".into()],announcement_at:None,announcement_seconds:3.}]);
+    overlay::refresh(vec![overlay::OverlayDisplay{display:invalid,names:vec!["Remote User".into()],appearance:Default::default(),session_ids:vec!["probe-fault".into()],announcement_at:None,announcement_seconds:3.,lenses:Vec::new()}]);
     let deadline=Instant::now()+Duration::from_millis(200);let mut recovered=overlay::status();
     while (recovered.degraded||recovered.active_display_ids.is_empty())&&Instant::now()<deadline {std::thread::sleep(Duration::from_millis(2));recovered=overlay::status();}
     check("same display recovers truthful availability in one scene update",recovered.available&&!recovered.degraded&&recovered.failed_displays.is_empty()&&recovered.message.is_none()&&recovered.active_display_ids==vec!["invalid-probe-display".to_string()]);

@@ -5,8 +5,8 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize,Serialize};
 use serde_json::Value;
-use super::{appearance::{Appearance,display_name},display::{self,DisplaySnapshot},view::{AppliedView,ViewMode}};
-pub const CAPABILITIES:&[&str]=&["display-geometry-v1","all-screens-v1","view-state-v1","controller-name-v1","desktop-appearance-v1","view-epoch-input-v1"];
+use super::{appearance::{Appearance,display_name},display::{self,DisplaySnapshot,PhysicalRect},view::{AppliedView,ViewMode}};
+pub const CAPABILITIES:&[&str]=&["display-geometry-v1","all-screens-v1","view-state-v1","controller-name-v1","desktop-appearance-v1","view-epoch-input-v1","viewport-v1"];
 pub const PRESENCE_TTL_MS:u64=6500;
 const HISTORY_MS:u64=60_000;
 #[derive(Clone,Debug,Serialize)]
@@ -21,6 +21,8 @@ pub struct PresenceUpdate {
     #[serde(default)] pub control_visible:bool,#[serde(default)] pub pip_visible:bool,#[serde(default)] pub immersive_visible:bool,
     pub mode:ViewMode,pub view_epoch:u64,pub selected_display_id:String,
     #[serde(default)] pub visible_display_ids:Vec<String>,#[serde(default)] pub appearance:Value,
+    /// viewport-v1: what the viewer actually sees, in physical desktop pixels.
+    #[serde(default)] pub view_rect:Option<PhysicalRect>,
 }
 #[derive(Clone,Debug)]
 pub struct Entry {
@@ -28,11 +30,25 @@ pub struct Entry {
     pub selected_display_id:String,
     pub expired:bool,
     pub visible_ids:Vec<String>,pub control:bool,pub pip:bool,pub immersive:bool,pub appearance:Appearance,
+    pub view_rect:Option<PhysicalRect>,
     pub last_valid_ms:u64,pub sequence:u64,pub announcement_at:Option<u64>,pub announcement_seconds:f32,
 }
 impl Entry {
     pub fn input_active(&self)->bool{self.control||self.pip||self.immersive}
     pub fn visible(&self)->bool {self.input_active()&&!self.visible_ids.is_empty()}
+}
+/// Intersection, or None when it is empty or degenerate.
+fn clip(r:PhysicalRect,bounds:PhysicalRect)->Option<PhysicalRect> {
+    let (l,t)=(r.x.max(bounds.x) as i64,r.y.max(bounds.y) as i64);
+    let right=(r.x as i64+r.width as i64).min(bounds.x as i64+bounds.width as i64);
+    let bottom=(r.y as i64+r.height as i64).min(bounds.y as i64+bounds.height as i64);
+    (right-l>=8&&bottom-t>=8).then(||PhysicalRect{x:l as i32,y:t as i32,width:(right-l) as u32,height:(bottom-t) as u32})
+}
+/// A lens is drawn on a display only while it marks out a real part of it.
+/// Near fit (≈ zoom 1.05×) it would just retrace the screen-edge border.
+pub(crate) const LENS_MAX_COVERAGE:f64=0.88;
+fn lens_on(display:PhysicalRect,view:PhysicalRect)->bool {
+    clip(view,display).is_some_and(|c|(c.width as f64*c.height as f64)<LENS_MAX_COVERAGE*display.width as f64*display.height as f64)
 }
 fn became_inactive(was_active:bool,entry:&Entry)->bool{was_active&&!entry.input_active()}
 #[derive(Default)]
@@ -48,7 +64,7 @@ impl Registry {
         if self.entries.len()>=16 {return false;}
         self.owners.insert(key,sid.to_owned());
         let selected_display_id=view.selected_display_id.clone();
-        self.entries.insert(sid.to_owned(),Entry {session_id:sid.into(),device_id:device.into(),scope:scope.into(),name:display_name(name),view,selected_display_id,expired:false,visible_ids:Vec::new(),control:false,pip:false,immersive:false,appearance:Appearance::default(),last_valid_ms:now,sequence:0,announcement_at:None,announcement_seconds:3.});true
+        self.entries.insert(sid.to_owned(),Entry {session_id:sid.into(),device_id:device.into(),scope:scope.into(),name:display_name(name),view,selected_display_id,expired:false,visible_ids:Vec::new(),control:false,pip:false,immersive:false,appearance:Appearance::default(),view_rect:None,last_valid_ms:now,sequence:0,announcement_at:None,announcement_seconds:3.});true
     }
     pub fn update(&mut self,sid:&str,update:PresenceUpdate,now:u64)->bool {
         let Some(entry)=self.entries.get_mut(sid) else{return false;};
@@ -61,6 +77,7 @@ impl Registry {
         entry.visible_ids=update.visible_display_ids.into_iter().take(16).filter(|id|entry.view.displays.iter().any(|d|d.id==*id)&&seen.insert(id.clone())&&(!entry.pip||*id==entry.selected_display_id)).collect();
         if !(entry.control||entry.pip||entry.immersive) {entry.visible_ids.clear();}
         entry.appearance=Appearance::validate(&update.appearance);
+        entry.view_rect=if entry.control {update.view_rect.and_then(|r|clip(r,entry.view.source))} else {None};
         if entry.visible() {
             let key=(entry.device_id.clone(),entry.scope.clone());
             let history=self.history.entry(key).or_insert((now,now,entry.appearance.number("label.announcementSeconds")));
@@ -84,7 +101,7 @@ impl Registry {
         // return must revive the same authorized session without a reconnect.
         let mut retired_input=Vec::new();
         for entry in self.entries.values_mut().filter(|e|!e.expired&&now.saturating_sub(e.last_valid_ms)>PRESENCE_TTL_MS) {
-            entry.visible_ids.clear();entry.control=false;entry.pip=false;entry.immersive=false;
+            entry.visible_ids.clear();entry.control=false;entry.pip=false;entry.immersive=false;entry.view_rect=None;
             entry.expired=true;retired_input.push(entry.session_id.clone());
         }
         self.history.retain(|_,v|now.saturating_sub(v.1)<=HISTORY_MS);
@@ -94,7 +111,7 @@ impl Registry {
     pub fn view(&self,sid:&str)->Option<&AppliedView> {self.entries.get(sid).map(|e|&e.view)}
     pub fn apply_view(&mut self,sid:&str,view:AppliedView)->bool {
         let Some(entry)=self.entries.get_mut(sid) else{return false;};
-        entry.selected_display_id=view.selected_display_id.clone();entry.view=view;entry.visible_ids.clear();true
+        entry.selected_display_id=view.selected_display_id.clone();entry.view=view;entry.visible_ids.clear();entry.view_rect=None;true
     }
 }
 static REGISTRY:Lazy<Mutex<Registry>>=Lazy::new(||Mutex::new(Registry::default()));
@@ -148,9 +165,12 @@ fn refresh_overlay() {
     for entry in entries {
         for id in &entry.visible_ids {
             let Some(display)=entry.view.displays.iter().find(|d|d.id==*id) else {continue;};
-            let item=scene.entry(id.clone()).or_insert_with(||super::overlay::OverlayDisplay {display:display.clone(),names:Vec::new(),appearance:entry.appearance.clone(),session_ids:Vec::new(),announcement_at:entry.announcement_at.and_then(|ms|ORIGIN.checked_add(Duration::from_millis(ms))),announcement_seconds:entry.announcement_seconds});
+            let item=scene.entry(id.clone()).or_insert_with(||super::overlay::OverlayDisplay {display:display.clone(),names:Vec::new(),appearance:entry.appearance.clone(),session_ids:Vec::new(),announcement_at:entry.announcement_at.and_then(|ms|ORIGIN.checked_add(Duration::from_millis(ms))),announcement_seconds:entry.announcement_seconds,lenses:Vec::new()});
             if !item.names.contains(&entry.name) {item.names.push(entry.name.clone());}
             item.session_ids.push(entry.session_id.clone());
+            if let Some(rect)=entry.view_rect.filter(|r|entry.appearance.enabled("lens.enabled")&&entry.appearance.number("lens.strength")>0.005&&lens_on(display.rect(),*r)) {
+                item.lenses.push(super::overlay::LensTarget{session_id:entry.session_id.clone(),name:entry.name.clone(),rect});
+            }
         }
     }
     let mut scene:Vec<_>=scene.into_values().collect();scene.sort_by(|a,b|a.display.id.cmp(&b.display.id));
@@ -161,7 +181,22 @@ fn refresh_overlay() {
 mod tests {
     use super::*;
     fn view()->AppliedView {AppliedView {epoch:1,layout_revision:1,mode:ViewMode::Single,selected_display_id:"p".into(),source:display::PhysicalRect{x:0,y:0,width:1920,height:1080},width:1920,height:1080,displays:vec![display::DisplayInfo{id:"p".into(),index:0,name:"p".into(),x:0,y:0,width:1920,height:1080,rotation:0,is_primary:true,selected:true,layout_revision:1}]}}
-    fn update(sequence:u64,visible:bool)->PresenceUpdate {PresenceUpdate {sequence,display_name:"Remote User".into(),control_visible:visible,pip_visible:false,immersive_visible:false,mode:ViewMode::Single,view_epoch:1,selected_display_id:"p".into(),visible_display_ids:vec!["p".into(),"not-captured".into()],appearance:Value::Null}}
+    fn update(sequence:u64,visible:bool)->PresenceUpdate {PresenceUpdate {sequence,display_name:"Remote User".into(),control_visible:visible,pip_visible:false,immersive_visible:false,mode:ViewMode::Single,view_epoch:1,selected_display_id:"p".into(),visible_display_ids:vec!["p".into(),"not-captured".into()],appearance:Value::Null,view_rect:None}}
+    #[test]fn view_rect_is_clipped_to_the_capture_and_dropped_outside_control(){
+        let mut r=Registry::default();r.authorize("a","phone","primary","name",view(),0);
+        let mut u=update(1,true);u.view_rect=Some(display::PhysicalRect{x:1500,y:-40,width:900,height:400});assert!(r.update("a",u,1));
+        assert_eq!(r.entries["a"].view_rect,Some(display::PhysicalRect{x:1500,y:0,width:420,height:360}));
+        let mut outside=update(2,true);outside.view_rect=Some(display::PhysicalRect{x:5000,y:0,width:100,height:100});r.update("a",outside,2);assert_eq!(r.entries["a"].view_rect,None);
+        let mut pip=update(3,false);pip.pip_visible=true;pip.view_rect=Some(display::PhysicalRect{x:0,y:0,width:100,height:100});r.update("a",pip,3);assert_eq!(r.entries["a"].view_rect,None);
+    }
+    #[test]fn lens_only_marks_a_real_part_of_a_display(){
+        let d=display::PhysicalRect{x:0,y:0,width:1920,height:1080};
+        assert!(!lens_on(d,d),"fit view retraces the border");
+        assert!(!lens_on(d,display::PhysicalRect{x:40,y:20,width:1840,height:1040}),"near-fit stays hidden");
+        assert!(lens_on(d,display::PhysicalRect{x:400,y:200,width:960,height:540}));
+        assert!(lens_on(d,display::PhysicalRect{x:1500,y:0,width:1000,height:1080}),"all-screens view straddling a seam");
+        assert!(!lens_on(d,display::PhysicalRect{x:1920,y:0,width:500,height:500}),"neighbour display only");
+    }
     #[test]fn active_gap_viewport_hides_decoration_without_releasing_a_drag(){
         let mut r=Registry::default();r.authorize("a","phone","primary","name",view(),0);r.update("a",update(1,true),1);
         let was=r.entries["a"].input_active();let mut gap=update(2,true);gap.visible_display_ids.clear();assert!(r.update("a",gap,2));

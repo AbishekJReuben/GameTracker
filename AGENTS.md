@@ -2075,3 +2075,32 @@ single-instance). It owns the WebRTC host (`/remote-host` route → `RemoteHostA
 - `hostproc.log` traces every spawn/restart and host startup stage.
 - Verified on this PC by killing processes (elevated script): main killed → host stayed up and
   kept publishing, relaunched main in ~18 s; host killed → respawned in ~3 s.
+
+---
+
+## 21. Desktop presence overlay + viewing-area lens — do not regress
+
+**The overlay** (`src-tauri/src/remote/overlay/`, remote-host process only) draws the
+"Controlled remotely by …" aurora on the PC: one click-through, `WDA_EXCLUDEFROMCAPTURE`
+window per display, one pixel shader (`aurora.hlsl`) plus a Direct2D label (`windows.rs`).
+The shader only rasterises scissored bands (screen edges, cursor, ripples, lens edges); the
+rest of the window is a plain clear. Appearance is one JSON schema shared by phone and PC
+(`src/shared/desktopAppearance.json`), edited on the phone (Desktop appearance).
+
+**Viewing-area lens (`viewport-v1`).** While the phone is zoomed in, the PC traces what it shows:
+- Phone: `reportRemoteViewport` (Control.tsx) sends `viewRect` = viewport ∩ frame, above the
+  keyboard, in physical desktop pixels (`visibleDesktopRect`). `ClientPresence` rate-limits
+  rect-only changes to ~15 Hz (`VIEW_RECT_INTERVAL_MS`); display changes still go at once.
+  PiP and immersive send `null`.
+- Host: `presence.rs` clips it to the capture source, keeps it only while Control is on screen,
+  and puts a `LensTarget` on each display where it covers < 88 % (`LENS_MAX_COVERAGE`; near
+  fit it would just retrace the border). All-screens views spanning a seam draw on both.
+- Renderer: `effects::Lens` glides 90 ms between reports, glows on movement (decays ~0.8 s)
+  and settles to `lens.resting`; `step` returns false once settled, so a still lens costs no
+  frames. 60 fps only while a lens moves and the 30 fps budget is comfortable. Reduced motion
+  snaps with no glow. The halo/ribbon fall **outward only** (`outside` factor): anything that
+  lights the inside gets cut off at the scissor band and shows as a visible box.
+- Label: with exactly one lens the compact label glides onto its top edge (`label_rest`),
+  tucking inside when there's no room above; several viewers keep it at the top.
+- `examples/remote_lens_probe.rs` renders the real shader + label to PNGs and a glide video:
+  `cargo run --example remote_lens_probe -- <out> [backdrop.png] [--video]`.

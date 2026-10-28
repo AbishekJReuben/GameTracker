@@ -56,6 +56,19 @@ export function visibleDisplayIds(view: AppliedCaptureView, content: PhysicalRec
       && Math.min(y + h, viewport.y + viewport.height) - Math.max(y, viewport.y) > 1e-6;
   }).map(d => d.id);
 }
+/** The part of the desktop the viewer can actually see (viewport ∩ frame), in
+ * physical desktop pixels. Feeds the PC's viewing-area lens; null when nothing
+ * of the frame is on screen. */
+export function visibleDesktopRect(view: AppliedCaptureView, content: PhysicalRect, viewport: PhysicalRect): PhysicalRect | null {
+  if (!validRect(content) || !validRect(view.source) || !validRect(viewport)) return null;
+  const left = Math.max(content.x, viewport.x), top = Math.max(content.y, viewport.y);
+  const right = Math.min(content.x + content.width, viewport.x + viewport.width), bottom = Math.min(content.y + content.height, viewport.y + viewport.height);
+  if (right - left < 1 || bottom - top < 1) return null;
+  const sx = view.source.width / content.width, sy = view.source.height / content.height;
+  const x = Math.round(view.source.x + (left - content.x) * sx), y = Math.round(view.source.y + (top - content.y) * sy);
+  const r = Math.round(view.source.x + (right - content.x) * sx), b = Math.round(view.source.y + (bottom - content.y) * sy);
+  return { x, y, width: Math.max(1, r - x), height: Math.max(1, b - y) };
+}
 /** Uniformly fit encoder/decoder limits; limits apply to the combined image. */
 export function fitCaptureSize(source: PhysicalRect, maxWidth: number, maxHeight = 4096, maxPixels = 8_294_400): { width: number; height: number } {
   if (!validRect(source)) return { width: 32, height: 32 };

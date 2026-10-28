@@ -1,5 +1,5 @@
 import { expect,it } from 'vitest';
-import { AppearancePreviewClock,appearancePreviewPoint } from './appearancePreviewModel';
+import { AppearancePreviewClock,PREVIEW_LENS_TARGETS,PreviewLens,appearancePreviewPoint,labelRest } from './appearancePreviewModel';
 it('integrates the same motion at 60/120Hz despite throttled paints',()=>{
   for(const hz of [60,120]){const c=new AppearancePreviewClock(0);let paints=0;for(let frame=1;frame<=hz;frame++){if(c.step(frame*1000/hz,.4,false,false).paint)paints++;}expect(c.phase).toBeCloseTo(.4,6);expect(paints).toBeLessThanOrEqual(25);expect(paints).toBeGreaterThan(15);}
 });
@@ -9,4 +9,16 @@ it('pauses reduced/hidden preview motion and resumes without integrating a hidde
 it('maps the first touch-down from its own coordinates without a preceding move',()=>{
   expect(appearancePreviewPoint({clientX:270,clientY:140},{left:70,top:40,width:400,height:200})).toEqual({x:400,y:200});
   expect(appearancePreviewPoint({clientX:70,clientY:40},{left:70,top:40,width:400,height:200})).toEqual({x:0,y:0});
+});
+it('preview lens glides to the next spot, glows, then rests; reduced motion holds still',()=>{
+  const l=new PreviewLens(0);let t=0;for(;t<3000;t+=16)l.step(t,false);expect(l.level(.5)).toBeLessThan(.6);
+  for(;t<3700;t+=16)l.step(t,false);expect(l.energy).toBeGreaterThan(.5);for(;t<5000;t+=16)l.step(t,false);
+  l.rect.forEach((v,i)=>expect(v).toBeCloseTo(PREVIEW_LENS_TARGETS[1][i],1));
+  const still=new PreviewLens(0);for(let s=0;s<20000;s+=16)still.step(s,true);expect(still.rect).toEqual([...PREVIEW_LENS_TARGETS[0]]);expect(still.level(.5)).toBe(.5);
+});
+it('label rest matches the PC rule: above the lens, inside at the top, on screen',()=>{
+  expect(labelRest(250,12,300,40,null,800,400)).toEqual({x:250,y:12});
+  expect(labelRest(250,12,300,40,[300,150,300,200],800,400)).toEqual({x:300,y:100});
+  expect(labelRest(250,12,300,40,[300,20,300,200],800,400)).toEqual({x:300,y:30});
+  expect(labelRest(250,12,300,40,[700,150,300,200],800,400).x).toBe(492);
 });

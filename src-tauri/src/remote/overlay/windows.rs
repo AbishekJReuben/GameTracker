@@ -49,6 +49,9 @@ pub struct OverlayWindow {
     write:IDWriteFactory,composition:IDCompositionDevice,
     pub device:ID3D11Device,pub context:ID3D11DeviceContext,
     render_target:ID3D11RenderTargetView,label_cache:Option<LabelCache>,
+    /// Lens the identity label rides (local rect) and how far it has travelled
+    /// there: 0 = its usual place at the top, 1 = sitting on the lens.
+    label_anchor:Option<([f32;4],f32)>,
 }
 struct LabelCache {text:String,font_key:u32,layout:IDWriteTextLayout,width:f32,height:f32}
 impl OverlayWindow {
@@ -72,9 +75,10 @@ impl OverlayWindow {
         canvas.SetTarget(&bitmap);canvas.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         let target=device.composition.CreateTargetForHwnd(hwnd,true)?;let visual=device.composition.CreateVisual()?;
         visual.SetContent(&swap)?;target.SetRoot(&visual)?;device.composition.Commit()?;
-        Ok(Self{window,rect,swap,canvas,_bitmap:bitmap,_target:target,_visual:visual,write:device.write.clone(),composition:device.composition.clone(),device:device.device.clone(),context:device.context.clone(),render_target:render_target.unwrap(),label_cache:None})
+        Ok(Self{window,rect,swap,canvas,_bitmap:bitmap,_target:target,_visual:visual,write:device.write.clone(),composition:device.composition.clone(),device:device.device.clone(),context:device.context.clone(),render_target:render_target.unwrap(),label_cache:None,label_anchor:None})
     }}
     pub fn hwnd(&self)->HWND {self.window.0}
+    pub fn set_label_anchor(&mut self,anchor:Option<([f32;4],f32)>) {self.label_anchor=anchor;}
     pub fn show(&self)->Result<()> {unsafe {SetWindowPos(self.hwnd(),HWND_TOPMOST,self.rect.x,self.rect.y,self.rect.width as i32,self.rect.height as i32,SWP_NOACTIVATE|SWP_SHOWWINDOW)}}
     pub fn hide(&self){unsafe{let _=ShowWindow(self.hwnd(),SW_HIDE);}}
     pub fn dpi_scale(&self)->f32 {unsafe{(GetDpiForWindow(self.hwnd()).max(96) as f32/96.).clamp(1.,4.)}}
@@ -101,7 +105,8 @@ impl OverlayWindow {
         let label=self.label_cache.as_ref().unwrap();let width=label.width+28.*dpi;let height=label.height+16.*dpi;
         let centered=(self.rect.width as f32-width)/2.;
         let compact=match appearance.text("label.placement") {"topLeft"=>20.*dpi,"topRight"=>self.rect.width as f32-width-20.*dpi,_=>centered};
-        let x=compact+(centered-compact)*notice.expansion;let y=(12.+notice.expansion*10.)*dpi;
+        let (compact,top)=label_rest(compact,12.*dpi,width,height,self.label_anchor,self.rect.width as f32,self.rect.height as f32,dpi);
+        let x=compact+(centered-compact)*notice.expansion;let y=top+(22.*dpi-top)*notice.expansion;
         self.canvas.BeginDraw();
         let backing=self.canvas.CreateSolidColorBrush(&D2D1_COLOR_F{r:0.025,g:0.035,b:0.055,a:appearance.number("label.backing")*notice.opacity},None)?;
         self.canvas.FillRoundedRectangle(&D2D1_ROUNDED_RECT{rect:D2D_RECT_F{left:x,top:y,right:x+width,bottom:y+height},radiusX:10.*dpi,radiusY:10.*dpi},&backing);
@@ -140,6 +145,27 @@ impl OverlayWindow {
         for y in 0..self.rect.height as usize {let row=std::slice::from_raw_parts((mapped.pData as *const u8).add(y*mapped.RowPitch as usize),self.rect.width as usize*4);bytes[y*self.rect.width as usize*4..(y+1)*self.rect.width as usize*4].copy_from_slice(row);}
         self.context.Unmap(&staging,0);Ok((self.rect.width,self.rect.height,bytes))
     }}
+}
+/// Where the compact label rests. While a viewer is zoomed in it glides onto
+/// the lens's top edge, so the name marks where that person is looking; it
+/// tucks inside the lens when there is no room above, and never leaves the screen.
+pub(crate) fn label_rest(x:f32,y:f32,width:f32,height:f32,anchor:Option<([f32;4],f32)>,screen_w:f32,screen_h:f32,dpi:f32)->(f32,f32) {
+    let Some(([lx,ly,lw,_],t))=anchor.filter(|(_,t)|*t>0.) else {return (x,y);};
+    let pad=8.*dpi;let gap=10.*dpi;
+    let ride_x=(lx+lw/2.-width/2.).clamp(pad,(screen_w-width-pad).max(pad));
+    let above=ly-height-gap;
+    let ride_y=(if above>=pad {above} else {ly+gap}).clamp(pad,(screen_h-height-pad).max(pad));
+    let t=t.clamp(0.,1.);(x+(ride_x-x)*t,y+(ride_y-y)*t)
+}
+#[cfg(test)]mod tests {
+    #[test]fn label_rides_the_lens_tucks_inside_at_the_top_and_stays_on_screen(){
+        let (w,h)=(300.,40.);
+        assert_eq!(super::label_rest(810.,12.,w,h,None,1920.,1080.,1.),(810.,12.));
+        assert_eq!(super::label_rest(810.,12.,w,h,Some(([600.,500.,600.,300.],1.)),1920.,1080.,1.),(750.,450.),"centred above the lens");
+        assert_eq!(super::label_rest(810.,12.,w,h,Some(([600.,20.,600.,300.],1.)),1920.,1080.,1.),(750.,30.),"no room above: inside the top edge");
+        assert_eq!(super::label_rest(810.,12.,w,h,Some(([1800.,500.,600.,300.],1.)),1920.,1080.,1.).0,1612.,"clamped to the screen");
+        assert_eq!(super::label_rest(810.,12.,w,h,Some(([600.,500.,600.,300.],0.5)),1920.,1080.,1.),(780.,231.),"glides");
+    }
 }
 impl Drop for OverlayWindow {fn drop(&mut self){self.hide();unsafe{let _=self._target.SetRoot(None::<&IDCompositionVisual>);let _=self.composition.Commit();self.canvas.SetTarget(None::<&ID2D1Image>);}}}
 pub fn pump_messages(){unsafe{let mut msg=MSG::default();while PeekMessageW(&mut msg,None,0,0,PM_REMOVE).as_bool(){let _=TranslateMessage(&msg);DispatchMessageW(&msg);}}}

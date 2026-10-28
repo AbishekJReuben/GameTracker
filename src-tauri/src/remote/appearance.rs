@@ -28,7 +28,7 @@ impl Appearance {
         for key in ["primary","secondary","accent"] {
             if let Some(s)=raw["palette"][key].as_str().filter(|s|s.len()==7 && s.starts_with('#') && s.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)) {value["palette"][key]=Value::from(s.to_ascii_lowercase());}
         }
-        for key in ["halo","ripples"] { if let Some(enabled)=raw[key]["enabled"].as_bool() {value[key]["enabled"]=Value::from(enabled);} }
+        for key in ["halo","ripples","lens"] { if let Some(enabled)=raw[key]["enabled"].as_bool() {value[key]["enabled"]=Value::from(enabled);} }
         if let Some(p)=raw["label"]["placement"].as_str().filter(|p|matches!(*p,"topCenter"|"topLeft"|"topRight")) {value["label"]["placement"]=Value::from(p);}
         if raw["motion"]=="reduce" {value["motion"]=Value::from("reduce");}
         Self(value)

@@ -1,7 +1,7 @@
 import { desktopBounds, type AppliedCaptureView, type DisplayInfo, type DisplaySnapshot, type PhysicalRect } from './displayLayout';
 import type { DesktopAppearance } from '../companion/remotePreferences';
 export const REMOTE_PROTOCOL_VERSION = 1;
-export const REMOTE_CAPABILITIES = ['display-geometry-v1','all-screens-v1','view-state-v1','controller-name-v1','desktop-appearance-v1','view-epoch-input-v1'] as const;
+export const REMOTE_CAPABILITIES = ['display-geometry-v1','all-screens-v1','view-state-v1','controller-name-v1','desktop-appearance-v1','view-epoch-input-v1','viewport-v1'] as const;
 export type RemoteCapability = typeof REMOTE_CAPABILITIES[number];
 export interface RemoteOverlayStatus {available:boolean;degraded:boolean;activeDisplayIds:string[];failedDisplays:Record<string,string>;message:string|null}
 export interface RemotePresenceReply {accepted:boolean;overlay:RemoteOverlayStatus}
@@ -18,8 +18,10 @@ export interface RemotePresenceUpdate {
   sequence: number; displayName: string; controlVisible: boolean; pipVisible: boolean; immersiveVisible: boolean;
   mode: 'single' | 'all'; viewEpoch: number; selectedDisplayId: string; visibleDisplayIds: string[];
   appearance: DesktopAppearance;
+  /** viewport-v1: the visible desktop area in physical pixels (null = whole frame / unknown). */
+  viewRect?: PhysicalRect | null;
 }
-export interface ClientViewReport { mode: 'single' | 'all'; epoch: number; selectedDisplayId: string; visibleDisplayIds: string[] }
+export interface ClientViewReport { mode: 'single' | 'all'; epoch: number; selectedDisplayId: string; visibleDisplayIds: string[]; viewRect?: PhysicalRect | null }
 export function negotiatedCapabilities(raw: unknown): RemoteCapability[] {
   if (!Array.isArray(raw)) return [];
   return REMOTE_CAPABILITIES.filter(c=>raw.includes(c));

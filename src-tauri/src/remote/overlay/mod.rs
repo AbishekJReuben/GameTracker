@@ -13,7 +13,11 @@ pub(crate) mod effects;
 pub(crate) struct OverlayDisplay {
     pub display:DisplayInfo,pub names:Vec<String>,pub appearance:Appearance,
     pub session_ids:Vec<String>,pub announcement_at:Option<Instant>,pub announcement_seconds:f32,
+    /// Viewers zoomed into part of this display (desktop physical pixels).
+    pub lenses:Vec<LensTarget>,
 }
+#[derive(Clone,Debug,PartialEq)]
+pub(crate) struct LensTarget {pub session_id:String,pub name:String,pub rect:super::display::PhysicalRect}
 #[cfg(windows)]
 pub(crate) mod windows;
 #[cfg(windows)]

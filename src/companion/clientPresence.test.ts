@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ClientPresence } from './clientPresence';
+import { ClientPresence, VIEW_RECT_INTERVAL_MS } from './clientPresence';
 import { saveControllerName, saveAppearance, readAppearance, changeAppearance } from './remotePreferences';
 import type { RemoteHandshake, RemotePresenceUpdate } from '@/lib/remoteProtocol';
 const d={id:'p',index:0,name:'Primary',x:0,y:0,width:1920,height:1080,rotation:0,isPrimary:true,selected:true,layoutRevision:1};
@@ -28,6 +28,20 @@ describe('truthful negotiated client presence',()=>{
     let appearance=readAppearance();appearance=changeAppearance(appearance,{...appearance.value,intensity:.5});saveAppearance(appearance);
     expect(sent).toHaveLength(before);vi.advanceTimersByTime(80);expect(sent).toHaveLength(before+1);
     expect(sent[sent.length-1]?.update.displayName).toBe('Arul 29');expect(sent[sent.length-1]?.update.appearance.intensity).toBe(.5);
+  });
+  it('sends the viewing area only to a viewport-v1 host, rate-limited and only while Control is on screen',()=>{
+    const view={mode:'single' as const,epoch:1,selectedDisplayId:'p',visibleDisplayIds:['p']};
+    p.accept(handshake);p.setScope({sink:true});p.setView({...view,viewRect:{x:0,y:0,width:960,height:540}});
+    expect('viewRect' in sent[sent.length-1]!.update).toBe(false);
+    p.accept({...handshake,sessionId:'lens',capabilities:[...handshake.capabilities,'viewport-v1']});
+    p.setView({...view,viewRect:{x:0,y:0,width:960,height:540}});vi.advanceTimersByTime(VIEW_RECT_INTERVAL_MS);expect(sent[sent.length-1]?.update.viewRect).toEqual({x:0,y:0,width:960,height:540});
+    vi.advanceTimersByTime(VIEW_RECT_INTERVAL_MS);const before=sent.length;
+    for(let i=1;i<=20;i++)p.setView({...view,viewRect:{x:i*10,y:0,width:960,height:540}});
+    expect(sent.length-before).toBe(1);vi.advanceTimersByTime(VIEW_RECT_INTERVAL_MS);expect(sent.length-before).toBe(2);
+    expect(sent[sent.length-1]?.update.viewRect?.x).toBe(200);
+    p.setView({...view,visibleDisplayIds:[],viewRect:{x:200,y:0,width:960,height:540}});expect(sent.length-before).toBe(3);
+    p.setScope({pip:true});expect(sent[sent.length-1]?.update.viewRect).toBeNull();
+    p.setScope({pip:false,immersive:true});expect(sent[sent.length-1]?.update.viewRect).toBeNull();
   });
   it('stops the old session timer and cannot retain a visible report after teardown',()=>{
     p.accept(handshake);p.setScope({sink:true});p.reset();const n=sent.length;vi.advanceTimersByTime(5000);expect(sent).toHaveLength(n);

@@ -11,6 +11,7 @@ const groups:{key:keyof DesktopAppearance;label:string;fields:[string,string,str
   {key:'tint',label:'Tint',fields:[['strength','Strength','%'],['reach','Inward reach','px']]},
   {key:'halo',label:'Cursor halo',fields:[['enabled','Enabled'],['radius','Radius','px'],['opacity','Opacity','%'],['softness','Softness','%'],['response','Movement response','%']]},
   {key:'ripples',label:'Click ripples',fields:[['enabled','Enabled'],['size','Size','px'],['strength','Strength','%'],['thickness','Thickness','px'],['duration','Duration','s']]},
+  {key:'lens',label:'Viewing area',fields:[['enabled','Enabled'],['strength','Strength','%'],['resting','Resting level','%']]},
   {key:'label',label:'Identity label',fields:[['size','Size','px'],['placement','Placement'],['backing','Backing opacity','%'],['announcementSeconds','Announcement duration','s']]},
 ];
 export function DesktopAppearanceSettings({connection}:{connection?:Connection|null}) {
@@ -46,6 +47,7 @@ export function DesktopAppearanceSettings({connection}:{connection?:Connection|n
           :key==='placement'?<label key={key} className="flex items-center justify-between text-xs">{label}<select aria-label="Label placement" className="input h-9" value={doc.value.label.placement} onChange={e=>edit('label','placement',e.target.value)}><option value="topCenter">Top center</option><option value="topLeft">Top left</option><option value="topRight">Top right</option></select></label>:range(group.key,key,label,unit))}
         <button type="button" className="text-xs text-ink-dim underline" onClick={()=>commit(resetAppearanceGroup(doc,group.key))}>Reset {group.label.toLowerCase()}</button>
         {group.key==='label'&&<p className="text-[11px] text-ink-faint">Announcement duration applies to the next arrival.</p>}
+        {group.key==='lens'&&<p className="text-[11px] text-ink-faint">While you zoom in, the PC traces the area on your screen and the identity label moves onto it. Resting level is how strong it stays once the view stops moving.</p>}
       </fieldset>)}
       <fieldset className="space-y-2 rounded-xl border border-line p-3"><legend className="px-1 text-sm font-600">Motion comfort</legend>
         <label className="flex items-center justify-between gap-2 text-xs">Motion<select className="input h-9" aria-label="Motion comfort" value={doc.value.motion} onChange={e=>edit('motion','',e.target.value)}><option value="system">Follow system preference</option><option value="reduce">Reduce motion</option></select></label>

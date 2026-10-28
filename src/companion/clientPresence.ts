@@ -1,5 +1,7 @@
 import { REMOTE_PREF_EVENT, readAppearance, readControllerName } from './remotePreferences';
 import { parseHandshake, parseOverlayStatus, supportsRemote, type ClientViewReport, type RemoteHandshake, type RemotePresenceUpdate, type RemoteOverlayStatus } from '@/lib/remoteProtocol';
+/** Viewing-area updates while a gesture runs: ~15 Hz; the PC glides between them. */
+export const VIEW_RECT_INTERVAL_MS=66;
 /** Visibility policy comes from CloudConn's existing debounced powerIdle state.
  * This adapter does not create a second background/PiP grace interpretation. */
 export class ClientPresence {
@@ -8,6 +10,8 @@ export class ClientPresence {
   private sequence=0;
   private timer:number|null=null;
   private updateTimer:number|null=null;
+  private rectTimer:number|null=null;
+  private lastPublish=0;
   private scope={sink:false,idle:false,pip:false,immersive:false};
   private closed=false;
   overlayStatus:RemoteOverlayStatus|null=null;
@@ -37,12 +41,26 @@ export class ClientPresence {
   }
   setOverlayStatus(raw:unknown){const status=parseOverlayStatus(raw);if(status&&this.handshake)this.overlayStatus=status;}
   setScope(scope:Partial<typeof this.scope>){this.scope={...this.scope,...scope};this.publish();}
-  setView(view:ClientViewReport){if(this.view&&JSON.stringify(this.view)===JSON.stringify(view))return;this.view=view;this.publish();}
+  setView(view:ClientViewReport){
+    if(this.view&&JSON.stringify(this.view)===JSON.stringify(view))return;
+    // A pinch/pan only moves the viewing-area rectangle: rate-limit those so a
+    // 120 Hz gesture cannot flood the control channel. Display changes go now.
+    const onlyRect=!!this.view&&JSON.stringify({...this.view,viewRect:null})===JSON.stringify({...view,viewRect:null});
+    this.view=view;
+    if(!onlyRect){this.publish();return;}
+    const wait=VIEW_RECT_INTERVAL_MS-(performance.now()-this.lastPublish);
+    if(wait<=0){this.publish();return;}
+    if(this.rectTimer===null)this.rectTimer=window.setTimeout(()=>{this.rectTimer=null;this.publish();},wait);
+  }
   publish(){
     if(this.closed || !supportsRemote(this.handshake,'view-state-v1') || !this.view)return;
+    if(this.rectTimer!==null){window.clearTimeout(this.rectTimer);this.rectTimer=null;}
+    this.lastPublish=performance.now();
     const {sink,idle,pip,immersive}=this.scope;
     const visible=sink&&!idle;
     const update:RemotePresenceUpdate={sequence:++this.sequence,displayName:readControllerName(),controlVisible:visible&&!pip&&!immersive,pipVisible:visible&&pip,immersiveVisible:visible&&immersive,...this.view,viewEpoch:this.view.epoch,appearance:readAppearance().value};
+    if(!supportsRemote(this.handshake,'viewport-v1'))delete update.viewRect;
+    else if(!visible||pip||immersive)update.viewRect=null;
     if(!visible)update.visibleDisplayIds=[];
     else if(pip)update.visibleDisplayIds=[this.view.selectedDisplayId];
     this.send({type:'presence',update});
@@ -52,6 +70,7 @@ export class ClientPresence {
     this.setScope({sink:false});this.closed=true;
     if(this.timer!==null)window.clearInterval(this.timer);
     if(this.updateTimer!==null)window.clearTimeout(this.updateTimer);
-    this.timer=null;this.updateTimer=null;window.removeEventListener(REMOTE_PREF_EVENT,this.onPreference);
+    if(this.rectTimer!==null)window.clearTimeout(this.rectTimer);
+    this.timer=null;this.updateTimer=null;this.rectTimer=null;window.removeEventListener(REMOTE_PREF_EVENT,this.onPreference);
   }
 }

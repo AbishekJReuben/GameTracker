@@ -1,6 +1,6 @@
 import { createContext, Suspense, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {lazyRoute} from '@/lib/lazyRoute';
-import { frameToDesktop,displayAt,videoContentRect,visibleDisplayIds } from '@/lib/displayLayout';
+import { frameToDesktop,displayAt,videoContentRect,visibleDisplayIds,visibleDesktopRect } from '@/lib/displayLayout';
 import type { CaptureIdentity } from '@/lib/captureView';
 import type { EpochStream } from '@/lib/epochVideo';
 import {sameCapture} from '@/lib/captureView';
@@ -1370,7 +1370,9 @@ export function ControlScreen({
     const identity=displayedViewRef.current,vp=viewportRef.current;if(!identity||!vp)return;const view=identity.view,rect=vp.getBoundingClientRect();
     const content=videoContentRect(view.width,view.height,{width:rect.width,height:rect.height,zoom:zoomRef.current,panX:panRef.current.x,panY:panRef.current.y});
     const ids=visibleDisplayIds(view,content,{x:0,y:0,width:rect.width,height:rect.height});const selected=view.displays.some(d=>d.id===selectedDisplayRef.current)?selectedDisplayRef.current:view.selectedDisplayId;
-    const report={mode:view.mode,epoch:view.epoch,selectedDisplayId:selected,visibleDisplayIds:ids},key=JSON.stringify(report);if(lastViewportReport.current===key)return;lastViewportReport.current=key;link.reportView?.(report);
+    // The PC's viewing-area lens: what is actually on screen, above the keyboard.
+    const viewRect=visibleDesktopRect(view,content,{x:0,y:0,width:rect.width,height:Math.max(1,rect.height-imeOverlap(vp))});
+    const report={mode:view.mode,epoch:view.epoch,selectedDisplayId:selected,visibleDisplayIds:ids,viewRect},key=JSON.stringify(report);if(lastViewportReport.current===key)return;lastViewportReport.current=key;link.reportView?.(report);
   };
   const requestCaptureMode=(mode:'single'|'all',id=selectedDisplayRef.current)=>{
     const current=displayedViewRef.current;if(!current||!id)return false;

@@ -70,6 +70,8 @@ export interface DesktopAppearance {
   tint: { strength: number; reach: number };
   halo: { enabled: boolean; radius: number; opacity: number; softness: number; response: number };
   ripples: { enabled: boolean; size: number; strength: number; thickness: number; duration: number };
+  /** The viewing-area lens drawn around what a zoomed-in phone is showing. */
+  lens: { enabled: boolean; strength: number; resting: number };
   label: { size: number; placement: 'topCenter' | 'topLeft' | 'topRight'; backing: number; announcementSeconds: number };
   motion: 'system' | 'reduce';
 }
@@ -103,7 +105,7 @@ export function validateAppearance(raw: unknown): DesktopAppearance {
     const color = record(input.palette)[key];
     if (typeof color === 'string' && /^#[\da-f]{6}$/i.test(color)) value.palette[key] = color.toLowerCase();
   }
-  for (const key of ['halo', 'ripples'] as const) {
+  for (const key of ['halo', 'ripples', 'lens'] as const) {
     const enabled = record(input[key]).enabled;
     if (typeof enabled === 'boolean') value[key].enabled = enabled;
   }

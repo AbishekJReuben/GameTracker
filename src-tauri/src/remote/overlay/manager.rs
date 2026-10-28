@@ -3,7 +3,7 @@
 use std::{collections::{HashMap,VecDeque},sync::{Arc,OnceLock},thread::JoinHandle,time::{Duration,Instant}};
 use parking_lot::{Condvar,Mutex};
 use serde::Serialize;
-use super::{OverlayDisplay,windows::{OverlayWindow,RenderDevice,pump_messages},aurora::{Aurora,Parameters},effects::{Notice,NoticeState,Reaction,MotionPolicy,retain_reactions}};
+use super::{OverlayDisplay,windows::{OverlayWindow,RenderDevice,pump_messages},aurora::{Aurora,Parameters},effects::{Lens,Notice,NoticeState,Reaction,MotionPolicy,retain_reactions,sync_lenses}};
 #[cfg(test)]use super::super::display::DisplayInfo;
 
 #[derive(Clone,Debug,Default,Serialize)]
@@ -15,6 +15,7 @@ pub(crate) struct Statistics {
     pub failed_displays:HashMap<String,String>,pub last_render_ms:f32,pub quality_fps:u32,
     pub active_display_ids:Vec<String>,
     pub painted_reactions:usize,
+    pub painted_lenses:usize,
 }
 #[derive(Default)]
 struct Mailbox {pending:Option<Vec<OverlayDisplay>>,last:Vec<OverlayDisplay>,reactions:VecDeque<Reaction>,stop:bool,ready:Option<bool>}
@@ -68,7 +69,26 @@ fn enqueue_reaction(shared:&Shared,session_id:&str,x:i32,y:i32)->bool {
     state.reactions.push_back(Reaction{session_id:session_id.into(),x,y,at:Instant::now()});shared.changed.notify_one();true
 }
 
-struct ManagedWindow {window:OverlayWindow,scene:OverlayDisplay,notice:Notice,departing:bool,parameters:Option<Parameters>,dirty:bool,last_cursor:Option<(i32,i32)>,still_phase:f32,shown:bool,last_notice:NoticeState,motion:MotionPolicy,last_reactions:usize}
+struct ManagedWindow {window:OverlayWindow,scene:OverlayDisplay,notice:Notice,departing:bool,parameters:Option<Parameters>,dirty:bool,last_cursor:Option<(i32,i32)>,still_phase:f32,shown:bool,last_notice:NoticeState,motion:MotionPolicy,last_reactions:usize,lenses:Vec<Lens>,ride:LabelRide}
+/// The identity label's trip between the top of the screen and a lone lens.
+#[derive(Default)]
+struct LabelRide {rect:[f32;4],t:f32}
+impl LabelRide {
+    /// Follows the single lens; with none (or several viewers) it glides home.
+    fn step(&mut self,lenses:&[Lens],dt:f32,reduce:bool)->bool {
+        let lone=match lenses {[l] if !l.leaving=>Some(l),_=>None};
+        if let Some(l)=lone {self.rect=l.current;}
+        let goal=if lone.is_some(){1.}else{0.};
+        if reduce {let changed=self.t!=goal;self.t=goal;return changed;}
+        self.t+=(goal-self.t)*(1.-(-dt.max(0.)/0.22).exp());
+        if (self.t-goal).abs()<0.002 {self.t=goal;false} else {true}
+    }
+    fn anchor(&self)->Option<([f32;4],f32)> {(self.t>0.).then_some((self.rect,self.t))}
+}
+fn lens_targets(scene:&OverlayDisplay)->Vec<(String,[f32;4])> {
+    let d=&scene.display;
+    scene.lenses.iter().map(|l|(l.session_id.clone(),[(l.rect.x-d.x) as f32,(l.rect.y-d.y) as f32,l.rect.width as f32,l.rect.height as f32])).collect()
+}
 fn run(shared:&Shared) {
     let renderer=match RenderDevice::new() {Ok(r)=>r,Err(error)=>{
         shared.stats.lock().error=Some(format!("Desktop overlay unavailable: {error}"));
@@ -80,12 +100,15 @@ fn run(shared:&Shared) {
     let mut windows:HashMap<String,ManagedWindow>=HashMap::new();
     let mut reactions=Vec::new();let mut phase=0_f64;let mut last_frame=Instant::now();let mut previous_cursor=None;
     let mut system_reduce=false;let mut comfort_check=Instant::now()-Duration::from_secs(2);let mut frame_budget_ms=0_f32;let mut fps=30_u32;
+    // A gliding lens follows a finger, so it gets 60 fps while it moves — but
+    // only when the 30 fps budget is comfortable; shedding still wins.
+    let mut lens_motion=false;
     loop {
         let (scene,clicks)={
             let mut state=shared.mailbox.lock();
             while state.pending.is_none()&&state.reactions.is_empty()&&!state.stop {
                 if windows.is_empty() {shared.changed.wait(&mut state);}
-                else {shared.changed.wait_for(&mut state,Duration::from_millis((1000/fps) as u64));break;}
+                else {let rate=if lens_motion&&fps>=30{60}else{fps};shared.changed.wait_for(&mut state,Duration::from_millis((1000/rate) as u64));break;}
             }
             if state.stop {break;}
             (state.pending.take(),state.reactions.drain(..).collect::<Vec<_>>())
@@ -106,7 +129,7 @@ fn run(shared:&Shared) {
                     old.dirty|=old.scene!=display;old.scene=display;old.departing=false;old.notice.resume();
                 }else {
                     match OverlayWindow::new(&renderer,display.display.rect()) {
-                        Ok(window)=>{shared.stats.lock().failed_displays.remove(&id);windows.insert(id,ManagedWindow{window,notice:Notice::new(display.announcement_at,now,display.announcement_seconds),scene:display,departing:false,parameters:None,dirty:true,last_cursor:None,still_phase:phase as f32,shown:false,last_notice:NoticeState::Hidden,motion:MotionPolicy::default(),last_reactions:0});},
+                        Ok(window)=>{shared.stats.lock().failed_displays.remove(&id);windows.insert(id,ManagedWindow{window,notice:Notice::new(display.announcement_at,now,display.announcement_seconds),scene:display,departing:false,parameters:None,dirty:true,last_cursor:None,still_phase:phase as f32,shown:false,last_notice:NoticeState::Hidden,motion:MotionPolicy::default(),last_reactions:0,lenses:Vec::new(),ride:LabelRide::default()});},
                         Err(error)=>{let message=format!("Overlay window unavailable: {error}");let mut stats=shared.stats.lock();stats.error=Some(message.clone());stats.failed_displays.insert(id,message);},
                     }
                 }
@@ -122,21 +145,30 @@ fn run(shared:&Shared) {
         let cursor=cursor_position();let velocity=match (previous_cursor,cursor) { (Some((x,y)),Some((nx,ny))) if dt>0.=>[(nx-x) as f32/dt,(ny-y) as f32/dt],_=>[0.,0.]};previous_cursor=cursor;
         let speed=windows.iter().min_by_key(|(id,_)|*id).map(|(_,w)|w.scene.appearance.number("aurora.speed")).unwrap_or(0.);
         if !system_reduce&&windows.values().any(|w|w.scene.appearance.text("motion")!="reduce"){phase+=dt as f64*speed as f64;}
-        let mut remove=Vec::new();
+        let mut remove=Vec::new();lens_motion=false;
         for (id,active) in &mut windows {
             let a=&active.scene.appearance;let reduce=system_reduce||a.text("motion")=="reduce";
             if active.motion.update(reduce) {active.dirty=true;if reduce{reactions.retain(|r|!active.scene.session_ids.contains(&r.session_id));}}
             let notice=active.notice.sample(now,a.number("label.announcementSeconds"),reduce);
             if notice.state==NoticeState::Hidden {remove.push(id.clone());continue;}
             let local_cursor=cursor.filter(|(x,y)|active.scene.display.rect().contains(*x,*y));
+            // A departing window keeps its lenses in place while it fades.
+            if !active.departing {sync_lenses(&mut active.lenses,&lens_targets(&active.scene),reduce);}
+            let lens_count=active.lenses.len();
+            let lenses_moving=active.lenses.iter_mut().fold(false,|m,l|l.step(dt,reduce)|m);
+            active.lenses.retain(|l|!l.gone());
+            let ride_moving=active.ride.step(&active.lenses,dt,reduce);
+            lens_motion|=lenses_moving||ride_moving;
             let visible_reactions:Vec<_>=reactions.iter().filter(|r|active.scene.session_ids.contains(&r.session_id)&&active.scene.display.rect().contains(r.x,r.y)&&now.saturating_duration_since(r.at).as_secs_f32()<a.number("ripples.duration")).cloned().collect();
             let reaction_count=if reduce||!a.enabled("ripples.enabled"){0}else{visible_reactions.len()};
             let transitions=!matches!(notice.state,NoticeState::Compact|NoticeState::Announcement);
             let moving=!reduce&&a.number("intensity")>0.&&a.number("aurora.speed")>0.;
             let pointer_changed=active.last_cursor!=local_cursor&&a.enabled("halo.enabled")&&a.number("intensity")>0.;
-            if active.dirty||moving||transitions||notice.state!=active.last_notice||pointer_changed||reaction_count!=active.last_reactions||reaction_count>0 {
+            let lenses_changed=lenses_moving||ride_moving||lens_count!=active.lenses.len();
+            if active.dirty||moving||transitions||notice.state!=active.last_notice||pointer_changed||reaction_count!=active.last_reactions||reaction_count>0||lenses_changed {
                 if !reduce {active.still_phase=phase as f32;}
-                let target=Parameters::new(active.scene.display.rect(),a,active.window.dpi_scale(),active.still_phase,notice.opacity,reduce,local_cursor,velocity,&visible_reactions,now);
+                let mut target=Parameters::new(active.scene.display.rect(),a,active.window.dpi_scale(),active.still_phase,notice.opacity,reduce,local_cursor,velocity,&visible_reactions,now);
+                target.set_lenses(&active.lenses,a,active.window.dpi_scale());active.window.set_label_anchor(active.ride.anchor());
                 let settled=if let Some(p)=active.parameters.as_mut(){p.approach(target,dt)}else{active.parameters=Some(target);true};
                 let mut presented=false;
                 match active.window.draw_animated(&aurora,active.parameters.as_ref().unwrap(),&active.scene.names.join(", "),notice,a).and_then(|presented|{if presented&&!active.shown{active.window.show()?;}Ok(presented)}) {
@@ -152,7 +184,7 @@ fn run(shared:&Shared) {
         // Decoration sheds cadence first. The capture/encode and pointer threads
         // never wait for this worker, including a slow DWM/driver.
         if frame_budget_ms>8. {fps=15;}else if frame_budget_ms<3. {fps=30;}
-        let mut stats=shared.stats.lock();stats.last_render_ms=elapsed;stats.quality_fps=fps;stats.windows=windows.len();stats.handles=windows.values().map(|w|w.window.hwnd().0 as usize).collect();stats.active_display_ids=windows.iter().filter(|(_,w)|w.shown&&!w.departing).map(|(id,_)|id.clone()).collect();stats.painted_reactions=windows.values().map(|w|w.last_reactions).sum();
+        let mut stats=shared.stats.lock();stats.last_render_ms=elapsed;stats.quality_fps=fps;stats.windows=windows.len();stats.handles=windows.values().map(|w|w.window.hwnd().0 as usize).collect();stats.active_display_ids=windows.iter().filter(|(_,w)|w.shown&&!w.departing).map(|(id,_)|id.clone()).collect();stats.painted_reactions=windows.values().map(|w|w.last_reactions).sum();stats.painted_lenses=windows.values().filter_map(|w|w.parameters.as_ref()).map(Parameters::lens_count).sum();
     }
     // Drop the HWNDs before the renderer/COM apartment, all on their owner thread.
     windows.clear();pump_messages();drop(aurora);drop(renderer);
@@ -174,9 +206,16 @@ mod tests {
         let shared=Arc::new(Shared::default());let manager=Manager{shared:shared.clone(),thread:Mutex::new(None)};
         manager.refresh(Vec::new());assert!(shared.mailbox.lock().pending.is_none());
         let mut display=DisplayInfo{id:"d".into(),index:0,name:"d".into(),x:0,y:0,width:1920,height:1080,rotation:0,is_primary:true,selected:true,layout_revision:1};
-        for i in 0..1000 {display.x=i;manager.refresh(vec![OverlayDisplay{display:display.clone(),names:vec!["Remote User".into()],appearance:Default::default(),session_ids:vec!["s".into()],announcement_at:Some(Instant::now()),announcement_seconds:3.}]);}
+        for i in 0..1000 {display.x=i;manager.refresh(vec![OverlayDisplay{display:display.clone(),names:vec!["Remote User".into()],appearance:Default::default(),session_ids:vec!["s".into()],announcement_at:Some(Instant::now()),announcement_seconds:3.,lenses:Vec::new()}]);}
         assert_eq!(shared.mailbox.lock().pending.as_ref().unwrap().len(),1);assert_eq!(shared.mailbox.lock().pending.as_ref().unwrap()[0].display.x,999);
         manager.stop();manager.refresh(Vec::new());assert_eq!(shared.mailbox.lock().pending.as_ref().unwrap().len(),1);
+    }
+    #[test]fn label_rides_a_lone_lens_and_glides_home_for_several(){
+        let mut ride=LabelRide::default();let lens=|sid:&str|{let mut l=Lens::new(sid,[100.,200.,600.,300.],true);l.retarget([100.,200.,600.,300.],true);l};
+        assert!(!ride.step(&[],1./30.,false));assert!(ride.anchor().is_none());
+        let one=[lens("a")];while ride.step(&one,1./30.,false){}assert_eq!(ride.anchor(),Some(([100.,200.,600.,300.],1.)));
+        let two=[lens("a"),lens("b")];assert!(ride.step(&two,1./30.,false));while ride.step(&two,1./30.,false){}assert!(ride.anchor().is_none());
+        assert!(ride.step(&one,1./30.,true));assert_eq!(ride.anchor().unwrap().1,1.,"reduced motion snaps");
     }
     #[test]fn contended_optional_reactions_return_without_waiting_for_input_thread(){
         let shared=Shared::default();let held=shared.mailbox.lock();let start=Instant::now();

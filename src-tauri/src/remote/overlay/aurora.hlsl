@@ -13,6 +13,9 @@ cbuffer Params : register(b0) {
     float4 rippleStyle;// size,strength,thickness,duration
     float4 effect;     // notice opacity,reduced motion,cursor visible,unused
     float4 ripples[8]; // local x,y,age,active
+    float4 lensLook;    // line thickness px,corner px,strength,glow reach px
+    float4 lensRect[4]; // local x,y,width,height (smoothed on the CPU)
+    float4 lensState[4];// level (fade·resting/moving),movement energy,unused,active
 };
 struct VOut {float4 position:SV_POSITION;};
 VOut vs(uint id:SV_VertexID) {
@@ -25,6 +28,7 @@ float noise(float2 p) {
     return lerp(lerp(hash(i),hash(i+float2(1,0)),f.x),lerp(hash(i+float2(0,1)),hash(i+1),f.x),f.y);
 }
 float fbm(float2 p) {return noise(p)*0.57+noise(p*2.03+7.1)*0.29+noise(p*4.11+23.7)*0.14;}
+float roundedBox(float2 p,float4 r,float corner) {float2 hs=r.zw*.5;float2 q=abs(p-r.xy-hs)-hs+corner;return length(max(q,0))+min(max(q.x,q.y),0)-corner;}
 float4 ps(VOut input):SV_TARGET {
     float2 p=input.position.xy,global=p+screen.zw;
     float2 q=abs(p-screen.xy*.5)-screen.xy*.5+flow.w;
@@ -51,6 +55,23 @@ float4 ps(VOut input):SV_TARGET {
     float tint=aura.z*pow(1.-smoothstep(0.,max(1.,aura.w),edge),2);
     float alpha=saturate((boundary+fringe+tint)*flow.y);
     float3 premul=color*alpha;
+    // Viewing-area lens: the border's own language (boundary line, drifting
+    // ribbon, mist) traced around what a zoomed-in viewer is looking at.
+    // Mist and ribbon fall outward so the viewed content itself stays clear.
+    [unroll]for(int j=0;j<4;j++)if(lensState[j].w>.5&&lensState[j].x>0.) {
+        float4 r=lensRect[j];float corner=min(lensLook.y,min(r.z,r.w)*.12);
+        float s=roundedBox(p,r,corner),th=max(.5,lensLook.x),energy=lensState[j].y;
+        // 0 inside, 1 just past the line: the halo never tints the viewed area.
+        float outside=saturate(s/th+.5);
+        float edgeLine=exp2(-pow(s/th,2)*1.7);
+        float drift=.6+.4*sin(along*1.8+time*.35+warp*3.);
+        float ribbon=exp2(-pow((s-(3.+warp*6.))/(1.4+aura.x*2.6),2))*(.18+.5*border.w)*drift*outside;
+        float mist=exp2(-max(s,0.)/max(2.,lensLook.w*.3))*(.12+.14*n)*outside;
+        float inner=s<0.?exp2(s/(th*4.))*.14:0.;
+        float a=saturate((edgeLine*.85+inner+(ribbon+mist)*(.45+.55*energy))*lensState[j].x*lensLook.z);
+        float3 c=lerp(color,accent.rgb,energy*.25)+energy*.08;
+        premul=c*a+premul*(1.-a);alpha=a+alpha*(1.-a);
+    }
     if(effect.z>.5&&halo.y>0.) {
         float2 direction=normalize(cursor.zw+float2(.001,0));
         float2 local=float2(dot(delta,direction),dot(delta,float2(-direction.y,direction.x)));

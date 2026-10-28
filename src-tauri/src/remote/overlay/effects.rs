@@ -35,8 +35,66 @@ pub fn retain_reactions(reactions:&mut Vec<Reaction>,owners:&[String],now:Instan
     reactions.retain(|r|owners.contains(&r.session_id)&&now.saturating_duration_since(r.at).as_secs_f32()<duration);
     if reactions.len()>MAX_RIPPLES {reactions.drain(..reactions.len()-MAX_RIPPLES);}
 }
+pub const MAX_LENSES:usize=4;
+/// One viewer's zoomed-in area on this display, smoothed on the render thread.
+/// The phone reports ~15 Hz while a gesture runs; the lens glides between
+/// reports, glows while the view moves and settles to its resting level.
+#[derive(Clone,Debug)]
+pub struct Lens {pub session_id:String,pub target:[f32;4],pub current:[f32;4],pub opacity:f32,pub energy:f32,pub leaving:bool}
+impl Lens {
+    pub fn new(session_id:&str,target:[f32;4],reduce:bool)->Self {
+        // Arrives a touch wider and settles in, like a camera finding focus.
+        let [x,y,w,h]=target;let grow=0.035;
+        let wide=[x-w*grow,y-h*grow,w*(1.+2.*grow),h*(1.+2.*grow)];
+        Self{session_id:session_id.into(),target,current:if reduce{target}else{wide},opacity:if reduce{1.}else{0.},energy:if reduce{0.}else{1.},leaving:false}
+    }
+    pub fn retarget(&mut self,target:[f32;4],reduce:bool) {
+        let moved=self.target.iter().zip(target).any(|(a,b)|(a-b).abs()>0.5);
+        self.target=target;self.leaving=false;
+        if moved&&!reduce {self.energy=1.;}
+    }
+    /// Advances one frame. Returns false once everything sits exactly on its
+    /// target, so a still lens costs no frames at all.
+    pub fn step(&mut self,dt:f32,reduce:bool)->bool {
+        let goal=if self.leaving{0.}else{1.};
+        if reduce {self.current=self.target;self.energy=0.;self.opacity=goal;return false;}
+        let glide=1.-(-dt.max(0.)/0.09).exp();let fade=1.-(-dt.max(0.)/0.16).exp();let mut moving=false;
+        for i in 0..4 {self.current[i]+=(self.target[i]-self.current[i])*glide;if (self.current[i]-self.target[i]).abs()<0.25{self.current[i]=self.target[i];}else{moving=true;}}
+        self.opacity+=(goal-self.opacity)*fade;if (self.opacity-goal).abs()<0.002{self.opacity=goal;}else{moving=true;}
+        self.energy*=(-dt.max(0.)/0.8).exp();if self.energy<0.003{self.energy=0.;}else{moving=true;}
+        moving
+    }
+    pub fn gone(&self)->bool {self.leaving&&self.opacity<=0.}
+    /// Overall strength: the resting level while still, full while moving.
+    pub fn level(&self,resting:f32)->f32 {self.opacity*(resting+(1.-resting)*self.energy)}
+}
+/// Matches render-thread lenses to the scene's targets (session id, local
+/// rect). Lenses whose viewer zoomed out or left fade out where they were.
+pub fn sync_lenses(lenses:&mut Vec<Lens>,targets:&[(String,[f32;4])],reduce:bool) {
+    for lens in lenses.iter_mut() {if !targets.iter().any(|(sid,_)|*sid==lens.session_id){lens.leaving=true;}}
+    for (sid,rect) in targets.iter().take(MAX_LENSES) {
+        if let Some(l)=lenses.iter_mut().find(|l|l.session_id==*sid) {l.retarget(*rect,reduce);}
+        else if lenses.len()<MAX_LENSES {lenses.push(Lens::new(sid,*rect,reduce));}
+    }
+}
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]fn lens_glides_glows_then_rests_and_stops_costing_frames(){
+        let mut l=Lens::new("s",[100.,100.,400.,300.],false);assert_eq!(l.opacity,0.);assert!(l.current[2]>400.);
+        for _ in 0..30 {l.step(1./30.,false);}assert!((l.opacity-1.).abs()<0.01);assert!(l.energy<1.&&l.energy>0.);
+        let before=l.level(0.5);l.retarget([300.,100.,400.,300.],false);assert_eq!(l.energy,1.);assert!(l.level(0.5)>before,"moving glows");
+        let mut frames=0;while l.step(1./30.,false){frames+=1;assert!(frames<400);}
+        assert_eq!(l.current,l.target);assert_eq!(l.energy,0.);assert_eq!(l.level(0.5),0.5);assert!(!l.step(1./30.,false),"settled lens is idle");
+    }
+    #[test]fn lens_reduced_motion_snaps_and_departures_fade_in_place(){
+        let mut lenses=Vec::new();sync_lenses(&mut lenses,&[("a".into(),[10.,10.,100.,100.])],true);
+        assert_eq!(lenses[0].current,[10.,10.,100.,100.]);assert_eq!(lenses[0].opacity,1.);assert_eq!(lenses[0].energy,0.);
+        lenses[0].retarget([50.,10.,100.,100.],true);assert_eq!(lenses[0].energy,0.,"no glow under reduced motion");assert!(!lenses[0].step(0.03,true));assert_eq!(lenses[0].current[0],50.);
+        let mut fading=vec![Lens::new("b",[0.,0.,50.,50.],false)];for _ in 0..30 {fading[0].step(1./30.,false);}
+        sync_lenses(&mut fading,&[],false);assert!(fading[0].leaving);let at=fading[0].current;
+        while fading[0].step(1./30.,false)&&!fading[0].gone(){}assert!(fading[0].gone());assert_eq!(fading[0].current,at);
+        let many:Vec<_>=(0..9).map(|i|(format!("s{i}"),[0.,0.,10.,10.])).collect();let mut capped=Vec::new();sync_lenses(&mut capped,&many,false);assert_eq!(capped.len(),MAX_LENSES);
+    }
     #[test]fn notice_runs_exact_states_and_interrupts_without_jump(){
         let start=Instant::now();let mut n=Notice::new(Some(start),start,3.);
         for (ms,state) in [(0,NoticeState::Arriving),(450,NoticeState::Announcement),(3440,NoticeState::Announcement),(3500,NoticeState::Settling),(3900,NoticeState::Compact)] {assert_eq!(n.sample(start+Duration::from_millis(ms),3.,false).state,state);}
