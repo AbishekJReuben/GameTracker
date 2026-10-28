@@ -19,6 +19,7 @@
 
 mod clip;
 mod voice;
+mod offroader;
 
 use axum::{
     body::Bytes,
@@ -68,6 +69,15 @@ struct JoinQuery {
 
 #[tokio::main]
 async fn main() {
+    // Isolated sidecar mode never opens the clipboard/voice database. It lets a
+    // new game namespace be tested/deployed without dropping live discovery WS.
+    if std::env::args().any(|a| a == "--offroader-only") {
+        let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8081);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("offroader bind");
+        println!("offroader sidecar listening on 127.0.0.1:{port}");
+        axum::serve(listener, offroader::router()).await.expect("offroader serve");
+        return;
+    }
     let state = AppState {
         rooms: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
@@ -137,6 +147,7 @@ async fn main() {
             get(move || serve_html(p.clone()))
         })
         .with_state(state)
+        .merge(offroader::router())
         // The desktop app (http://tauri.localhost) and Android companion webview
         // fetch /health and /clip/blob/* cross-origin; without CORS headers those
         // fetches are blocked and image sync + health probes fail silently. The

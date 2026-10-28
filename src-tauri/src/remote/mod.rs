@@ -54,6 +54,7 @@ pub(crate) mod input_mapping;
 /// Loopback WebSocket carrying frames/audio to the host page and input back,
 /// off Tauri's UI-thread IPC.
 pub(crate) mod pipe;
+mod pair_limit;
 pub(crate) mod uac;
 
 use crate::db::{games, media as mediadb, music, playlists, screenshots, sessions, settings, stats, DbPool};
@@ -64,7 +65,7 @@ use crate::tracking::TrackingShared;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, Query, Request, State,
     },
     http::{header, StatusCode},
     middleware::{self, Next},
@@ -93,10 +94,17 @@ pub struct RemoteShared {
     /// The secret "permanent key" (code 2). A phone that presents it is auto-trusted.
     pub secret: Mutex<String>,
     pub tokens: Mutex<HashSet<String>>,
+    pairing_attempts: Mutex<pair_limit::PairLimit>,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl RemoteShared {
+    pub fn reset_pairing_attempts(&self) { self.pairing_attempts.lock().clear(); }
+
+    pub fn token_is_valid(&self, token: &str) -> bool {
+        self.enabled.load(Ordering::SeqCst) && self.tokens.lock().contains(token)
+    }
+
     pub fn new(port: u16) -> Self {
         Self {
             enabled: AtomicBool::new(false),
@@ -108,6 +116,7 @@ impl RemoteShared {
             code: Mutex::new(gen_code()),
             secret: Mutex::new(gen_code()),
             tokens: Mutex::new(HashSet::new()),
+            pairing_attempts: Mutex::new(pair_limit::PairLimit::default()),
             shutdown: Mutex::new(None),
         }
     }
@@ -115,8 +124,14 @@ impl RemoteShared {
     /// Rotate the pairing PIN and invalidate every previously issued token.
     pub fn rotate_pin(&self) -> String {
         let pin = gen_pin();
-        *self.pin.lock() = pin.clone();
+        // Pairing holds this same lock through token issuance. Keep the new
+        // PIN private until invalidation finishes, so a fresh pairing cannot
+        // receive a token that this rotation immediately clears.
+        let mut current = self.pin.lock();
+        *current = pin.clone();
         self.tokens.lock().clear();
+        self.pairing_attempts.lock().clear();
+        drop(current);
         pin
     }
 
@@ -190,7 +205,7 @@ pub fn start(ctx: ApiState) {
             }
         };
         let app = build_router(ctx.clone());
-        let _ = axum::serve(listener, app)
+        let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async move {
                 let _ = rx.await;
             })
@@ -202,6 +217,7 @@ pub fn start(ctx: ApiState) {
 
 /// Signal the running server to shut down and reset live counters.
 pub fn stop(remote: &RemoteShared) {
+    remote.tokens.lock().clear();
     if let Some(tx) = remote.shutdown.lock().take() {
         let _ = tx.send(());
     }
@@ -267,7 +283,7 @@ fn build_router(state: ApiState) -> Router {
     // browser WebSocket and <img> can't set an Authorization header).
     let public = Router::new()
         .route("/ping", get(ping))
-        .route("/pair", post(pair))
+        .route("/pair", post(pair).layer(DefaultBodyLimit::max(1024)))
         .route("/ws", get(ws_handler))
         .route("/media", get(media_file));
 
@@ -286,7 +302,7 @@ async fn require_auth(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|tok| s.remote.tokens.lock().contains(tok))
+        .map(|tok| s.remote.token_is_valid(tok))
         .unwrap_or(false);
     if ok {
         Ok(next.run(req).await)
@@ -307,11 +323,26 @@ struct PairResp {
     version: String,
 }
 
-async fn pair(State(s): State<ApiState>, Json(body): Json<PairReq>) -> Response {
-    let expected = s.remote.pin.lock().clone();
-    if body.pin.trim() == expected {
+async fn pair(State(s): State<ApiState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<PairReq>) -> Response {
+    if !s.remote.enabled.load(Ordering::SeqCst) {
+        return (StatusCode::UNAUTHORIZED, "Remote access is disabled").into_response();
+    }
+    if let Err(wait) = s.remote.pairing_attempts.lock().reserve(peer.ip(), std::time::Instant::now()) {
+        return (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, wait.as_secs().saturating_add(1).to_string())], "Too many pairing attempts. Wait, or regenerate the PIN on the PC.").into_response();
+    }
+    // Keep the PIN locked until token issuance so a concurrent PIN rotation
+    // cannot leave a newly issued token authenticated with the old PIN.
+    let expected = s.remote.pin.lock();
+    if body.pin.trim() == expected.as_str() {
         let token = gen_token();
-        s.remote.tokens.lock().insert(token.clone());
+        let mut tokens = s.remote.tokens.lock();
+        if !s.remote.enabled.load(Ordering::SeqCst) {
+            return (StatusCode::UNAUTHORIZED, "Remote access is disabled").into_response();
+        }
+        if tokens.len() >= 128 {
+            return (StatusCode::TOO_MANY_REQUESTS, "Pairing capacity reached. Regenerate the PIN on the PC.").into_response();
+        }
+        tokens.insert(token.clone());
         Json(PairResp {
             token,
             name: "GameTracker".into(),
@@ -677,7 +708,7 @@ async fn system_app_history(
 
 async fn get_settings(State(s): State<ApiState>) -> ApiResult<std::collections::HashMap<String, String>> {
     let pool = s.pool.clone();
-    blocking(move || settings::all(&pool)).await
+    blocking(move || settings::public_remote(&pool)).await
 }
 
 // ---------- write endpoints ----------
@@ -919,31 +950,35 @@ async fn ws_handler(
     if !ws_authorized(&s, &q) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    ws.on_upgrade(move |socket| live_socket(socket, s))
+    let Some(token) = q.token else {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    };
+    ws.on_upgrade(move |socket| live_socket(socket, s, token))
 }
 
 /// Push the live tracking snapshot to the client once a second until it drops.
-async fn live_socket(mut socket: WebSocket, s: ApiState) {
+async fn live_socket(mut socket: WebSocket, s: ApiState, token: String) {
     s.remote.clients.fetch_add(1, Ordering::SeqCst);
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         ticker.tick().await;
+        if !s.remote.token_is_valid(&token) { break; }
         let snapshot = { s.tracking.state.lock().clone() };
         let payload = match serde_json::to_string(&snapshot) {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if socket.send(Message::Text(payload.into())).await.is_err() {
+        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(1), socket.send(Message::Text(payload.into()))).await, Ok(Ok(()))) {
             break;
         }
     }
-    s.remote.clients.fetch_sub(1, Ordering::SeqCst);
+    let _ = s.remote.clients.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
 }
 
 fn ws_authorized(s: &ApiState, q: &WsQuery) -> bool {
     q.token
         .as_deref()
-        .map(|t| s.remote.tokens.lock().contains(t))
+        .map(|t| s.remote.token_is_valid(t))
         .unwrap_or(false)
 }
 

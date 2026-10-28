@@ -286,6 +286,7 @@ pub fn sync_remote_from_db(pool: &crate::db::DbPool, r: &crate::remote::RemoteSh
         if *cur != pin {
             *cur = pin;
             r.tokens.lock().clear();
+            r.reset_pairing_attempts();
         }
     }
 }

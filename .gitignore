@@ -141,3 +141,10 @@ src-tauri/target/release/deps/gametracker_lib.lib
 # Platform pre-commit entry (Unix copy of pre-commit.sh). Windows uses .cmd.
 .githooks/pre-commit
 /signaling/target-hot/release
+/signaling/target-offroader/
+/signaling/target-offroader-roster/
+/signaling/offroader-runtime/
+/signaling/static/offroader.json
+# Local release logs, web-bundle snapshots and probe evidence: kept on disk, not in git.
+/.logs/
+/docs/remote-implementation/evidence/

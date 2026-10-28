@@ -2042,72 +2042,16 @@ pub fn remote_regen_secret(state: State<AppState>) -> RemoteStatus {
 
 // ---- per-device access grants (permanent trust + temporary timed grants) ----
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TrustedDevice {
-    pub id: String,
-    pub name: String,
-    pub added_utc: String,
-}
+use crate::db::remote_grants::{self, RemoteGrants};
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TempGrant {
-    pub id: String,
-    pub name: String,
-    pub expires_utc: String,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteGrants {
-    pub trusted: Vec<TrustedDevice>,
-    pub temporary: Vec<TempGrant>,
-}
-
-fn read_trusted(pool: &crate::db::DbPool) -> Vec<TrustedDevice> {
-    settings::get(pool, "remote_trusted_devices")
-        .ok()
-        .flatten()
-        .and_then(|j| serde_json::from_str(&j).ok())
-        .unwrap_or_default()
-}
-
-/// Read the temp grants, dropping any that have expired (and persist the pruned
-/// list so it doesn't grow unbounded).
-fn read_temp_pruned(pool: &crate::db::DbPool) -> Vec<TempGrant> {
-    let now = chrono::Utc::now();
-    let all: Vec<TempGrant> = settings::get(pool, "remote_temp_grants")
-        .ok()
-        .flatten()
-        .and_then(|j| serde_json::from_str(&j).ok())
-        .unwrap_or_default();
-    let live: Vec<TempGrant> = all
-        .into_iter()
-        .filter(|g| {
-            chrono::DateTime::parse_from_rfc3339(&g.expires_utc)
-                .map(|t| t.with_timezone(&chrono::Utc) > now)
-                .unwrap_or(false)
-        })
-        .collect();
-    let _ = settings::set(
-        pool,
-        "remote_temp_grants",
-        &serde_json::to_string(&live).unwrap_or_else(|_| "[]".into()),
-    );
-    live
-}
-
-/// List trusted (permanent) devices and active temporary grants (expired pruned).
+/// List a consistent read-only snapshot of permanent and live temporary grants.
 #[tauri::command]
-pub fn remote_list_grants(state: State<AppState>) -> RemoteGrants {
-    RemoteGrants {
-        trusted: read_trusted(&state.pool),
-        temporary: read_temp_pruned(&state.pool),
-    }
+pub fn remote_list_grants(state: State<AppState>) -> AppResult<RemoteGrants> {
+    let mut conn = state.pool.get()?;
+    remote_grants::list(&mut conn)
 }
 
-/// Grant a device permanent trust or a temporary (timed) grant.
+/// Grant and revoke operations serialize through SQLite across both processes.
 #[tauri::command]
 pub fn remote_grant(
     state: State<AppState>,
@@ -2116,115 +2060,34 @@ pub fn remote_grant(
     kind: String,
     duration_secs: Option<i64>,
 ) -> AppResult<RemoteGrants> {
-    let now = chrono::Utc::now();
-    if kind == "permanent" {
-        let mut trusted = read_trusted(&state.pool);
-        trusted.retain(|d| d.id != device_id);
-        trusted.push(TrustedDevice {
-            id: device_id.clone(),
-            name,
-            added_utc: now.to_rfc3339(),
-        });
-        settings::set(
-            &state.pool,
-            "remote_trusted_devices",
-            &serde_json::to_string(&trusted).unwrap_or_else(|_| "[]".into()),
-        )?;
-        // A permanent grant supersedes any temp grant for the same device.
-        let mut temp = read_temp_pruned(&state.pool);
-        temp.retain(|g| g.id != device_id);
-        settings::set(
-            &state.pool,
-            "remote_temp_grants",
-            &serde_json::to_string(&temp).unwrap_or_else(|_| "[]".into()),
-        )?;
-    } else {
-        let secs = duration_secs.unwrap_or(3600).clamp(60, 60 * 60 * 24 * 30);
-        let expires = now + chrono::Duration::seconds(secs);
-        let mut temp = read_temp_pruned(&state.pool);
-        temp.retain(|g| g.id != device_id);
-        temp.push(TempGrant {
-            id: device_id.clone(),
-            name,
-            expires_utc: expires.to_rfc3339(),
-        });
-        settings::set(
-            &state.pool,
-            "remote_temp_grants",
-            &serde_json::to_string(&temp).unwrap_or_else(|_| "[]".into()),
-        )?;
-    }
-    Ok(RemoteGrants {
-        trusted: read_trusted(&state.pool),
-        temporary: read_temp_pruned(&state.pool),
-    })
+    let mut conn = state.pool.get()?;
+    remote_grants::grant(&mut conn, &device_id, &name, &kind, duration_secs)
 }
 
-/// Revoke a device — removes it from both the trusted and temporary lists.
 #[tauri::command]
 pub fn remote_revoke(state: State<AppState>, device_id: String) -> AppResult<RemoteGrants> {
-    let mut trusted = read_trusted(&state.pool);
-    trusted.retain(|d| d.id != device_id);
-    settings::set(
-        &state.pool,
-        "remote_trusted_devices",
-        &serde_json::to_string(&trusted).unwrap_or_else(|_| "[]".into()),
-    )?;
-    let mut temp = read_temp_pruned(&state.pool);
-    temp.retain(|g| g.id != device_id);
-    settings::set(
-        &state.pool,
-        "remote_temp_grants",
-        &serde_json::to_string(&temp).unwrap_or_else(|_| "[]".into()),
-    )?;
-    Ok(RemoteGrants {
-        trusted: read_trusted(&state.pool),
-        temporary: read_temp_pruned(&state.pool),
-    })
+    let mut conn = state.pool.get()?;
+    remote_grants::revoke(&mut conn, &device_id)
 }
 
-/// Decide a connecting device's access level, used by the host handshake:
-/// `"secret"`  — supplied the correct secret key (auto-persisted as permanent),
-/// `"permanent"` / `"temporary"` — already granted,
-/// `"none"`    — needs the desktop approval prompt.
+/// Preserve the existing successful wire levels; storage failures reject the
+/// command instead of acknowledging a device whose grant was not committed.
 #[tauri::command]
 pub fn remote_check_auth(
     state: State<AppState>,
     device_id: String,
     name: Option<String>,
     secret: Option<String>,
-) -> String {
+) -> AppResult<String> {
     let expected = state.remote.secret.lock().clone();
+    let mut conn = state.pool.get()?;
     if let Some(s) = secret {
         if !s.trim().is_empty() && s.trim().eq_ignore_ascii_case(expected.trim()) {
-            // Correct secret → remember this device permanently.
-            let now = chrono::Utc::now();
-            let mut trusted = read_trusted(&state.pool);
-            if !trusted.iter().any(|d| d.id == device_id) {
-                trusted.push(TrustedDevice {
-                    id: device_id,
-                    name: name.unwrap_or_else(|| "Phone".into()),
-                    added_utc: now.to_rfc3339(),
-                });
-                let _ = settings::set(
-                    &state.pool,
-                    "remote_trusted_devices",
-                    &serde_json::to_string(&trusted).unwrap_or_else(|_| "[]".into()),
-                );
-            }
-            return "secret".into();
+            remote_grants::remember_permanent(&mut conn, &device_id, name.as_deref().unwrap_or("Phone"))?;
+            return Ok("secret".into());
         }
     }
-    if read_trusted(&state.pool).iter().any(|d| d.id == device_id) {
-        return "permanent".into();
-    }
-    if read_temp_pruned(&state.pool)
-        .iter()
-        .any(|g| g.id == device_id)
-    {
-        return "temporary".into();
-    }
-    "none".into()
+    Ok(remote_grants::access_level(&mut conn, &device_id)?.into())
 }
 
 // ---- USB install (adb) ----

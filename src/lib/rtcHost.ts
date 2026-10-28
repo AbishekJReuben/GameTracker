@@ -39,6 +39,8 @@ import { EpochVideoHost } from './epochVideo';
 import { parseCapturePacket, sameCapture, type CaptureIdentity } from './captureView';
 import { supportsRemote } from './remoteProtocol';
 import { onlyLiveSession, runAuthorizedStartup } from './hostAuthorization';
+import { maySharePermanentSecret, remoteAccessLevel, remotePublicSettings, type RemoteAccessLevel } from './remoteAccessPolicy';
+import { RemoteGrantLease, type GrantFailure } from './remoteGrantLease';
 import { CaptureStallWatchdog, HostCaptureRecovery } from './hostCaptureRecovery';
 
 /** Live host telemetry for the desktop Remote page (published each ~1s). */
@@ -366,7 +368,7 @@ async function handleData(path: string, body?: any): Promise<unknown> {
   if (urlPath === "/api/system/specs") return api.systemSpecs();
   if (urlPath === "/api/system/live") return api.systemLive();
   if (urlPath === "/api/system/history") return api.systemHistory(num("minutes") ?? 60);
-  if (urlPath === "/api/settings") return api.getSettings();
+  if (urlPath === "/api/settings") return remotePublicSettings(await api.getSettings());
   // Online game panels (mirrors the desktop GameDetail): live stats, reviews, Twitch.
   if (urlPath === "/api/steam/reviews") {
     const appId = num("appId");
@@ -2231,6 +2233,8 @@ export function startHost(opts: HostOptions): () => void {
     // Access gate: the screen/audio capture and input injection stay off until the
     // guest is authorized (trusted device, correct secret, or user approval).
     let authorized = false;
+    let authorizedAccess: RemoteAccessLevel = 'none';
+    let grantLease: RemoteGrantLease | null = null;
     let authAnnounced=false;
     let presenceSession: HostPresenceSession | null = null;
     // Latest auth message from this peer asked for the clipboard secret. Reset per
@@ -2337,10 +2341,28 @@ export function startHost(opts: HostOptions): () => void {
       window.removeEventListener("focus", recoverAfterVisibility);
     };
 
+    const rejectGrant = (reason: GrantFailure) => {
+      if (!sessionAlive || pc !== myPc || activeSessionId !== sessionId || stopped) return;
+      authorized = false; authorizedAccess = 'none'; authAnnounced = false;
+      // A revoked/expired grant is terminal. A transient verification failure
+      // only closes this transport, allowing normal reconnection to retry safely.
+      if ((reason === 'revoked' || reason === 'expired') && dataCh?.readyState === 'open') {
+        dataCh.send(JSON.stringify({ event: 'auth', state: 'denied', reason }));
+      }
+      guestNeedsOffer = true;
+      teardownPeer();
+    };
+    const bindGrant = async (deviceId: string) => {
+      if (grantLease && grantLease.deviceId !== deviceId) { rejectGrant('revoked'); return false; }
+      grantLease ??= new RemoteGrantLease(deviceId, () => api.remoteListGrants(), rejectGrant);
+      if (!await grantLease.refresh() || !sessionAlive || pc !== myPc || stopped) return false;
+      authorizedAccess = grantLease.accessLevel;
+      return grantLease.check();
+    };
     const authorize = async () => {
       if (authorized) return;
       await runAuthorizedStartup({
-        isAlive: () => sessionAlive && pc === myPc && activeSessionId === sessionId && !stopped,
+        isAlive: () => sessionAlive && pc === myPc && activeSessionId === sessionId && !stopped && !!grantLease?.check(),
         registerPresence: () => presenceSession?.authorize() ?? Promise.resolve(),
         activate: () => { authorized = true; },
         startVideo: () => startVideoCapture?.(),
@@ -2354,7 +2376,7 @@ export function startHost(opts: HostOptions): () => void {
           const authOk: Record<string, unknown> = { event: "auth", state: "ok", ...presenceSession?.authFields() };
           // Secret is only read/sent after every asynchronous startup boundary
           // has proved that this is still the authorized peer.
-          if (opts.clipboardSecret && lastAuthWantedSecret) authOk.secret = opts.clipboardSecret;
+          if (opts.clipboardSecret && lastAuthWantedSecret && maySharePermanentSecret(grantLease?.accessLevel ?? 'none')) authOk.secret = opts.clipboardSecret;
           dataCh.send(JSON.stringify(authOk));authAnnounced=true;
         },
         onVideoError: (error) => console.warn("[remote] start capture failed:", error),
@@ -2388,7 +2410,13 @@ export function startHost(opts: HostOptions): () => void {
     let sessionAlive = true;
     sessionCleanups.add(() => {
       sessionAlive = false;
+      grantLease?.close();
     });
+    const grantTimer = window.setInterval(() => {
+      if (!sessionAlive || pc !== myPc || activeSessionId !== sessionId || stopped || !authorized) return;
+      if (grantLease?.check()) void grantLease.refresh();
+    }, 1000);
+    sessionCleanups.add(() => window.clearInterval(grantTimer));
     let iceRestartTimer: number | null = null;
     let deadTimer: number | null = null;
     let restartAttempts = 0;
@@ -3609,6 +3637,7 @@ export function startHost(opts: HostOptions): () => void {
       try {
         const msg = JSON.parse(e.data as string);
         lastGuestMsg = Date.now();
+        if (authorized && !grantLease?.check()) return;
         // Explicit goodbye from the phone (user tapped Disconnect): tear down now
         // instead of waiting ~30s for ICE to notice the peer is gone.
         if (msg && msg.type === "bye") {
@@ -3630,8 +3659,10 @@ export function startHost(opts: HostOptions): () => void {
           // the authorize() callback above — the secret only ships post-approval.
           lastAuthWantedSecret = msg.wantSecret === true;
           if (authorized) {
+            if (String(msg.deviceId ?? '') !== grantLease?.deviceId) { rejectGrant('revoked'); return; }
+            if (!await bindGrant(grantLease.deviceId)) return;
             const ack: Record<string, unknown> = { event: "auth", state: "ok", ...presenceSession?.authFields() };
-            if (opts.clipboardSecret && lastAuthWantedSecret) ack.secret = opts.clipboardSecret;
+            if (opts.clipboardSecret && lastAuthWantedSecret && maySharePermanentSecret(grantLease?.accessLevel ?? 'none')) ack.secret = opts.clipboardSecret;
             if (dataCh?.readyState === "open") dataCh.send(JSON.stringify(ack));
             return;
           }
@@ -3644,16 +3675,18 @@ export function startHost(opts: HostOptions): () => void {
           authBusy = true;
           try {
             const deviceId = String(msg.deviceId ?? "");
+            if (!/^[A-Za-z0-9._:-]{8,128}$/.test(deviceId)) { rejectGrant('revoked'); return; }
             const name = String(msg.name ?? "Phone");
             const secret = typeof msg.secret === "string" ? msg.secret : undefined;
-            let level: string;
+            let level: RemoteAccessLevel;
             try {
-              level = await api.remoteCheckAuth(deviceId, name, secret);
+              level = remoteAccessLevel(await api.remoteCheckAuth(deviceId, name, secret));
             } catch {
               level = "none";
             }
             if (pc !== myPc) return; // session superseded/torn down while we awaited
             if (level !== "none") {
+              if (!await bindGrant(deviceId)) return;
               await authorize();
               return;
             }
@@ -3683,8 +3716,14 @@ export function startHost(opts: HostOptions): () => void {
                   decision.kind === "temporary" ? decision.durationSecs : undefined,
                 );
               } catch {
-                /* grant persistence best-effort */
+                // A failed durable grant must not start an untracked session.
+                if (pc !== myPc) return;
+                if (dataCh?.readyState === 'open') dataCh.send(JSON.stringify({ event: 'auth', state: 'denied' }));
+                teardownPeer();
+                return;
               }
+              if (pc !== myPc) return;
+              if (!await bindGrant(deviceId)) return;
               await authorize();
             }
           } finally {
@@ -3692,6 +3731,9 @@ export function startHost(opts: HostOptions): () => void {
           }
           return;
         }
+        // Every non-handshake control message requires a current grant, including
+        // stream tuning, audio/video negotiation, probes and pointer input.
+        if (!authorized || !grantLease?.check()) return;
         // Guest video-reset request: its decoder is receiving bytes but decoding
         // nothing. Rebuild the canvas + generator track + Rust feed in place
         // (replaceTrack keeps the session/auth) — a fresh encoder emits a fresh
@@ -4038,6 +4080,7 @@ export function startHost(opts: HostOptions): () => void {
     move.onmessage = onControlMsg;
 
     data.onmessage = async (e) => {
+      if (!sessionAlive || pc !== myPc || activeSessionId !== sessionId || stopped) return;
       let req: { id?: number; path?: string; body?: any; ping?: number };
       try {
         req = JSON.parse(e.data as string);
@@ -4055,14 +4098,14 @@ export function startHost(opts: HostOptions): () => void {
       if (typeof req.id !== "number" || typeof req.path !== "string") return;
       const id = req.id;
       // Don't answer stats/data requests until the device is authorized.
-      if (!authorized) {
+      if (!authorized || !grantLease?.check() || !await grantLease.refresh()) {
         if (data.readyState === "open") data.send(JSON.stringify({ id, ok: false, error: "awaiting approval" }));
         return;
       }
       // Responses can exceed the SCTP max message size (e.g. base64 cover art).
       // Split anything large into ordered chunks the guest reassembles by id.
       const respond = (payloadObj: unknown) => {
-        if (data.readyState !== "open") return;
+        if (!sessionAlive || pc !== myPc || stopped || !authorized || !grantLease?.check() || data.readyState !== "open") return;
         const payload = JSON.stringify(payloadObj);
         const MAX = 15000;
         if (payload.length <= MAX) {
@@ -4071,13 +4114,16 @@ export function startHost(opts: HostOptions): () => void {
         }
         const total = Math.ceil(payload.length / MAX);
         for (let i = 0; i < total; i++) {
+          if (!grantLease?.check()) return;
           data.send(JSON.stringify({ c: id, i, n: total, s: payload.slice(i * MAX, (i + 1) * MAX) }));
         }
       };
       try {
         const result = await handleData(req.path, req.body);
+        if (!await grantLease.refresh()) return;
         respond({ id, ok: true, data: result });
       } catch (err) {
+        if (!await grantLease.refresh()) return;
         respond({ id, ok: false, error: String(err) });
       }
     };

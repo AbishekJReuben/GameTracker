@@ -5,6 +5,7 @@ pub mod media;
 pub mod models;
 pub mod music;
 pub mod playlists;
+pub mod remote_grants;
 pub mod screenshots;
 pub mod shares;
 pub mod sessions;

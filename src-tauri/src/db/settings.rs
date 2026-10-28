@@ -133,3 +133,13 @@ pub fn all(pool: &DbPool) -> AppResult<HashMap<String, String>> {
     }
     Ok(map)
 }
+
+/// Only companion presentation settings may cross a remote transport boundary.
+/// Shared with the WebRTC adapter; unknown/new desktop settings stay private.
+pub fn public_remote(pool: &DbPool) -> AppResult<HashMap<String, String>> {
+    let allowed: Vec<String> = serde_json::from_str(include_str!("../../../src/lib/remotePublicSettings.json"))
+        .unwrap_or_default();
+    let mut map = all(pool)?;
+    map.retain(|key, _| allowed.contains(key));
+    Ok(map)
+}

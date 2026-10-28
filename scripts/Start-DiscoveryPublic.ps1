@@ -38,7 +38,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $SignalingDir = Join-Path $RepoRoot 'signaling'
-$Exe = Join-Path $SignalingDir 'target\release\gametracker-signal.exe'
+# This prepared build includes /offroader as well as discovery/clipboard/voice.
+# Its separate target avoids the old running binary locking a source upgrade.
+$BuildExe = Join-Path $SignalingDir 'target-offroader\release\gametracker-signal.exe'
+$Exe = $BuildExe
 Set-Location $RepoRoot
 
 $LogDir = Join-Path $RepoRoot '.logs'
@@ -128,7 +131,7 @@ $needBuild = (-not $SkipBuild) -or (-not (Test-Path -LiteralPath $Exe))
 if ($needBuild) {
   Write-Step 'Building signaling server (cargo release)'
   Append-DiscoveryLog -FileName 'discovery-start.log' -Message 'cargo build --release'
-  $buildOut = cmd /c "cargo build --release --manifest-path `"$SignalingDir\Cargo.toml`" 2>&1"
+  $buildOut = cmd /c "cargo build --release --manifest-path `"$SignalingDir\Cargo.toml`" --target-dir `"$SignalingDir\target-offroader`" 2>&1"
   if ($buildOut) { Add-Content -LiteralPath $SignalLog -Value ($buildOut -join [Environment]::NewLine) }
   if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: cargo build failed (exit $LASTEXITCODE)." -ForegroundColor Red
@@ -141,6 +144,17 @@ if ($needBuild) {
 } else {
   Write-Step 'Skipping build (-SkipBuild, binary present)'
 }
+
+# Run a deployment copy, so Cargo can replace its build output during the next
+# upgrade without Windows refusing because that same executable is running.
+$hashAlgorithm=[Security.Cryptography.SHA256]::Create()
+$binaryStream=[IO.File]::OpenRead($BuildExe)
+try {$binaryHash=([BitConverter]::ToString($hashAlgorithm.ComputeHash($binaryStream))).Replace('-','').ToLowerInvariant()}
+finally {$binaryStream.Dispose();$hashAlgorithm.Dispose()}
+$deploymentDir=Join-Path $SignalingDir ('offroader-runtime\discovery-bin\'+$binaryHash)
+if(-not (Test-Path -LiteralPath $deploymentDir)){[void][IO.Directory]::CreateDirectory($deploymentDir)}
+$Exe=Join-Path $deploymentDir 'gametracker-signal.exe'
+if(-not (Test-Path -LiteralPath $Exe)){Copy-Item -LiteralPath $BuildExe -Destination $Exe}
 
 Stop-ProcessOnPort -ListenPort $Port
 Get-Job -Name 'DiscoverySignal', 'DiscoveryTunnel' -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue
