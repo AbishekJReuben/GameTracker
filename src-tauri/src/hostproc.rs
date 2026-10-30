@@ -50,6 +50,10 @@ const STATUS_FRESH_MS: i64 = 20_000;
 /// One line per supervision event in `hostproc.log` (kept small): spawns,
 /// restarts and host startup stages, so a host that won't stay up is diagnosable.
 pub fn trace(msg: &str) {
+    // Unit tests would otherwise write to the real app's log.
+    if cfg!(test) {
+        return;
+    }
     let path = data_dir().join("hostproc.log");
     if std::fs::metadata(&path).map(|m| m.len() > 256 * 1024).unwrap_or(false) {
         let _ = std::fs::rename(&path, path.with_extension("log.old"));
