@@ -2,8 +2,7 @@
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN};
-use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsZoomed};
 
 /// Monitor-sized windows that belong to the shell, not to an app.
 const SHELL_CLASSES: [&str; 5] = ["Progman", "WorkerW", "XamlExplorerHostIslandWindow", "Windows.UI.Core.CoreWindow", "TopLevelWindowForOverflowXamlIsland"];
@@ -23,10 +22,10 @@ pub unsafe fn covers(monitor: HMONITOR) -> bool {
     if n > 0 && SHELL_CLASSES.contains(&String::from_utf16_lossy(&class[..n as usize]).as_str()) {
         return false;
     }
-    if matches!(SHQueryUserNotificationState(), Ok(QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)) {
-        return true;
-    }
-    fills(hwnd, monitor)
+    // Maximized isn't fullscreen, even when an auto-hiding taskbar lets it fill the
+    // monitor. And SHQueryUserNotificationState can't help here: it says a fullscreen
+    // app exists somewhere, which would hide the orb on every other monitor too.
+    !IsZoomed(hwnd).as_bool() && fills(hwnd, monitor)
 }
 
 unsafe fn fills(hwnd: HWND, monitor: HMONITOR) -> bool {

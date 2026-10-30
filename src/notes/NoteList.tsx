@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Check, ChevronDown, Copy, Pencil, Pin, PinOff, Plus, Share2, Tag, Tags, Trash2 } from "lucide-react";
 import { cn } from "@/lib/cn";
@@ -63,7 +63,7 @@ function TagPicker({ current, known, onChange, onClose }: { current: string[]; k
   );
 }
 
-function Act({ label, onClick, active, children }: { label: string; onClick: () => void; active?: boolean; children: React.ReactNode }) {
+function Act({ label, onClick, active, children }: { label: string; onClick: (e: MouseEvent<HTMLButtonElement>) => void; active?: boolean; children: React.ReactNode }) {
   return (
     <button type="button" className="np-act" data-active={active || undefined} title={label} aria-label={label} onClick={onClick}>
       {children}
@@ -206,7 +206,7 @@ export const NoteCard = memo(function NoteCard({ item, selected, knownTags, acti
           {isImage && item.size > 0 && <span>{Math.round(item.size / 1024)} KB</span>}
         </span>
         <span className="np-acts">
-          <Act label={copied ? "Copied" : "Copy"} onClick={() => void doCopy()} active={copied}>
+          <Act label={copied ? "Copied" : "Copy"} onClick={(e) => void doCopy(e)} active={copied}>
             {copied ? <Check /> : <Copy />}
           </Act>
           {!isImage && (

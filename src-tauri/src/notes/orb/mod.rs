@@ -999,6 +999,7 @@ impl Orb {
             return;
         }
         self.hidden.set(covered);
+        crate::hostproc::trace(if covered { "notes orb: fullscreen app, hiding" } else { "notes orb: back" });
         if covered {
             self.scene(|orb, _| orb.presence(0.0));
             let _ = ShowWindow(self.hit, SW_HIDE);

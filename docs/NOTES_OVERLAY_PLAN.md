@@ -1,6 +1,6 @@
 # Notes floating overlay: rewrite plan
 
-**Status: waiting for your go-ahead. None of this is built yet.** Published with a live prototype: [Notes Orb Plan](https://claude.ai/artifact/No73HXdMke9KN9xLeUuVRY).
+**Status: built, shipped in 3.9.124.** The rollout changed from the plan below: the new orb is on by default instead of off, because the go-ahead was to do everything, and the classic overlay stays as the fallback for one release. See `AGENTS.md` section 22 for how it works now. Published with a live prototype: [Notes Orb Plan](https://claude.ai/artifact/No73HXdMke9KN9xLeUuVRY).
 
 Researched 2026-10-30 on this PC: Windows 11 build 26300, two 3840×2160 monitors at 125 % (one at negative X), 60 Hz, WebView2 156.0.4314.50, Tauri 2.11.3, tao 0.35.3, wry 0.55.1. Every number below was measured here unless it says otherwise. Lab code and raw results are in the shared notes folder under `overlay-lab/`.
 

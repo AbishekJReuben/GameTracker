@@ -2118,3 +2118,86 @@ rest of the window is a plain clear. Appearance is one JSON schema shared by pho
   tucking inside when there's no room above; several viewers keep it at the top.
 - `examples/remote_lens_probe.rs` renders the real shader + label to PNGs and a glide video:
   `cargo run --example remote_lens_probe -- <out> [backdrop.png] [--video]`.
+
+---
+
+## 22. Floating Notes: the orb and panel in their own process (3.9.124) — do not regress
+
+The old overlay ran in the main app and froze with it: `EmptyClipboard` on the UI thread waits
+for whichever app owns the clipboard, up to 5 s, and every synchronous command shared that thread.
+Full story and measurements: `docs/NOTES_OVERLAY_PLAN.md`. The classic overlay
+(`ClipboardOverlay.tsx`) stays for one release as the fallback.
+
+**Processes.** `gametracker.exe --notes-shell` (`notes/shell.rs`), started and restarted by the main
+app (`hostproc::supervise_shell`). Mutex `Local\GameTrackerNotes-v1`, stop event
+`Local\GameTrackerNotesQuit-v1`; it also leaves on `quit.flag` or a fresh `updating.flag`. Three
+quick deaths and the classic overlay takes over for that run (`hostproc::shell_failed`). The main app
+still owns the clipboard watcher and relay sync. The shell reads and writes the database directly,
+so neither needs the other: `notes/bus.rs` (two named events) only makes changes show up sooner.
+Sync status reaches the shell through `notes-status.json`, written every 2 s by `ClipSyncEngine`.
+
+**Threads in the shell.**
+- `notes-orb` (`notes/orb/`) must never wait for anything: no database, no WebView, no blocking
+  call into the Tauri thread. Touching the panel's window from here uses `SWP_ASYNCWINDOWPOS`.
+- The Tauri UI thread hosts only the panel, and every panel command is async.
+- `notes-control` turns what the orb reports (`FromOrb`) into panel and database work.
+- `notes-feed` wakes on a change or every 2 s, and tells the orb about new notes, sync and settings.
+
+**Three windows, on purpose.** `hit` is exactly the orb's shape, draws nothing and takes the mouse.
+`glass` draws the orb and its glow and is click-through, so the glow never eats a click, and it never
+resizes, so the orb can't jump. `stage` is click-through, hidden at rest, and sits under `glass`: it
+holds the ripple, the peek card and the morph shape, so the shape comes out from behind the orb.
+
+**Composition (`orb/scene.rs`).** Windows.UI.Composition, so animations run in the compositor and
+survive a frozen thread. Keep these true:
+- Nothing animates at rest: the rim turns only while hovered, and pulses have an iteration count.
+  Measured 0.0 ms of CPU over 6 s at rest. Don't add an idle animation.
+- Springs are sampled into keyframes as `Lerp(this.StartingValue, target, k)`, so an animation that
+  interrupts another picks up mid-flight. `FinalValue` on natural-motion animations needs
+  `IReference<Vector>`, which is awkward from Rust.
+- A surface painted once with Direct2D lives on one GPU device. `watch()` rebuilds the scene if
+  that device is lost.
+- Tuck slides the visual out of its own window, and `clip_to_work` stops it reaching the next monitor.
+
+**The morph.** Click, the shape grows on the stage, and at 80 % of the spring (`REVEAL_AT`) the real
+panel is shown under the stage and the shape fades over it. Waiting for the last pixel of the spring
+is what made an open feel slow. The panel is shown with `SWP_SHOWWINDOW | SWP_NOACTIVATE`; focus comes
+after the fade, because activating a topmost window lifts it over the stage. The page keeps its rows
+veiled (`data-veiled`) from close to the next `notes://reveal`, or they flash before they rise.
+Windows' own open animation is off (`DWMWA_TRANSITIONS_FORCEDISABLED`), or it fights the shape.
+
+**The panel (`notes/panel.rs`, `src/notes/`).** Entry `notes.html`, about 52 KB of its own code.
+- Real acrylic: `chrome()` strips the caption styles first, or Windows paints buttons into the frame.
+  Nothing on the page may use `backdrop-filter`: inside a transparent WebView it blurs only the page.
+  Windows swaps acrylic for flat grey while unfocused; the tint on `.np` is what keeps that looking
+  chosen.
+- `COREWEBVIEW2_FORCED_HOSTING_MODE` Window to Visual: no cross-process child windows. Typing, search,
+  Enter, Esc, scroll, window drag, edge resize, right-click and the file dialog are tested. IME isn't,
+  because this PC has no IME; if one misbehaves, remove that line in `run_notes_shell`.
+- Own WebView2 folder `EBWebView-notes`. Built on first hover, released after 15 idle minutes.
+  A dead renderer reloads; a dead browser process rebuilds (`hostproc::on_browser_exit`). A page that
+  never reports in within 12 s ends the process, and the supervisor starts a fresh one, because only
+  that clears a wedged WebView2.
+- Virtual list, CSS motion only. No `motion` import in `src/notes` or `Composer`: it would be most of
+  the start-up weight. `reflow()` turns on the row transition for a moment; leaving it on makes rows
+  swim while scrolling, as they get measured.
+- The window API list in `src-tauri/capabilities/notes.json` is checked by `capabilities.test.ts`.
+- Drafts and sizes live in the database: the panel's WebView has its own localStorage. The first
+  run copies the old ones across (`moveOverlayState`).
+
+**Testing beside the installed app.**
+
+```bash
+GT_NOTES_TEST_DATA=<scratch folder> cargo run --example notes_shell -- --notes-shell
+```
+
+- The example refuses to start without that variable. Never run a new build against the real data
+  folder: it migrates the database, and the installed app is on an older schema.
+- In debug builds that variable also makes Copy a no-op, because the installed app's watcher would
+  capture anything a test wrote to the real clipboard. The real path is tested in a private window
+  station: `cargo test --lib window_station -- --ignored`.
+- `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333` gives you the page over the
+  DevTools protocol.
+- `--notes-supervise-test` runs the supervisor alone, so killing the shell shows a real restart.
+- Debug builds load the page from Vite. Add `--features tauri/custom-protocol` to test the real
+  bundle and its Content Security Policy.
