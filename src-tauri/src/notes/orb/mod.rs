@@ -54,6 +54,9 @@ const DRAG_DIP: f32 = 5.0;
 const TUCK_AFTER: Duration = Duration::from_secs(4);
 const TUCK_DIM: f32 = 0.62;
 const PEEK_HOLD_MS: f32 = 1900.0;
+/// The panel takes over once the shape looks finished, not when its spring has
+/// settled to the last pixel. That tail is what made an open feel slow.
+const REVEAL_AT: f32 = 0.8;
 const REVEAL_FADE_MS: f32 = 130.0;
 
 const WM_WAKE: u32 = WM_APP + 1;
@@ -72,6 +75,8 @@ pub struct Config {
     pub tuck: bool,
     pub spark: bool,
     pub peek: bool,
+    /// Keep the orb and panel out of screen capture and the phone stream.
+    pub private: bool,
     pub hotkey: String,
     /// Logical size of the panel the next open should grow into.
     pub panel: (f32, f32),
@@ -300,6 +305,7 @@ unsafe fn run(config: Config, place: Option<Place>, legacy: Option<String>, even
     ORB.with(|o| o.set(state as *const Orb));
 
     state.clip_to_work();
+    state.apply_privacy();
     let _ = ShowWindow(glass, SW_SHOWNOACTIVATE);
     let _ = ShowWindow(hit, SW_SHOWNOACTIVATE);
     state.register_hotkey();
@@ -392,7 +398,10 @@ unsafe extern "system" fn hit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            o.relayout(true);
+            // Mid-drag the orb is simply crossing a monitor. `settle` sorts it out.
+            if o.press.get().is_none() && !o.flying.get() {
+                o.relayout(true);
+            }
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
@@ -619,8 +628,12 @@ impl Orb {
         self.move_to(tx, ty);
         self.scene(|orb, _| orb.stretch(0.0, 0.0));
         let place = locate(&monitor, edge, ty, size, gap);
+        let rescale = monitor.scale != self.scale.get();
         *self.monitor.borrow_mut() = monitor;
         *self.place.borrow_mut() = place.clone();
+        if rescale {
+            self.relayout(true);
+        }
         self.clip_to_work();
         self.tell(FromOrb::Moved(place));
         self.arm_tuck();
@@ -829,8 +842,8 @@ impl Orb {
         let stage = orb_rect.union(rect).inflate(4);
         let (ox, oy) = self.raise_stage(stage);
         let at = |r: Rect| Rect { x: r.x - ox, y: r.y - oy, w: r.w, h: r.h };
-        let secs = self.scene(|orb, s| orb.morph(s, at(orb_rect), at(rect), true, self.reduced.get())).unwrap_or(0.1);
-        SetTimer(self.hit, TIMER_MORPH, (secs * 1000.0) as u32, None);
+        let secs = self.scene(|orb, s| orb.morph(s, Some(at(orb_rect)), at(rect), true, self.reduced.get())).unwrap_or(0.1);
+        SetTimer(self.hit, TIMER_MORPH, (secs * 1000.0 * REVEAL_AT) as u32, None);
     }
 
     /// The shape has settled, or the page just got ready. Whichever comes second
@@ -911,7 +924,9 @@ impl Orb {
         let (ox, oy) = self.raise_stage(stage);
         let at = |r: Rect| Rect { x: r.x - ox, y: r.y - oy, w: r.w, h: r.h };
         self.scene(|orb, s| orb.hide_skeleton(s));
-        let secs = self.scene(|orb, s| orb.morph(s, at(from), at(orb_rect), false, self.reduced.get())).unwrap_or(0.1);
+        // Still growing: turn round from wherever it has got to.
+        let start = (opening != Panel::Opening).then(|| at(from));
+        let secs = self.scene(|orb, s| orb.morph(s, start, at(orb_rect), false, self.reduced.get())).unwrap_or(0.1);
         if !panel.0.is_null() {
             let _ = SetWindowPos(panel, None, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         }
@@ -1035,6 +1050,15 @@ impl Orb {
         self.arm_tuck();
     }
 
+    unsafe fn apply_privacy(&self) {
+        let affinity = if self.config.borrow().private { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+        for hwnd in [self.glass, self.stage, HWND(self.panel_hwnd.get() as _)] {
+            if !hwnd.0.is_null() {
+                let _ = SetWindowDisplayAffinity(hwnd, affinity);
+            }
+        }
+    }
+
     unsafe fn register_hotkey(&self) {
         if self.hotkey_on.replace(false) {
             let _ = UnregisterHotKey(self.hit, HOTKEY_ID);
@@ -1062,6 +1086,7 @@ impl Orb {
                     let hotkey_changed = config.hotkey != self.config.borrow().hotkey;
                     let tuck_off = !config.tuck;
                     *self.config.borrow_mut() = config;
+                    self.apply_privacy();
                     if hotkey_changed {
                         self.register_hotkey();
                     }
@@ -1089,6 +1114,7 @@ impl Orb {
                 ToOrb::PanelReady(hwnd) => {
                     self.panel_hwnd.set(hwnd);
                     self.panel_ready.set(true);
+                    self.apply_privacy();
                     self.try_reveal();
                 }
                 ToOrb::PanelGone => {

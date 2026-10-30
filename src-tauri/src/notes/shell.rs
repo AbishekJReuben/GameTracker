@@ -57,6 +57,7 @@ pub fn load_config(pool: &DbPool) -> Config {
         tuck: settings::get_bool(pool, "notes_orb_tuck").unwrap_or(true),
         spark: settings::get_bool(pool, "notes_orb_spark").unwrap_or(false),
         peek: settings::get_bool(pool, "notes_orb_peek").unwrap_or(true),
+        private: settings::get_bool(pool, "notes_orb_private").unwrap_or(false),
         hotkey: settings::get(pool, "notes_hotkey").ok().flatten().unwrap_or_else(|| "Ctrl+Shift+Space".into()),
         panel: panel_size(settings::get(pool, "notes_panel_size").ok().flatten()),
     }
@@ -128,7 +129,13 @@ fn control(app: tauri::AppHandle, ctx: NotesCtx, orb: Handle, rx: std::sync::mps
     loop {
         let message = rx.recv_timeout(Duration::from_secs(1));
         match message {
-            Ok(FromOrb::Prewarm(rect)) => panel::prewarm(&app, &ctx, rect),
+            Ok(FromOrb::Prewarm(rect)) => {
+                panel::prewarm(&app, &ctx, rect);
+                // Warmed but never opened still has to be given back.
+                if !PANEL_OPEN.load(Ordering::SeqCst) {
+                    closed_at = Some(Instant::now());
+                }
+            }
             Ok(FromOrb::Open(rect)) => {
                 PANEL_OPEN.store(true, Ordering::SeqCst);
                 closed_at = None;
@@ -263,10 +270,8 @@ fn feed(ctx: NotesCtx, orb: Handle) {
     let mut unread = 0u32;
     let mut config = load_config(pool);
     let mut rim = None;
-    let mut ticks = 0u32;
     loop {
         bus::wait(FEED_TICK);
-        ticks = ticks.wrapping_add(1);
         if PANEL_OPEN.load(Ordering::SeqCst) {
             unread = 0;
         }
@@ -293,12 +298,10 @@ fn feed(ctx: NotesCtx, orb: Handle) {
             rim = Some(next);
             orb.send(ToOrb::Rim(next));
         }
-        if ticks % 3 == 0 {
-            let fresh = load_config(pool);
-            if fresh != config {
-                config = fresh.clone();
-                orb.send(ToOrb::Config(fresh));
-            }
+        let fresh = load_config(pool);
+        if fresh != config {
+            config = fresh.clone();
+            orb.send(ToOrb::Config(fresh));
         }
     }
 }

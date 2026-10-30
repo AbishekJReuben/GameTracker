@@ -468,6 +468,14 @@ pub fn run() {
         run_remote_host(context);
         return;
     }
+    // Lets a test exercise the supervisor without the rest of the main app.
+    #[cfg(all(windows, debug_assertions))]
+    if std::env::args().any(|a| a == "--notes-supervise-test") {
+        hostproc::supervise_shell(|| true, || eprintln!("gave up"));
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
     #[cfg(windows)]
     if hostproc::is_notes_shell() {
         hostproc::install_panic_log("notes-shell");

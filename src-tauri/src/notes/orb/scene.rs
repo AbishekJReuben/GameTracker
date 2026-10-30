@@ -840,17 +840,20 @@ impl OrbScene {
         stage.spark.SetIsVisible(false)
     }
 
-    /// Grow the shape from `from` to `to`, both relative to the stage. Returns seconds.
-    pub unsafe fn morph(&self, stage: &StageScene, from: Rect, to: Rect, opening: bool, reduced: bool) -> Result<f32> {
+    /// Grow the shape to `to`, relative to the stage. `from` is where it starts, or
+    /// None to turn round from wherever it has got to. Returns seconds.
+    pub unsafe fn morph(&self, stage: &StageScene, from: Option<Rect>, to: Rect, opening: bool, reduced: bool) -> Result<f32> {
         let panel = PANEL_RADIUS_DIP * self.scale;
         let orb = self.size * 0.42;
         let (spec, r0, r1) = if opening { (OPEN, orb, panel) } else { (CLOSE, panel, orb) };
         stage.blob.StopAnimation(&prop("Opacity"))?;
         stage.blob.SetOpacity(1.0)?;
         stage.blob.SetSize(stage.root.Size()?)?;
-        stage.blob_shape.SetOffset(v2(from.x as f32, from.y as f32))?;
-        stage.blob_shape.SetSize(v2(from.w as f32, from.h as f32))?;
-        stage.blob_shape.SetCornerRadius(v2(r0, r0))?;
+        if let Some(from) = from {
+            stage.blob_shape.SetOffset(v2(from.x as f32, from.y as f32))?;
+            stage.blob_shape.SetSize(v2(from.w as f32, from.h as f32))?;
+            stage.blob_shape.SetCornerRadius(v2(r0, r0))?;
+        }
         stage.blob.SetIsVisible(true)?;
         if reduced {
             stage.blob_shape.SetOffset(v2(to.x as f32, to.y as f32))?;

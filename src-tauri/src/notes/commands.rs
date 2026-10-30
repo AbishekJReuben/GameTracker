@@ -446,6 +446,11 @@ pub async fn clipboard_copy(app: AppHandle, ctx: State<'_, NotesCtx>, id: String
 #[cfg(windows)]
 fn copy_item(app: &AppHandle, item: &ClipItem) -> AppResult<()> {
     use super::os_clipboard::{dib_from_rgba, owner_app, submit, Payload};
+    // A test shell must leave the real clipboard alone: the installed app is watching it.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GT_NOTES_TEST_DATA").is_some() {
+        return Ok(());
+    }
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
     let payload = if item.kind == "image" {

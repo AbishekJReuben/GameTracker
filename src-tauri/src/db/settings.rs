@@ -85,6 +85,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("notes_orb_tuck", "true"),
     ("notes_orb_peek", "true"),
     ("notes_orb_spark", "false"),
+    ("notes_orb_private", "false"),
     ("notes_hotkey", "Ctrl+Shift+Space"),
 ];
 

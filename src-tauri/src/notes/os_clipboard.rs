@@ -245,3 +245,83 @@ mod tests {
         assert_eq!(&dib[40..48], &[7, 6, 5, 8, 3, 2, 1, 4], "last row first, red and blue swapped");
     }
 }
+
+#[cfg(test)]
+mod window_station {
+    use super::*;
+    use std::time::Instant;
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::StationsAndDesktops::{CreateDesktopW, CreateWindowStationW, SetProcessWindowStation, DESKTOP_CONTROL_FLAGS};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, RegisterClassW, HWND_MESSAGE, MSG, PM_REMOVE, WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPED,
+    };
+
+    const UNICODE_TEXT: u32 = 13;
+
+    unsafe extern "system" fn busy_owner(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        DefWindowProcW(h, m, w, l)
+    }
+
+    /// The reason this module exists. A private window station has its own clipboard,
+    /// so the real one, and the installed app watching it, never see any of this.
+    /// Run it alone, because it changes the whole process's window station:
+    ///
+    ///   cargo test --lib window_station -- --ignored
+    #[test]
+    #[ignore = "changes this process's window station"]
+    fn a_busy_clipboard_owner_costs_the_caller_nothing() {
+        const BUSY: Duration = Duration::from_secs(3);
+        unsafe {
+            let station = CreateWindowStationW(PCWSTR::null(), 0, 0x37F, None).unwrap();
+            SetProcessWindowStation(station).unwrap();
+            // A thread joins the desktop called Default the first time it touches a window.
+            CreateDesktopW(w!("Default"), None, None, DESKTOP_CONTROL_FLAGS(0), 0x1FF, None).unwrap();
+        }
+        let (owned, ready) = channel();
+        let owner = std::thread::spawn(move || unsafe {
+            let module = GetModuleHandleW(None).unwrap();
+            let class = WNDCLASSW { lpfnWndProc: Some(busy_owner), hInstance: module.into(), lpszClassName: w!("GtBusyOwner"), ..Default::default() };
+            RegisterClassW(&class);
+            let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("GtBusyOwner"), w!("owner"), WS_OVERLAPPED, 0, 0, 10, 10, HWND_MESSAGE, None, module, None).unwrap();
+            OpenClipboard(hwnd).unwrap();
+            EmptyClipboard().unwrap();
+            let text: Vec<u16> = "from the busy app\0".encode_utf16().collect();
+            let global = GlobalAlloc(GMEM_MOVEABLE, text.len() * 2).unwrap();
+            std::ptr::copy_nonoverlapping(text.as_ptr(), GlobalLock(global) as *mut u16, text.len());
+            let _ = GlobalUnlock(global);
+            SetClipboardData(UNICODE_TEXT, HANDLE(global.0)).unwrap();
+            CloseClipboard().unwrap();
+            owned.send(()).unwrap();
+            // Busy: alive but not pumping, like Unity during a domain reload.
+            std::thread::sleep(BUSY);
+            let mut msg = MSG::default();
+            let until = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < until {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        ready.recv().unwrap();
+
+        let asked = Instant::now();
+        let done = submit(Payload::Text("the note".into())).unwrap();
+        assert!(asked.elapsed() < Duration::from_millis(50), "returned in {:?}", asked.elapsed());
+        done.recv_timeout(Duration::from_secs(12)).unwrap().unwrap();
+        assert!(asked.elapsed() > Duration::from_secs(1), "it really did have to wait: {:?}", asked.elapsed());
+        owner.join().unwrap();
+
+        unsafe {
+            OpenClipboard(HWND::default()).unwrap();
+            let handle = GetClipboardData(UNICODE_TEXT).unwrap();
+            let p = GlobalLock(HGLOBAL(handle.0)) as *const u16;
+            let len = (0..).take_while(|&i| *p.add(i) != 0).count();
+            let got = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+            let _ = CloseClipboard();
+            assert_eq!(got, "the note");
+        }
+    }
+}

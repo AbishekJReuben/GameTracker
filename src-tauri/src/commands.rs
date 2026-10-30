@@ -64,7 +64,13 @@ pub fn get_settings(state: State<AppState>) -> AppResult<HashMap<String, String>
 
 #[tauri::command]
 pub fn set_setting(state: State<AppState>, key: String, value: String) -> AppResult<()> {
-    settings::set(&state.pool, &key, &value)
+    let notes = key.starts_with("notes_");
+    settings::set(&state.pool, &key, &value)?;
+    if notes {
+        // The floating Notes process reads these; this wakes it to look now.
+        crate::notes::bus::changed();
+    }
+    Ok(())
 }
 
 #[tauri::command]

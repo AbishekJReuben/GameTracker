@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { ClipboardList, Layers, Zap, Mic, Stethoscope, Check, KeyRound } from "lucide-react";
+import { ClipboardList, Layers, Zap, Mic, Stethoscope, Check, KeyRound, Keyboard, PanelRightClose, MessageSquareText, Sparkles, EyeOff, CircleDot } from "lucide-react";
 import { api } from "@/lib/api";
 import { clip } from "@/lib/clip";
 import { clipSync } from "@/lib/clipboardSync";
 import { useSettings } from "@/lib/queries";
 import { Toggle } from "@/components/ui";
+import { comboOf } from "@/notes/hotkey";
 import { ClipboardIntro } from "./ClipboardIntro";
 
 /** Build a single diagnostics report (Rust runtime log + JS sync state). */
@@ -55,6 +56,36 @@ function Row({
   );
 }
 
+/** Click, then press the shortcut. Esc cancels, Delete clears it. */
+function ShortcutField({ value, onChange }: { value: string; onChange: (combo: string) => void }) {
+  const [listening, setListening] = useState(false);
+  return (
+    <button
+      type="button"
+      className="btn btn-subtle min-w-[9rem] px-3 py-1.5 text-xs"
+      onClick={() => setListening(true)}
+      onBlur={() => setListening(false)}
+      onKeyDown={(e) => {
+        if (!listening) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === "Escape") return setListening(false);
+        if (e.key === "Delete" || e.key === "Backspace") {
+          onChange("");
+          return setListening(false);
+        }
+        const combo = comboOf(e);
+        if (combo) {
+          onChange(combo);
+          setListening(false);
+        }
+      }}
+    >
+      {listening ? "Press the keys…" : value || "None"}
+    </button>
+  );
+}
+
 /** Self-contained Settings section for the shared clipboard. */
 export function ClipboardSettings() {
   const { data: settings } = useSettings();
@@ -74,6 +105,27 @@ export function ClipboardSettings() {
   }, [settings?.clipboard_sarvam_key]);
 
   const refresh = () => qc.invalidateQueries({ queryKey: ["settings"] });
+
+  const orbOption = (key: string, fallback: boolean) => ({
+    checked: settings?.[key] === undefined ? fallback : settings[key] === "true",
+    onChange: async (v: boolean) => {
+      await api.setSetting(key, v ? "true" : "false");
+      refresh();
+    },
+  });
+  const shell = settings?.notes_shell_enabled !== "false";
+  const setShell = async (v: boolean) => {
+    await api.setSetting("notes_shell_enabled", v ? "true" : "false");
+    await clip.configure(enabled, overlay, auto);
+    refresh();
+  };
+  const hotkey = settings?.notes_hotkey ?? "";
+  const setHotkey = async (combo: string) => {
+    await api.setSetting("notes_hotkey_error", "");
+    await api.setSetting("notes_hotkey", combo);
+    refresh();
+  };
+  const hotkeyTaken = !!hotkey && settings?.notes_hotkey_error === hotkey;
 
   const saveKey = async () => {
     await api.setSetting("clipboard_sarvam_key", keyInput.trim());
@@ -139,9 +191,39 @@ export function ClipboardSettings() {
 
       {enabled && (
         <>
-          <Row icon={<Layers className="h-4 w-4" />} title="Floating widget" desc="Show the draggable bubble on top of every window.">
+          <Row icon={<Layers className="h-4 w-4" />} title="Floating widget" desc="Keep your notes one click away, on top of every window.">
             <Toggle checked={overlay} onChange={setOverlay} />
           </Row>
+          {overlay && (
+            <div className="ml-[3.25rem] mb-1">
+              {shell && (
+                <>
+                  <Row
+                    icon={<Keyboard className="h-4 w-4" />}
+                    title="Shortcut"
+                    desc={hotkeyTaken ? "Another app is using this shortcut. Pick a different one." : "Open and close your notes from anywhere."}
+                  >
+                    <ShortcutField value={hotkey} onChange={(combo) => void setHotkey(combo)} />
+                  </Row>
+                  <Row icon={<PanelRightClose className="h-4 w-4" />} title="Tuck into the edge" desc="Slide the orb out of the way when you aren't using it.">
+                    <Toggle {...orbOption("notes_orb_tuck", true)} />
+                  </Row>
+                  <Row icon={<MessageSquareText className="h-4 w-4" />} title="Preview new notes" desc="Show the first line beside the orb when a note lands.">
+                    <Toggle {...orbOption("notes_orb_peek", true)} />
+                  </Row>
+                  <Row icon={<Sparkles className="h-4 w-4" />} title="Copy spark" desc="A small spark flies to the orb each time you copy.">
+                    <Toggle {...orbOption("notes_orb_spark", false)} />
+                  </Row>
+                  <Row icon={<EyeOff className="h-4 w-4" />} title="Hide from screen sharing" desc="Keep the orb and panel out of your phone stream and any recording.">
+                    <Toggle {...orbOption("notes_orb_private", false)} />
+                  </Row>
+                </>
+              )}
+              <Row icon={<CircleDot className="h-4 w-4" />} title="Classic bubble" desc="Use the old floating bubble instead of the orb.">
+                <Toggle checked={!shell} onChange={(v) => void setShell(!v)} />
+              </Row>
+            </div>
+          )}
           <Row icon={<Zap className="h-4 w-4" />} title="Auto-capture copies" desc="Automatically save everything you copy on this PC.">
             <Toggle checked={auto} onChange={setAuto} />
           </Row>
