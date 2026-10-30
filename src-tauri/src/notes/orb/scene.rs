@@ -490,7 +490,7 @@ impl OrbScene {
         sheen_brush.SetEndPoint(v2(-0.6, -0.6))?;
         let list = sheen_brush.ColorStops()?;
         list.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.0, rgba(255, 255, 255, 0))?)?;
-        list.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.5, rgba(255, 255, 255, 120))?)?;
+        list.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.5, rgba(255, 255, 255, 84))?)?;
         list.Append(&c.CreateColorGradientStopWithOffsetAndColor(1.0, rgba(255, 255, 255, 0))?)?;
         let mask = c.CreateMaskBrush()?;
         mask.SetSource(&sheen_brush)?;
@@ -707,8 +707,11 @@ impl OrbScene {
         fill.SetStartPoint(v2(0.0, 0.0))?;
         fill.SetEndPoint(v2(1.0, 1.0))?;
         let list = fill.ColorStops()?;
-        list.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.0, rgba(17, 16, 36, 252))?)?;
-        list.Append(&c.CreateColorGradientStopWithOffsetAndColor(1.0, rgba(9, 16, 26, 252))?)?;
+        // The orb's own glass, thinned out: the shape reads as the orb opening up, and
+        // what's behind it shows through the way it will through the panel.
+        list.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.0, rgba(44, 34, 104, 226))?)?;
+        list.Append(&c.CreateColorGradientStopWithOffsetAndColor(0.46, rgba(17, 18, 38, 232))?)?;
+        list.Append(&c.CreateColorGradientStopWithOffsetAndColor(1.0, rgba(10, 38, 48, 226))?)?;
         sprite.SetFillBrush(&fill)?;
         let edge = c.CreateLinearGradientBrush()?;
         edge.SetStartPoint(v2(0.0, 0.0))?;

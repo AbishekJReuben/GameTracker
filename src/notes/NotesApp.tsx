@@ -1,8 +1,8 @@
-import { Component, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { Component, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { AlertTriangle, AlignLeft, Braces, Code2, FolderTree, Link2, NotebookPen, Search, Tag, TerminalSquare, X, type LucideIcon } from "lucide-react";
+import { AlertTriangle, AlignLeft, Braces, Code2, FolderTree, Hash, Link2, NotebookPen, Search, Tag, TerminalSquare, X, type LucideIcon } from "lucide-react";
 import { clip, type ClipItem } from "@/lib/clip";
 import type { ClipContentKind } from "@/lib/clipContent";
 import { useClipboard, visibleClips, type ClipFilter } from "@/store/clipboard";
@@ -115,11 +115,23 @@ function Panel() {
   const [editing, setEditing] = useState<ComposerEdit | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [gone, setGone] = useState<ReadonlySet<string>>(new Set());
+  const [tagsOpen, setTagsOpen] = useState(false);
   const pending = useRef(new Map<string, number>());
   const searchBox = useRef<HTMLInputElement>(null);
   const root = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<number | undefined>(undefined);
+  const reflowTimer = useRef<number | undefined>(undefined);
   const ready = useRef(false);
+
+  // Rows glide only when they move on purpose. While scrolling they must not:
+  // measuring a row would make everything under it swim.
+  const reflow = useCallback(() => {
+    const track = root.current?.querySelector<HTMLElement>(".np-track");
+    if (!track) return;
+    track.dataset.reflow = "true";
+    window.clearTimeout(reflowTimer.current);
+    reflowTimer.current = window.setTimeout(() => delete track.dataset.reflow, 420);
+  }, []);
 
   const say = useCallback((text: string, undo?: () => void) => {
     window.clearTimeout(toastTimer.current);
@@ -152,8 +164,11 @@ function Panel() {
   // A page that rises in looks alive; the rows it animates are only ever the first
   // few on screen, and the work is the compositor's.
   const riseIn = useCallback(() => {
+    const page = root.current;
+    if (!page) return;
+    delete page.dataset.veiled;
     if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    root.current?.querySelectorAll<HTMLElement>(".np-card, .np-label").forEach((el, i) => {
+    page.querySelectorAll<HTMLElement>(".np-card, .np-label").forEach((el, i) => {
       if (i > 8) return;
       el.animate(
         [
@@ -183,10 +198,13 @@ function Panel() {
         void useClipboard.getState().sync();
         searchBox.current?.focus();
         riseIn();
+        reflow();
       }),
       listen("notes://close", () => {
         flushDeletes();
         setSelected(null);
+        // Rows wait out of sight, so the next open can't flash them before they rise.
+        if (root.current) root.current.dataset.veiled = "true";
       }),
       listen<string | null>("clipboard://copy-wait", (e) => say(e.payload ? `Waiting for ${e.payload}…` : "Waiting for the clipboard…")),
     ];
@@ -204,7 +222,7 @@ function Panel() {
       window.clearInterval(statusTimer);
       subscriptions.forEach((u) => void u.then((f) => f()));
     };
-  }, [flushDeletes, riseIn, say]);
+  }, [flushDeletes, reflow, riseIn, say]);
 
   useEffect(() => {
     void useClipboard.getState().ensureMatches();
@@ -248,11 +266,13 @@ function Panel() {
 
   const remove = useCallback(
     (item: ClipItem) => {
+      reflow();
       setGone((old) => new Set(old).add(item.id));
       pending.current.set(item.id, window.setTimeout(() => commitDelete(item.id), UNDO_MS));
       say("Note deleted", () => {
         window.clearTimeout(pending.current.get(item.id));
         pending.current.delete(item.id);
+        reflow();
         setGone((old) => {
           const next = new Set(old);
           next.delete(item.id);
@@ -261,14 +281,17 @@ function Panel() {
         setToast(null);
       });
     },
-    [commitDelete, say],
+    [commitDelete, reflow, say],
   );
 
   const actions = useMemo<NoteActions>(
     () => ({
       copy,
       remove,
-      togglePin: (item) => void useClipboard.getState().togglePin(item),
+      togglePin: (item) => {
+        reflow();
+        void useClipboard.getState().togglePin(item);
+      },
       edit: (item) => {
         if (item.kind !== "text") return;
         const short = (item.textLen ?? 0) > (item.text?.length ?? 0);
@@ -276,8 +299,9 @@ function Panel() {
       },
       setTags: (item, tags) => void useClipboard.getState().setTags(item.id, tags),
       select: setSelected,
+      reflow,
     }),
-    [copy, remove],
+    [copy, reflow, remove],
   );
 
   const selectedItem = (): ClipItem | null => {
@@ -322,10 +346,22 @@ function Panel() {
     }
   };
 
+  // The browser's own menu (Back, Refresh, Print…) has nothing to offer here. Fields
+  // and selected text keep theirs, for Cut, Copy and Paste.
+  const onContextMenu = (e: MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+    if (target.closest("input, textarea") || getSelection()?.toString()) return;
+    e.preventDefault();
+  };
+
   const searching = !!s.search.trim() || s.filter !== "all" || !!s.tagFilter || !!s.typeFilter;
 
   return (
-    <div ref={root} className="np" onKeyDown={onKeyDown}>
+    <div ref={root} className="np" data-veiled="true" onKeyDown={onKeyDown} onContextMenu={onContextMenu}>
+      <div className="np-aurora" aria-hidden="true">
+        <i />
+        <i />
+      </div>
       <header className="np-head" data-tauri-drag-region>
         <span className="np-mark">
           <NotebookPen />
@@ -365,8 +401,13 @@ function Panel() {
               ))}
             </div>
           )}
+          {s.tags.length > 0 && (
+            <button type="button" className="np-tags-toggle" data-on={tagsOpen || !!s.tagFilter} aria-pressed={tagsOpen || !!s.tagFilter} aria-label="Show tags" title="Tags" onClick={() => setTagsOpen((v) => !v)}>
+              <Hash />
+            </button>
+          )}
         </div>
-        {s.tags.length > 0 && (
+        {s.tags.length > 0 && (tagsOpen || s.tagFilter) && (
           <div className="np-chips np-chips-tags" role="group" aria-label="Filter by tag">
             {s.tags.map((tag) => (
               <button key={tag} type="button" className="np-chip" data-on={s.tagFilter === tag} aria-pressed={s.tagFilter === tag} onClick={() => s.setTagFilter(s.tagFilter === tag ? null : tag)}>
@@ -399,8 +440,14 @@ function Panel() {
           <Composer
             variant="panel"
             compact
-            onAddText={s.addText}
-            onAddImage={s.addImage}
+            onAddText={(text) => {
+              reflow();
+              return s.addText(text);
+            }}
+            onAddImage={(image, mime) => {
+              reflow();
+              return s.addImage(image, mime);
+            }}
             sttEnabled={config.sttEnabled}
             draft={config.draft}
             onDraftChange={(text) => void invoke("notes_panel_set_draft", { text }).catch(() => {})}

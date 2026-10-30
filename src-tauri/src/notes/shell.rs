@@ -98,6 +98,8 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&data_dir)?;
     let pool = crate::db::init_pool(&data_dir.join("gametracker.db")).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let ctx = NotesCtx { pool: pool.clone(), media_dir: data_dir.join("media"), data_dir };
+    // Already inside the app's scope, except for a test shell running on a copy.
+    let _ = app.asset_protocol_scope().allow_directory(&ctx.media_dir, true);
     app.manage(ctx.clone());
     bus::start(handle.clone(), bus::Side::Shell);
 

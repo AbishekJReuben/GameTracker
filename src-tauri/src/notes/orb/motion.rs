@@ -51,8 +51,8 @@ impl Spring {
 
 pub const PRESS: Spring = Spring { damping: 0.72, response: 0.12 };
 pub const HOVER: Spring = Spring { damping: 0.62, response: 0.28 };
-pub const OPEN: Spring = Spring { damping: 0.82, response: 0.36 };
-pub const CLOSE: Spring = Spring { damping: 1.0, response: 0.24 };
+pub const OPEN: Spring = Spring { damping: 0.88, response: 0.3 };
+pub const CLOSE: Spring = Spring { damping: 1.0, response: 0.2 };
 pub const TUCK: Spring = Spring { damping: 0.9, response: 0.42 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,14 +249,14 @@ mod tests {
     #[test]
     fn open_overshoots_a_little_and_close_never_does() {
         let peak = |s: Spring| s.keys(120).iter().fold(0f32, |m, k| m.max(k.1));
-        assert!(peak(OPEN) > 1.005 && peak(OPEN) < 1.06, "{}", peak(OPEN));
+        assert!(peak(OPEN) > 1.001 && peak(OPEN) < 1.03, "{}", peak(OPEN));
         assert!(peak(CLOSE) <= 1.0001);
     }
 
     #[test]
     fn settle_is_short_enough_to_feel_immediate() {
-        assert!(OPEN.settle() < 0.5, "{}", OPEN.settle());
-        assert!(CLOSE.settle() < 0.4, "{}", CLOSE.settle());
+        assert!(OPEN.settle() < 0.4, "{}", OPEN.settle());
+        assert!(CLOSE.settle() < 0.3, "{}", CLOSE.settle());
         assert!(PRESS.settle() < 0.25);
     }
 

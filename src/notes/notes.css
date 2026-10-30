@@ -45,9 +45,9 @@ body,
   font-feature-settings: "cv11", "ss03";
   -webkit-font-smoothing: antialiased;
   background:
-    radial-gradient(110% 46% at 0% 0%, rgba(124, 92, 255, 0.2), transparent 70%),
-    radial-gradient(90% 40% at 100% 100%, rgba(34, 211, 238, 0.13), transparent 70%),
-    rgba(9, 10, 20, 0.68);
+    radial-gradient(110% 46% at 0% 0%, rgba(124, 92, 255, 0.16), transparent 70%),
+    radial-gradient(90% 40% at 100% 100%, rgba(34, 211, 238, 0.1), transparent 70%),
+    rgba(10, 11, 24, 0.76);
   user-select: none;
 }
 
@@ -60,6 +60,56 @@ body,
   background: linear-gradient(90deg, rgba(167, 150, 255, 0.75), rgba(34, 211, 238, 0.42) 52%, rgba(52, 211, 153, 0.1));
   pointer-events: none;
   z-index: 3;
+}
+
+/* Two slow pools of light drifting behind everything. Transform only, so it's the
+   compositor's work, and it stops by itself while the panel is hidden. */
+.np-aurora {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.np-aurora i {
+  position: absolute;
+  width: 92%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  will-change: transform;
+}
+
+.np-aurora i:nth-child(1) {
+  left: -38%;
+  top: -34%;
+  background: radial-gradient(closest-side, rgba(124, 92, 255, 0.26), transparent);
+  animation: np-drift-a 21s ease-in-out infinite alternate;
+}
+
+.np-aurora i:nth-child(2) {
+  right: -36%;
+  bottom: -30%;
+  background: radial-gradient(closest-side, rgba(34, 211, 238, 0.17), transparent);
+  animation: np-drift-b 27s ease-in-out infinite alternate;
+}
+
+@keyframes np-drift-a {
+  to {
+    transform: translate(22%, 12%) scale(1.14);
+  }
+}
+
+@keyframes np-drift-b {
+  to {
+    transform: translate(-20%, -16%) scale(1.2);
+  }
+}
+
+.np-head,
+.np-tools,
+.np-scroll,
+.np-empty {
+  position: relative;
 }
 
 .np ::selection {
@@ -305,6 +355,35 @@ body,
   min-width: 0;
 }
 
+.np-tags-toggle {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  margin-left: auto;
+  border: 0;
+  border-radius: 8px;
+  color: var(--dim);
+  background: transparent;
+  transition: background 0.16s, color 0.16s;
+}
+
+.np-tags-toggle svg {
+  width: 14px;
+  height: 14px;
+}
+
+.np-tags-toggle:hover {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.np-tags-toggle[data-on="true"] {
+  color: #fff;
+  background: rgba(124, 92, 255, 0.34);
+}
+
 .np-seg {
   position: relative;
   flex: none;
@@ -437,15 +516,32 @@ body,
   min-height: 0;
   overflow: hidden auto;
   overscroll-behavior: contain;
-  padding: 0 12px;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+  padding: 0 5px 0 12px;
+  scrollbar-gutter: stable;
   mask: linear-gradient(180deg, transparent 0, #000 10px, #000 calc(100% - 88px), transparent calc(100% - 26px));
+}
+
+.np-scroll::-webkit-scrollbar {
+  width: 7px;
+}
+
+.np-scroll::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.16) padding-box;
+}
+
+.np-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3) padding-box;
 }
 
 .np-track {
   position: relative;
   margin-bottom: 72px;
+}
+
+.np-track[data-reflow] .np-slot {
+  transition: transform 0.34s var(--out);
 }
 
 .np-slot {
@@ -468,6 +564,11 @@ body,
 
 .np-label-pinned {
   color: var(--violet);
+}
+
+.np[data-veiled] .np-card,
+.np[data-veiled] .np-label {
+  opacity: 0;
 }
 
 .np-card {
@@ -550,6 +651,23 @@ body,
     0 0 0 3px rgba(52, 211, 153, 0.1);
 }
 
+/* A note that has just landed. */
+.np-card[data-fresh] {
+  animation: np-fresh 1.4s var(--out) both;
+}
+
+@keyframes np-fresh {
+  0% {
+    transform: translateY(-8px) scale(0.98);
+    box-shadow:
+      inset 0 0 0 1.25px rgba(34, 211, 238, 0.9),
+      0 0 26px -4px rgba(34, 211, 238, 0.6);
+  }
+  100% {
+    transform: none;
+  }
+}
+
 .np-ripple {
   position: absolute;
   width: 10px;
@@ -573,6 +691,34 @@ body,
   z-index: 1;
   min-width: 0;
   user-select: text;
+}
+
+/* The stripe already says what kind of note this is, so the block inside stays
+   plain, and its scrollbars only exist once the note is open. */
+.np-body > code,
+.np-body > div {
+  border-left: 0;
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.26);
+}
+
+.np-body > div > span {
+  display: none;
+}
+
+.np-body > code,
+.np-body pre {
+  scrollbar-width: none;
+}
+
+.np-card:not([data-expanded]) .np-body pre,
+.np-card:not([data-expanded]) .np-body > code {
+  overflow: hidden;
+}
+
+.np-card[data-expanded] .np-body pre {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
 }
 
 .np-image {
@@ -627,6 +773,11 @@ body,
 
 .np-meta-tag {
   color: #a9b8ff;
+}
+
+.np-meta-kind {
+  font-weight: 600;
+  color: var(--tint);
 }
 
 .np-meta-device {
@@ -859,6 +1010,10 @@ body,
 .np-composer textarea {
   font-family: var(--sans);
   user-select: text;
+}
+
+.np-composer textarea:focus-visible {
+  outline: none;
 }
 
 .np-toast {

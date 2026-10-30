@@ -20,7 +20,12 @@ export interface NoteActions {
   edit: (item: ClipItem) => void;
   setTags: (item: ClipItem, tags: string[]) => void;
   select: (id: string) => void;
+  /** Rows are about to change places on purpose: let them glide. */
+  reflow: () => void;
 }
+
+/** A note that just landed gets a sweep of light. */
+const FRESH_MS = 4000;
 
 function TagPicker({ current, known, onChange, onClose }: { current: string[]; known: string[]; onChange: (tags: string[]) => void; onClose: () => void }) {
   const [name, setName] = useState("");
@@ -74,6 +79,7 @@ export const NoteCard = memo(function NoteCard({ item, selected, knownTags, acti
   const [copied, setCopied] = useState(false);
   const [full, setFull] = useState<string | null>(null);
   const [ripple, setRipple] = useState<{ x: number; y: number; n: number } | null>(null);
+  const [fresh, setFresh] = useState(() => Date.now() - Date.parse(item.createdUtc) < FRESH_MS);
   const body = useRef<HTMLElement>(null);
   const card = useRef<HTMLDivElement>(null);
 
@@ -98,8 +104,26 @@ export const NoteCard = memo(function NoteCard({ item, selected, knownTags, acti
     return () => ro.disconnect();
   }, [item.text, isImage, expanded]);
 
+  const leave = () => {
+    const el = card.current;
+    if (!el || matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      actions.remove(item);
+      return;
+    }
+    el.style.pointerEvents = "none";
+    const out = el.animate(
+      [
+        { opacity: 1, transform: "none" },
+        { opacity: 0, transform: "translateX(28px) scale(.97)" },
+      ],
+      { duration: 170, easing: "cubic-bezier(.4,0,1,1)", fill: "forwards" },
+    );
+    void out.finished.then(() => actions.remove(item)).catch(() => actions.remove(item));
+  };
+
   const toggleExpanded = async () => {
     const opening = !expanded;
+    actions.reflow();
     if (opening && !isImage && whole > preview.length && full === null) {
       const text = await clip.text(item.id).catch(() => null);
       if (text !== null) setFull(text.slice(0, MAX_SHOWN));
@@ -116,7 +140,8 @@ export const NoteCard = memo(function NoteCard({ item, selected, knownTags, acti
     }
   };
 
-  const thumb = clipAssetUrl(item.thumbPath ?? item.imagePath);
+  const [imageFailed, setImageFailed] = useState(false);
+  const thumb = imageFailed ? undefined : clipAssetUrl(item.thumbPath ?? item.imagePath);
   const fullImage = clipAssetUrl(item.imagePath ?? item.thumbPath);
   const canExpand = isImage ? imageCanGrow || expanded : clamped || expanded;
 
@@ -128,6 +153,11 @@ export const NoteCard = memo(function NoteCard({ item, selected, knownTags, acti
       data-selected={selected || undefined}
       data-pinned={item.pinned || undefined}
       data-copied={copied || undefined}
+      data-expanded={expanded || undefined}
+      data-fresh={fresh || undefined}
+      onAnimationEnd={(e) => {
+        if (e.animationName === "np-fresh") setFresh(false);
+      }}
       onPointerDown={() => actions.select(item.id)}
     >
       {ripple && <span key={ripple.n} className="np-ripple" style={{ left: ripple.x, top: ripple.y }} onAnimationEnd={() => setRipple(null)} />}
@@ -140,6 +170,7 @@ export const NoteCard = memo(function NoteCard({ item, selected, knownTags, acti
               draggable={false}
               className="np-image"
               data-expanded={expanded || undefined}
+              onError={() => setImageFailed(true)}
               onLoad={(e) => {
                 const img = e.currentTarget;
                 setImageCanGrow(img.naturalHeight > 136 || img.naturalWidth > img.clientWidth);
@@ -164,6 +195,7 @@ export const NoteCard = memo(function NoteCard({ item, selected, knownTags, acti
           </button>
         )}
         <span className="np-meta">
+          {content.label && <span className="np-meta-kind">{content.label}</span>}
           {(item.tags ?? []).slice(0, 2).map((tag) => (
             <span key={tag} className="np-meta-tag">
               {tag}
@@ -191,7 +223,7 @@ export const NoteCard = memo(function NoteCard({ item, selected, knownTags, acti
           <Act label={item.pinned ? "Unpin" : "Pin"} onClick={() => actions.togglePin(item)} active={item.pinned}>
             {item.pinned ? <PinOff /> : <Pin />}
           </Act>
-          <Act label="Delete" onClick={() => actions.remove(item)}>
+          <Act label="Delete" onClick={leave}>
             <Trash2 />
           </Act>
         </span>
@@ -222,6 +254,7 @@ export function NoteList({
   scrollTo: { id: string; n: number } | null;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
+  const track = useRef<HTMLDivElement>(null);
   const list = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scroller.current,
@@ -256,7 +289,7 @@ export function NoteList({
 
   return (
     <div ref={scroller} className="np-scroll" onPointerMove={onPointerMove}>
-      <div className="np-track" style={{ height: list.getTotalSize() }}>
+      <div ref={track} className="np-track" style={{ height: list.getTotalSize() }}>
         {items.map((v) => {
           const row = rows[v.index];
           if (!row) return null;
