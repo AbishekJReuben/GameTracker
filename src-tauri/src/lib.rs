@@ -30,6 +30,7 @@ mod system;
 mod tracking;
 mod thumbnails;
 mod tray;
+mod uistall;
 mod util;
 pub mod voice;
 
@@ -410,7 +411,12 @@ macro_rules! app_commands {
 fn guarded<R: tauri::Runtime>(
     handler: impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static,
 ) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
-    move |invoke| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(invoke))).unwrap_or(true)
+    move |invoke| {
+        uistall::enter(invoke.message.command());
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(invoke))).unwrap_or(true);
+        uistall::leave();
+        handled
+    }
 }
 
 pub fn run() {
@@ -570,6 +576,7 @@ pub fn run() {
                 hostproc::reload_on_renderer_crash(&w);
             }
             // Remote desktop: keep the separate host process running.
+            uistall::watch(handle.clone(), "app");
             hostproc::trace("main app started; supervising the remote host");
             hostproc::supervise_host();
 
@@ -738,6 +745,7 @@ fn run_remote_host(mut context: tauri::Context<tauri::Wry>) {
             .build()?;
             hostproc::reload_on_renderer_crash(&window);
             let _ = window.hide();
+            uistall::watch(app.handle().clone(), "remote-host");
             hostproc::trace("host window ready");
             hostproc::watch_main(|| {
                 let _ = remote::uac::set_visible(false);
