@@ -601,6 +601,12 @@ Shared Control features (Android + Quest + discovery mobile browser):
 - Fullscreen (`immersive`): keyboard FAB + pinned rail + tap-to-type (same as dock-collapsed).
 
 Quest-specific gotchas — do not regress:
+- **Right click is a dock tab, not a floating button** (`RightClickButton`, `Control.tsx`). The
+  old `top-right` button sat over the PC picture. It arms the next tap (`useTargetRightClick`),
+  draws its own pink highlight (never the shared `dockTabActive` pill), and becomes a round button
+  beside the keyboard FAB while the dock is hidden, so it stays reachable. The armed hint is
+  `pointer-events-none` on purpose: it must never take the tap it asks for. Quest only; phones
+  keep the two-finger tap and the Mouse panel's Right button.
 - **System keyboard has NO key events** and **overwrites the whole value** each open.
   Control resets before `focus()`; immersive still uses `textDiff.ts` (`TextDiffSender`).
   Needs Quest Browser **26.1+**. Hidden `<input>` stays in-DOM and on-screen.

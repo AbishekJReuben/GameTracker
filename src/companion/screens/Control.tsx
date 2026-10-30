@@ -45,6 +45,7 @@ import {
   Shrink,
   Camera,
   MousePointerClick,
+  MouseRight,
   Grip,
   Volume2,
   Volume1,
@@ -3736,19 +3737,6 @@ export function ControlScreen({
         </div>
       )}
       {/* ---- screen viewport ---- */}
-      {questBrowser && !pipView && (
-        <button
-          type="button"
-          aria-pressed={targetRightClick.armed}
-          disabled={!connected || inputLocked}
-          onClick={targetRightClick.toggle}
-          title="Select Right click, then tap a target on the PC screen. Select again to cancel."
-          className="absolute right-3 top-3 z-40 flex min-h-11 items-center gap-2 rounded-xl border border-white/20 bg-base px-3 text-sm font-700 text-ink disabled:opacity-50"
-        >
-          <MousePointerClick className="h-4 w-4" />
-          {targetRightClick.armed ? "Tap target · Cancel" : "Right click"}
-        </button>
-      )}
       <div
         ref={viewportRef}
         data-testid="remote-viewport"
@@ -4641,6 +4629,15 @@ export function ControlScreen({
           >
             <Keyboard className="h-5 w-5" />
           </motion.button>
+          {questBrowser && (
+            <RightClickButton
+              fab
+              armed={targetRightClick.armed}
+              disabled={!connected || inputLocked}
+              reducedMotion={!!reducedMotion}
+              onClick={targetRightClick.toggle}
+            />
+          )}
           <motion.button
             whileTap={{ scale: 0.92 }}
             onClick={() => {
@@ -4654,6 +4651,28 @@ export function ControlScreen({
           </motion.button>
         </div>
       )}
+
+      {/* ---- Quest right click armed: says what the next tap does, never takes it ---- */}
+      <AnimatePresence>
+        {questBrowser && targetRightClick.armed && !pipView && (
+          <motion.div
+            key="right-click-hint"
+            role="status"
+            initial={{ y: 14, opacity: 0, scale: 0.92 }}
+            animate={{ y: 0, opacity: 1, scale: 1 }}
+            exit={{ y: 10, opacity: 0, scale: 0.96 }}
+            transition={{ type: "spring", stiffness: 420, damping: 30 }}
+            className={`pointer-events-none absolute inset-x-0 z-40 flex justify-center ${
+              immersive || dockCollapsed ? "bottom-16" : "bottom-3"
+            }`}
+          >
+            <span className="flex items-center gap-2 rounded-full border border-pink/40 bg-base/90 px-3.5 py-1.5 text-xs font-700 text-white shadow-float backdrop-blur">
+              <MouseRight className="h-3.5 w-3.5 text-pink" />
+              Tap a target on the PC
+            </span>
+          </motion.div>
+        )}
+      </AnimatePresence>
       </div>{/* ==== end viewport area ==== */}
 
       {/* Ghost input — ABSOLUTE inside this screen (not fixed to the layout
@@ -5280,8 +5299,16 @@ export function ControlScreen({
 
           {/* always-visible icon tab strip — kept compact so the row still clears
               the curve after the container's edge padding eats into the width. */}
-          <div className="flex items-center gap-0.5 py-0.5">
+          <div data-testid="dock-tabs" className="flex items-center gap-0.5 py-0.5">
             <Tab active={panel === "mouse"} onClick={() => openPanel("mouse")} title="Mouse"><MousePointer2 className="h-4 w-4" /></Tab>
+            {questBrowser && (
+              <RightClickButton
+                armed={targetRightClick.armed}
+                disabled={!connected || inputLocked}
+                reducedMotion={!!reducedMotion}
+                onClick={targetRightClick.toggle}
+              />
+            )}
             <Tab active={panel === "keys"} onClick={() => openPanel("keys")} title="Special keys"><Command className="h-4 w-4" /></Tab>
             <Tab active={panel === "game"} onClick={() => openPanel("game")} title="Game keys"><Crosshair className="h-4 w-4" /></Tab>
             <Tab active={panel === "shortcuts"} onClick={() => openPanel("shortcuts")} title="Shortcuts"><Grip className="h-4 w-4" /></Tab>
@@ -6789,6 +6816,76 @@ function Tab({ onClick, active, title, children }: { onClick: () => void; active
         />
       )}
       <span className="relative z-10">{children}</span>
+    </motion.button>
+  );
+}
+/**
+ * Quest's one-shot right click: a dock tab, or a round button while the dock is
+ * hidden. It arms the next tap on the PC screen rather than opening a panel, so it
+ * draws its own pink highlight instead of pulling the shared dockTabActive pill
+ * away from the open panel's tab.
+ */
+function RightClickButton({
+  fab,
+  armed,
+  disabled,
+  reducedMotion,
+  onClick,
+}: {
+  fab?: boolean;
+  armed: boolean;
+  disabled: boolean;
+  reducedMotion: boolean;
+  onClick: () => void;
+}) {
+  const round = fab ? "rounded-full" : "rounded-lg";
+  return (
+    <motion.button
+      type="button"
+      {...(fab ? { initial: { scale: 0, opacity: 0 }, animate: { scale: 1, opacity: 1 } } : null)}
+      whileTap={{ scale: 0.9 }}
+      // Same reason as Tab: never take focus from the ghost input.
+      onPointerDown={(e) => e.preventDefault()}
+      onClick={onClick}
+      disabled={disabled}
+      aria-label="Right click"
+      aria-pressed={armed}
+      title={armed ? "Cancel right click" : "Right click: select, then tap a target on the PC screen"}
+      className={`relative grid place-items-center transition-colors disabled:opacity-40 ${round} ${
+        fab
+          ? `pointer-events-auto ml-2 h-11 w-11 border shadow-float backdrop-blur ${armed ? "border-pink/60 text-white" : "border-white/15 bg-black/45 text-white/90"}`
+          : `h-8 min-w-0 flex-1 ${armed ? "text-white" : "text-ink-dim active:bg-white/[0.06]"}`
+      }`}
+    >
+      <AnimatePresence>
+        {armed && (
+          <motion.span
+            key="fill"
+            aria-hidden
+            className={`absolute inset-0 bg-pink shadow-[0_0_18px_rgba(244,114,182,0.55)] ${round}`}
+            initial={{ scale: 0.55, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.55, opacity: 0 }}
+            transition={{ type: "spring", stiffness: 520, damping: 30 }}
+          />
+        )}
+      </AnimatePresence>
+      {armed && !reducedMotion && (
+        <motion.span
+          aria-hidden
+          className={`pointer-events-none absolute inset-0 border-2 border-pink ${round}`}
+          initial={{ scale: 1, opacity: 0.7 }}
+          animate={{ scale: 1.4, opacity: 0 }}
+          transition={{ duration: 1.25, repeat: Infinity, ease: "easeOut" }}
+        />
+      )}
+      <motion.span
+        className="relative z-10 block"
+        animate={{ scale: armed ? 1.14 : 1 }}
+        transition={{ type: "spring", stiffness: 600, damping: 18 }}
+      >
+        <MouseRight className={fab ? "h-5 w-5" : "h-4 w-4"} />
+      </motion.span>
     </motion.button>
   );
 }
