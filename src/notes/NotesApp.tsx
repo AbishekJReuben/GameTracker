@@ -161,23 +161,24 @@ function Panel() {
     void invoke("notes_panel_close");
   }, []);
 
-  // A page that rises in looks alive; the rows it animates are only ever the first
-  // few on screen, and the work is the compositor's.
+  // Rows settle into place as the shape fades off them. They stay visible throughout:
+  // a page that was hidden takes a moment to draw, and fading them in as well left
+  // the panel empty for that moment.
   const riseIn = useCallback(() => {
     const page = root.current;
     if (!page) return;
-    delete page.dataset.veiled;
-    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    page.querySelectorAll<HTMLElement>(".np-card, .np-label").forEach((el, i) => {
-      if (i > 8) return;
-      el.animate(
-        [
-          { opacity: 0, transform: "translateY(10px) scale(.985)" },
-          { opacity: 1, transform: "none" },
-        ],
-        { duration: 340, delay: i * 18, easing: "cubic-bezier(.16,1,.3,1)", fill: "backwards" },
-      );
-    });
+    if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      page.querySelectorAll<HTMLElement>(".np-card, .np-label").forEach((el, i) => {
+        el.animate([{ transform: "translateY(9px)" }, { transform: "none" }], {
+          duration: 380,
+          delay: Math.min(i, 9) * 16,
+          easing: "cubic-bezier(.16,1,.3,1)",
+          fill: "backwards",
+        });
+      });
+    }
+    // Two frames: the first runs before this one's paint, the second after it.
+    requestAnimationFrame(() => requestAnimationFrame(() => void invoke("notes_panel_painted")));
   }, []);
 
   useEffect(() => {
@@ -203,8 +204,6 @@ function Panel() {
       listen("notes://close", () => {
         flushDeletes();
         setSelected(null);
-        // Rows wait out of sight, so the next open can't flash them before they rise.
-        if (root.current) root.current.dataset.veiled = "true";
       }),
       listen<string | null>("clipboard://copy-wait", (e) => say(e.payload ? `Waiting for ${e.payload}…` : "Waiting for the clipboard…")),
     ];
@@ -357,7 +356,7 @@ function Panel() {
   const searching = !!s.search.trim() || s.filter !== "all" || !!s.tagFilter || !!s.typeFilter;
 
   return (
-    <div ref={root} className="np" data-veiled="true" onKeyDown={onKeyDown} onContextMenu={onContextMenu}>
+    <div ref={root} className="np" onKeyDown={onKeyDown} onContextMenu={onContextMenu}>
       <div className="np-aurora" aria-hidden="true">
         <i />
         <i />

@@ -570,11 +570,6 @@ body,
   color: var(--violet);
 }
 
-.np[data-veiled] .np-card,
-.np[data-veiled] .np-label {
-  opacity: 0;
-}
-
 .np-card {
   --tint: var(--violet);
   --mx: 50%;

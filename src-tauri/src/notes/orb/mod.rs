@@ -57,6 +57,10 @@ const PEEK_HOLD_MS: f32 = 1900.0;
 /// The panel takes over once the shape looks finished, not when its spring has
 /// settled to the last pixel. That tail is what made an open feel slow.
 const REVEAL_AT: f32 = 0.8;
+/// How long the shape waits for the page's first frame. A hidden page has to wake up
+/// before it can draw; fading sooner shows an empty panel. A page that stays silent
+/// this long isn't worth waiting for.
+const PAINT_WAIT: Duration = Duration::from_millis(280);
 const REVEAL_FADE_MS: f32 = 130.0;
 
 const WM_WAKE: u32 = WM_APP + 1;
@@ -95,6 +99,8 @@ pub enum ToOrb {
     PanelReady(isize),
     /// The panel window is gone, so a new one has to be built before the next open.
     PanelGone,
+    /// The page has drawn since it was shown, so the shape can fade off it.
+    PanelPainted,
 }
 
 /// What the orb tells the shell. Nothing here may be answered on the orb's thread.
@@ -193,6 +199,8 @@ struct Orb {
     panel_kept: Cell<Option<Rect>>,
     morph_done: Cell<bool>,
     shown_at: Cell<Option<Instant>>,
+    painted: Cell<bool>,
+    fading_at: Cell<Option<Instant>>,
     focus_before: Cell<isize>,
     rim: Cell<Rim>,
     unread: Cell<u32>,
@@ -297,6 +305,8 @@ unsafe fn run(config: Config, place: Option<Place>, legacy: Option<String>, even
         panel_kept: Cell::new(None),
         morph_done: Cell::new(false),
         shown_at: Cell::new(None),
+        painted: Cell::new(false),
+        fading_at: Cell::new(None),
         focus_before: Cell::new(0),
         rim: Cell::new(Rim::Synced),
         unread: Cell::new(0),
@@ -326,6 +336,22 @@ unsafe fn build_scenes(compositor: &Compositor, glass: HWND, stage: HWND, window
     let orb = OrbScene::new(compositor.clone(), glass, window as f32, size as f32, scale)?;
     let stage = orb.stage(stage)?;
     Ok(Scenes { orb, stage })
+}
+
+/// What the window adds round what you see: Windows keeps invisible resize borders
+/// outside the client area, and the rest of this file deals in what you see.
+unsafe fn frame_of(panel: HWND) -> (i32, i32, i32, i32) {
+    let (mut outer, seen) = (RECT::default(), visible_rect(panel));
+    let _ = GetWindowRect(panel, &mut outer);
+    (seen.x - outer.left, seen.y - outer.top, outer.right - seen.right(), outer.bottom - seen.bottom())
+}
+
+unsafe fn visible_rect(panel: HWND) -> Rect {
+    let mut client = RECT::default();
+    let _ = GetClientRect(panel, &mut client);
+    let mut origin = POINT::default();
+    let _ = ClientToScreen(panel, &mut origin);
+    Rect { x: origin.x, y: origin.y, w: client.right, h: client.bottom }
 }
 
 /// The hit area: the orb's shape, or the sliver left when tucked.
@@ -860,10 +886,21 @@ impl Orb {
             return;
         }
         self.panel.set(Panel::Revealing);
+        self.painted.set(false);
+        self.fading_at.set(None);
         let r = self.panel_rect.get();
+        let (left, top, right, bottom) = frame_of(panel);
         self.tell(FromOrb::Reveal);
         // Async: if the shell's UI thread is busy this thread must not wait for it.
-        let _ = SetWindowPos(panel, self.stage, r.x, r.y, r.w, r.h, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        let _ = SetWindowPos(
+            panel,
+            self.stage,
+            r.x - left,
+            r.y - top,
+            r.w + left + right,
+            r.h + top + bottom,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
         self.shown_at.set(None);
         SetTimer(self.hit, TIMER_REVEAL, 8, None);
     }
@@ -874,24 +911,28 @@ impl Orb {
         (r.left, r.top)
     }
 
-    /// Runs on a short timer until the panel is really on screen, then fades the
-    /// shape off it. Leaves the panel in the hands of the page.
+    /// Runs on a short timer: wait for the window, wait for the page's first frame,
+    /// fade the shape off it, then hand the panel to the page.
     unsafe fn reveal_tick(&self) {
         let panel = HWND(self.panel_hwnd.get() as _);
-        match self.shown_at.get() {
-            None if IsWindowVisible(panel).as_bool() => {
-                self.shown_at.set(Some(Instant::now()));
-                self.scene(|orb, stage| {
-                    orb.hide_skeleton(stage)?;
-                    orb.fade_blob(stage, REVEAL_FADE_MS)
-                });
-            }
-            Some(at) if at.elapsed().as_secs_f32() * 1000.0 > REVEAL_FADE_MS + 16.0 => {
+        if let Some(at) = self.fading_at.get() {
+            if at.elapsed().as_secs_f32() * 1000.0 > REVEAL_FADE_MS + 16.0 {
                 let _ = KillTimer(self.hit, TIMER_REVEAL);
                 self.lower_stage();
                 self.panel.set(Panel::Open);
                 let _ = SetForegroundWindow(panel);
                 self.tell(FromOrb::Focus);
+            }
+            return;
+        }
+        match self.shown_at.get() {
+            None if IsWindowVisible(panel).as_bool() => self.shown_at.set(Some(Instant::now())),
+            Some(at) if self.painted.get() || at.elapsed() > PAINT_WAIT => {
+                self.fading_at.set(Some(Instant::now()));
+                self.scene(|orb, stage| {
+                    orb.hide_skeleton(stage)?;
+                    orb.fade_blob(stage, REVEAL_FADE_MS)
+                });
             }
             _ => {}
         }
@@ -909,9 +950,7 @@ impl Orb {
         let mut from = self.panel_rect.get();
         let mut kept = None;
         if !panel.0.is_null() && IsWindowVisible(panel).as_bool() {
-            let mut r = RECT::default();
-            let _ = GetWindowRect(panel, &mut r);
-            let now = Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top };
+            let now = visible_rect(panel);
             if now != from {
                 kept = Some(now);
             }
@@ -1118,6 +1157,7 @@ impl Orb {
                     self.apply_privacy();
                     self.try_reveal();
                 }
+                ToOrb::PanelPainted => self.painted.set(true),
                 ToOrb::PanelGone => {
                     self.panel_hwnd.set(0);
                     self.panel_ready.set(false);

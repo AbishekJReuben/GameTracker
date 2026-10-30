@@ -432,6 +432,7 @@ macro_rules! notes_commands {
             notes::commands::clipboard_copy,
             notes::commands::speech_to_text,
             notes::panel::notes_panel_ready,
+            notes::panel::notes_panel_painted,
             notes::panel::notes_panel_close,
             notes::panel::notes_panel_recording,
             notes::panel::notes_panel_config,
@@ -719,9 +720,6 @@ fn run_notes_shell(mut context: tauri::Context<tauri::Wry>) {
     if !hostproc::shell_started() {
         return;
     }
-    // No child windows from another process, so nothing outside this process can hold
-    // up this one's windows.
-    std::env::set_var("COREWEBVIEW2_FORCED_HOSTING_MODE", "COREWEBVIEW2_HOSTING_MODE_WINDOW_TO_VISUAL");
     context.config_mut().app.windows.clear();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

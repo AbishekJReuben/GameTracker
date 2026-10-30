@@ -2121,7 +2121,7 @@ rest of the window is a plain clear. Appearance is one JSON schema shared by pho
 
 ---
 
-## 22. Floating Notes: the orb and panel in their own process (3.9.124) — do not regress
+## 22. Floating Notes: the orb and panel in their own process (3.9.125) — do not regress
 
 The old overlay ran in the main app and froze with it: `EmptyClipboard` on the UI thread waits
 for whichever app owns the clipboard, up to 5 s, and every synchronous command shared that thread.
@@ -2162,18 +2162,23 @@ survive a frozen thread. Keep these true:
 **The morph.** Click, the shape grows on the stage, and at 80 % of the spring (`REVEAL_AT`) the real
 panel is shown under the stage and the shape fades over it. Waiting for the last pixel of the spring
 is what made an open feel slow. The panel is shown with `SWP_SHOWWINDOW | SWP_NOACTIVATE`; focus comes
-after the fade, because activating a topmost window lifts it over the stage. The page keeps its rows
-veiled (`data-veiled`) from close to the next `notes://reveal`, or they flash before they rise.
-Windows' own open animation is off (`DWMWA_TRANSITIONS_FORCEDISABLED`), or it fights the shape.
+after the fade, because activating a topmost window lifts it over the stage. The shape waits for the
+page to report a painted frame (`notes_panel_painted`, at most `PAINT_WAIT`): a hidden page takes a
+moment to wake, and fading sooner shows an empty panel. For the same reason rows only settle on open,
+they never fade in. Windows' own open animation is off (`DWMWA_TRANSITIONS_FORCEDISABLED`), or it
+fights the shape.
 
 **The panel (`notes/panel.rs`, `src/notes/`).** Entry `notes.html`, about 52 KB of its own code.
 - Real acrylic: `chrome()` strips the caption styles first, or Windows paints buttons into the frame.
   Nothing on the page may use `backdrop-filter`: inside a transparent WebView it blurs only the page.
   Windows swaps acrylic for flat grey while unfocused; the tint on `.np` is what keeps that looking
   chosen.
-- `COREWEBVIEW2_FORCED_HOSTING_MODE` Window to Visual: no cross-process child windows. Typing, search,
-  Enter, Esc, scroll, window drag, edge resize, right-click and the file dialog are tested. IME isn't,
-  because this PC has no IME; if one misbehaves, remove that line in `run_notes_shell`.
+- Normal WebView2 hosting, on purpose. `COREWEBVIEW2_FORCED_HOSTING_MODE=...WINDOW_TO_VISUAL` looks
+  attractive (no cross-process child windows) but draws through a top-level window in the browser
+  process that stays visible while the panel is hidden.
+- The window is bigger than what you see: Windows keeps invisible resize borders round the client
+  area. The orb works in client rects (`visible_rect`, `frame_of`), or the panel lands 18 px off the
+  shape it's meant to replace.
 - Own WebView2 folder `EBWebView-notes`. Built on first hover, released after 15 idle minutes.
   A dead renderer reloads; a dead browser process rebuilds (`hostproc::on_browser_exit`). A page that
   never reports in within 12 s ends the process, and the supervisor starts a fresh one, because only
@@ -2197,7 +2202,10 @@ GT_NOTES_TEST_DATA=<scratch folder> cargo run --example notes_shell -- --notes-s
   capture anything a test wrote to the real clipboard. The real path is tested in a private window
   station: `cargo test --lib window_station -- --ignored`.
 - `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333` gives you the page over the
-  DevTools protocol.
+  DevTools protocol. It replaces wry's own browser arguments, so don't trust window-level findings
+  made with it set.
+- Don't raise the hidden panel from a test tool: a Z-order change on it put a blank white sheet on
+  screen that looked exactly like an app bug.
 - `--notes-supervise-test` runs the supervisor alone, so killing the shell shows a real restart.
 - Debug builds load the page from Vite. Add `--features tauri/custom-protocol` to test the real
   bundle and its Content Security Policy.

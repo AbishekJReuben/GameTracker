@@ -154,6 +154,13 @@ pub async fn notes_panel_ready(window: WebviewWindow, shell: State<'_, Shell>) -
     Ok(())
 }
 
+/// The page has drawn a frame since being shown.
+#[tauri::command]
+pub async fn notes_panel_painted(shell: State<'_, Shell>) -> AppResult<()> {
+    shell.orb.send(ToOrb::PanelPainted);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn notes_panel_close(shell: State<'_, Shell>) -> AppResult<()> {
     shell.orb.send(ToOrb::Close);
