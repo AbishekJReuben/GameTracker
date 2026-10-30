@@ -31,7 +31,7 @@ export async function openExternalUrl(url: string) {
 /** Native metadata avoids WebView CORS: Open Graph image, Twitter Card image, favicon.
  *  A page that publishes real artwork gets the full-width hero treatment; one that
  *  only yields a favicon degrades to a compact row rather than a broken image box. */
-export function LinkPreview({ url }: { url: string }) {
+export function LinkPreview({ url, compact }: { url: string; compact?: boolean }) {
   const [preview, setPreview] = useState<LinkPreviewData | null>(null);
   const [artFailed, setArtFailed] = useState(false);
   const [iconFailed, setIconFailed] = useState(false);
@@ -43,7 +43,8 @@ export function LinkPreview({ url }: { url: string }) {
     return () => { live = false; };
   }, [url]);
   const data = preview ?? fallbackPreview(url);
-  const hero = !artFailed && !!data.imageUrl && data.source !== "favicon";
+  const art = !artFailed && !!data.imageUrl && data.source !== "favicon";
+  const hero = art && !compact;
   return <button type="button" onPointerDown={(event) => event.stopPropagation()} onClick={() => void openExternalUrl(data.url)} className={cn("mt-2 w-full select-text overflow-hidden rounded-xl border border-cyan-300/15 bg-cyan-300/[0.06] text-left transition-colors hover:border-cyan-200/35 hover:bg-cyan-300/[0.1]", hero ? "block" : "flex")} title={`Open ${data.host}`}>
     {hero ? (
       <img
@@ -55,6 +56,8 @@ export function LinkPreview({ url }: { url: string }) {
         onError={() => setArtFailed(true)}
         className="aspect-video w-full object-cover"
       />
+    ) : art ? (
+      <img src={data.imageUrl!} alt="" loading="lazy" onError={() => setArtFailed(true)} className="w-[88px] shrink-0 self-stretch object-cover" />
     ) : data.faviconUrl && !iconFailed ? (
       <span className="grid h-16 w-16 shrink-0 place-items-center bg-cyan-300/[0.08]">
         {/* Plenty of hosts 404 their /favicon.ico. Swap in the globe rather than
@@ -67,7 +70,7 @@ export function LinkPreview({ url }: { url: string }) {
     <span className="flex min-w-0 flex-1 items-start gap-1 px-2.5 py-2">
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1 text-[10px] font-700 text-cyan-200/90">
-          {hero && data.faviconUrl && !iconFailed && (
+          {art && data.faviconUrl && !iconFailed && (
             <img src={data.faviconUrl} alt="" onError={() => setIconFailed(true)} className="h-3 w-3 shrink-0 rounded-[3px]" />
           )}
           <span className="truncate">{data.host}</span>

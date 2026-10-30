@@ -1,5 +1,4 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { motion, AnimatePresence } from "motion/react";
 import { Send, ImagePlus, Mic, Square, Loader2, Check, X } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { clip } from "@/lib/clip";
@@ -50,6 +49,10 @@ export function Composer({
   onSaveEdit,
   onCancelEdit,
   compact = false,
+  variant = "page",
+  draft,
+  onDraftChange,
+  onRecordingChange,
 }: {
   onAddText: (text: string) => void;
   onAddImage: (b64: string, mime?: string) => void;
@@ -67,10 +70,18 @@ export function Composer({
   onCancelEdit?: () => void;
   /** Floating panels start as a one-line composer, then claim full width once typed. */
   compact?: boolean;
+  /** The floating panel styles itself. */
+  variant?: "page" | "panel";
+  /** Where the panel keeps its draft instead of localStorage (the database, which
+   *  outlives its WebView). */
+  draft?: string;
+  onDraftChange?: (text: string) => void;
+  /** The mic went on or off. */
+  onRecordingChange?: (on: boolean) => void;
 }) {
-  const [text, setText] = useState(() =>
-    draftKey ? localStorage.getItem(draftKey) ?? "" : "",
-  );
+  const storedDraft = () => draftRef.current ?? (draftKey ? localStorage.getItem(draftKey) ?? "" : "");
+  const draftRef = useRef(draft);
+  const [text, setText] = useState(storedDraft);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
@@ -110,9 +121,23 @@ export function Composer({
   // Draft persistence: mirror unsent text (not edits) to localStorage.
   useEffect(() => {
     if (!draftKey || editing) return;
-    if (text) localStorage.setItem(draftKey, text);
-    else localStorage.removeItem(draftKey);
+    try {
+      if (text) localStorage.setItem(draftKey, text);
+      else localStorage.removeItem(draftKey);
+    } catch {
+      /* too big for localStorage: the note in the box is still there */
+    }
   }, [text, draftKey, editing]);
+
+  useEffect(() => {
+    if (!onDraftChange || editing || text === draftRef.current) return;
+    draftRef.current = text;
+    const t = window.setTimeout(() => onDraftChange(text), 400);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text, editing]);
+
+  useEffect(() => onRecordingChange?.(recording), [recording]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Entering edit mode swaps the buffer to the note's text (draft is already
   // saved above); leaving restores the draft.
@@ -125,7 +150,7 @@ export function Composer({
       setText(editing.text);
       areaRef.current?.focus();
     } else {
-      setText(draftKey ? localStorage.getItem(draftKey) ?? "" : "");
+      setText(storedDraft());
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing?.id]);
@@ -145,6 +170,8 @@ export function Composer({
     } else {
       onAddText(t);
       if (draftKey) localStorage.removeItem(draftKey);
+      if (onDraftChange) draftRef.current = "";
+      onDraftChange?.("");
     }
     setText("");
   };
@@ -270,26 +297,22 @@ export function Composer({
 
   return (
     <div
-      className={cn(
-        "rounded-2xl border bg-white/[0.03] p-2 backdrop-blur-sm transition-colors",
-        compact && !text ? "flex items-center gap-1" : "",
-        editing ? "border-accent-2/50" : "border-white/10 focus-within:border-accent-3/40",
-      )}
+      className={
+        variant === "panel"
+          ? cn("np-composer", compact && !text && "flex items-center gap-1")
+          : cn(
+              "rounded-2xl border bg-white/[0.03] p-2 backdrop-blur-sm transition-colors",
+              compact && !text ? "flex items-center gap-1" : "",
+              editing ? "border-accent-2/50" : "border-white/10 focus-within:border-accent-3/40",
+            )
+      }
+      data-editing={editing ? "true" : undefined}
     >
-      <AnimatePresence initial={false}>
-        {editing && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: "auto" }}
-            exit={{ opacity: 0, height: 0 }}
-            className="overflow-hidden"
-          >
-            <div className="flex items-center gap-1.5 px-2 pb-1 text-[10px] font-700 uppercase tracking-wide text-accent-2">
-              Editing note
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {editing && (
+        <div className="flex items-center gap-1.5 px-2 pb-1 text-[10px] font-700 uppercase tracking-wide text-accent-2">
+          Editing note
+        </div>
+      )}
       <textarea
         ref={areaRef}
         value={text}
@@ -300,7 +323,10 @@ export function Composer({
             e.preventDefault();
             submit();
           }
-          if (e.key === "Escape" && editing) onCancelEdit?.();
+          if (e.key === "Escape" && editing) {
+            e.stopPropagation();
+            onCancelEdit?.();
+          }
         }}
         rows={1}
         placeholder={placeholder}
@@ -324,12 +350,11 @@ export function Composer({
             </>
           )}
           {micAvailable && (
-            <motion.button
-              whileTap={{ scale: 0.9 }}
+            <button
               onClick={toggleMic}
               title={recording ? "Stop" : transcribing ? "Transcribing…" : "Speak"}
               className={cn(
-                "grid h-7 w-7 place-items-center rounded-lg",
+                "grid h-7 w-7 place-items-center rounded-lg transition-transform active:scale-90",
                 recording
                   ? "bg-rose-500/90 text-white"
                   : "text-ink-dim hover:bg-white/10 hover:text-ink",
@@ -342,7 +367,7 @@ export function Composer({
               ) : (
                 <Mic className="h-3.5 w-3.5" />
               )}
-            </motion.button>
+            </button>
           )}
           {recording ? (
             <span className="truncate text-[10px] font-600 text-rose-300">Listening… tap to stop</span>
@@ -356,23 +381,21 @@ export function Composer({
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {editing && (
-            <motion.button
-              whileTap={{ scale: 0.94 }}
+            <button
               onClick={() => onCancelEdit?.()}
-              className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-600 text-ink-dim hover:bg-white/10 hover:text-ink"
+              className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-600 text-ink-dim transition-transform hover:bg-white/10 hover:text-ink active:scale-95"
             >
               <X className="h-3 w-3" /> Cancel
-            </motion.button>
+            </button>
           )}
-          <motion.button
-            whileTap={{ scale: 0.94 }}
+          {(variant !== "panel" || text.trim()) && <button
             onClick={submit}
             disabled={!text.trim()}
-            className="btn-primary flex items-center gap-1 px-2.5 py-1 text-[11px] disabled:opacity-40"
+            className="btn-primary flex items-center gap-1 px-2.5 py-1 text-[11px] transition-transform active:scale-95 disabled:opacity-40"
           >
             {editing ? <Check className="h-3 w-3" /> : <Send className="h-3 w-3" />}
             {editing ? "Save" : "Add"}
-          </motion.button>
+          </button>}
         </div>
       </div>
     </div>

@@ -91,6 +91,9 @@ fn main() {
         let attrs = tauri_build::Attributes::new()
             .windows_attributes(tauri_build::WindowsAttributes::new().app_manifest(APP_MANIFEST));
         tauri_build::try_build(attrs).expect("failed to run tauri-build");
+        // Only bins get the app manifest, and Tauri can't start without Common Controls 6.
+        println!("cargo:rustc-link-arg-examples=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-examples=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
     }
     #[cfg(not(windows))]
     {

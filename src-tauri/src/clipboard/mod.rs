@@ -155,12 +155,16 @@ pub fn apply_settings(app: &AppHandle) -> AppResult<()> {
     #[cfg(not(windows))]
     let _ = auto;
 
+    // The floating Notes process runs on its own (hostproc::supervise_shell). The
+    // classic overlay below is the fallback for when it's turned off or keeps dying.
+    let classic = enabled && overlay && !wants_shell(pool);
+
     // Floating overlay window. IMPORTANT: building a WebView window must happen
     // on the Tauri main thread (it pumps the Win32 message loop for WebView2
     // controller init). If `apply_settings` is ever called from a sync command,
     // `build()` deadlocks the main thread — see `clipboard_configure` which now
     // defers this via `run_on_main_thread`.
-    if enabled && overlay {
+    if classic {
         match open_overlay(app) {
             Ok(()) => log("open_overlay ok"),
             Err(e) => {
@@ -175,6 +179,12 @@ pub fn apply_settings(app: &AppHandle) -> AppResult<()> {
         log("close_overlay");
     }
     Ok(())
+}
+
+/// Should the floating Notes process be running right now?
+pub fn wants_shell(pool: &crate::db::DbPool) -> bool {
+    let on = |key: &str, default: bool| crate::db::settings::get_bool(pool, key).unwrap_or(default);
+    on("clipboard_enabled", false) && on("clipboard_overlay_enabled", false) && on("notes_shell_enabled", true) && !crate::hostproc::shell_failed()
 }
 
 /// While the overlay is on, hide it whenever the foreground app is fullscreen

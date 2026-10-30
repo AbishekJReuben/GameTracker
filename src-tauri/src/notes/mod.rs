@@ -7,7 +7,13 @@
 
 pub mod bus;
 pub mod commands;
+#[cfg(windows)]
+pub mod orb;
 pub mod os_clipboard;
+#[cfg(windows)]
+pub mod panel;
+#[cfg(windows)]
+pub mod shell;
 
 use crate::db::DbPool;
 use std::path::PathBuf;

@@ -39,6 +39,7 @@ export default defineConfig(async () => ({
         main: path.resolve(__dirname, "index.html"),
         companion: path.resolve(__dirname, "companion.html"),
         quest: path.resolve(__dirname, "quest.html"),
+        notes: path.resolve(__dirname, "notes.html"),
       },
     },
   },

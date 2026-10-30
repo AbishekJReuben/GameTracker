@@ -401,7 +401,42 @@ macro_rules! app_commands {
             notes::commands::clipboard_configure,
             notes::commands::clipboard_diagnostics,
             notes::commands::clipboard_overlay_set_pos,
+            notes::commands::clipboard_publish_status,
             notes::commands::speech_to_text,
+        ]
+    };
+}
+
+/// What the floating Notes panel may call. Every one of these is async: its process
+/// has one UI thread, and that thread is what keeps the panel moving.
+#[cfg(windows)]
+macro_rules! notes_commands {
+    () => {
+        tauri::generate_handler![
+            commands::link_preview,
+            commands::open_external_link,
+            notes::commands::clipboard_device_info,
+            notes::commands::clipboard_list,
+            notes::commands::clipboard_text,
+            notes::commands::clipboard_changes,
+            notes::commands::clipboard_search,
+            notes::commands::clipboard_pinned,
+            notes::commands::clipboard_add,
+            notes::commands::clipboard_delete,
+            notes::commands::clipboard_set_pinned,
+            notes::commands::clipboard_update_text,
+            notes::commands::clipboard_set_folder,
+            notes::commands::clipboard_folders,
+            notes::commands::clipboard_tags,
+            notes::commands::clipboard_set_tags,
+            notes::commands::clipboard_copy,
+            notes::commands::speech_to_text,
+            notes::panel::notes_panel_ready,
+            notes::panel::notes_panel_close,
+            notes::panel::notes_panel_recording,
+            notes::panel::notes_panel_config,
+            notes::panel::notes_panel_set_draft,
+            notes::panel::notes_panel_status,
         ]
     };
 }
@@ -431,6 +466,12 @@ pub fn run() {
         hostproc::trace("remote-host process launched");
         hostproc::install_panic_log("remote-host");
         run_remote_host(context);
+        return;
+    }
+    #[cfg(windows)]
+    if hostproc::is_notes_shell() {
+        hostproc::install_panic_log("notes-shell");
+        run_notes_shell(context);
         return;
     }
     hostproc::install_panic_log("app");
@@ -566,6 +607,12 @@ pub fn run() {
                 });
             }
 
+            // The floating Notes process, supervised from here on.
+            {
+                let (pool, app) = (pool.clone(), handle.clone());
+                hostproc::supervise_shell(move || clipboard::wants_shell(&pool), move || clipboard::apply_settings_deferred(app.clone()));
+            }
+
             // Voice: narrate Claude Code sessions to the phone (off by default).
             voice::init(pool.clone(), handle.path().app_local_data_dir()?);
 
@@ -655,6 +702,35 @@ fn tray_tooltip(st: &tracking::TrackingState) -> String {
         );
     }
     format!("Tracker · {} today", fmt(st.today_active_seconds))
+}
+
+/// The floating Notes process (`--notes-shell`, see `notes/shell.rs`): the orb and the
+/// panel, and nothing else. It keeps working if the main app freezes or crashes.
+#[cfg(windows)]
+fn run_notes_shell(mut context: tauri::Context<tauri::Wry>) {
+    if !hostproc::shell_started() {
+        return;
+    }
+    // No child windows from another process, so nothing outside this process can hold
+    // up this one's windows.
+    std::env::set_var("COREWEBVIEW2_FORCED_HOSTING_MODE", "COREWEBVIEW2_HOSTING_MODE_WINDOW_TO_VISUAL");
+    context.config_mut().app.windows.clear();
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .setup(notes::shell::setup)
+        .invoke_handler(guarded(notes_commands!()))
+        .build(context)
+        .map_err(|e| {
+            hostproc::trace(&format!("notes shell failed to start: {e}"));
+            e
+        })
+        .expect("error while building the notes shell")
+        .run(|_, event| {
+            // Releasing the panel closes the last window. That isn't a reason to leave.
+            if let tauri::RunEvent::ExitRequested { api, code: None, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }
 
 /// The remote-desktop host process (`--remote-host`, see `hostproc.rs`): the

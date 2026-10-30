@@ -56,7 +56,7 @@ fn decode_b64(s: &str) -> AppResult<Vec<u8>> {
 
 /// Normalize image bytes to PNG. Bytes that already are PNG stay as they are: a
 /// re-encode cost 371 ms on a 15 MB screenshot and changed nothing.
-fn to_png(raw: Vec<u8>) -> Vec<u8> {
+pub(super) fn to_png(raw: Vec<u8>) -> Vec<u8> {
     const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     if raw.starts_with(&PNG_MAGIC) {
         return raw;
@@ -534,6 +534,23 @@ pub async fn clipboard_configure(
 #[tauri::command]
 pub async fn clipboard_diagnostics() -> AppResult<Vec<String>> {
     Ok(clipboard::diagnostics())
+}
+
+/// Keep the floating Notes process up to date on sync. It reads this from a file, so
+/// it needs nothing from this process to stay alive.
+#[tauri::command]
+pub async fn clipboard_publish_status(ctx: State<'_, NotesCtx>, mut status: serde_json::Value) -> AppResult<()> {
+    let path = ctx.data_dir.join("notes-status.json");
+    run_blocking(move || {
+        if let Some(o) = status.as_object_mut() {
+            o.insert("updatedMs".into(), chrono::Utc::now().timestamp_millis().into());
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, status.to_string())?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]

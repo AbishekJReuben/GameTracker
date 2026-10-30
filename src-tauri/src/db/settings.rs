@@ -80,6 +80,12 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // (generated on first use). Empty until set.
     ("clipboard_overlay_pos", ""),
     ("clipboard_device_id", ""),
+    // The floating Notes process. Off falls back to the classic overlay.
+    ("notes_shell_enabled", "true"),
+    ("notes_orb_tuck", "true"),
+    ("notes_orb_peek", "true"),
+    ("notes_orb_spark", "false"),
+    ("notes_hotkey", "Ctrl+Shift+Space"),
 ];
 
 fn default_for(key: &str) -> Option<&'static str> {

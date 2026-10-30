@@ -19,12 +19,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 pub const HOST_ARG: &str = "--remote-host";
+pub const SHELL_ARG: &str = "--notes-shell";
 const MAIN_MUTEX: &str = "Local\\GameTrackerMain-v1";
 const HOST_MUTEX: &str = "Local\\GameTrackerRemoteHost-v1";
+const SHELL_MUTEX: &str = "Local\\GameTrackerNotes-v1";
+const SHELL_QUIT: &str = "Local\\GameTrackerNotesQuit-v1";
 /// An update older than this is treated as finished (or failed).
 const UPDATE_GRACE: Duration = Duration::from_secs(5 * 60);
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
+/// The notes shell keeps dying at startup. The classic overlay takes over for this run.
+static SHELL_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// A host whose page never loads (or stops) still holds its mutex, so the
 /// main app believes remote access is up while phones sit on "PC online".
@@ -65,8 +70,17 @@ pub fn is_remote_host() -> bool {
     std::env::args().any(|a| a == HOST_ARG)
 }
 
+pub fn is_notes_shell() -> bool {
+    std::env::args().any(|a| a == SHELL_ARG)
+}
+
 /// `%LOCALAPPDATA%\com.chilloutgames.gametracker` — usable before Tauri starts.
 pub fn data_dir() -> PathBuf {
+    // A development shell runs against a copy of the data, beside the installed app.
+    #[cfg(debug_assertions)]
+    if let Ok(dir) = std::env::var("GT_NOTES_TEST_DATA") {
+        return PathBuf::from(dir);
+    }
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("com.chilloutgames.gametracker")
@@ -339,6 +353,179 @@ fn end_stuck_host() -> bool {
     false
 }
 
+// ---- notes shell -------------------------------------------------------------
+
+#[cfg(windows)]
+mod quit_event {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent, WaitForSingleObject};
+
+    fn open() -> Option<HANDLE> {
+        // Auto-reset: one signal ends one shell.
+        unsafe { CreateEventW(None, false, false, &HSTRING::from(super::SHELL_QUIT)) }.ok()
+    }
+
+    pub fn signal() {
+        if let Some(h) = open() {
+            unsafe {
+                let _ = SetEvent(h);
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+
+    /// Drop a signal nobody took, so a new shell doesn't stop as soon as it starts.
+    pub fn clear() {
+        if let Some(h) = open() {
+            unsafe {
+                let _ = ResetEvent(h);
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+
+    /// True if signalled before `millis` passed.
+    pub fn wait(millis: u32) -> bool {
+        let Some(h) = open() else {
+            std::thread::sleep(std::time::Duration::from_millis(millis as u64));
+            return false;
+        };
+        let signalled = unsafe { WaitForSingleObject(h, millis) }.0 == 0;
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        signalled
+    }
+}
+
+#[cfg(not(windows))]
+mod quit_event {
+    pub fn signal() {}
+    pub fn clear() {}
+    pub fn wait(millis: u32) -> bool {
+        std::thread::sleep(std::time::Duration::from_millis(millis as u64));
+        false
+    }
+}
+
+pub fn shell_failed() -> bool {
+    SHELL_FAILED.load(Ordering::SeqCst)
+}
+
+/// Called first in the shell process. False means one is already running.
+pub fn shell_started() -> bool {
+    let ok = mutex::claim(SHELL_MUTEX);
+    trace(&format!("notes shell starting, claimed mutex: {ok}"));
+    ok
+}
+
+/// Shell: leave when asked, when the user quits, or before an update replaces the exe.
+pub fn watch_shell_quit() {
+    let _ = std::thread::Builder::new().name("notes-shell-quit".into()).spawn(|| loop {
+        let asked = quit_event::wait(2000);
+        if asked || flag("quit.flag").exists() || flag_age("updating.flag").is_some_and(|a| a < UPDATE_GRACE) {
+            trace("notes shell leaving");
+            std::process::exit(0);
+        }
+    });
+}
+
+/// What the shell supervisor should do next. Pure, so its rules are tested.
+#[derive(Debug, PartialEq, Eq)]
+enum ShellStep {
+    Wait,
+    Start,
+    Stop,
+    GiveUp,
+}
+
+#[derive(Default)]
+struct ShellWatch {
+    spawned: Option<Instant>,
+    seen: bool,
+    quick_deaths: u32,
+    next_start: Option<Instant>,
+}
+
+impl ShellWatch {
+    /// A shell that hasn't claimed its mutex by now isn't coming. A new process can be
+    /// slow on this machine, so a slow start must not read as a death.
+    const START_GRACE: Duration = Duration::from_secs(25);
+    /// Dying sooner than this counts against the shell.
+    const QUICK: Duration = Duration::from_secs(60);
+    const GIVE_UP_AFTER: u32 = 3;
+
+    fn step(&mut self, wanted: bool, running: bool, now: Instant) -> ShellStep {
+        if running {
+            self.seen = true;
+            return if wanted { ShellStep::Wait } else { ShellStep::Stop };
+        }
+        if !wanted {
+            *self = Self { quick_deaths: self.quick_deaths, ..Self::default() };
+            return ShellStep::Wait;
+        }
+        if let Some(at) = self.spawned {
+            let age = now.duration_since(at);
+            if !self.seen && age < Self::START_GRACE {
+                return ShellStep::Wait;
+            }
+            self.spawned = None;
+            self.seen = false;
+            if age < Self::QUICK {
+                self.quick_deaths += 1;
+                if self.quick_deaths >= Self::GIVE_UP_AFTER {
+                    return ShellStep::GiveUp;
+                }
+                self.next_start = Some(now + Duration::from_secs(4 << self.quick_deaths));
+            } else {
+                self.quick_deaths = 0;
+            }
+        }
+        if self.next_start.is_some_and(|t| now < t) {
+            return ShellStep::Wait;
+        }
+        self.next_start = None;
+        self.spawned = Some(now);
+        self.seen = false;
+        ShellStep::Start
+    }
+}
+
+/// Keep the notes shell running while it's wanted. `gave_up` runs once if it keeps
+/// dying, so the classic overlay can take over.
+pub fn supervise_shell(wanted: impl Fn() -> bool + Send + 'static, gave_up: impl Fn() + Send + 'static) {
+    let _ = std::thread::Builder::new().name("notes-shell-supervisor".into()).spawn(move || {
+        let mut watch = ShellWatch::default();
+        loop {
+            if QUITTING.load(Ordering::SeqCst) {
+                return;
+            }
+            let updating = flag_age("updating.flag").is_some_and(|a| a < UPDATE_GRACE);
+            if !updating && !shell_failed() {
+                match watch.step(wanted(), mutex::exists(SHELL_MUTEX), Instant::now()) {
+                    ShellStep::Wait => {}
+                    ShellStep::Start => {
+                        trace("notes shell not running: starting it");
+                        quit_event::clear();
+                        let _ = spawn_exe(&[SHELL_ARG]);
+                    }
+                    ShellStep::Stop => {
+                        trace("notes shell not wanted: stopping it");
+                        quit_event::signal();
+                    }
+                    ShellStep::GiveUp => {
+                        trace("notes shell keeps dying: falling back to the classic overlay");
+                        SHELL_FAILED.store(true, Ordering::SeqCst);
+                        gave_up();
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
 // ---- shared remote state across the two processes ----------------------------
 
 /// The host process follows the Remote page through the database: the switch,
@@ -563,6 +750,47 @@ mod tests {
         }
         std::panic::set_hook(prev);
         assert_eq!(runs.load(Ordering::SeqCst), 2, "ran again after the panic, then stopped");
+    }
+
+    #[test]
+    fn the_shell_starts_only_when_wanted_and_stops_when_not() {
+        let mut w = ShellWatch::default();
+        let t = Instant::now();
+        assert_eq!(w.step(false, false, t), ShellStep::Wait);
+        assert_eq!(w.step(true, false, t), ShellStep::Start);
+        assert_eq!(w.step(true, true, t + Duration::from_secs(2)), ShellStep::Wait);
+        assert_eq!(w.step(false, true, t + Duration::from_secs(4)), ShellStep::Stop);
+    }
+
+    #[test]
+    fn a_slow_shell_start_is_not_a_death() {
+        let mut w = ShellWatch::default();
+        let t = Instant::now();
+        assert_eq!(w.step(true, false, t), ShellStep::Start);
+        assert_eq!(w.step(true, false, t + Duration::from_secs(20)), ShellStep::Wait);
+        assert_eq!(w.step(true, true, t + Duration::from_secs(22)), ShellStep::Wait);
+        assert_eq!(w.quick_deaths, 0);
+    }
+
+    #[test]
+    fn a_long_lived_shell_restarts_at_once_and_a_crashing_one_is_given_up_on() {
+        let mut w = ShellWatch::default();
+        let t = Instant::now();
+        assert_eq!(w.step(true, false, t), ShellStep::Start);
+        assert_eq!(w.step(true, true, t + Duration::from_secs(5)), ShellStep::Wait);
+        assert_eq!(w.step(true, false, t + Duration::from_secs(600)), ShellStep::Start, "ran for ten minutes");
+        assert_eq!(w.quick_deaths, 0);
+
+        let mut now = t + Duration::from_secs(600);
+        for death in 1..ShellWatch::GIVE_UP_AFTER {
+            assert_eq!(w.step(true, true, now + Duration::from_secs(1)), ShellStep::Wait);
+            now += Duration::from_secs(5);
+            assert_eq!(w.step(true, false, now), ShellStep::Wait, "backs off after death {death}");
+            now += Duration::from_secs(60);
+            assert_eq!(w.step(true, false, now), ShellStep::Start);
+        }
+        assert_eq!(w.step(true, true, now + Duration::from_secs(1)), ShellStep::Wait);
+        assert_eq!(w.step(true, false, now + Duration::from_secs(5)), ShellStep::GiveUp);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! misses a signal catches up on its next revision check.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
@@ -24,6 +24,7 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 static SIDE: OnceLock<Side> = OnceLock::new();
 static CHANGED: AtomicBool = AtomicBool::new(false);
 static OUTBOX: AtomicBool = AtomicBool::new(false);
+static SIGNAL: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
 /// Called once per process, before any note can change.
 pub fn start(app: AppHandle, side: Side) {
@@ -54,9 +55,21 @@ fn flush() {
     let Some(app) = APP.get() else { return };
     if CHANGED.swap(false, Ordering::SeqCst) {
         let _ = app.emit("clipboard://changed", ());
+        if let Ok(mut flag) = SIGNAL.0.lock() {
+            *flag = true;
+            SIGNAL.1.notify_all();
+        }
     }
     if OUTBOX.swap(false, Ordering::SeqCst) {
         let _ = app.emit("clipboard://outbox", ());
+    }
+}
+
+/// Sleep until a note changes, or for `timeout`.
+pub fn wait(timeout: Duration) {
+    let Ok(flag) = SIGNAL.0.lock() else { return };
+    if let Ok((mut flag, _)) = SIGNAL.1.wait_timeout_while(flag, timeout, |changed| !*changed) {
+        *flag = false;
     }
 }
 
