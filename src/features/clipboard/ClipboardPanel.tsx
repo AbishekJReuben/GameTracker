@@ -8,7 +8,7 @@ import { useClipboard, visibleClips, type ClipFilter } from "@/store/clipboard";
 import { EmptyState } from "@/components/ui";
 import { Composer, type ComposerEdit } from "./Composer";
 import { ClipboardList } from "./ClipboardList";
-import type { ClipItem } from "@/lib/clip";
+import { clip, type ClipItem } from "@/lib/clip";
 
 const FILTERS: ClipFilter[] = ["all", "text", "image"];
 
@@ -111,20 +111,33 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
 
   useEffect(() => {
     void s.load();
-    const unChanged = listen("clipboard://changed", () => void s.refresh());
-    const unItem = listen("clipboard://item", () => void s.refresh());
-    return () => { unChanged.then((f) => f()); unItem.then((f) => f()); };
+    const unChanged = listen("clipboard://changed", () => void useClipboard.getState().sync());
+    return () => { unChanged.then((f) => f()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Narrowing to a tag (or a search term) has to reach past the pages already in
-  // memory, otherwise a tag whose notes are older than the first page looks empty.
-  // Debounced so typing a query doesn't fire a paging run per keystroke.
+  // Narrowing to a tag has to reach past the pages already in memory, otherwise a
+  // tag whose notes are older than the first page looks empty.
   useEffect(() => {
-    const t = window.setTimeout(() => void s.ensureMatches(), s.search ? 250 : 0);
+    void s.ensureMatches();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.tagFilter, s.typeFilter, s.filter]);
+
+  // Search runs in the database over the whole history. Debounced so typing doesn't
+  // fire a scan per keystroke.
+  useEffect(() => {
+    const t = window.setTimeout(() => void s.runSearch(), s.search ? 180 : 0);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tagFilter, s.typeFilter, s.filter, s.search]);
+  }, [s.search]);
+
+  // Lists carry a preview, so an edit starts from the full note.
+  const startEdit = async (item: ClipItem) => {
+    if (item.kind !== "text") return;
+    const short = (item.textLen ?? 0) > (item.text?.length ?? 0);
+    const text = short ? await clip.text(item.id).catch(() => null) : item.text;
+    setEditing({ id: item.id, text: text ?? item.text ?? "" });
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
@@ -161,7 +174,7 @@ export function ClipboardPanel({ compact, sttEnabled, draftKey = "gt.clip.draft.
           <ClipboardList
             pinned={pinned} rest={rest} loading={s.loading} hasMore={s.hasMore}
             onCopy={s.copy} onDelete={s.remove} onTogglePin={s.togglePin}
-            onEdit={(item: ClipItem) => item.kind === "text" && setEditing({ id: item.id, text: item.text ?? "" })}
+            onEdit={(item: ClipItem) => void startEdit(item)}
             onSetTags={(id, tags) => void s.setTags(id, tags)} knownTags={s.tags}
             onLoadMore={s.loadMore} compact={compact} showHistory={!compact}
           />

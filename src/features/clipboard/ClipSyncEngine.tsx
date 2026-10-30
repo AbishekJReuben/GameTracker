@@ -15,7 +15,7 @@ import { useClipboard } from "@/store/clipboard";
 export function ClipSyncEngine() {
   useEffect(() => {
     if (!clipDesktop()) return;
-    clipSync.start(() => useClipboard.getState().refresh());
+    void clipSync.start();
     const publish = () => {
       const d = clipSync.diagnostics();
       const items = useClipboard.getState().items;

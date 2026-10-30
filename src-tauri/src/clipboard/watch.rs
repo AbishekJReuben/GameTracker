@@ -13,18 +13,16 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use tauri::AppHandle;
 use windows::core::w;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RemoveClipboardFormatListener, SetClipboardData,
+    AddClipboardFormatListener, CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
+    OpenClipboard, RemoveClipboardFormatListener,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
-};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
     PostQuitMessage, RegisterClassW, TranslateMessage, HMENU, HWND_MESSAGE, MSG, WINDOW_EX_STYLE,
@@ -46,18 +44,11 @@ struct Ctx {
 static WATCH: Lazy<Mutex<Option<Ctx>>> = Lazy::new(|| Mutex::new(None));
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static HWND_PTR: AtomicIsize = AtomicIsize::new(0);
-/// Suppress capture for a short window after we set the clipboard ourselves
-/// (quick-copy), so a copy doesn't loop back in as a "new" item.
-static IGNORE_UNTIL: AtomicI64 = AtomicI64::new(0);
 /// Hash of the last content we captured (text or image). Windows fires
 /// `WM_CLIPBOARDUPDATE` several times for a single copy (an app sets CF_DIB,
 /// CF_DIBV5 and CF_BITMAP in separate calls), so without this an image copy
 /// lands as two or three identical rows. 0 means "nothing captured yet".
 static LAST_HASH: AtomicU64 = AtomicU64::new(0);
-
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
 
 /// Stable hash of a captured payload, namespaced by kind so an image and a text
 /// item that happen to collide never dedupe each other. Never returns 0 (that
@@ -73,11 +64,6 @@ fn content_hash(kind: &str, bytes: &[u8]) -> u64 {
     } else {
         v
     }
-}
-
-/// Ignore the next clipboard update (called right before we SetClipboardData).
-pub fn ignore_next() {
-    IGNORE_UNTIL.store(now_ms() + 1500, Ordering::SeqCst);
 }
 
 /// Start (or refresh) the listener thread. Safe to call repeatedly. Returns Ok on
@@ -195,13 +181,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 unsafe fn handle_update(hwnd: HWND) {
-    if now_ms() < IGNORE_UNTIL.load(Ordering::SeqCst) {
+    // Our own copies carry a private format, whichever process wrote them. A note
+    // copied back to the clipboard is not a new note.
+    if IsClipboardFormatAvailable(crate::notes::os_clipboard::origin_format()).is_ok() {
         return;
     }
     let Some(ctx) = WATCH.lock().clone() else {
         return;
     };
-    let (text, png) = read_clipboard(hwnd);
+    let (text, dib) = read_clipboard(hwnd);
+    // Encoded after the clipboard is closed: a 4K PNG takes hundreds of milliseconds,
+    // and every other app's copy and paste fails while we hold it open.
+    let png = dib.and_then(|dib| dib_to_png(&dib));
     // Millisecond UTC + literal Z — the shared wire shape (see clipboard_add).
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -239,7 +230,7 @@ unsafe fn handle_update(hwnd: HWND) {
                 synced: false,
             };
             // add_local dedups: a re-copy of the same image bumps the existing note.
-            let _ = crate::clipboard::add_local(&ctx.app, &ctx.pool, input);
+            let _ = crate::clipboard::add_local(&ctx.pool, input);
             LAST_HASH.store(hash, Ordering::SeqCst);
         }
         return;
@@ -280,18 +271,27 @@ unsafe fn handle_update(hwnd: HWND) {
             copies: Vec::new(),
             synced: false,
         };
-        let _ = crate::clipboard::add_local(&ctx.app, &ctx.pool, input);
+        let _ = crate::clipboard::add_local(&ctx.pool, input);
         LAST_HASH.store(hash, Ordering::SeqCst);
     }
 }
 
-/// Read the current clipboard once (text + DIB image in a single session).
+/// Read the current clipboard once (text + raw DIB in a single session). The app
+/// that just copied may still hold the clipboard open, so this retries briefly.
 unsafe fn read_clipboard(hwnd: HWND) -> (Option<String>, Option<Vec<u8>>) {
-    if OpenClipboard(hwnd).is_err() {
+    let mut opened = false;
+    for attempt in 0..8 {
+        if OpenClipboard(hwnd).is_ok() {
+            opened = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15 << attempt.min(3)));
+    }
+    if !opened {
         return (None, None);
     }
     let mut text = None;
-    let mut png = None;
+    let mut image = None;
 
     if IsClipboardFormatAvailable(CF_UNICODETEXT).is_ok() {
         if let Ok(h) = GetClipboardData(CF_UNICODETEXT) {
@@ -318,15 +318,14 @@ unsafe fn read_clipboard(hwnd: HWND) -> (Option<String>, Option<Vec<u8>>) {
             let size = GlobalSize(hg);
             let ptr = GlobalLock(hg) as *const u8;
             if !ptr.is_null() && size > 0 {
-                let dib = std::slice::from_raw_parts(ptr, size).to_vec();
+                image = Some(std::slice::from_raw_parts(ptr, size).to_vec());
                 let _ = GlobalUnlock(hg);
-                png = dib_to_png(&dib);
             }
         }
     }
 
     let _ = CloseClipboard();
-    (text, png)
+    (text, image)
 }
 
 /// Convert a CF_DIB payload (BITMAPINFOHEADER + pixels) to PNG bytes by wrapping
@@ -386,68 +385,4 @@ fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .ok()?;
     Some(png)
-}
-
-/// Put UTF-16 text on the OS clipboard.
-pub fn set_os_text(text: &str) {
-    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes = wide.len() * 2;
-    unsafe {
-        if OpenClipboard(HWND::default()).is_err() {
-            return;
-        }
-        let _ = EmptyClipboard();
-        if let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
-            let ptr = GlobalLock(hg) as *mut u16;
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
-                let _ = GlobalUnlock(hg);
-                // On success the system owns the memory — don't free it.
-                let _ = SetClipboardData(CF_UNICODETEXT, HANDLE(hg.0));
-            }
-        }
-        let _ = CloseClipboard();
-    }
-}
-
-/// Put an image on the OS clipboard as a bottom-up 32bpp BI_RGB DIB.
-pub fn set_os_image(rgba: &image::RgbaImage) {
-    let (w, h) = rgba.dimensions();
-    let pixels = (w as usize) * (h as usize) * 4;
-    let mut dib = Vec::with_capacity(40 + pixels);
-    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
-    dib.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
-    dib.extend_from_slice(&(h as i32).to_le_bytes()); // biHeight (+ = bottom-up)
-    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
-    dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
-    dib.extend_from_slice(&(pixels as u32).to_le_bytes()); // biSizeImage
-    dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
-    dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
-    for y in (0..h).rev() {
-        for x in 0..w {
-            let p = rgba.get_pixel(x, y).0;
-            dib.push(p[2]);
-            dib.push(p[1]);
-            dib.push(p[0]);
-            dib.push(p[3]);
-        }
-    }
-    unsafe {
-        if OpenClipboard(HWND::default()).is_err() {
-            return;
-        }
-        let _ = EmptyClipboard();
-        if let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, dib.len()) {
-            let ptr = GlobalLock(hg) as *mut u8;
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr, dib.len());
-                let _ = GlobalUnlock(hg);
-                let _ = SetClipboardData(CF_DIB, HANDLE(hg.0));
-            }
-        }
-        let _ = CloseClipboard();
-    }
 }

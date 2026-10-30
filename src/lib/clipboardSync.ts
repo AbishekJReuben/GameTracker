@@ -4,8 +4,10 @@
 // tray), so no TLS/WebSocket/AEAD crate is needed on the desktop Rust side and the
 // E2E crypto is shared with the companion webview. It:
 //   - holds one push-based WebSocket to the relay's /clip namespace,
-//   - encrypts locally-captured items (from the `clipboard://item` event) and
-//     uploads them (text inline, images as blobs over HTTP),
+//   - encrypts unsynced items and uploads them (text inline, images as blobs
+//     over HTTP), and sends the durable outbox of pins, deletes and tag changes.
+//     Both live in the database, so either process can queue work, and work queued
+//     offline just waits (`clipboard://outbox` is only the nudge),
 //   - applies remote items into the local store (decrypt → invoke commands),
 //   - flushes any backlog on (re)connect and pings to survive idle proxies.
 //
@@ -13,7 +15,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { clip, type ClipItem } from "./clip";
+import { clip, type ClipItem, type OutboxOp } from "./clip";
 import {
   deriveKey,
   clipId as deriveClipId,
@@ -61,7 +63,10 @@ class ClipSyncManager {
   private retryTimer?: ReturnType<typeof setTimeout>;
   private pingTimer?: ReturnType<typeof setInterval>;
   private unlisteners: UnlistenFn[] = [];
-  private onChange?: () => void;
+  /** Relay notices apply strictly in arrival order. */
+  private inbound: Promise<void> = Promise.resolve();
+  private draining = false;
+  private drainAgain = false;
   // Diagnostic surface — surfaced by diagnostics() so the user can copy a full
   // report from Settings instead of staring at "Turning on…".
   private startedAt: number | null = null;
@@ -83,8 +88,7 @@ class ClipSyncManager {
 
   /** Start (idempotent). Reads secret/signal URL from settings; no-op if the
    *  feature is off or no secret is configured yet. */
-  async start(onChange?: () => void): Promise<void> {
-    this.onChange = onChange;
+  async start(): Promise<void> {
     if (this.started) return;
     let settings: Record<string, string>;
     try {
@@ -114,22 +118,7 @@ class ClipSyncManager {
     this.lastError = null;
     this.lastEvent = "started";
 
-    this.unlisteners.push(
-      await listen<ClipItem>("clipboard://item", (e) => void this.uploadItem(e.payload)),
-    );
-    this.unlisteners.push(
-      await listen<string>("clipboard://delete", (e) => this.sendDelete(e.payload)),
-    );
-    this.unlisteners.push(
-      await listen<[string, string]>("clipboard://folder", (e) =>
-        this.sendFolder(e.payload[0], e.payload[1]),
-      ),
-    );
-    this.unlisteners.push(
-      await listen<[string, string[]]>("clipboard://tags", (e) =>
-        this.sendTags(e.payload[0], e.payload[1]),
-      ),
-    );
+    this.unlisteners.push(await listen("clipboard://outbox", () => void this.drain()));
     // Reconnect immediately when the network comes back or the window becomes
     // visible — don't wait out the (now short) backoff for events the user can
     // already see should work. This is the JS twin of the Android service's
@@ -198,9 +187,9 @@ class ClipSyncManager {
   }
 
   /** Restart to pick up a settings change (enable/secret/url). */
-  async restart(onChange?: () => void): Promise<void> {
+  async restart(): Promise<void> {
     this.stop();
-    await this.start(onChange ?? this.onChange);
+    await this.start();
   }
 
   private connect(): void {
@@ -230,7 +219,8 @@ class ClipSyncManager {
     };
     ws.onmessage = (ev) => {
       try {
-        void this.handleMsg(JSON.parse(ev.data as string) as Notice);
+        const notice = JSON.parse(ev.data as string) as Notice;
+        this.inbound = this.inbound.then(() => this.handleMsg(notice)).catch(() => {});
       } catch (e) {
         this.lastError = `malformed message: ${e instanceof Error ? e.message : String(e)}`;
       }
@@ -272,7 +262,7 @@ class ClipSyncManager {
   private async handleMsg(v: Notice): Promise<void> {
     if (v.t === "synced") {
       this.bumpRev(v.rev);
-      await this.flushBacklog();
+      await this.drain();
       await this.dedupeOnce();
       return;
     }
@@ -292,7 +282,6 @@ class ClipSyncManager {
           deleted: v.deleted ?? false,
         })
         .catch(() => {});
-      this.onChange?.();
       return;
     }
 
@@ -301,24 +290,20 @@ class ClipSyncManager {
 
     if (v.deleted) {
       await clip.delete(v.itemId, false).catch(() => {});
-      this.onChange?.();
       return;
     }
     // A bare pin update (no content fields).
     if (v.kind === undefined && v.pinned !== undefined) {
-      await clip.setPinned(v.itemId, v.pinned).catch(() => {});
-      this.onChange?.();
+      await clip.setPinned(v.itemId, v.pinned, false).catch(() => {});
       return;
     }
     // A bare folder move (no content fields).
     if (v.kind === undefined && v.folder !== undefined) {
       await clip.setTags(v.itemId, v.folder ? [v.folder] : [], false).catch(() => {});
-      this.onChange?.();
       return;
     }
     if (v.kind === undefined && Array.isArray(v.tags)) {
       await clip.setTags(v.itemId, v.tags, false).catch(() => {});
-      this.onChange?.();
       return;
     }
     if (!this.key) return;
@@ -362,7 +347,6 @@ class ClipSyncManager {
           true,
         );
       }
-      this.onChange?.();
     } catch {
       /* decrypt/apply failure — skip this item */
     }
@@ -375,13 +359,11 @@ class ClipSyncManager {
     const flag = `gt.clip.deduped.v1.${this.clipId}`;
     if (localStorage.getItem(flag)) return;
     try {
-      const losers = await clip.dedupe();
-      for (const id of losers) this.sendDelete(id);
-      // Survivors were marked unsynced by the merge — re-upload their merged
-      // copy history now.
-      await this.flushBacklog();
+      await clip.dedupe();
+      // Survivors were marked unsynced by the merge and the losers queued for
+      // deletion: send both now.
+      await this.drain();
       localStorage.setItem(flag, String(Date.now()));
-      this.onChange?.();
     } catch {
       /* try again on the next reconnect */
     }
@@ -469,29 +451,69 @@ class ClipSyncManager {
     }
   }
 
-  private sendDelete(id: string): void {
-    if (this.ready()) this.ws!.send(JSON.stringify({ t: "delete", itemId: id }));
-  }
-
-  sendPin(id: string, pinned: boolean): void {
-    if (this.ready()) this.ws!.send(JSON.stringify({ t: "pin", itemId: id, pinned }));
-  }
-
-  sendFolder(id: string, folder: string): void {
-    if (this.ready()) this.ws!.send(JSON.stringify({ t: "folder", itemId: id, folder }));
-  }
-
-  sendTags(id: string, tags: string[]): void {
-    if (this.ready()) this.ws!.send(JSON.stringify({ t: "tags", itemId: id, tags }));
+  /** Send everything waiting, in the order it was queued. Safe to call any time:
+   *  concurrent calls collapse into one more pass. */
+  private async drain(): Promise<void> {
+    if (this.draining) {
+      this.drainAgain = true;
+      return;
+    }
+    this.draining = true;
+    try {
+      do {
+        this.drainAgain = false;
+        await this.flushBacklog();
+        await this.flushOutbox();
+      } while (this.drainAgain);
+    } finally {
+      this.draining = false;
+    }
   }
 
   private async flushBacklog(): Promise<void> {
     try {
-      const items = await clip.unsynced(100);
-      for (const it of items) await this.uploadItem(it);
+      for (;;) {
+        if (!this.ready()) return;
+        const items = await clip.unsynced(100);
+        for (const it of items) await this.uploadItem(it);
+        if (items.length < 100) return;
+      }
     } catch {
       /* ignore */
     }
+  }
+
+  private async flushOutbox(): Promise<void> {
+    try {
+      for (;;) {
+        const ops = await clip.outboxList(200);
+        if (ops.length === 0) return;
+        let sent = 0;
+        for (const op of ops) {
+          if (!this.ready()) break;
+          this.sendOp(op);
+          sent = op.seq;
+        }
+        // Whatever wasn't acknowledged goes again; the relay's handling is idempotent.
+        if (sent) await clip.outboxAck(sent);
+        if (sent !== ops[ops.length - 1].seq) return;
+      }
+    } catch {
+      /* try again on the next nudge */
+    }
+  }
+
+  private sendOp(op: OutboxOp): void {
+    const itemId = op.itemId;
+    const wire =
+      op.op === "delete"
+        ? { t: "delete", itemId }
+        : op.op === "pin"
+          ? { t: "pin", itemId, pinned: op.payload === "true" }
+          : op.op === "folder"
+            ? { t: "folder", itemId, folder: op.payload ?? "" }
+            : { t: "tags", itemId, tags: JSON.parse(op.payload ?? "[]") as string[] };
+    this.ws!.send(JSON.stringify(wire));
   }
 
   private async putBlob(itemId: string, cipher: Uint8Array): Promise<boolean> {

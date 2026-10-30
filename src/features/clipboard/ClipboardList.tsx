@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { relativeTime } from "@/lib/format";
-import { clipAssetUrl, type ClipItem } from "@/lib/clip";
+import { clip, clipAssetUrl, type ClipItem } from "@/lib/clip";
 import { Skeleton } from "@/components/ui";
 import { firstHttpUrl, LinkPreview } from "@/lib/linkPreview";
 import { classifyClip } from "@/lib/clipContent";
@@ -85,7 +85,9 @@ async function shareClip(item: ClipItem, fallbackCopy: () => void) {
   const nav = navigator as Navigator & { canShare?: (d: unknown) => boolean };
   try {
     if (item.kind === "text" && item.text && nav.share) {
-      await nav.share({ text: item.text });
+      // Desktop lists carry a preview; the companion's items are already whole.
+      const whole = (item.textLen ?? 0) > item.text.length ? await clip.text(item.id).catch(() => null) : null;
+      await nav.share({ text: whole ?? item.text });
       return;
     }
     if (item.kind === "image" && item.imagePath && nav.share) {
@@ -254,7 +256,7 @@ export function ClipRow({
   // Only prose and bare links get a preview card. A URL buried in a stack trace
   // or a config file is a detail of the snippet, not the point of the note.
   const previewText = (item.text ?? "").slice(0, 8192);
-  const shortened = previewText.length < (item.text?.length ?? 0);
+  const shortened = previewText.length < Math.max(item.text?.length ?? 0, item.textLen ?? 0);
   const link = !isImage && (content.kind === "link" || content.kind === "text") ? firstHttpUrl(previewText) : null;
 
   // Detect whether the collapsed body actually overflows, so the "More"

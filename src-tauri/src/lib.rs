@@ -17,6 +17,7 @@ mod importer;
 mod launcher_catalog;
 mod link_preview;
 mod metadata;
+mod notes;
 #[cfg(windows)]
 mod registry;
 mod remote;
@@ -371,30 +372,35 @@ macro_rules! app_commands {
             commands::remote_inject,
             commands::remote_inject_on,
             commands::remote_gamepad_available,
-            commands::clipboard_device_info,
-            commands::clipboard_list,
-            commands::clipboard_pinned,
-            commands::clipboard_unsynced,
-            commands::clipboard_mark_synced,
-            commands::clipboard_add,
-            commands::clipboard_delete,
-            commands::clipboard_set_pinned,
-            commands::clipboard_update_text,
-            commands::clipboard_set_folder,
-            commands::clipboard_folders,
-            commands::clipboard_tags,
-            commands::clipboard_set_tags,
-            commands::clipboard_create_folder,
-            commands::clipboard_delete_folder,
-            commands::clipboard_apply_folder,
-            commands::clipboard_dedupe,
-            commands::clipboard_copy,
-            commands::clipboard_image_b64,
-            commands::clipboard_clear_all,
-            commands::clipboard_configure,
-            commands::clipboard_diagnostics,
-            commands::clipboard_overlay_set_pos,
-            commands::speech_to_text,
+            notes::commands::clipboard_device_info,
+            notes::commands::clipboard_list,
+            notes::commands::clipboard_text,
+            notes::commands::clipboard_changes,
+            notes::commands::clipboard_search,
+            notes::commands::clipboard_outbox_list,
+            notes::commands::clipboard_outbox_ack,
+            notes::commands::clipboard_pinned,
+            notes::commands::clipboard_unsynced,
+            notes::commands::clipboard_mark_synced,
+            notes::commands::clipboard_add,
+            notes::commands::clipboard_delete,
+            notes::commands::clipboard_set_pinned,
+            notes::commands::clipboard_update_text,
+            notes::commands::clipboard_set_folder,
+            notes::commands::clipboard_folders,
+            notes::commands::clipboard_tags,
+            notes::commands::clipboard_set_tags,
+            notes::commands::clipboard_create_folder,
+            notes::commands::clipboard_delete_folder,
+            notes::commands::clipboard_apply_folder,
+            notes::commands::clipboard_dedupe,
+            notes::commands::clipboard_copy,
+            notes::commands::clipboard_image_b64,
+            notes::commands::clipboard_clear_all,
+            notes::commands::clipboard_configure,
+            notes::commands::clipboard_diagnostics,
+            notes::commands::clipboard_overlay_set_pos,
+            notes::commands::speech_to_text,
         ]
     };
 }
@@ -485,6 +491,12 @@ pub fn run() {
                 }
             }
 
+            app.manage(notes::NotesCtx {
+                pool: pool.clone(),
+                media_dir: media_dir.clone(),
+                data_dir: data_dir.clone(),
+            });
+            notes::bus::start(handle.clone(), notes::bus::Side::Main);
             app.manage(AppState {
                 pool: pool.clone(),
                 shared: shared.clone(),
@@ -669,6 +681,11 @@ fn run_remote_host(mut context: tauri::Context<tauri::Wry>) {
                 .clamp(1024, 65535) as u16;
             let remote_shared = Arc::new(remote::RemoteShared::new(remote_port));
             hostproc::sync_remote_from_db(&pool, &remote_shared);
+            app.manage(notes::NotesCtx {
+                pool: pool.clone(),
+                media_dir: media_dir.clone(),
+                data_dir: data_dir.clone(),
+            });
             app.manage(AppState {
                 pool: pool.clone(),
                 shared: shared.clone(),

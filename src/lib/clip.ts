@@ -32,6 +32,25 @@ export interface ClipItem {
   copies?: string[];
   deleted?: boolean;
   synced?: boolean;
+  /** Full length. Lists carry only the first 8 KB in `text`. */
+  textLen?: number;
+  /** Revision of the last change to this row. */
+  rev?: number;
+}
+
+export interface ClipChanges {
+  rev: number;
+  /** Too much changed to merge: reload instead. */
+  reload: boolean;
+  items: ClipItem[];
+}
+
+/** A change the relay hasn't seen yet. */
+export interface OutboxOp {
+  seq: number;
+  op: "delete" | "pin" | "folder" | "tags";
+  itemId: string;
+  payload?: string | null;
 }
 
 export interface ClipAddInput {
@@ -62,14 +81,22 @@ export const clip = {
   list: (beforeUtc?: string, limit = 50) =>
     invoke<ClipItem[]>("clipboard_list", { beforeUtc: beforeUtc ?? null, limit }),
   pinned: () => invoke<ClipItem[]>("clipboard_pinned"),
+  /** A note's full text. Lists only carry a preview. */
+  text: (id: string) => invoke<string | null>("clipboard_text", { id }),
+  /** Rows changed after `since`, plus the current revision. */
+  changes: (since: number) => invoke<ClipChanges>("clipboard_changes", { since }),
+  /** Search the whole history, not just what's loaded. */
+  search: (query: string, limit = 200) => invoke<ClipItem[]>("clipboard_search", { query, limit }),
+  outboxList: (limit = 200) => invoke<OutboxOp[]>("clipboard_outbox_list", { limit }),
+  outboxAck: (seq: number) => invoke<void>("clipboard_outbox_ack", { seq }),
   unsynced: (limit = 100) => invoke<ClipItem[]>("clipboard_unsynced", { limit }),
   markSynced: (id: string) => invoke<void>("clipboard_mark_synced", { id }),
   add: (input: ClipAddInput, remote = false) =>
     invoke<ClipItem>("clipboard_add", { input, remote }),
   delete: (id: string, propagate = true) =>
     invoke<void>("clipboard_delete", { id, propagate }),
-  setPinned: (id: string, pinned: boolean) =>
-    invoke<void>("clipboard_set_pinned", { id, pinned }),
+  setPinned: (id: string, pinned: boolean, propagate = true) =>
+    invoke<void>("clipboard_set_pinned", { id, pinned, propagate }),
   /** Edit a text note in place; the sync engine re-uploads it under the same id. */
   updateText: (id: string, text: string) =>
     invoke<ClipItem>("clipboard_update_text", { id, text }),
@@ -92,8 +119,8 @@ export const clip = {
     deviceName?: string | null;
     deleted?: boolean;
   }) => invoke<void>("clipboard_apply_folder", args),
-  /** One-time retroactive dedup; returns tombstoned loser ids to propagate. */
-  dedupe: () => invoke<string[]>("clipboard_dedupe"),
+  /** One-time retroactive dedup. Its deletes go through the outbox. */
+  dedupe: () => invoke<void>("clipboard_dedupe"),
   copy: (id: string) => invoke<void>("clipboard_copy", { id }),
   imageB64: (id: string) => invoke<string | null>("clipboard_image_b64", { id }),
   clearAll: () => invoke<void>("clipboard_clear_all"),

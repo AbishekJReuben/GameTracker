@@ -46,6 +46,23 @@ pub struct ClipItem {
     pub deleted: bool,
     #[serde(default)]
     pub synced: bool,
+    /// Full length in characters. `text` holds only the first 8 KB in lists, so
+    /// this is how the UI knows there is more to fetch.
+    #[serde(default)]
+    pub text_len: i64,
+    /// Revision of the last change to this row.
+    #[serde(default)]
+    pub rev: i64,
+}
+
+/// A change the relay hasn't seen yet. `payload` is the op's JSON body.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxOp {
+    pub seq: i64,
+    pub op: String,
+    pub item_id: String,
+    pub payload: Option<String>,
 }
 
 /// Everything needed to insert an item. A local capture leaves `id`/`device_id`
@@ -148,12 +165,20 @@ fn from_row(r: &Row) -> rusqlite::Result<ClipItem> {
         copies: parse_copies(r.get::<_, Option<String>>("copies")?),
         deleted: r.get::<_, i64>("deleted")? != 0,
         synced: r.get::<_, i64>("synced")? != 0,
+        text_len: r.get("text_len")?,
+        rev: r.get("rev")?,
     })
 }
 
+/// A whole row. Only for code that really needs a note's full text.
 const COLS: &str = "id, kind, text, image_path, thumb_path, mime, size, created_utc, \
                     device_id, device_name, source, pinned, folder, tags, content_hash, copies, \
-                    deleted, synced";
+                    deleted, synced, text_len, rev";
+/// A row for a list: the same shape with `text` limited to its preview, so a page
+/// can never carry a 20 MB note through the UI.
+const LIST_COLS: &str = "id, kind, preview AS text, image_path, thumb_path, mime, size, created_utc, \
+                    device_id, device_name, source, pinned, folder, tags, content_hash, copies, \
+                    deleted, synced, text_len, rev";
 
 /// Item lists never surface folder entities (kind='folder' rows are the synced
 /// empty-folder registry, not notes).
@@ -295,6 +320,25 @@ pub fn set_tags(pool: &DbPool, id: &str, tags: Vec<String>) -> AppResult<Vec<Str
 }
 
 pub fn list_tags(pool: &DbPool) -> AppResult<Vec<String>> {
+    // Every refresh asks for this and it scans the whole table, so it only runs
+    // when a note actually changed.
+    static CACHE: std::sync::Mutex<Option<(i64, Vec<String>)>> = std::sync::Mutex::new(None);
+    let rev = current_rev(pool)?;
+    if let Ok(cache) = CACHE.lock() {
+        if let Some((seen, tags)) = cache.as_ref() {
+            if *seen == rev {
+                return Ok(tags.clone());
+            }
+        }
+    }
+    let tags = scan_tags(pool)?;
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((rev, tags.clone()));
+    }
+    Ok(tags)
+}
+
+fn scan_tags(pool: &DbPool) -> AppResult<Vec<String>> {
     let conn = pool.get()?;
     let mut stmt = conn.prepare(
         "SELECT tags, folder FROM clipboard_items WHERE deleted = 0 AND kind != 'folder'",
@@ -480,7 +524,7 @@ pub fn list(pool: &DbPool, before_utc: Option<&str>, limit: i64) -> AppResult<Ve
     match before_utc {
         Some(before) => {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {COLS} FROM clipboard_items
+                "SELECT {LIST_COLS} FROM clipboard_items
                  WHERE deleted = 0 AND {NOT_FOLDER} AND created_utc < ?1
                  ORDER BY created_utc DESC LIMIT ?2"
             ))?;
@@ -491,7 +535,7 @@ pub fn list(pool: &DbPool, before_utc: Option<&str>, limit: i64) -> AppResult<Ve
         }
         None => {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {COLS} FROM clipboard_items
+                "SELECT {LIST_COLS} FROM clipboard_items
                  WHERE deleted = 0 AND {NOT_FOLDER}
                  ORDER BY created_utc DESC LIMIT ?1"
             ))?;
@@ -509,7 +553,7 @@ pub fn list(pool: &DbPool, before_utc: Option<&str>, limit: i64) -> AppResult<Ve
 pub fn list_pinned(pool: &DbPool) -> AppResult<Vec<ClipItem>> {
     let conn = pool.get()?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT {COLS} FROM clipboard_items
+        "SELECT {LIST_COLS} FROM clipboard_items
          WHERE deleted = 0 AND pinned = 1 AND {NOT_FOLDER}
          ORDER BY created_utc DESC"
     ))?;
@@ -519,6 +563,98 @@ pub fn list_pinned(pool: &DbPool) -> AppResult<Vec<ClipItem>> {
         out.push(row?);
     }
     Ok(out)
+}
+
+/// The note's full text. Lists only carry the first 8 KB.
+pub fn text_of(pool: &DbPool, id: &str) -> AppResult<Option<String>> {
+    let conn = pool.get()?;
+    let text = conn
+        .query_row("SELECT text FROM clipboard_items WHERE id = ?1", [id], |r| r.get(0))
+        .ok()
+        .flatten();
+    Ok(text)
+}
+
+/// The revision of the newest change to any note, in either process.
+pub fn current_rev(pool: &DbPool) -> AppResult<i64> {
+    let conn = pool.get()?;
+    Ok(conn.query_row("SELECT rev FROM clipboard_meta WHERE id = 1", [], |r| r.get(0))?)
+}
+
+/// Rows changed after `since`, oldest first, tombstones included so a list can
+/// drop them. `limit + 1` rows from the caller's point of view means "reload".
+pub fn changes_since(pool: &DbPool, since: i64, limit: i64) -> AppResult<Vec<ClipItem>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LIST_COLS} FROM clipboard_items
+         WHERE rev > ?1 AND {NOT_FOLDER}
+         ORDER BY rev ASC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params![since, limit.clamp(1, 1000)], from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Search the whole history: note text, device names and tags. Case-insensitive
+/// for ASCII, which is what LIKE gives; the scan is short enough on a worker.
+pub fn search(pool: &DbPool, query: &str, limit: i64) -> AppResult<Vec<ClipItem>> {
+    let like = format!(
+        "%{}%",
+        query.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    );
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LIST_COLS} FROM clipboard_items
+         WHERE deleted = 0 AND {NOT_FOLDER}
+           AND (text LIKE ?1 ESCAPE '\\' OR device_name LIKE ?1 ESCAPE '\\' OR tags LIKE ?1 ESCAPE '\\')
+         ORDER BY created_utc DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params![like, limit.clamp(1, 500)], from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Queue a change for the relay. Survives restarts, and works from either process.
+pub fn outbox_push(pool: &DbPool, op: &str, item_id: &str, payload: Option<&str>) -> AppResult<()> {
+    let conn = pool.get()?;
+    conn.execute(
+        "INSERT INTO clipboard_outbox (op, item_id, payload, created_utc) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![op, item_id, payload, wire_now()],
+    )?;
+    Ok(())
+}
+
+pub fn outbox_list(pool: &DbPool, limit: i64) -> AppResult<Vec<OutboxOp>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT seq, op, item_id, payload FROM clipboard_outbox ORDER BY seq ASC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit.clamp(1, 500)], |r| {
+        Ok(OutboxOp { seq: r.get(0)?, op: r.get(1)?, item_id: r.get(2)?, payload: r.get(3)? })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Sent: forget everything up to and including `seq`.
+pub fn outbox_ack(pool: &DbPool, seq: i64) -> AppResult<()> {
+    let conn = pool.get()?;
+    conn.execute("DELETE FROM clipboard_outbox WHERE seq <= ?1", [seq])?;
+    Ok(())
+}
+
+/// The one timestamp shape every client emits and parses (millis, literal Z).
+pub fn wire_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// Items captured locally that the relay hasn't acknowledged yet, oldest first,
@@ -703,16 +839,121 @@ pub fn clear_all(pool: &DbPool) -> AppResult<Vec<String>> {
             }
         }
     }
-    conn.execute("DELETE FROM clipboard_items", [])?;
+    // Published with the delete, or cleared history reappears on the next catch-up
+    // from the relay, which is a permanent store.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO clipboard_outbox (op, item_id, created_utc)
+         SELECT 'delete', id, ?1 FROM clipboard_items WHERE deleted = 0",
+        [wire_now()],
+    )?;
+    tx.execute("DELETE FROM clipboard_items", [])?;
+    tx.commit()?;
     Ok(files)
 }
 
-/// IDs of every live item, used to publish tombstones before a local clear-all.
-/// This selects only the primary key and therefore remains cheap even with a
-/// large image history.
-pub fn live_ids(pool: &DbPool) -> AppResult<Vec<String>> {
-    let conn = pool.get()?;
-    let mut stmt = conn.prepare("SELECT id FROM clipboard_items WHERE deleted = 0")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    Ok(rows.filter_map(Result::ok).collect())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool() -> DbPool {
+        let path = std::env::temp_dir().join(format!("gt-notes-{}.db", uuid::Uuid::new_v4()));
+        crate::db::init_pool(&path).unwrap()
+    }
+
+    fn note(id: &str, text: &str, created: &str) -> ClipInput {
+        ClipInput {
+            id: id.into(),
+            kind: "text".into(),
+            text: Some(text.into()),
+            image_path: None,
+            thumb_path: None,
+            mime: None,
+            size: text.len() as i64,
+            created_utc: created.into(),
+            device_id: "pc".into(),
+            device_name: Some("Desk".into()),
+            source: "manual".into(),
+            pinned: false,
+            folder: String::new(),
+            tags: Vec::new(),
+            content_hash: None,
+            copies: Vec::new(),
+            synced: false,
+        }
+    }
+
+    #[test]
+    fn lists_carry_a_preview_and_the_full_text_is_one_call_away() {
+        let pool = pool();
+        let long = "x".repeat(50_000);
+        upsert(&pool, &note("big", &long, "2026-10-01T00:00:00.000Z")).unwrap();
+        let listed = list(&pool, None, 40).unwrap();
+        assert_eq!(listed[0].text.as_ref().unwrap().len(), 8192);
+        assert_eq!(listed[0].text_len, 50_000);
+        assert_eq!(text_of(&pool, "big").unwrap().unwrap().len(), 50_000);
+        assert_eq!(list_unsynced(&pool, 10).unwrap()[0].text.as_ref().unwrap().len(), 50_000, "uploads need the whole note");
+    }
+
+    #[test]
+    fn changes_since_reports_edits_and_tombstones_in_order() {
+        let pool = pool();
+        upsert(&pool, &note("a", "one", "2026-10-01T00:00:00.000Z")).unwrap();
+        upsert(&pool, &note("b", "two", "2026-10-02T00:00:00.000Z")).unwrap();
+        let seen = current_rev(&pool).unwrap();
+        assert!(changes_since(&pool, seen, 50).unwrap().is_empty());
+        set_pinned(&pool, "a", true).unwrap();
+        tombstone(&pool, "b").unwrap();
+        let changed = changes_since(&pool, seen, 50).unwrap();
+        assert_eq!(changed.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert!(changed[0].pinned);
+        assert!(changed[1].deleted);
+    }
+
+    #[test]
+    fn search_reaches_past_the_preview_and_treats_wildcards_literally() {
+        let pool = pool();
+        let deep = format!("{}needle at the end", "x".repeat(20_000));
+        upsert(&pool, &note("deep", &deep, "2026-10-01T00:00:00.000Z")).unwrap();
+        upsert(&pool, &note("pct", "100% done", "2026-10-02T00:00:00.000Z")).unwrap();
+        assert_eq!(search(&pool, "NEEDLE", 10).unwrap()[0].id, "deep");
+        let literal = search(&pool, "0%", 10).unwrap();
+        assert_eq!(literal.len(), 1);
+        assert_eq!(literal[0].id, "pct");
+        assert_eq!(search(&pool, "%", 10).unwrap().len(), 1, "a bare % is a character, not everything");
+        assert_eq!(search(&pool, "Desk", 10).unwrap().len(), 2, "device names are searched too");
+    }
+
+    #[test]
+    fn outbox_keeps_order_until_acknowledged() {
+        let pool = pool();
+        outbox_push(&pool, "pin", "a", Some("true")).unwrap();
+        outbox_push(&pool, "delete", "b", None).unwrap();
+        let ops = outbox_list(&pool, 10).unwrap();
+        assert_eq!(ops.iter().map(|o| o.op.as_str()).collect::<Vec<_>>(), ["pin", "delete"]);
+        outbox_ack(&pool, ops[0].seq).unwrap();
+        assert_eq!(outbox_list(&pool, 10).unwrap()[0].item_id, "b");
+    }
+
+    #[test]
+    fn clear_all_queues_a_delete_for_every_live_note() {
+        let pool = pool();
+        upsert(&pool, &note("a", "one", "2026-10-01T00:00:00.000Z")).unwrap();
+        upsert(&pool, &note("b", "two", "2026-10-02T00:00:00.000Z")).unwrap();
+        tombstone(&pool, "b").unwrap();
+        clear_all(&pool).unwrap();
+        let ops = outbox_list(&pool, 10).unwrap();
+        assert_eq!(ops.iter().map(|o| (o.op.as_str(), o.item_id.as_str())).collect::<Vec<_>>(), [("delete", "a")]);
+    }
+
+    #[test]
+    fn tags_follow_changes_through_the_cache() {
+        let pool = pool();
+        upsert(&pool, &note("a", "one", "2026-10-01T00:00:00.000Z")).unwrap();
+        assert!(list_tags(&pool).unwrap().is_empty());
+        set_tags(&pool, "a", vec!["work".into()]).unwrap();
+        assert_eq!(list_tags(&pool).unwrap(), ["work"]);
+        set_tags(&pool, "a", Vec::new()).unwrap();
+        assert!(list_tags(&pool).unwrap().is_empty());
+    }
 }

@@ -4,7 +4,6 @@
 import { create } from "zustand";
 import { clip, type ClipItem, type ClipKind } from "@/lib/clip";
 import { classifyClip, type ClipContentKind } from "@/lib/clipContent";
-import { clipSync } from "@/lib/clipboardSync";
 
 const PAGE = 40;
 
@@ -22,6 +21,10 @@ interface ClipStore {
   tags: string[];
   loading: boolean;
   hasMore: boolean;
+  /** Last revision merged into this store. */
+  rev: number;
+  /** Search hits from the whole history; null when not searching. */
+  results: ClipItem[] | null;
 
   setFilter: (f: ClipFilter) => void;
   setSearch: (s: string) => void;
@@ -31,6 +34,10 @@ interface ClipStore {
   load: () => Promise<void>;
   loadMore: () => Promise<void>;
   refresh: () => Promise<void>;
+  /** Merge only what changed since the last look. */
+  sync: () => Promise<void>;
+  /** Run the current search against the whole history. */
+  runSearch: () => Promise<void>;
   /** Page deeper until the active filters have something to show. */
   ensureMatches: () => Promise<void>;
 
@@ -54,9 +61,11 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   tags: [],
   loading: false,
   hasMore: false,
+  rev: 0,
+  results: null,
 
   setFilter: (filter) => set({ filter }),
-  setSearch: (search) => set({ search }),
+  setSearch: (search) => set(search.trim() ? { search } : { search, results: null }),
   setTagFilter: (tagFilter) => set({ tagFilter }),
   setTypeFilter: (typeFilter) => set({ typeFilter }),
 
@@ -64,12 +73,15 @@ export const useClipboard = create<ClipStore>((set, get) => ({
     if (get().loading) return;
     set({ loading: true });
     try {
+      // The revision is read first: a change landing during this load is then seen
+      // again by the next sync, which is harmless, instead of being missed.
+      const { rev } = await clip.changes(Number.MAX_SAFE_INTEGER);
       const [pinned, items, tags] = await Promise.all([
         clip.pinned(),
         clip.list(undefined, PAGE),
         clip.tags().catch(() => []),
       ]);
-      set({ pinned, items, tags, hasMore: items.length >= PAGE, loading: false });
+      set({ pinned, items, tags, rev, hasMore: items.length >= PAGE, loading: false });
     } catch {
       set({ loading: false });
     }
@@ -115,14 +127,64 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   // list from growing unbounded on every push.
   refresh: async () => {
     try {
+      const { rev } = await clip.changes(Number.MAX_SAFE_INTEGER);
       const [pinned, items, tags] = await Promise.all([
         clip.pinned(),
         clip.list(undefined, PAGE),
         clip.tags().catch(() => []),
       ]);
-      set({ pinned, items, tags, hasMore: items.length >= PAGE });
+      set({ pinned, items, tags, rev, hasMore: items.length >= PAGE });
     } catch {
       /* ignore */
+    }
+  },
+
+  // A burst of notices collapses into one more pass, and the list keeps its loaded
+  // pages and scroll position instead of snapping back to the first page.
+  sync: async () => {
+    if (syncing) {
+      syncAgain = true;
+      return;
+    }
+    syncing = true;
+    try {
+      do {
+        syncAgain = false;
+        const { rev, reload, items: changed } = await clip.changes(get().rev);
+        if (reload) {
+          await get().refresh();
+          continue;
+        }
+        if (changed.length === 0) {
+          set({ rev });
+          continue;
+        }
+        set((s) => ({ ...mergeChanges(s.items, s.pinned, changed), rev }));
+        if (changed.some((c) => c.tags?.length)) {
+          const tags = await clip.tags().catch(() => null);
+          if (tags) set({ tags });
+        }
+        if (get().search.trim()) await get().runSearch();
+      } while (syncAgain);
+    } catch {
+      /* the next notice tries again */
+    } finally {
+      syncing = false;
+    }
+  },
+
+  runSearch: async () => {
+    const q = get().search.trim();
+    const mine = ++searchRun;
+    if (!q) {
+      set({ results: null });
+      return;
+    }
+    try {
+      const results = await clip.search(q);
+      if (mine === searchRun) set({ results });
+    } catch {
+      /* keep the previous hits */
     }
   },
 
@@ -132,7 +194,7 @@ export const useClipboard = create<ClipStore>((set, get) => ({
     if (!t) return;
     const tags = get().tagFilter ? [get().tagFilter!] : [];
     await clip.add({ kind: "text", text: t, source: "manual", tags, folder: tags[0] ?? "" });
-    await get().refresh();
+    await get().sync();
   },
 
   addImage: async (imageBase64, mime) => {
@@ -145,19 +207,19 @@ export const useClipboard = create<ClipStore>((set, get) => ({
       tags,
       folder: tags[0] ?? "",
     });
-    await get().refresh();
+    await get().sync();
   },
 
   editText: async (id, text) => {
     const t = text.trim();
     if (!t) return;
     await clip.updateText(id, t);
-    await get().refresh();
+    await get().sync();
   },
 
   setTags: async (id, tags) => {
     await clip.setTags(id, tags);
-    await get().refresh();
+    await get().sync();
   },
 
   copy: async (id) => {
@@ -175,8 +237,7 @@ export const useClipboard = create<ClipStore>((set, get) => ({
   togglePin: async (item) => {
     const pinned = !item.pinned;
     await clip.setPinned(item.id, pinned);
-    clipSync.sendPin(item.id, pinned);
-    await get().refresh();
+    await get().sync();
   },
 
   clearAll: async () => {
@@ -184,6 +245,23 @@ export const useClipboard = create<ClipStore>((set, get) => ({
     set({ items: [], pinned: [] });
   },
 }));
+
+let syncing = false;
+let syncAgain = false;
+let searchRun = 0;
+
+/** Apply changed rows to the loaded lists: newest first, tombstones removed, and
+ *  rows older than what's loaded left for paging to find. */
+export function mergeChanges(items: ClipItem[], pinned: ClipItem[], changed: ClipItem[]): { items: ClipItem[]; pinned: ClipItem[] } {
+  const ids = new Set(changed.map((c) => c.id));
+  const oldest = items[items.length - 1]?.createdUtc ?? "";
+  const live = changed.filter((c) => !c.deleted);
+  const byNewest = (a: ClipItem, b: ClipItem) => b.createdUtc.localeCompare(a.createdUtc);
+  return {
+    items: [...items.filter((i) => !ids.has(i.id)), ...live.filter((c) => c.createdUtc >= oldest)].sort(byNewest),
+    pinned: [...pinned.filter((i) => !ids.has(i.id)), ...live.filter((c) => c.pinned)].sort(byNewest),
+  };
+}
 
 /** Items after search + kind + tag + content-type filters (pinned first, then the paged list, deduped). */
 export function visibleClips(s: {
@@ -193,6 +271,7 @@ export function visibleClips(s: {
   search: string;
   tagFilter?: string | null;
   typeFilter?: ClipContentKind | null;
+  results?: ClipItem[] | null;
 }): { pinned: ClipItem[]; rest: ClipItem[] } {
   const q = s.search.trim().toLowerCase();
   const tf = s.tagFilter ?? null;
@@ -202,11 +281,17 @@ export function visibleClips(s: {
     if (tf !== null && !(i.tags ?? []).some((t) => t.toLowerCase() === tf.toLowerCase())) return false;
     // Images have no text to classify; a content-type filter simply excludes them.
     if (yf !== null && (i.kind !== "text" || classifyClip(i.text).kind !== yf)) return false;
-    if (!q) return true;
+    // Search hits come from the database, which reads full notes; what's loaded
+    // here is only each note's first 8 KB.
+    if (!q || s.results) return true;
     return (i.text ?? "").toLowerCase().includes(q) ||
       (i.deviceName ?? "").toLowerCase().includes(q) ||
       (i.tags ?? []).some((tag) => tag.toLowerCase().includes(q));
   };
+  if (s.results) {
+    const hits = s.results.filter(match);
+    return { pinned: hits.filter((i) => i.pinned), rest: hits.filter((i) => !i.pinned) };
+  }
   const pinnedIds = new Set(s.pinned.map((p) => p.id));
   return {
     pinned: s.pinned.filter(match),

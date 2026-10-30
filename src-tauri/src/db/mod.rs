@@ -586,6 +586,103 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         }
     }
 
+    if version < 29 {
+        // Notes. `tags` and friends lived after `text`, so every metadata read walked
+        // each note's text: 20 ms per tag scan on a real history with a 20 MB note,
+        // 4.7 ms once `text` is out of the way. Same rows, `text` last, plus what the
+        // list needs without ever touching it (`preview`, `text_len`) and a revision
+        // both processes can follow (`rev`, bumped by triggers so no writer can
+        // forget). `clipboard_outbox` holds changes the relay hasn't seen yet, so a
+        // pin or delete made offline, or in the notes shell, survives until it is sent.
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current < 29 {
+            tx.execute_batch(
+                r#"
+                CREATE TABLE clipboard_items_new (
+                    id           TEXT PRIMARY KEY,
+                    kind         TEXT NOT NULL DEFAULT 'text',
+                    image_path   TEXT,
+                    thumb_path   TEXT,
+                    mime         TEXT,
+                    size         INTEGER NOT NULL DEFAULT 0,
+                    created_utc  TEXT NOT NULL,
+                    device_id    TEXT NOT NULL DEFAULT '',
+                    device_name  TEXT,
+                    source       TEXT NOT NULL DEFAULT 'desktop',
+                    pinned       INTEGER NOT NULL DEFAULT 0,
+                    deleted      INTEGER NOT NULL DEFAULT 0,
+                    synced       INTEGER NOT NULL DEFAULT 0,
+                    folder       TEXT NOT NULL DEFAULT '',
+                    tags         TEXT NOT NULL DEFAULT '[]',
+                    content_hash TEXT,
+                    copies       TEXT,
+                    rev          INTEGER NOT NULL DEFAULT 0,
+                    text_len     INTEGER NOT NULL DEFAULT 0,
+                    preview      TEXT,
+                    text         TEXT
+                );
+                INSERT INTO clipboard_items_new
+                    (id, kind, image_path, thumb_path, mime, size, created_utc, device_id,
+                     device_name, source, pinned, deleted, synced, folder, tags, content_hash,
+                     copies, rev, text_len, preview, text)
+                SELECT id, kind, image_path, thumb_path, mime, size, created_utc, device_id,
+                       device_name, source, pinned, deleted, synced, folder, tags, content_hash,
+                       copies, rowid, coalesce(length(text), 0), substr(text, 1, 8192), text
+                  FROM clipboard_items;
+                DROP TABLE clipboard_items;
+                ALTER TABLE clipboard_items_new RENAME TO clipboard_items;
+                CREATE INDEX idx_clip_created ON clipboard_items(created_utc);
+                CREATE INDEX idx_clip_pinned ON clipboard_items(pinned);
+                CREATE INDEX idx_clip_hash ON clipboard_items(content_hash);
+                CREATE INDEX idx_clip_rev ON clipboard_items(rev);
+
+                CREATE TABLE clipboard_meta (id INTEGER PRIMARY KEY CHECK (id = 1), rev INTEGER NOT NULL);
+                INSERT INTO clipboard_meta (id, rev)
+                    SELECT 1, coalesce(max(rev), 0) FROM clipboard_items;
+
+                CREATE TABLE clipboard_outbox (
+                    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    op          TEXT NOT NULL,
+                    item_id     TEXT NOT NULL,
+                    payload     TEXT,
+                    created_utc TEXT NOT NULL
+                );
+
+                CREATE TRIGGER clip_rev_insert AFTER INSERT ON clipboard_items BEGIN
+                    UPDATE clipboard_meta SET rev = rev + 1 WHERE id = 1;
+                    UPDATE clipboard_items
+                       SET rev = (SELECT rev FROM clipboard_meta WHERE id = 1),
+                           preview = substr(NEW.text, 1, 8192),
+                           text_len = coalesce(length(NEW.text), 0)
+                     WHERE id = NEW.id;
+                END;
+                CREATE TRIGGER clip_rev_update AFTER UPDATE ON clipboard_items
+                WHEN NEW.rev = OLD.rev BEGIN
+                    UPDATE clipboard_meta SET rev = rev + 1 WHERE id = 1;
+                    UPDATE clipboard_items
+                       SET rev = (SELECT rev FROM clipboard_meta WHERE id = 1)
+                     WHERE id = NEW.id;
+                END;
+                CREATE TRIGGER clip_text_update AFTER UPDATE OF text ON clipboard_items BEGIN
+                    UPDATE clipboard_items
+                       SET preview = substr(NEW.text, 1, 8192),
+                           text_len = coalesce(length(NEW.text), 0)
+                     WHERE id = NEW.id;
+                END;
+                CREATE TRIGGER clip_rev_delete AFTER DELETE ON clipboard_items BEGIN
+                    UPDATE clipboard_meta SET rev = rev + 1 WHERE id = 1;
+                END;
+                "#,
+            )?;
+            tx.execute_batch("PRAGMA user_version = 29;")?;
+        }
+        tx.commit()?;
+        version = 29;
+        // The rebuild doubled the WAL; give that back now. Best-effort.
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+
     let _ = version;
     Ok(())
 }
@@ -636,11 +733,112 @@ fn reclassify_smtc_plays(conn: &rusqlite::Connection) -> AppResult<()> {
 mod tests {
     use super::*;
 
+    /// The notes table as it stood at version 28, column order included.
+    fn notes_v28(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "CREATE TABLE clipboard_items (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'text', text TEXT, image_path TEXT,
+                thumb_path TEXT, mime TEXT, size INTEGER NOT NULL DEFAULT 0, created_utc TEXT NOT NULL,
+                device_id TEXT NOT NULL DEFAULT '', device_name TEXT, source TEXT NOT NULL DEFAULT 'desktop',
+                pinned INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0,
+                synced INTEGER NOT NULL DEFAULT 0, folder TEXT NOT NULL DEFAULT '', content_hash TEXT,
+                copies TEXT, tags TEXT NOT NULL DEFAULT '[]');
+             CREATE INDEX idx_clip_created ON clipboard_items(created_utc);
+             CREATE INDEX idx_clip_pinned ON clipboard_items(pinned);
+             CREATE INDEX idx_clip_hash ON clipboard_items(content_hash);
+             PRAGMA user_version = 28;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_29_keeps_every_note_and_moves_text_last() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        notes_v28(&conn);
+        let huge = "x".repeat(2_000_000);
+        conn.execute(
+            "INSERT INTO clipboard_items (id, text, created_utc, tags, pinned, copies, folder)
+             VALUES ('huge', ?1, '2026-08-25T01:18:16.000Z', '[\"logs\"]', 1, '[\"a\"]', 'logs')",
+            [&huge],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO clipboard_items (id, kind, image_path, created_utc, deleted) VALUES ('img', 'image', 'a.png', '2026-08-26T00:00:00.000Z', 1)", []).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let (text, preview, len, tags, pinned): (String, String, i64, String, i64) = conn
+            .query_row("SELECT text, preview, text_len, tags, pinned FROM clipboard_items WHERE id = 'huge'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap();
+        assert_eq!(text.len(), 2_000_000, "full text survives");
+        assert_eq!(preview.len(), 8192);
+        assert_eq!(len, 2_000_000);
+        assert_eq!((tags.as_str(), pinned), ("[\"logs\"]", 1));
+        let deleted: i64 = conn.query_row("SELECT deleted FROM clipboard_items WHERE id = 'img'", [], |r| r.get(0)).unwrap();
+        assert_eq!(deleted, 1, "tombstones survive");
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('clipboard_items')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect();
+        assert_eq!(columns.last().map(String::as_str), Some("text"));
+    }
+
+    #[test]
+    fn migration_29_triggers_follow_every_writer() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        notes_v28(&conn);
+        run_migrations(&conn).unwrap();
+        let rev = |c: &rusqlite::Connection| -> i64 { c.query_row("SELECT rev FROM clipboard_meta", [], |r| r.get(0)).unwrap() };
+        let row = |c: &rusqlite::Connection| -> (i64, Option<String>, i64) {
+            c.query_row("SELECT rev, preview, text_len FROM clipboard_items WHERE id = 'n'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+        };
+        assert_eq!(rev(&conn), 0);
+        conn.execute("INSERT INTO clipboard_items (id, text, created_utc) VALUES ('n', 'hello', 'x')", []).unwrap();
+        let (r1, preview, len) = row(&conn);
+        assert_eq!((preview.as_deref(), len), (Some("hello"), 5));
+        assert_eq!(r1, rev(&conn), "a row carries the revision that created it");
+
+        conn.execute("UPDATE clipboard_items SET pinned = 1 WHERE id = 'n'", []).unwrap();
+        let (r2, _, _) = row(&conn);
+        assert!(r2 > r1, "a metadata change is visible to other processes");
+
+        conn.execute("UPDATE clipboard_items SET text = 'changed text' WHERE id = 'n'", []).unwrap();
+        let (r3, preview, len) = row(&conn);
+        assert!(r3 > r2);
+        assert_eq!((preview.as_deref(), len), (Some("changed text"), 12));
+
+        conn.execute("UPDATE clipboard_items SET text = NULL, deleted = 1 WHERE id = 'n'", []).unwrap();
+        let (_, preview, len) = row(&conn);
+        assert_eq!((preview, len), (None, 0), "a tombstone keeps no text anywhere");
+
+        let before = rev(&conn);
+        conn.execute("DELETE FROM clipboard_items", []).unwrap();
+        assert!(rev(&conn) > before);
+    }
+
+    #[test]
+    fn migration_29_stops_cleanly_if_the_rebuild_fails() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        notes_v28(&conn);
+        // Something already in the way: the rebuild must roll back, not half-apply.
+        conn.execute_batch("CREATE TABLE clipboard_meta (x);").unwrap();
+        conn.execute("INSERT INTO clipboard_items (id, text, created_utc) VALUES ('n', 'kept', 'x')", []).unwrap();
+        assert!(run_migrations(&conn).is_err());
+        let text: String = conn.query_row("SELECT text FROM clipboard_items WHERE id = 'n'", [], |r| r.get(0)).unwrap();
+        assert_eq!(text, "kept");
+        assert_eq!(user_version(&conn).unwrap(), 28);
+    }
+
     #[test]
     fn migration_28_moves_app_samples_to_without_rowid_and_keeps_every_row() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         // The pre-28 layout, as ensure_app_table used to create it.
+        conn.execute_batch("DROP TABLE clipboard_items; DROP TABLE clipboard_meta; DROP TABLE clipboard_outbox;").unwrap();
+        notes_v28(&conn);
         conn.execute_batch(
             "CREATE TABLE app_samples (
                 ts TEXT NOT NULL, game_id TEXT NOT NULL,
@@ -656,7 +854,7 @@ mod tests {
 
         run_migrations(&conn).unwrap();
 
-        assert_eq!(user_version(&conn).unwrap(), 28);
+        assert_eq!(user_version(&conn).unwrap(), 29);
         let sql: String = conn
             .query_row("SELECT sql FROM sqlite_master WHERE name = 'app_samples'", [], |r| r.get(0))
             .unwrap();
@@ -687,14 +885,14 @@ mod tests {
 
         // A second launch is a no-op.
         run_migrations(&conn).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), 28);
+        assert_eq!(user_version(&conn).unwrap(), 29);
     }
 
     #[test]
     fn migration_28_on_a_fresh_install_just_bumps_the_version() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), 28);
+        assert_eq!(user_version(&conn).unwrap(), 29);
         let tables: i64 = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'app_samples'", [], |r| r.get(0))
             .unwrap();

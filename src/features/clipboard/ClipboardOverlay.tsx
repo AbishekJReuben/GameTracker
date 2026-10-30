@@ -39,29 +39,37 @@ function savedPanelSize(): { w: number; h: number } {
 /** Pointer-driven window drag that also reports a tap (no movement). Distinguishes
  *  a click-to-open from a drag-to-move, and persists the final position. */
 function useWindowDrag(onTap?: () => void) {
-  const st = useRef<{ ox: number; oy: number; sf: number; moved: boolean; sx: number; sy: number } | null>(
+  const st = useRef<{ ox: number; oy: number; sf: number; moved: boolean; sx: number; sy: number; ready: boolean } | null>(
     null,
   );
 
-  const onPointerDown = useCallback(async (e: React.PointerEvent) => {
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
     (e.target as Element).setPointerCapture?.(e.pointerId);
+    // Drag state must exist before this handler returns. Fetching the window position
+    // first let a quick click finish during the wait: the release found no state and
+    // was dropped, and the state then arrived with no button held, so the bubble
+    // followed the mouse.
+    const drag = { ox: 0, oy: 0, sf: 1, moved: false, sx: e.screenX, sy: e.screenY, ready: false };
+    st.current = drag;
     const win = getCurrentWindow();
-    const [pos, sf] = await Promise.all([win.outerPosition(), win.scaleFactor()]);
-    st.current = {
-      ox: e.screenX * sf - pos.x,
-      oy: e.screenY * sf - pos.y,
-      sf,
-      moved: false,
-      sx: e.screenX,
-      sy: e.screenY,
-    };
+    const { screenX, screenY } = e;
+    void Promise.all([win.outerPosition(), win.scaleFactor()]).then(([pos, sf]) => {
+      drag.ox = screenX * sf - pos.x;
+      drag.oy = screenY * sf - pos.y;
+      drag.sf = sf;
+      drag.ready = true;
+    });
   }, []);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const s = st.current;
     if (!s) return;
+    if (e.buttons === 0) {
+      st.current = null;
+      return;
+    }
     if (!s.moved && Math.hypot(e.screenX - s.sx, e.screenY - s.sy) > 3) s.moved = true;
-    if (!s.moved) return;
+    if (!s.moved || !s.ready) return;
     const nx = Math.round(e.screenX * s.sf - s.ox);
     const ny = Math.round(e.screenY * s.sf - s.oy);
     getCurrentWindow().setPosition(new PhysicalPosition(nx, ny));
@@ -176,12 +184,10 @@ export default function ClipboardOverlay() {
       setPulse(true);
       setTimeout(() => setPulse(false), 1400);
     };
-    const refresh = () => {
+    const unChanged = listen("clipboard://changed", () => {
       triggerPulse();
-      void useClipboard.getState().refresh();
-    };
-    const unItem = listen("clipboard://item", refresh);
-    const unChanged = listen("clipboard://changed", refresh);
+      void useClipboard.getState().sync();
+    });
 
     // Live sync status pill in the header. The real WebSocket runs in the MAIN
     // window (ClipSyncEngine), which broadcasts its diagnostics over a Tauri event
@@ -217,7 +223,6 @@ export default function ClipboardOverlay() {
     }, 2000);
 
     return () => {
-      unItem.then((f) => f());
       unChanged.then((f) => f());
       unStatus.then((f) => f());
       window.clearInterval(statusTimer);
@@ -320,7 +325,11 @@ export default function ClipboardOverlay() {
   // The bubble must never grow OS resize grips; only the expanded panel is
   // user-resizable (the window is created resizable — turn it off at mount).
   useEffect(() => {
-    void getCurrentWindow().setResizable(false);
+    const win = getCurrentWindow();
+    void win.setResizable(false).catch(() => {});
+    // Windows widens a captioned window to 133 logical px at creation, leaving an
+    // invisible strip beside the bubble that takes clicks.
+    void win.setSize(new LogicalSize(BUBBLE, BUBBLE)).catch(() => {});
   }, []);
 
   const expand = useCallback(async () => {
