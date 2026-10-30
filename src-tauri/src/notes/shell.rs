@@ -130,7 +130,7 @@ fn control(app: tauri::AppHandle, ctx: NotesCtx, orb: Handle, rx: std::sync::mps
         let message = rx.recv_timeout(Duration::from_secs(1));
         match message {
             Ok(FromOrb::Prewarm(rect)) => {
-                panel::prewarm(&app, &ctx, rect);
+                panel::prewarm(&app, &ctx, &orb, rect);
                 // Warmed but never opened still has to be given back.
                 if !PANEL_OPEN.load(Ordering::SeqCst) {
                     closed_at = Some(Instant::now());
@@ -310,6 +310,40 @@ fn feed(ctx: NotesCtx, orb: Handle) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_ctx() -> NotesCtx {
+        let dir = std::env::temp_dir().join(format!("gt-shell-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::db::init_pool(&dir.join("t.db")).unwrap();
+        NotesCtx { pool, media_dir: dir.join("media"), data_dir: dir }
+    }
+
+    #[test]
+    fn a_dropped_image_becomes_an_image_note_and_anything_else_its_path() {
+        let ctx = test_ctx();
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let picture = ctx.data_dir.join("shot.PNG");
+        std::fs::write(&picture, &png).unwrap();
+        let other = ctx.data_dir.join("report.pdf");
+        std::fs::write(&other, b"not a picture").unwrap();
+
+        add_dropped(&ctx, vec![picture, other.clone()]);
+
+        let notes = store::list(&ctx.pool, None, 10).unwrap();
+        assert_eq!(notes.len(), 2);
+        let image = notes.iter().find(|n| n.kind == "image").expect("image note");
+        assert!(std::path::Path::new(image.image_path.as_ref().unwrap()).is_file());
+        let text = notes.iter().find(|n| n.kind == "text").expect("path note");
+        assert_eq!(text.text.as_deref(), Some(other.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn a_dropped_file_that_cannot_be_read_is_skipped() {
+        let ctx = test_ctx();
+        add_dropped(&ctx, vec![ctx.data_dir.join("gone.png")]);
+        assert!(store::list(&ctx.pool, None, 10).unwrap().is_empty());
+    }
 
     #[test]
     fn saved_panel_sizes_are_kept_in_bounds() {

@@ -185,6 +185,28 @@ pub fn reload_on_renderer_crash(window: &tauri::WebviewWindow) {
 #[cfg(not(windows))]
 pub fn reload_on_renderer_crash(_window: &tauri::WebviewWindow) {}
 
+/// A dead renderer can be reloaded, but a dead browser process takes the whole
+/// WebView with it. `gone` runs when that happens, so the window can be rebuilt.
+#[cfg(windows)]
+pub fn on_browser_exit(window: &tauri::WebviewWindow, gone: impl Fn() + Send + 'static) {
+    let _ = window.with_webview(move |wv| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::*;
+        use webview2_com::ProcessFailedEventHandler;
+        let Ok(core) = wv.controller().CoreWebView2() else { return };
+        let handler = ProcessFailedEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else { return Ok(()) };
+            let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+            let _ = args.ProcessFailedKind(&mut kind);
+            if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
+                gone();
+            }
+            Ok(())
+        }));
+        let mut token = Default::default();
+        let _ = core.add_ProcessFailed(&handler, &mut token);
+    });
+}
+
 // ---- named mutexes ----------------------------------------------------------
 
 #[cfg(windows)]

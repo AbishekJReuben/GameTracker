@@ -1120,8 +1120,19 @@ impl Orb {
                 ToOrb::PanelGone => {
                     self.panel_hwnd.set(0);
                     self.panel_ready.set(false);
-                    if self.panel.get() == Panel::Open {
-                        self.panel.set(Panel::Closed);
+                    match self.panel.get() {
+                        Panel::Open => {
+                            self.panel.set(Panel::Closed);
+                            self.arm_tuck();
+                        }
+                        // Mid-open: ask for another. The skeleton holds until it's up.
+                        Panel::Opening | Panel::Revealing => {
+                            let _ = KillTimer(self.hit, TIMER_REVEAL);
+                            self.panel.set(Panel::Opening);
+                            self.tell(FromOrb::Open(self.panel_rect.get()));
+                            self.try_reveal();
+                        }
+                        _ => {}
                     }
                 }
             }

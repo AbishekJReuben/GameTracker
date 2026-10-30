@@ -30,11 +30,11 @@ fn hwnd(window: &WebviewWindow) -> isize {
 }
 
 /// Build the window on a worker: `build` waits for the UI thread and for WebView2.
-fn build(app: &AppHandle, ctx: &NotesCtx, rect: Rect) {
+fn build(app: &AppHandle, ctx: &NotesCtx, orb: &Handle, rect: Rect) {
     if app.get_webview_window(LABEL).is_some() || BUILDING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let (app, data) = (app.clone(), ctx.data_dir.join("EBWebView-notes"));
+    let (app, data, orb) = (app.clone(), ctx.data_dir.join("EBWebView-notes"), orb.clone());
     let _ = std::thread::Builder::new().name("notes-panel-build".into()).spawn(move || {
         let built = WebviewWindowBuilder::new(&app, LABEL, WebviewUrl::App("notes.html".into()))
             .title("Notes")
@@ -56,6 +56,12 @@ fn build(app: &AppHandle, ctx: &NotesCtx, rect: Rect) {
                 set_physical(&window, rect);
                 chrome(&window);
                 crate::hostproc::reload_on_renderer_crash(&window);
+                let dead = app.clone();
+                crate::hostproc::on_browser_exit(&window, move || {
+                    crate::hostproc::trace("notes panel: browser process exited");
+                    release(&dead);
+                    orb.send(ToOrb::PanelGone);
+                });
             }
             Err(e) => crate::hostproc::trace(&format!("notes panel build failed: {e}")),
         }
@@ -99,8 +105,8 @@ fn chrome(window: &WebviewWindow) {
 
 /// The pointer is near the orb. Worth starting now: a cold start takes longer than
 /// the gap between hover and click.
-pub fn prewarm(app: &AppHandle, ctx: &NotesCtx, rect: Rect) {
-    build(app, ctx, rect);
+pub fn prewarm(app: &AppHandle, ctx: &NotesCtx, orb: &Handle, rect: Rect) {
+    build(app, ctx, orb, rect);
 }
 
 /// An open is under way: the window must exist and sit where the shape is heading.
@@ -113,7 +119,7 @@ pub fn prepare(app: &AppHandle, ctx: &NotesCtx, orb: &Handle, rect: Rect) {
                 orb.send(ToOrb::PanelReady(hwnd(&window)));
             }
         }
-        None => build(app, ctx, rect),
+        None => build(app, ctx, orb, rect),
     }
 }
 

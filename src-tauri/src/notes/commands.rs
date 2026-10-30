@@ -537,8 +537,24 @@ pub async fn clipboard_configure(
 
 /// Snapshot of the clipboard runtime log for the Settings "Copy logs" button.
 #[tauri::command]
-pub async fn clipboard_diagnostics() -> AppResult<Vec<String>> {
-    Ok(clipboard::diagnostics())
+pub async fn clipboard_diagnostics(ctx: State<'_, NotesCtx>) -> AppResult<Vec<String>> {
+    const TAIL: usize = 30;
+    let dir = ctx.data_dir.clone();
+    run_blocking(move || {
+        let mut lines = clipboard::diagnostics();
+        let tail = |file: &str, keep: &dyn Fn(&str) -> bool| -> Vec<String> {
+            let text = std::fs::read_to_string(dir.join(file)).unwrap_or_default();
+            let mut kept: Vec<String> = text.lines().rev().filter(|l| keep(l)).take(TAIL).map(str::to_string).collect();
+            kept.reverse();
+            kept
+        };
+        lines.push("--- Floating Notes process ---".into());
+        lines.extend(tail("hostproc.log", &|l| l.contains("notes")));
+        lines.push("--- UI stalls ---".into());
+        lines.extend(tail("ui-stalls.log", &|_| true));
+        Ok(lines)
+    })
+    .await
 }
 
 /// Keep the floating Notes process up to date on sync. It reads this from a file, so

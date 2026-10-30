@@ -118,30 +118,12 @@ export function Composer({
     return () => cancelAnimationFrame(frame);
   }, [text, compact]);
 
-  // Draft persistence: mirror unsent text (not edits) to localStorage.
-  useEffect(() => {
-    if (!draftKey || editing) return;
-    try {
-      if (text) localStorage.setItem(draftKey, text);
-      else localStorage.removeItem(draftKey);
-    } catch {
-      /* too big for localStorage: the note in the box is still there */
-    }
-  }, [text, draftKey, editing]);
-
-  useEffect(() => {
-    if (!onDraftChange || editing || text === draftRef.current) return;
-    draftRef.current = text;
-    const t = window.setTimeout(() => onDraftChange(text), 400);
-    return () => window.clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, editing]);
-
   useEffect(() => onRecordingChange?.(recording), [recording]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Entering edit mode swaps the buffer to the note's text (draft is already
   // saved above); leaving restores the draft.
   const prevEditId = useRef<string | null>(null);
+  const leavingEdit = useRef(false);
   useEffect(() => {
     const id = editing?.id ?? null;
     if (id === prevEditId.current) return;
@@ -150,10 +132,34 @@ export function Composer({
       setText(editing.text);
       areaRef.current?.focus();
     } else {
+      leavingEdit.current = true;
       setText(storedDraft());
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing?.id]);
+
+  // Draft persistence: mirror unsent text (not edits). Runs after the effect above,
+  // because the commit that ends an edit still holds the edited note in `text`.
+  useEffect(() => {
+    if (editing) return;
+    if (leavingEdit.current) {
+      leavingEdit.current = false;
+      return;
+    }
+    if (draftKey) {
+      try {
+        if (text) localStorage.setItem(draftKey, text);
+        else localStorage.removeItem(draftKey);
+      } catch {
+        /* too big for localStorage: the note in the box is still there */
+      }
+    }
+    if (!onDraftChange || text === draftRef.current) return;
+    draftRef.current = text;
+    const t = window.setTimeout(() => onDraftChange(text), 400);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text, draftKey, editing]);
 
   const showSttError = (msg: string) => {
     setSttError(msg);
