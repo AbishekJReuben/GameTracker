@@ -441,6 +441,11 @@ pub fn shell_failed() -> bool {
 
 /// Called first in the shell process. False means one is already running.
 pub fn shell_started() -> bool {
+    // A development shell runs beside the installed one.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GT_NOTES_TEST_DATA").is_some() {
+        return mutex::claim("Local\\GameTrackerNotesTest-v1");
+    }
     let ok = mutex::claim(SHELL_MUTEX);
     trace(&format!("notes shell starting, claimed mutex: {ok}"));
     ok
