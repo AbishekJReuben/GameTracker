@@ -2160,13 +2160,34 @@ survive a frozen thread. Keep these true:
 - Tuck slides the visual out of its own window, and `clip_to_work` stops it reaching the next monitor.
 
 **The morph.** Click, the shape grows on the stage, and at 80 % of the spring (`REVEAL_AT`) the real
-panel is shown under the stage and the shape fades over it. Waiting for the last pixel of the spring
-is what made an open feel slow. The panel is shown with `SWP_SHOWWINDOW | SWP_NOACTIVATE`; focus comes
-after the fade, because activating a topmost window lifts it over the stage. The shape waits for the
-page to report a painted frame (`notes_panel_painted`, at most `PAINT_WAIT`): a hidden page takes a
-moment to wake, and fading sooner shows an empty panel. For the same reason rows only settle on open,
-they never fade in. Windows' own open animation is off (`DWMWA_TRANSITIONS_FORCEDISABLED`), or it
-fights the shape.
+panel comes out from under it and the shape fades over it. Waiting for the last pixel of the spring
+is what made an open feel slow. Focus comes after the fade, because activating a topmost window lifts
+it over the stage. Rows only settle on open, they never fade in. Windows' own open animation is off
+(`DWMWA_TRANSITIONS_FORCEDISABLED`), or it fights the shape.
+
+**The cloak: why the panel never flashes white.** The panel window is cloaked (`DWMWA_CLOAK`) whenever
+it isn't open. Windows still composes a cloaked window, so the page can draw behind it. An open runs
+in this order, and the order is the fix:
+
+1. The orb shows the window under the stage, still cloaked (`wake_panel`, on `PanelReady`).
+2. `FromOrb::Wake(id)`: the control thread wakes the WebView and sends `notes://wake`.
+3. The page syncs and answers `notes_panel_painted(id)` two frames later. The id stops a frame from
+   a cancelled open uncloaking this one.
+4. When the shape has reached `REVEAL_AT` and the page has drawn, `FromOrb::Reveal` takes the cloak
+   off, `PanelShown` comes back, and the shape fades.
+
+Waking the WebView while its window was hidden put a blank white sheet on screen for 120 to 290 ms,
+even though `IsWindowVisible` said false and nothing had shown the window. Filmed on the old build,
+25 of 32 opens showed it, and 0 of 32 after this. Why Windows draws it isn't known; skipping the wake
+stops it, and so does the cloak. Chromium hides its own first-frame flash with a cloak too. Keep these
+true:
+- Never call `webview.show()` before the window is up behind its cloak.
+- The cloak belongs to the control thread: `window.hwnd()` waits for the UI thread and DWM calls can
+  block, and the orb must not wait for either.
+- Don't reveal on a timer to keep opens fast. `PAINT_WAIT_MS` is a safety net for a page in real
+  trouble, and it logs when it fires. A healthy first frame takes 20 to 45 ms.
+- `scripts/notes-white-probe.py` films opens and closes and fails on a white frame. Run it after any
+  change to how the panel opens: logs, window state and the DOM all looked fine during this bug.
 
 **The panel (`notes/panel.rs`, `src/notes/`).** Entry `notes.html`, about 52 KB of its own code.
 - Real acrylic: `chrome()` strips the caption styles first, or Windows paints buttons into the frame.
@@ -2198,14 +2219,17 @@ GT_NOTES_TEST_DATA=<scratch folder> cargo run --example notes_shell -- --notes-s
 
 - The example refuses to start without that variable. Never run a new build against the real data
   folder: it migrates the database, and the installed app is on an older schema.
-- In debug builds that variable also makes Copy a no-op, because the installed app's watcher would
-  capture anything a test wrote to the real clipboard. The real path is tested in a private window
-  station: `cargo test --lib window_station -- --ignored`.
+- In debug builds that variable gives the shell its own mutex, so it runs beside the installed one.
+  It also makes Copy a no-op, because the installed app's watcher would capture anything a test wrote
+  to the real clipboard. The real path is tested in a private window station:
+  `cargo test --lib window_station -- --ignored`.
 - `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333` gives you the page over the
   DevTools protocol. It replaces wry's own browser arguments, so don't trust window-level findings
   made with it set.
-- Don't raise the hidden panel from a test tool: a Z-order change on it put a blank white sheet on
-  screen that looked exactly like an app bug.
+- A white sheet on screen is a real bug until proven otherwise. It was seen in testing before 3.9.125
+  shipped, blamed on the test script, and reached the user.
+- A window behind the panel in a test has to stack under it. Above it, a white sheet in the panel's
+  layer can't be seen, and a broken build passes.
 - `--notes-supervise-test` runs the supervisor alone, so killing the shell shows a real restart.
 - Debug builds load the page from Vite. Add `--features tauri/custom-protocol` to test the real
   bundle and its Content Security Policy.
