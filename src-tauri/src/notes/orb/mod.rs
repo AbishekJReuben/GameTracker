@@ -57,10 +57,12 @@ const PEEK_HOLD_MS: f32 = 1900.0;
 /// The panel takes over once the shape looks finished, not when its spring has
 /// settled to the last pixel. That tail is what made an open feel slow.
 const REVEAL_AT: f32 = 0.8;
-/// How long the shape waits for the page's first frame. A hidden page has to wake up
-/// before it can draw; fading sooner shows an empty panel. A page that stays silent
-/// this long isn't worth waiting for.
-const PAINT_WAIT: Duration = Duration::from_millis(280);
+/// How long the shape waits for the page's first frame. Only a page in real trouble
+/// gets near this. Past it the panel shows as it is, because a panel that won't open
+/// at all is worse than one that opens blank.
+const PAINT_WAIT_MS: u32 = 1500;
+/// A first frame slower than this goes in the log.
+const SLOW_PAINT_MS: u128 = 400;
 const REVEAL_FADE_MS: f32 = 130.0;
 
 const WM_WAKE: u32 = WM_APP + 1;
@@ -72,6 +74,7 @@ const TIMER_MORPH: usize = 4;
 const TIMER_REVEAL: usize = 5;
 const TIMER_FOREGROUND: usize = 6;
 const TIMER_SPARK: usize = 7;
+const TIMER_PAINT: usize = 8;
 const HOTKEY_ID: i32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,8 +102,10 @@ pub enum ToOrb {
     PanelReady(isize),
     /// The panel window is gone, so a new one has to be built before the next open.
     PanelGone,
-    /// The page has drawn since it was shown, so the shape can fade off it.
-    PanelPainted,
+    /// The page drew a frame for this open, so the cloak can come off.
+    PanelPainted(u32),
+    /// The cloak is off, so the shape can fade.
+    PanelShown,
 }
 
 /// What the orb tells the shell. Nothing here may be answered on the orb's thread.
@@ -108,6 +113,8 @@ pub enum FromOrb {
     /// The pointer is near: start building the panel now.
     Prewarm(Rect),
     Open(Rect),
+    /// The window is up behind its cloak: wake the page for this open.
+    Wake(u32),
     Reveal,
     Focus,
     Close,
@@ -198,9 +205,11 @@ struct Orb {
     /// Where the user left a panel they moved, until the orb itself moves.
     panel_kept: Cell<Option<Rect>>,
     morph_done: Cell<bool>,
-    shown_at: Cell<Option<Instant>>,
+    /// Tells this open's first frame from one a cancelled open asked for.
+    open_id: Cell<u32>,
+    woken_at: Cell<Option<Instant>>,
     painted: Cell<bool>,
-    fading_at: Cell<Option<Instant>>,
+    skeleton_up: Cell<bool>,
     focus_before: Cell<isize>,
     rim: Cell<Rim>,
     unread: Cell<u32>,
@@ -304,9 +313,10 @@ unsafe fn run(config: Config, place: Option<Place>, legacy: Option<String>, even
         panel_rect: Cell::new(Rect { x: 0, y: 0, w: 0, h: 0 }),
         panel_kept: Cell::new(None),
         morph_done: Cell::new(false),
-        shown_at: Cell::new(None),
+        open_id: Cell::new(0),
+        woken_at: Cell::new(None),
         painted: Cell::new(false),
-        fading_at: Cell::new(None),
+        skeleton_up: Cell::new(false),
         focus_before: Cell::new(0),
         rim: Cell::new(Rim::Synced),
         unread: Cell::new(0),
@@ -762,6 +772,7 @@ impl Orb {
 
     unsafe fn lower_stage(&self) {
         let _ = ShowWindow(self.stage, SW_HIDE);
+        self.skeleton_up.set(false);
         self.scene(|orb, stage| {
             orb.hide_blob(stage)?;
             orb.hide_skeleton(stage)?;
@@ -858,7 +869,8 @@ impl Orb {
         }
         self.panel.set(Panel::Opening);
         self.morph_done.set(false);
-        self.shown_at.set(None);
+        self.painted.set(false);
+        self.open_id.set(self.open_id.get().wrapping_add(1));
         self.focus_before.set(GetForegroundWindow().0 as isize);
         self.set_unread(0);
         let rect = self.wanted_panel();
@@ -872,25 +884,16 @@ impl Orb {
         SetTimer(self.hit, TIMER_MORPH, (secs * 1000.0 * REVEAL_AT) as u32, None);
     }
 
-    /// The shape has settled, or the page just got ready. Whichever comes second
-    /// shows the real panel.
-    unsafe fn try_reveal(&self) {
-        if self.panel.get() != Panel::Opening || !self.morph_done.get() {
+    /// The page is ready: put its window in place and wake it, all behind the cloak
+    /// while the shape grows. The window has to come first. A WebView woken while its
+    /// window is hidden throws a blank white sheet on screen until it has drawn.
+    unsafe fn wake_panel(&self) {
+        if self.panel.get() != Panel::Opening {
             return;
         }
         let panel = HWND(self.panel_hwnd.get() as _);
-        if !self.panel_ready.get() || panel.0.is_null() {
-            let (ox, oy) = self.stage_origin();
-            let r = self.panel_rect.get();
-            self.scene(|orb, stage| orb.skeleton(stage, Rect { x: r.x - ox, y: r.y - oy, w: r.w, h: r.h }));
-            return;
-        }
-        self.panel.set(Panel::Revealing);
-        self.painted.set(false);
-        self.fading_at.set(None);
         let r = self.panel_rect.get();
         let (left, top, right, bottom) = frame_of(panel);
-        self.tell(FromOrb::Reveal);
         // Async: if the shell's UI thread is busy this thread must not wait for it.
         let _ = SetWindowPos(
             panel,
@@ -901,41 +904,69 @@ impl Orb {
             r.h + top + bottom,
             SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         );
-        self.shown_at.set(None);
-        SetTimer(self.hit, TIMER_REVEAL, 8, None);
+        self.painted.set(false);
+        self.woken_at.set(Some(Instant::now()));
+        self.tell(FromOrb::Wake(self.open_id.get()));
+        SetTimer(self.hit, TIMER_PAINT, PAINT_WAIT_MS, None);
+    }
+
+    /// The shape has settled, or the page just drew. Whichever comes second takes the
+    /// cloak off.
+    unsafe fn try_reveal(&self) {
+        if self.panel.get() != Panel::Opening || !self.morph_done.get() {
+            return;
+        }
+        if !self.painted.get() {
+            if !self.skeleton_up.replace(true) {
+                let (ox, oy) = self.stage_origin();
+                let r = self.panel_rect.get();
+                self.scene(|orb, stage| orb.skeleton(stage, Rect { x: r.x - ox, y: r.y - oy, w: r.w, h: r.h }));
+            }
+            return;
+        }
+        self.panel.set(Panel::Revealing);
+        self.tell(FromOrb::Reveal);
+    }
+
+    /// The page drew, or never will.
+    unsafe fn page_painted(&self, gave_up: bool) {
+        let _ = KillTimer(self.hit, TIMER_PAINT);
+        if let Some(took) = self.woken_at.take().map(|at| at.elapsed().as_millis()) {
+            if gave_up || took >= SLOW_PAINT_MS || cfg!(debug_assertions) {
+                let how = if gave_up { "no frame from the page after" } else { "first frame after" };
+                crate::hostproc::trace(&format!("notes panel: {how} {took} ms"));
+            }
+        }
+        self.painted.set(true);
+        self.try_reveal();
+    }
+
+    /// The cloak is off: fade the shape from over the panel.
+    unsafe fn panel_shown(&self) {
+        if self.panel.get() != Panel::Revealing {
+            return;
+        }
+        self.skeleton_up.set(false);
+        self.scene(|orb, stage| {
+            orb.hide_skeleton(stage)?;
+            orb.fade_blob(stage, REVEAL_FADE_MS)
+        });
+        SetTimer(self.hit, TIMER_REVEAL, REVEAL_FADE_MS as u32 + 16, None);
+    }
+
+    /// The shape has faded off the panel: hand it to the page.
+    unsafe fn panel_revealed(&self) {
+        let _ = KillTimer(self.hit, TIMER_REVEAL);
+        self.lower_stage();
+        self.panel.set(Panel::Open);
+        let _ = SetForegroundWindow(HWND(self.panel_hwnd.get() as _));
+        self.tell(FromOrb::Focus);
     }
 
     unsafe fn stage_origin(&self) -> (i32, i32) {
         let mut r = RECT::default();
         let _ = GetWindowRect(self.stage, &mut r);
         (r.left, r.top)
-    }
-
-    /// Runs on a short timer: wait for the window, wait for the page's first frame,
-    /// fade the shape off it, then hand the panel to the page.
-    unsafe fn reveal_tick(&self) {
-        let panel = HWND(self.panel_hwnd.get() as _);
-        if let Some(at) = self.fading_at.get() {
-            if at.elapsed().as_secs_f32() * 1000.0 > REVEAL_FADE_MS + 16.0 {
-                let _ = KillTimer(self.hit, TIMER_REVEAL);
-                self.lower_stage();
-                self.panel.set(Panel::Open);
-                let _ = SetForegroundWindow(panel);
-                self.tell(FromOrb::Focus);
-            }
-            return;
-        }
-        match self.shown_at.get() {
-            None if IsWindowVisible(panel).as_bool() => self.shown_at.set(Some(Instant::now())),
-            Some(at) if self.painted.get() || at.elapsed() > PAINT_WAIT => {
-                self.fading_at.set(Some(Instant::now()));
-                self.scene(|orb, stage| {
-                    orb.hide_skeleton(stage)?;
-                    orb.fade_blob(stage, REVEAL_FADE_MS)
-                });
-            }
-            _ => {}
-        }
     }
 
     unsafe fn close(&self) {
@@ -945,11 +976,13 @@ impl Orb {
         }
         let panel = HWND(self.panel_hwnd.get() as _);
         let _ = KillTimer(self.hit, TIMER_MORPH);
+        let _ = KillTimer(self.hit, TIMER_PAINT);
         let _ = KillTimer(self.hit, TIMER_REVEAL);
         let had_focus = !panel.0.is_null() && GetForegroundWindow() == panel;
         let mut from = self.panel_rect.get();
         let mut kept = None;
-        if !panel.0.is_null() && IsWindowVisible(panel).as_bool() {
+        // Behind the cloak the window is still on its way to `from`.
+        if opening != Panel::Opening && !panel.0.is_null() && IsWindowVisible(panel).as_bool() {
             let now = visible_rect(panel);
             if now != from {
                 kept = Some(now);
@@ -1007,7 +1040,8 @@ impl Orb {
                 self.morph_done.set(true);
                 self.try_reveal();
             }
-            TIMER_REVEAL => self.reveal_tick(),
+            TIMER_PAINT => self.page_painted(true),
+            TIMER_REVEAL => self.panel_revealed(),
             TIMER_SPARK => {
                 let _ = KillTimer(self.hit, TIMER_SPARK);
                 self.scene(|orb, stage| orb.hide_spark(stage));
@@ -1155,9 +1189,15 @@ impl Orb {
                     self.panel_hwnd.set(hwnd);
                     self.panel_ready.set(true);
                     self.apply_privacy();
+                    self.wake_panel();
                     self.try_reveal();
                 }
-                ToOrb::PanelPainted => self.painted.set(true),
+                ToOrb::PanelPainted(id) => {
+                    if id == self.open_id.get() {
+                        self.page_painted(false);
+                    }
+                }
+                ToOrb::PanelShown => self.panel_shown(),
                 ToOrb::PanelGone => {
                     self.panel_hwnd.set(0);
                     self.panel_ready.set(false);
@@ -1168,8 +1208,10 @@ impl Orb {
                         }
                         // Mid-open: ask for another. The skeleton holds until it's up.
                         Panel::Opening | Panel::Revealing => {
+                            let _ = KillTimer(self.hit, TIMER_PAINT);
                             let _ = KillTimer(self.hit, TIMER_REVEAL);
                             self.panel.set(Panel::Opening);
+                            self.painted.set(false);
                             self.tell(FromOrb::Open(self.panel_rect.get()));
                             self.try_reveal();
                         }

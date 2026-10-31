@@ -2,8 +2,9 @@
 //!
 //! It is built the first time the pointer nears the orb, stays warm after closing, and
 //! is released after 15 idle minutes. The orb decides when it shows, so nothing here
-//! shows it: this file only makes sure it exists, in the right place, with its page
-//! ready. Everything runs on the control thread or a worker, never on the orb's thread.
+//! shows it: this file only makes sure it exists with its page ready, and keeps it
+//! cloaked until there's something to see. Everything runs on the control thread or a
+//! worker, never on the orb's thread.
 
 use super::orb::motion::Rect;
 use super::orb::{Handle, ToOrb};
@@ -14,7 +15,7 @@ use crate::db::settings;
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 pub const LABEL: &str = "notes-panel";
 
@@ -36,6 +37,8 @@ fn build(app: &AppHandle, ctx: &NotesCtx, orb: &Handle, rect: Rect) {
     }
     let (app, data, orb) = (app.clone(), ctx.data_dir.join("EBWebView-notes"), orb.clone());
     let _ = std::thread::Builder::new().name("notes-panel-build".into()).spawn(move || {
+        let began = std::time::Instant::now();
+        crate::hostproc::trace("notes panel: building");
         let built = WebviewWindowBuilder::new(&app, LABEL, WebviewUrl::App("notes.html".into()))
             .title("Notes")
             .inner_size(rect.w as f64, rect.h as f64)
@@ -55,6 +58,7 @@ fn build(app: &AppHandle, ctx: &NotesCtx, orb: &Handle, rect: Rect) {
             Ok(window) => {
                 set_physical(&window, rect);
                 chrome(&window);
+                crate::hostproc::trace(&format!("notes panel: window up after {} ms", began.elapsed().as_millis()));
                 crate::hostproc::reload_on_renderer_crash(&window);
                 let dead = app.clone();
                 crate::hostproc::on_browser_exit(&window, move || {
@@ -101,6 +105,22 @@ fn chrome(window: &WebviewWindow) {
             let _ = DwmSetWindowAttribute(h, DWMWINDOWATTRIBUTE(attribute), &value as *const u32 as *const _, 4);
         }
     }
+    set_cloaked(window, true);
+}
+
+/// Windows still composes a cloaked window, it just doesn't put it on screen. Without
+/// this the panel shows up blank white: Windows paints a window white until it has
+/// drawn, and a WebView takes a moment to draw when it wakes. So the panel is cloaked
+/// whenever it isn't open, and the cloak only comes off once the page has a frame up.
+#[cfg(windows)]
+fn set_cloaked(window: &WebviewWindow, on: bool) {
+    use windows::Win32::Foundation::{BOOL, HWND};
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+    let Ok(raw) = window.hwnd() else { return };
+    let value = BOOL::from(on);
+    if let Err(e) = unsafe { DwmSetWindowAttribute(HWND(raw.0), DWMWA_CLOAK, &value as *const BOOL as *const _, 4) } {
+        crate::hostproc::trace(&format!("notes panel: cloak {on} failed: {e}"));
+    }
 }
 
 /// The pointer is near the orb. Worth starting now: a cold start takes longer than
@@ -109,12 +129,11 @@ pub fn prewarm(app: &AppHandle, ctx: &NotesCtx, orb: &Handle, rect: Rect) {
     build(app, ctx, orb, rect);
 }
 
-/// An open is under way: the window must exist and sit where the shape is heading.
+/// An open is under way: the window must exist. Once its page is ready the orb puts it
+/// where the shape is heading.
 pub fn prepare(app: &AppHandle, ctx: &NotesCtx, orb: &Handle, rect: Rect) {
     match app.get_webview_window(LABEL) {
         Some(window) => {
-            set_physical(&window, rect);
-            let _ = window.as_ref().show();
             if is_ready() {
                 orb.send(ToOrb::PanelReady(hwnd(&window)));
             }
@@ -123,9 +142,26 @@ pub fn prepare(app: &AppHandle, ctx: &NotesCtx, orb: &Handle, rect: Rect) {
     }
 }
 
+/// The window is up behind its cloak: wake the page and have it report a frame.
+pub fn wake(app: &AppHandle, id: u32) {
+    if let Some(window) = app.get_webview_window(LABEL) {
+        let _ = window.as_ref().show();
+        let _ = window.emit_to(LABEL, "notes://wake", id);
+    }
+}
+
+/// The page has drawn: let it be seen.
+pub fn reveal(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(LABEL) {
+        set_cloaked(&window, false);
+        let _ = window.emit_to(LABEL, "notes://reveal", ());
+    }
+}
+
 /// The panel is closed: stop its page drawing, but keep it.
 pub fn suspend(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(LABEL) {
+        set_cloaked(&window, true);
         let _ = window.as_ref().hide();
     }
 }
@@ -154,10 +190,10 @@ pub async fn notes_panel_ready(window: WebviewWindow, shell: State<'_, Shell>) -
     Ok(())
 }
 
-/// The page has drawn a frame since being shown.
+/// The page has drawn a frame for this open.
 #[tauri::command]
-pub async fn notes_panel_painted(shell: State<'_, Shell>) -> AppResult<()> {
-    shell.orb.send(ToOrb::PanelPainted);
+pub async fn notes_panel_painted(shell: State<'_, Shell>, id: u32) -> AppResult<()> {
+    shell.orb.send(ToOrb::PanelPainted(id));
     Ok(())
 }
 

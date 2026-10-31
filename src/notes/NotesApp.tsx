@@ -161,9 +161,7 @@ function Panel() {
     void invoke("notes_panel_close");
   }, []);
 
-  // Rows settle into place as the shape fades off them. They stay visible throughout:
-  // a page that was hidden takes a moment to draw, and fading them in as well left
-  // the panel empty for that moment.
+  // Rows settle into place as the shape fades off them.
   const riseIn = useCallback(() => {
     const page = root.current;
     if (!page) return;
@@ -177,8 +175,6 @@ function Panel() {
         });
       });
     }
-    // Two frames: the first runs before this one's paint, the second after it.
-    requestAnimationFrame(() => requestAnimationFrame(() => void invoke("notes_panel_painted")));
   }, []);
 
   useEffect(() => {
@@ -188,18 +184,21 @@ function Panel() {
       ready.current = true;
       void invoke("notes_panel_ready");
     };
-    void store.load().finally(() => window.setTimeout(announce, 0));
-    // A failed or slow load must not hold the panel closed.
-    const deadline = window.setTimeout(announce, 1500);
+    let deadline: number | undefined;
     void invoke<PanelConfig>("notes_panel_config").then(setConfig).catch(() => setConfig({ sttEnabled: false, draft: "", hotkey: "" }));
 
     const subscriptions = [
       listen("clipboard://changed", () => void useClipboard.getState().sync()),
-      listen("notes://reveal", () => {
+      // The window is up but cloaked, and the cloak comes off once this has a frame up.
+      listen<number>("notes://wake", (e) => {
         void useClipboard.getState().sync();
+        reflow();
+        // Two frames: the first runs before this one's paint, the second after it.
+        requestAnimationFrame(() => requestAnimationFrame(() => void invoke("notes_panel_painted", { id: e.payload })));
+      }),
+      listen("notes://reveal", () => {
         searchBox.current?.focus();
         riseIn();
-        reflow();
       }),
       listen("notes://close", () => {
         flushDeletes();
@@ -207,6 +206,12 @@ function Panel() {
       }),
       listen<string | null>("clipboard://copy-wait", (e) => say(e.payload ? `Waiting for ${e.payload}…` : "Waiting for the clipboard…")),
     ];
+    // The shell answers "ready" with an event, so the listeners have to be up first.
+    void Promise.all(subscriptions).then(() => {
+      void store.load().finally(() => window.setTimeout(announce, 0));
+      // A failed or slow load must not hold the panel closed.
+      deadline = window.setTimeout(announce, 1500);
+    });
     const refreshStatus = () => {
       void invoke<Record<string, unknown> | null>("notes_panel_status")
         .then((report) => setStatus(statusOf(report)))

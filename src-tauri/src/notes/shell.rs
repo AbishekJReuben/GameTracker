@@ -144,9 +144,11 @@ fn control(app: tauri::AppHandle, ctx: NotesCtx, orb: Handle, rx: std::sync::mps
                 }
                 panel::prepare(&app, &ctx, &orb, rect);
             }
+            Ok(FromOrb::Wake(id)) => panel::wake(&app, id),
             Ok(FromOrb::Reveal) => {
                 waiting_since = None;
-                let _ = app.emit_to(panel::LABEL, "notes://reveal", ());
+                panel::reveal(&app);
+                orb.send(ToOrb::PanelShown);
             }
             Ok(FromOrb::Focus) => panel::focus(&app),
             Ok(FromOrb::Close) => {
