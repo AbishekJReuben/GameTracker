@@ -1758,19 +1758,23 @@ pub fn record_media_play(state: State<AppState>, track: JukeboxPlayInput) -> App
     Ok(())
 }
 
-/// Stop accruing for the in-app jukebox (pause / stop / closed).
+/// Stop accruing for the in-app jukebox (pause / stop / closed). Off the UI thread: it
+/// runs at startup, where this write can wait behind other writers.
 #[tauri::command]
-pub fn stop_media_play(state: State<AppState>) -> AppResult<()> {
-    crate::db::media::close_open_for_source(&state.pool, "jukebox")
+pub async fn stop_media_play(state: State<'_, AppState>) -> AppResult<()> {
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::media::close_open_for_source(&pool, "jukebox")).await
 }
 
+/// Off the UI thread: the timeline asks for tens of thousands of rows.
 #[tauri::command]
-pub fn foreground_spans(
-    state: State<AppState>,
+pub async fn foreground_spans(
+    state: State<'_, AppState>,
     from_utc: Option<String>,
     to_utc: Option<String>,
 ) -> AppResult<Vec<crate::db::foreground::ForegroundSpanDto>> {
-    crate::db::foreground::list(&state.pool, from_utc.as_deref(), to_utc.as_deref())
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::foreground::list(&pool, from_utc.as_deref(), to_utc.as_deref())).await
 }
 
 // ---------- playlists ----------
