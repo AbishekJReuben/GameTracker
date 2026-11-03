@@ -2313,8 +2313,14 @@ unsynced (every copy since 30 Oct), the relay's newest item 30 Oct 13:41 UTC, an
   `idx_clip_unsynced`, migration 31). It used to re-fetch the same 100 oldest items for as long as
   they failed, so 100 stuck items stopped every newer copy. Items that fail are skipped until the
   next start (`skippedUploads` in the diagnostics).
-- **Images over the relay's 10 MB `MAX_BLOB`** (PNG screenshots reach 15 MB) are re-encoded as WebP
-  for the other devices (`fitImage`); the PC keeps the original.
+- **The relay's real image limit was 2 MB, not `MAX_BLOB`** (3.9.130): the blob route took a `Bytes`
+  body without raising axum's default `DefaultBodyLimit` (2 MB), so every larger image was refused
+  from both devices — the largest blob ever stored was 2,086,434 bytes. The route now allows
+  `MAX_BLOB`. Clients re-encode as WebP (`src/lib/fitImage.ts`) to fit `MAX_BLOB`, and on a 413 again
+  under `LEGACY_BLOB` (2 MB) so they work with an un-rebuilt relay. Any new axum route that takes
+  `Bytes`/`String`/`Json` bodies over 2 MB needs its own `DefaultBodyLimit`.
+- The phone's queue drops an image the relay can never take (it stays on the phone); a stuck head
+  must never block later changes.
 - **The phone queues every change made while the socket is down** (`send()` → `outgoing`, text
   messages persisted as ciphertext under `gt.clip.outgoing.<clipId>`, image blobs retried before
   their note). Before, each was sent only `if (ready())` and silently dropped otherwise.
