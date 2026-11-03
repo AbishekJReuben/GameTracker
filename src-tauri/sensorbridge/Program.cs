@@ -51,6 +51,8 @@ new Thread(() =>
     catch { /* stdin gone — keep sampling at the last interval */ }
 }) { IsBackground = true, Name = "stdin-control" }.Start();
 
+RemoveLegacyDriver();
+
 var computer = new Computer
 {
     IsCpuEnabled = true,
@@ -128,13 +130,64 @@ object BuildSpecs(Computer c)
                 break;
         }
     }
+    // CPU temperature/power, SuperIO and SMBus readings need the PawnIO driver
+    // (installed separately, e.g. `winget install namazso.PawnIO`); without it those
+    // fields stay null and GPU, load and NVMe readings still work.
+    bool pawnIo = false;
+    string? pawnIoVersion = null;
+    try
+    {
+        pawnIo = LibreHardwareMonitor.PawnIo.PawnIo.IsInstalled;
+        pawnIoVersion = LibreHardwareMonitor.PawnIo.PawnIo.Version?.ToString();
+    }
+    catch { }
     return new
     {
         type = "specs",
         cpuName,
         gpuNames = gpus,
         motherboard,
+        pawnIo,
+        pawnIoVersion,
     };
+}
+
+// LibreHardwareMonitorLib up to 0.9.4 installed WinRing0 1.2 (CVE-2020-14979,
+// flagged by Defender as HackTool:Win32/Winring0) as the kernel service
+// "R0<exe name>" from "<exe name>.sys" beside this exe, at every start. 0.9.6 uses
+// the signed PawnIO driver instead, so take down what the old builds left behind.
+// Cheap when there is nothing to do: one registry lookup. Needs the elevated
+// parent the app already is; unelevated it just tries again next start.
+static void RemoveLegacyDriver()
+{
+    try
+    {
+        var exe = Environment.ProcessPath;
+        if (exe is null) return;
+        var service = "R0" + Path.GetFileNameWithoutExtension(exe);
+        using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Services\{service}"))
+        {
+            if (key is not null)
+            {
+                Sc($"stop {service}");
+                Sc($"delete {service}");
+            }
+        }
+        var sys = Path.ChangeExtension(exe, ".sys");
+        if (File.Exists(sys)) File.Delete(sys);
+    }
+    catch { /* still loaded or not elevated: next start */ }
+
+    static void Sc(string args)
+    {
+        using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("sc.exe", args)
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+        });
+        p?.WaitForExit(5000);
+    }
 }
 
 object BuildSample(Computer c)
@@ -294,11 +347,35 @@ static class Cfg
 
 sealed class UpdateVisitor : IVisitor
 {
+    // DIMM temperatures come over the SMBus (the DDR5 SPD hub), a bus shared with
+    // the BIOS and RGB tools, one transaction per DIMM per read. They move slowly.
+    static readonly TimeSpan MemoryEvery = TimeSpan.FromSeconds(60);
+    readonly Dictionary<IHardware, DateTime> _lastMemory = new();
+
     public void VisitComputer(IComputer computer) => computer.Traverse(this);
     public void VisitHardware(IHardware hardware)
     {
+        if (Skip(hardware)) return;
         hardware.Update();
         foreach (var sub in hardware.SubHardware) sub.Accept(this);
+    }
+
+    bool Skip(IHardware hardware)
+    {
+        // A spinning disk: every update is a SMART query, which spins it up from
+        // standby (the SMR data drives on the dev PC woke every 2–10 s). Its
+        // activity and temperature are left out; SSD and NVMe readings stay.
+        if (hardware is LibreHardwareMonitor.Hardware.Storage.StorageDevice d &&
+            !d.Storage.IsSSD && !d.Storage.IsNVMe)
+            return true;
+        if (hardware.HardwareType == HardwareType.Memory)
+        {
+            var now = DateTime.UtcNow;
+            if (_lastMemory.TryGetValue(hardware, out var last) && now - last < MemoryEvery)
+                return true;
+            _lastMemory[hardware] = now;
+        }
+        return false;
     }
     public void VisitSensor(ISensor sensor) { }
     public void VisitParameter(IParameter parameter) { }
