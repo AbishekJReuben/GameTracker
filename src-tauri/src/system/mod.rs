@@ -488,7 +488,7 @@ fn persist(pool: &DbPool, s: &SystemSample) -> AppResult<()> {
     Ok(())
 }
 
-fn prune(pool: &DbPool) -> AppResult<()> {
+pub(crate) fn prune(pool: &DbPool) -> AppResult<()> {
     let conn = pool.get()?;
     let cutoff = (Utc::now() - ChronoDuration::days(PRUNE_DAYS)).to_rfc3339();
     conn.execute("DELETE FROM system_samples WHERE ts < ?1", [cutoff])?;

@@ -36,6 +36,8 @@ pub mod voice;
 
 #[cfg(test)]
 mod audit_regression;
+#[cfg(test)]
+mod perf_real_db;
 
 use state::AppState;
 use std::sync::Arc;
