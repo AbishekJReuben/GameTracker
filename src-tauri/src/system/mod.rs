@@ -23,6 +23,17 @@ const LIVE_CAP: usize = 300; // ~10 minutes at 2s resolution
 const PERSIST_EVERY: u32 = 8; // persist a row roughly every 16s
 const DISKS_EVERY: u32 = 15; // refresh disk capacity roughly every 30s
 const PRUNE_DAYS: i64 = 30;
+/// Most timestamps a history chart is sent. Longer windows are averaged into
+/// buckets: at 1 week the page used to get 38k system rows and 161k per-app rows,
+/// refetched every 4–8 s and drawn as SVG, which froze it.
+const HISTORY_POINTS: i64 = 720;
+/// Samples younger than this keep their ~16 s resolution on disk; older ones are
+/// averaged into COMPACT_SECS buckets (677k per-app rows → ~45k for 30 days).
+const RAW_DAYS: i64 = 2;
+const COMPACT_SECS: i64 = 300;
+/// Bucket start for an RFC3339 `ts`, in the same sortable format (25 chars, which
+/// no raw sample has: they carry fractional seconds).
+const BUCKET_TS: &str = "strftime('%Y-%m-%dT%H:%M:%S+00:00', (CAST(strftime('%s', ts) AS INTEGER) / ?2) * ?2, 'unixepoch')";
 const SENSOR_STALE_SECS: u64 = 8; // ignore sidecar readings older than this
 
 /// Latest readings from the sensor sidecar (real hardware sensors).
@@ -329,6 +340,7 @@ pub fn spawn(pool: DbPool, shared: Arc<SystemShared>, sidecar: Option<PathBuf>) 
 fn run_loop(pool: DbPool, shared: Arc<SystemShared>) {
     let _ = ensure_table(&pool);
     let _ = prune(&pool);
+    let _ = compact_samples(&pool);
 
     let mut sys = System::new();
     sys.refresh_cpu_all();
@@ -445,6 +457,7 @@ fn run_loop(pool: DbPool, shared: Arc<SystemShared>) {
             let _ = persist(&pool, &sample);
             if tick % (PERSIST_EVERY * 200) == 0 {
                 let _ = prune(&pool);
+                let _ = compact_samples(&pool);
             }
         }
     }
@@ -495,6 +508,70 @@ pub(crate) fn prune(pool: &DbPool) -> AppResult<()> {
     Ok(())
 }
 
+/// Bucket width for a history window, or None to send raw rows. Up to 6 h the
+/// ~16 s rows are already under HISTORY_POINTS timestamps.
+pub(crate) fn history_bucket_secs(minutes: i64) -> Option<i64> {
+    let secs = minutes * 60 / HISTORY_POINTS;
+    (secs > 30).then_some(secs)
+}
+
+/// Average samples older than RAW_DAYS into COMPACT_SECS buckets, one UTC day per
+/// transaction so the write lock is never held for long and a power cut loses at
+/// most the day in flight (its transaction rolls back; the next run redoes it).
+/// Returns the number of days compacted.
+pub(crate) fn compact_samples(pool: &DbPool) -> AppResult<usize> {
+    let cutoff = (Utc::now() - ChronoDuration::days(RAW_DAYS)).format("%Y-%m-%d").to_string();
+    let mut done = 0;
+    for (table, cols, avg, key) in [
+        (
+            "system_samples",
+            "ts, cpu, cpu_temp, gpu, gpu_temp, ram, ram_temp, disk",
+            "AVG(cpu), AVG(cpu_temp), AVG(gpu), AVG(gpu_temp), AVG(ram), AVG(ram_temp), AVG(disk)",
+            "b",
+        ),
+        ("app_samples", "ts, game_id, cpu, ram_mb, gpu", "game_id, AVG(cpu), AVG(ram_mb), AVG(gpu)", "b, game_id"),
+    ] {
+        let days: Vec<String> = {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT substr(ts, 1, 10) FROM {table} WHERE ts < ?1 AND length(ts) <> 25"
+            ))?;
+            let rows = stmt.query_map([&cutoff], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for day in days {
+            let Some(next) = chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.succ_opt())
+                .map(|d| d.format("%Y-%m-%d").to_string())
+            else {
+                continue;
+            };
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let raw = "ts >= ?1 AND ts < ?3 AND length(ts) <> 25";
+            tx.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {table}({cols})
+                     SELECT b, {avg} FROM (SELECT {BUCKET_TS} AS b, * FROM {table} WHERE {raw})
+                     GROUP BY {key}"
+                ),
+                rusqlite::params![&day, COMPACT_SECS, &next],
+            )?;
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE {raw}"),
+                rusqlite::params![&day, rusqlite::types::Null, &next],
+            )?;
+            tx.commit()?;
+            done += 1;
+            drop(conn);
+            // Let the tracker and the UI's writes in between days.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Ok(done)
+}
+
 // ---------- command-facing reads ----------
 
 pub fn specs(shared: &SystemShared) -> SystemSpecs {
@@ -516,29 +593,46 @@ pub fn history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppResult<
     let from = (Utc::now() - ChronoDuration::minutes(minutes)).to_rfc3339();
 
     let conn = pool.get()?;
-    let mut stmt = conn.prepare(
-        "SELECT ts, cpu, cpu_temp, gpu, gpu_temp, ram, ram_temp, disk
-         FROM system_samples WHERE ts >= ?1 ORDER BY ts ASC",
-    )?;
-    let mut points: Vec<HistoryPoint> = stmt
-        .query_map([&from], |r| {
-            Ok(HistoryPoint {
-                ts: r.get(0)?,
-                cpu: r.get(1)?,
-                cpu_temp: r.get(2)?,
-                gpu: r.get(3)?,
-                gpu_temp: r.get(4)?,
-                ram: r.get(5)?,
-                ram_temp: r.get(6)?,
-                disk: r.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let bucket = history_bucket_secs(minutes);
+    fn point(r: &rusqlite::Row) -> rusqlite::Result<HistoryPoint> {
+        Ok(HistoryPoint {
+            ts: r.get(0)?,
+            cpu: r.get(1)?,
+            cpu_temp: r.get(2)?,
+            gpu: r.get(3)?,
+            gpu_temp: r.get(4)?,
+            ram: r.get(5)?,
+            ram_temp: r.get(6)?,
+            disk: r.get(7)?,
+        })
+    }
+    let mut points: Vec<HistoryPoint> = match bucket {
+        Some(secs) => conn
+            .prepare(&format!(
+                "SELECT {BUCKET_TS} AS b, AVG(cpu), AVG(cpu_temp), AVG(gpu), AVG(gpu_temp), AVG(ram), AVG(ram_temp), AVG(disk)
+                 FROM system_samples WHERE ts >= ?1 GROUP BY b ORDER BY b ASC"
+            ))?
+            .query_map(rusqlite::params![&from, secs], point)?
+            .collect::<Result<Vec<_>, _>>()?,
+        None => conn
+            .prepare(
+                "SELECT ts, cpu, cpu_temp, gpu, gpu_temp, ram, ram_temp, disk
+                 FROM system_samples WHERE ts >= ?1 ORDER BY ts ASC",
+            )?
+            .query_map([&from], point)?
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     // Fold in the most recent live samples so the tail of the chart is current
-    // even between persistence writes (which only happen every ~16s).
+    // even between persistence writes (which only happen every ~16s). A bucketed
+    // chart takes just the newest one: 2 s samples would crowd its last bucket.
     let last_ts = points.last().map(|p| p.ts.clone());
-    for s in shared.live.lock().iter() {
+    let live = shared.live.lock();
+    let tail: Vec<&SystemSample> = match bucket {
+        Some(_) => live.back().into_iter().collect(),
+        None => live.iter().collect(),
+    };
+    for s in tail {
         if s.ts >= from && last_ts.as_deref().map(|t| s.ts.as_str() > t).unwrap_or(true) {
             points.push(HistoryPoint {
                 ts: s.ts.clone(),
@@ -552,6 +646,7 @@ pub fn history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppResult<
             });
         }
     }
+    drop(live);
 
     // Sessions (games + apps) overlapping the window — include in-progress rows
     // so overlays grow live like the main timeline (tracker updates last_seen ~2s).
@@ -561,7 +656,8 @@ pub fn history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppResult<
                 s.runtime_seconds, s.active_seconds, s.was_idle_ended, s.focus_spans_json,
                 g.cover_path
          FROM sessions s JOIN games g ON g.id = s.game_id
-         WHERE datetime(s.start_utc) < datetime('now')
+         WHERE s.last_seen_utc >= ?1
+           AND datetime(s.start_utc) < datetime('now')
            AND datetime(COALESCE(s.end_utc, s.last_seen_utc)) > datetime(?1)
          ORDER BY s.start_utc ASC",
     )?;
@@ -650,27 +746,43 @@ pub fn app_history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppRes
     let conn = pool.get()?;
     ensure_app_table(pool)?;
 
-    // Persisted history (downsampled, ~16s resolution).
-    let mut stmt = conn.prepare(
-        "SELECT ts, game_id, cpu, ram_mb, gpu FROM app_samples
-         WHERE ts >= ?1 ORDER BY ts ASC",
-    )?;
-    let mut points: Vec<AppUsagePoint> = stmt
-        .query_map([&from], |r| {
-            Ok(AppUsagePoint {
-                ts: r.get(0)?,
-                game_id: r.get(1)?,
-                cpu: r.get(2)?,
-                ram_mb: r.get(3)?,
-                gpu: r.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    // Persisted history (~16 s rows; averaged into buckets for long windows).
+    let bucket = history_bucket_secs(minutes);
+    fn point(r: &rusqlite::Row) -> rusqlite::Result<AppUsagePoint> {
+        Ok(AppUsagePoint {
+            ts: r.get(0)?,
+            game_id: r.get(1)?,
+            cpu: r.get(2)?,
+            ram_mb: r.get(3)?,
+            gpu: r.get(4)?,
+        })
+    }
+    let mut points: Vec<AppUsagePoint> = match bucket {
+        Some(secs) => conn
+            .prepare(&format!(
+                "SELECT {BUCKET_TS} AS b, game_id, AVG(cpu), AVG(ram_mb), AVG(gpu)
+                 FROM app_samples WHERE ts >= ?1 GROUP BY b, game_id ORDER BY b ASC"
+            ))?
+            .query_map(rusqlite::params![&from, secs], point)?
+            .collect::<Result<Vec<_>, _>>()?,
+        None => conn
+            .prepare(
+                "SELECT ts, game_id, cpu, ram_mb, gpu FROM app_samples
+                 WHERE ts >= ?1 ORDER BY ts ASC",
+            )?
+            .query_map([&from], point)?
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     // Fold in the live tail so the chart tip stays current (2s) between persists,
     // exactly like `history()` does for the system-usage chart.
     let last_ts = points.last().map(|p| p.ts.clone());
-    for s in shared.live_apps.lock().iter() {
+    let live = shared.live_apps.lock();
+    let tail: Vec<&AppTickSample> = match bucket {
+        Some(_) => live.back().into_iter().collect(),
+        None => live.iter().collect(),
+    };
+    for s in tail {
         if s.ts.as_str() >= from.as_str()
             && last_ts.as_deref().map(|t| s.ts.as_str() > t).unwrap_or(true)
         {
@@ -685,6 +797,7 @@ pub fn app_history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppRes
             }
         }
     }
+    drop(live);
 
     // Rank apps by cumulative load (CPU + a scaled RAM term + GPU) so the busiest
     // ones sit at the base of the stack; collect ids in first-seen order.
@@ -739,4 +852,76 @@ pub fn app_history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppRes
     });
 
     Ok(AppUsageHistory { apps, points, has_gpu })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_pool() -> DbPool {
+        let path = std::env::temp_dir().join(format!("gt_samples_{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(&path).expect("pool");
+        ensure_table(&pool).unwrap();
+        ensure_app_table(&pool).unwrap();
+        pool
+    }
+
+    #[test]
+    fn long_windows_are_bucketed_to_a_chartable_size() {
+        assert_eq!(history_bucket_secs(60), None);
+        assert_eq!(history_bucket_secs(360), None, "6 h of 16 s rows is already small");
+        assert_eq!(history_bucket_secs(1440), Some(120));
+        for minutes in [1440, 7 * 1440, 30 * 1440] {
+            let secs = history_bucket_secs(minutes).unwrap();
+            assert!(minutes * 60 / secs <= HISTORY_POINTS);
+        }
+    }
+
+    #[test]
+    fn compaction_averages_old_days_and_leaves_recent_rows() {
+        let pool = test_pool();
+        let old = (Utc::now() - ChronoDuration::days(10)).date_naive().and_hms_opt(10, 0, 0).unwrap().and_utc();
+        let recent = Utc::now() - ChronoDuration::minutes(5);
+        {
+            let conn = pool.get().unwrap();
+            // 10 minutes of 16 s samples on an old day → two 5-minute buckets.
+            for i in 0..38 {
+                let ts = (old + ChronoDuration::seconds(i * 16)).to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+                let cpu = if i * 16 < 300 { 10.0 } else { 30.0 };
+                conn.execute(
+                    "INSERT INTO system_samples(ts, cpu, ram, cpu_temp) VALUES (?1, ?2, 50, NULL)",
+                    rusqlite::params![ts, cpu],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO app_samples(ts, game_id, cpu, ram_mb) VALUES (?1, 'g', ?2, 100)",
+                    rusqlite::params![ts, cpu],
+                )
+                .unwrap();
+            }
+            let ts = recent.to_rfc3339();
+            conn.execute("INSERT INTO system_samples(ts, cpu, ram) VALUES (?1, 1, 1)", [&ts]).unwrap();
+            conn.execute("INSERT INTO app_samples(ts, game_id, cpu, ram_mb) VALUES (?1, 'g', 1, 1)", [&ts]).unwrap();
+        }
+
+        assert_eq!(compact_samples(&pool).unwrap(), 2, "one old day in each table");
+        let conn = pool.get().unwrap();
+        for table in ["system_samples", "app_samples"] {
+            let rows: Vec<(String, f64)> = conn
+                .prepare(&format!("SELECT ts, cpu FROM {table} ORDER BY ts"))
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(rows.len(), 3, "{table}: two buckets + the untouched recent row: {rows:?}");
+            assert_eq!(rows[0].0, old.format("%Y-%m-%dT10:00:00+00:00").to_string());
+            assert_eq!((rows[0].1, rows[1].1), (10.0, 30.0), "{table}");
+            assert_eq!(rows[2].0, recent.to_rfc3339(), "{table}: recent rows keep full resolution");
+        }
+        let temp: Option<f64> = conn.query_row("SELECT cpu_temp FROM system_samples ORDER BY ts LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(temp, None, "a sensor that never reported stays unknown, not 0");
+        drop(conn);
+        assert_eq!(compact_samples(&pool).unwrap(), 0, "a second run has nothing to do");
+    }
 }

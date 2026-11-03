@@ -683,6 +683,53 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
+    if version < 30 {
+        // Read paths. `sessions` rows carry their focus/activity JSON inline (~8 KB
+        // each), so every aggregate that walked the table read about a page per row:
+        // the tracker's two today-totals queries read 1,088 pages (4.3 MB) every 2 s,
+        // the jukebox accrue scanned media_plays for 596 more, and list_games /
+        // dashboard walked 14 MB. The covering indexes hold only the scalar columns
+        // those queries use (1,088 → 94 pages, 596 → 2 on a real 215 MB install).
+        // The partial `*_open` indexes and the last_seen ones let the startup
+        // close_orphans and prunes find their rows instead of scanning 35 MB while
+        // they hold the write lock, which is what kept the first set_setting after
+        // every launch waiting 3–5 s. `games_meta.rev` lets the tracker skip
+        // reloading games (332 pages every 16 s) until one actually changed.
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current < 30 {
+            tx.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_sessions_totals ON sessions(
+                    game_id, end_utc, runtime_seconds, active_seconds, start_utc, last_seen_utc, was_idle_ended);
+                CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(
+                    last_seen_utc, game_id, runtime_seconds, active_seconds);
+                CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions(game_id) WHERE end_utc IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_games_kind_id ON games(kind, id);
+                CREATE INDEX IF NOT EXISTS idx_media_open ON media_plays(source) WHERE end_utc IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_media_seen ON media_plays(last_seen_utc);
+                CREATE INDEX IF NOT EXISTS idx_fg_open ON foreground_spans(app_key) WHERE end_utc IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_fg_seen ON foreground_spans(last_seen_utc);
+
+                CREATE TABLE IF NOT EXISTS games_meta (id INTEGER PRIMARY KEY CHECK (id = 1), rev INTEGER NOT NULL);
+                INSERT OR IGNORE INTO games_meta(id, rev) VALUES (1, 0);
+                CREATE TRIGGER IF NOT EXISTS games_rev_insert AFTER INSERT ON games BEGIN
+                    UPDATE games_meta SET rev = rev + 1 WHERE id = 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS games_rev_update AFTER UPDATE ON games BEGIN
+                    UPDATE games_meta SET rev = rev + 1 WHERE id = 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS games_rev_delete AFTER DELETE ON games BEGIN
+                    UPDATE games_meta SET rev = rev + 1 WHERE id = 1;
+                END;
+                PRAGMA user_version = 30;
+                "#,
+            )?;
+        }
+        tx.commit()?;
+        version = 30;
+    }
+
     let _ = version;
     Ok(())
 }
@@ -746,6 +793,13 @@ mod tests {
              CREATE INDEX idx_clip_created ON clipboard_items(created_utc);
              CREATE INDEX idx_clip_pinned ON clipboard_items(pinned);
              CREATE INDEX idx_clip_hash ON clipboard_items(content_hash);
+             -- Every real v28 database also has these; later migrations index them.
+             CREATE TABLE IF NOT EXISTS games (id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'game');
+             CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, start_utc TEXT NOT NULL,
+                end_utc TEXT, last_seen_utc TEXT NOT NULL, runtime_seconds INTEGER NOT NULL DEFAULT 0,
+                active_seconds INTEGER NOT NULL DEFAULT 0, was_idle_ended INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS media_plays (id TEXT PRIMARY KEY, source TEXT NOT NULL, end_utc TEXT, last_seen_utc TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS foreground_spans (id TEXT PRIMARY KEY, app_key TEXT NOT NULL, end_utc TEXT, last_seen_utc TEXT NOT NULL);
              PRAGMA user_version = 28;",
         )
         .unwrap();
@@ -784,6 +838,53 @@ mod tests {
             .map(|c| c.unwrap())
             .collect();
         assert_eq!(columns.last().map(String::as_str), Some("text"));
+    }
+
+    fn plan(conn: &rusqlite::Connection, sql: &str) -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|d| d.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn migration_30_indexes_the_hot_paths() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // Each of these used to SCAN its table (a page per wide session row), most
+        // of them every tracker tick or while holding the write lock at startup.
+        for (what, sql, want) in [
+            ("today totals", "SELECT SUM(s.runtime_seconds) FROM sessions s JOIN games g ON g.id = s.game_id
+                              WHERE s.last_seen_utc >= 'x' AND g.kind = 'app'", "COVERING INDEX idx_sessions_totals"),
+            ("per-game stats", "SELECT game_id, SUM(runtime_seconds), COUNT(*), MIN(start_utc) FROM sessions
+                                WHERE end_utc IS NOT NULL AND runtime_seconds >= 30 GROUP BY game_id", "COVERING INDEX idx_sessions_totals"),
+            ("jukebox accrue", "UPDATE media_plays SET played_seconds = played_seconds + 2
+                                WHERE source = 'jukebox' AND end_utc IS NULL", "idx_media_open"),
+            ("session orphans", "UPDATE sessions SET end_utc = last_seen_utc WHERE end_utc IS NULL", "idx_sessions_open"),
+            ("span orphans", "UPDATE foreground_spans SET end_utc = last_seen_utc WHERE end_utc IS NULL", "idx_fg_open"),
+            ("span prune", "DELETE FROM foreground_spans WHERE last_seen_utc < 'x'", "idx_fg_seen"),
+            ("media prune", "DELETE FROM media_plays WHERE last_seen_utc < 'x'", "idx_media_seen"),
+        ] {
+            let p = plan(&conn, sql);
+            assert!(p.contains(want), "{what}: {p}");
+        }
+    }
+
+    #[test]
+    fn migration_30_games_revision_follows_every_writer() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let rev = |c: &rusqlite::Connection| -> i64 { c.query_row("SELECT rev FROM games_meta", [], |r| r.get(0)).unwrap() };
+        assert_eq!(rev(&conn), 0);
+        conn.execute("INSERT INTO games (id, display_name, created_at) VALUES ('g', 'G', 'x')", []).unwrap();
+        assert_eq!(rev(&conn), 1);
+        conn.execute("UPDATE games SET exe_paths = '[\"c:\\\\g.exe\"]' WHERE id = 'g'", []).unwrap();
+        assert_eq!(rev(&conn), 2);
+        conn.execute("DELETE FROM games WHERE id = 'g'", []).unwrap();
+        assert_eq!(rev(&conn), 3);
     }
 
     #[test]
@@ -854,7 +955,7 @@ mod tests {
 
         run_migrations(&conn).unwrap();
 
-        assert_eq!(user_version(&conn).unwrap(), 29);
+        assert_eq!(user_version(&conn).unwrap(), 30);
         let sql: String = conn
             .query_row("SELECT sql FROM sqlite_master WHERE name = 'app_samples'", [], |r| r.get(0))
             .unwrap();
@@ -885,14 +986,14 @@ mod tests {
 
         // A second launch is a no-op.
         run_migrations(&conn).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), 29);
+        assert_eq!(user_version(&conn).unwrap(), 30);
     }
 
     #[test]
     fn migration_28_on_a_fresh_install_just_bumps_the_version() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), 29);
+        assert_eq!(user_version(&conn).unwrap(), 30);
         let tables: i64 = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'app_samples'", [], |r| r.get(0))
             .unwrap();

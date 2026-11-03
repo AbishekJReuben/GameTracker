@@ -116,6 +116,33 @@ fn perf_real_db() {
         });
     }
 
+    // One-time on an install that predates compaction; later runs only see the
+    // day that just aged past RAW_DAYS.
+    let t = Instant::now();
+    let days = system::compact_samples(&pool).unwrap();
+    println!("{:34} {:8.1} ms ({days} table-days)", "compact_samples (first run)", t.elapsed().as_secs_f64() * 1000.0);
+    for minutes in [60 * 24 * 7, 60 * 24 * 30] {
+        time_case(&format!("compacted system_history {minutes}"), &pool, &writer, || {
+            system::history(&pool, &shared, minutes).unwrap()
+        });
+        time_case(&format!("compacted app_history {minutes}"), &pool, &writer, || {
+            system::app_history(&pool, &shared, minutes).unwrap()
+        });
+    }
+    {
+        let conn = pool.get().unwrap();
+        let count = |t: &str| -> i64 { conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap() };
+        println!("rows after compaction: system_samples {}, app_samples {}", count("system_samples"), count("app_samples"));
+    }
+    let t = Instant::now();
+    writer.execute_batch("VACUUM;").unwrap();
+    println!(
+        "{:34} {:8.1} ms -> {:.0} MB",
+        "VACUUM",
+        t.elapsed().as_secs_f64() * 1000.0,
+        std::fs::metadata(&path).map(|m| m.len() as f64 / 1_048_576.0).unwrap_or(0.0)
+    );
+
     println!("-- writes");
     time_case("set_setting", &pool, &writer, || settings::set(&pool, "perf_probe2", "x").unwrap());
 

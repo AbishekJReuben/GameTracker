@@ -198,6 +198,7 @@ fn run_loop(
 
     let mut sys = System::new();
     let mut games_cache = games::match_candidates(&pool).unwrap_or_default();
+    let mut games_rev = games::revision(&pool).ok();
     let mut active: HashMap<String, String> = HashMap::new();
     let mut tick: u32 = 0;
     let notify = settings::get_bool(&pool, "notify_sessions").unwrap_or(true);
@@ -217,13 +218,21 @@ fn run_loop(
     let mut last_shot: HashMap<String, Instant> = HashMap::new();
     // Per-session de-dupe key (title|url) so we only write activity on change.
     let mut last_activity_key: HashMap<String, String> = HashMap::new();
+    // Last focus state written per session. record_focus_tick reads the session's
+    // whole focus JSON (up to ~100 KB) to compare, so ask it only on a change.
+    let mut last_focus: HashMap<String, bool> = HashMap::new();
     // Seconds of uninterrupted active game play, for the break reminder.
     let mut break_accum: i64 = 0;
 
     loop {
         tick = tick.wrapping_add(1);
         if tick % RELOAD_EVERY == 0 {
-            games_cache = games::match_candidates(&pool).unwrap_or_default();
+            // A one-row read; the full reload walks every game's wide row.
+            let rev = games::revision(&pool).ok();
+            if rev.is_none() || rev != games_rev {
+                games_cache = games::match_candidates(&pool).unwrap_or_default();
+                games_rev = rev;
+            }
         }
 
         let paused = settings::get_bool(&pool, "tracking_paused").unwrap_or(false);
@@ -232,6 +241,7 @@ fn run_loop(
             for (_gid, sid) in active.drain() {
                 let _ = sessions::end(&pool, &sid, false);
             }
+            last_focus.clear();
             if let Some((id, _)) = open_fg.take() {
                 let _ = fg_db::end(&pool, &id);
             }
@@ -348,6 +358,7 @@ fn run_loop(
             .collect();
         for gid in ended {
             if let Some(sid) = active.remove(&gid) {
+                last_focus.remove(&sid);
                 let _ = sessions::end(&pool, &sid, is_idle);
                 if notify {
                     let name = running
@@ -399,7 +410,11 @@ fn run_loop(
             let add_active = if is_fg && !is_idle { TICK_SECS as i64 } else { 0 };
             let focused = is_fg && !is_idle;
             let _ = sessions::accrue(&pool, &sid, add_runtime, add_active);
-            let _ = sessions::record_focus_tick(&pool, &sid, focused);
+            if last_focus.get(&sid) != Some(&focused)
+                && sessions::record_focus_tick(&pool, &sid, focused).is_ok()
+            {
+                last_focus.insert(sid.clone(), focused);
+            }
         }
 
         // --- Foreground activity (window title + browser URL) for the focused

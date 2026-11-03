@@ -141,11 +141,16 @@ export function useSystemLive(enabled = true) {
   });
 }
 
+/** Past 6 h the backend averages history into 2–60 minute buckets
+ *  (system::history_bucket_secs), so polling it every few seconds redraws the
+ *  same chart; once a minute keeps the tip current. */
+const historyPoll = (minutes: number, short: number) => (minutes > 360 ? 60_000 : short);
+
 export function useSystemHistory(minutes: number, enabled = true) {
   return useQuery({
     queryKey: keys.systemHistory(minutes),
     queryFn: () => api.systemHistory(minutes),
-    refetchInterval: enabled ? 4_000 : false,
+    refetchInterval: enabled ? historyPoll(minutes, 4_000) : false,
     enabled,
   });
 }
@@ -154,7 +159,7 @@ export function useSystemAppHistory(minutes: number, enabled = true) {
   return useQuery({
     queryKey: keys.systemAppHistory(minutes),
     queryFn: () => api.systemAppHistory(minutes),
-    refetchInterval: enabled ? 8_000 : false,
+    refetchInterval: enabled ? historyPoll(minutes, 8_000) : false,
     enabled,
   });
 }

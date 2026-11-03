@@ -1144,6 +1144,13 @@ pub fn set_info_json(pool: &DbPool, id: &str, json: &str) -> AppResult<()> {
 }
 
 /// Games eligible for live matching (enabled, with exe paths or an install folder).
+/// Bumped by triggers on every insert/update/delete of `games` (migration 30), in
+/// any process, so a cache of match candidates knows when it went stale.
+pub fn revision(pool: &DbPool) -> AppResult<i64> {
+    let conn = pool.get()?;
+    Ok(conn.query_row("SELECT rev FROM games_meta WHERE id = 1", [], |r| r.get(0))?)
+}
+
 pub fn match_candidates(pool: &DbPool) -> AppResult<Vec<MatchGame>> {
     let conn = pool.get()?;
     let mut stmt = conn.prepare(
