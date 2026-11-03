@@ -48,6 +48,9 @@
   Pop $1
   ${If} $0 = 0
     nsExec::Exec 'schtasks /Create /TN "GameTracker Autostart" /TR "\"$INSTDIR\${MAINBINARYNAME}.exe\" --minimized" /SC ONLOGON /RL HIGHEST /F'
+    ; schtasks gives the task a 72-hour limit and stop-on-battery; clear them (the app
+    ; re-registers the same settings from XML on launch, see autostart.rs).
+    nsExec::Exec `powershell -NoProfile -ExecutionPolicy Bypass -Command "$$s = (Get-ScheduledTask -TaskName 'GameTracker Autostart').Settings; $$s.ExecutionTimeLimit = 'PT0S'; $$s.DisallowStartIfOnBatteries = $$false; $$s.StopIfGoingOnBatteries = $$false; Set-ScheduledTask -TaskName 'GameTracker Autostart' -Settings $$s"`
   ${EndIf}
 !macroend
 

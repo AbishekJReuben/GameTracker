@@ -51,16 +51,56 @@ pub fn set(enabled: bool) -> AppResult<()> {
     Ok(())
 }
 
+/// Task definition for `schtasks /XML`. Plain `/SC ONLOGON` would inherit Task
+/// Scheduler's defaults: a 72-hour execution limit (Windows kills the tray app
+/// after 3 days up) and stop/skip on battery (a USB UPS reports as one).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn task_xml(exe: &str) -> String {
+    let exe = exe
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>--minimized</Arguments></Exec></Actions>
+</Task>
+"#
+    )
+}
+
 /// Register (or overwrite) the logon task so it points at the **current** binary.
 /// Safe to call on every launch and after reinstalling to a new folder.
 #[cfg(windows)]
 fn register_task() -> AppResult<()> {
     let exe = std::env::current_exe().map_err(|e| AppError::msg(e.to_string()))?;
-    // Launch minimized to tray, elevated, at every logon. /F overwrites stale paths.
-    let tr = format!("\"{}\" --minimized", exe.display());
+    // Launch minimized to tray, elevated, at every logon. /F overwrites stale paths
+    // and upgrades tasks created by older builds with the 72-hour limit.
+    let xml = task_xml(&exe.display().to_string());
+    // schtasks reads the file as UTF-16 (BOM + LE), matching the XML declaration.
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+    let path = std::env::temp_dir().join("gametracker-autostart-task.xml");
+    std::fs::write(&path, bytes).map_err(|e| AppError::msg(e.to_string()))?;
     let out = run_schtasks(&[
-        "/Create", "/TN", TASK_NAME, "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
-    ])?;
+        "/Create",
+        "/TN",
+        TASK_NAME,
+        "/XML",
+        &path.to_string_lossy(),
+        "/F",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let out = out?;
     if !out.status.success() {
         return Err(AppError::msg(format!(
             "Could not register startup task: {}",
@@ -78,4 +118,25 @@ fn register_task() -> AppResult<()> {
 /// Apply the `start_with_windows` setting — creates/updates or removes the task.
 pub fn sync_from_setting(enabled: bool) -> AppResult<()> {
     set(enabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_xml;
+
+    #[test]
+    fn task_has_no_time_limit_or_battery_stop_and_stays_elevated() {
+        let xml = task_xml(r"C:\Program Files\Tracker\gametracker.exe");
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains(r"<Command>C:\Program Files\Tracker\gametracker.exe</Command>"));
+    }
+
+    #[test]
+    fn exe_path_is_xml_escaped() {
+        let xml = task_xml(r"D:\R&D <x>\gametracker.exe");
+        assert!(xml.contains(r"<Command>D:\R&amp;D &lt;x&gt;\gametracker.exe</Command>"));
+    }
 }
