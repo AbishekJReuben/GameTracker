@@ -291,7 +291,7 @@ describe("a relay that started a new store", () => {
     await flush();
     socket.message(note("fresh", 3));
     await flush();
-    expect(socket.sent.at(-1)).toEqual({ t: "hello", since: 0 });
+    expect(socket.sent[socket.sent.length - 1]).toEqual({ t: "hello", since: 0 });
     expect(store.getState().items.map((i) => i.id)).toContain("fresh");
   });
 });

@@ -57,7 +57,7 @@ let clipSync: (typeof import("./clipboardSync"))["clipSync"];
 const flush = () => vi.advanceTimersByTimeAsync(50);
 const connect = async () => {
   await clipSync.start();
-  const socket = Socket.instances.at(-1)!;
+  const socket = Socket.instances[Socket.instances.length - 1]!;
   socket.open();
   return socket;
 };
@@ -93,7 +93,7 @@ describe("upload backlog", () => {
     const socket = await connect();
     socket.message({ t: "synced", rev: 0 });
     await flush();
-    const adds = socket.sent.filter((m) => m.t === "add").map((m) => m.item.itemId);
+    const adds = socket.sent.filter((m: any) => m.t === "add").map((m: any) => m.item.itemId);
     expect(adds).toEqual(["today", "older"]);
     const unsyncedCalls = mocks.invoke.mock.calls.filter(([cmd]) => cmd === "clipboard_unsynced").length;
     expect(unsyncedCalls).toBeLessThanOrEqual(3);
@@ -108,7 +108,7 @@ describe("a relay that started a new store", () => {
     expect(socket.sent[0]).toEqual({ t: "hello", since: 7496 });
     socket.message({ t: "synced", rev: 7496, head: 2719 });
     await flush();
-    expect(socket.sent.at(-1)).toEqual({ t: "hello", since: 0 });
+    expect(socket.sent[socket.sent.length - 1]).toEqual({ t: "hello", since: 0 });
     expect(localStorage.getItem("gt.clip.rev.space")).toBe("0");
   });
 
@@ -119,7 +119,7 @@ describe("a relay that started a new store", () => {
     await flush();
     socket.message({ t: "item", itemId: "x", rev: 2720, kind: "text", textCipher: "hi", deviceId: "phone" });
     await flush();
-    expect(socket.sent.some((m) => m.t === "hello" && m.since === 0)).toBe(true);
+    expect(socket.sent.some((m: any) => m.t === "hello" && m.since === 0)).toBe(true);
     expect(mocks.invoke.mock.calls.some(([cmd, a]) => cmd === "clipboard_add" && a.input.id === "x")).toBe(true);
   });
 
