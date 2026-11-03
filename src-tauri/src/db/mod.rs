@@ -30,12 +30,15 @@ pub fn init_pool(db_path: &Path) -> AppResult<DbPool> {
         c.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
-        )
+             PRAGMA foreign_keys = ON;",
+        )?;
+        // Same 5 s budget as `busy_timeout`, but a long wait leaves a line in
+        // ui-stalls.log naming the thread that waited.
+        c.busy_handler(Some(busy_wait as fn(i32) -> bool))
     });
     let pool = Pool::builder()
         .max_size(6)
+        .event_handler(Box::new(SlowCheckout))
         .build(manager)
         .map_err(|e| crate::error::AppError::msg(e.to_string()))?;
 
@@ -43,7 +46,62 @@ pub fn init_pool(db_path: &Path) -> AppResult<DbPool> {
         let conn = pool.get()?;
         run_migrations(&conn)?;
     }
+    let _ = settings::protect_stored_secrets(&pool);
     Ok(pool)
+}
+
+/// Commands that took seconds in the live app (list_games 2 s, set_setting 3–5 s)
+/// run in milliseconds on the same data (see perf_real_db), so the time went to
+/// waiting: for one of the pool's connections or for SQLite's write lock. These
+/// two hooks put any such wait in ui-stalls.log with the thread that waited.
+#[derive(Debug)]
+struct SlowCheckout;
+
+impl r2d2::HandleEvent for SlowCheckout {
+    fn handle_checkout(&self, event: r2d2::event::CheckoutEvent) {
+        if event.duration() >= std::time::Duration::from_millis(250) {
+            crate::uistall::note(&format!(
+                "db: waited {} ms for a pooled connection ({})",
+                event.duration().as_millis(),
+                thread_label()
+            ));
+        }
+    }
+
+    fn handle_timeout(&self, event: r2d2::event::TimeoutEvent) {
+        crate::uistall::note(&format!(
+            "db: no pooled connection after {} ms ({})",
+            event.timeout().as_millis(),
+            thread_label()
+        ));
+    }
+}
+
+/// SQLite's own busy-wait schedule (sqliteDefaultBusyCallback), 5 s in all.
+fn busy_wait(attempt: i32) -> bool {
+    const DELAYS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+    const BUDGET_MS: u64 = 5000;
+    let n = attempt.max(0) as usize;
+    let waited: u64 = if n < DELAYS.len() {
+        DELAYS[..n].iter().sum()
+    } else {
+        DELAYS.iter().sum::<u64>() + (n - DELAYS.len()) as u64 * 100
+    };
+    let delay = DELAYS.get(n).copied().unwrap_or(100);
+    if waited >= BUDGET_MS {
+        crate::uistall::note(&format!("db: gave up on a locked database after {waited} ms ({})", thread_label()));
+        return false;
+    }
+    if waited < 1000 && waited + delay >= 1000 {
+        crate::uistall::note(&format!("db: waiting over 1 s for a locked database ({})", thread_label()));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(delay));
+    true
+}
+
+fn thread_label() -> String {
+    let t = std::thread::current();
+    t.name().map(str::to_string).unwrap_or_else(|| format!("{:?}", t.id()))
 }
 
 fn user_version(conn: &rusqlite::Connection) -> AppResult<i64> {

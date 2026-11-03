@@ -32,6 +32,11 @@ pub fn leave() {
     }
 }
 
+/// Append a line from anywhere in the process (database waits, for one).
+pub fn note(line: &str) {
+    write(line);
+}
+
 fn write(line: &str) {
     use std::io::Write;
     let path = crate::hostproc::data_dir().join("ui-stalls.log");

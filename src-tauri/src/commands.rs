@@ -124,13 +124,15 @@ pub fn share_session_finish(state: State<AppState>, session: shares::ShareDownlo
 // ---------- games ----------
 
 #[tauri::command]
-pub fn list_games(state: State<AppState>) -> AppResult<Vec<GameDto>> {
-    games::list(&state.pool)
+pub async fn list_games(state: State<'_, AppState>) -> AppResult<Vec<GameDto>> {
+    let pool = state.pool.clone();
+    run_blocking(move || games::list(&pool)).await
 }
 
 #[tauri::command]
-pub fn get_game(state: State<AppState>, id: String) -> AppResult<Option<GameDto>> {
-    games::get(&state.pool, &id)
+pub async fn get_game(state: State<'_, AppState>, id: String) -> AppResult<Option<GameDto>> {
+    let pool = state.pool.clone();
+    run_blocking(move || games::get(&pool, &id)).await
 }
 
 #[tauri::command]
@@ -916,52 +918,63 @@ pub fn delete_screenshot(state: State<AppState>, id: String) -> AppResult<()> {
 // ---------- sessions & analytics ----------
 
 #[tauri::command]
-pub fn list_sessions(state: State<AppState>, filter: SessionFilter) -> AppResult<Vec<SessionDto>> {
-    sessions::list(&state.pool, &filter)
+pub async fn list_sessions(state: State<'_, AppState>, filter: SessionFilter) -> AppResult<Vec<SessionDto>> {
+    let pool = state.pool.clone();
+    run_blocking(move || sessions::list(&pool, &filter)).await
 }
 
 #[tauri::command]
-pub fn dashboard(state: State<AppState>) -> AppResult<Dashboard> {
-    stats::dashboard(&state.pool)
+pub async fn dashboard(state: State<'_, AppState>) -> AppResult<Dashboard> {
+    let pool = state.pool.clone();
+    run_blocking(move || stats::dashboard(&pool)).await
 }
 
 #[tauri::command]
-pub fn apps_overview(state: State<AppState>) -> AppResult<AppsOverview> {
-    stats::apps_overview(&state.pool)
+pub async fn apps_overview(state: State<'_, AppState>) -> AppResult<AppsOverview> {
+    let pool = state.pool.clone();
+    run_blocking(move || stats::apps_overview(&pool)).await
 }
 
 #[tauri::command]
-pub fn heatmap(
-    state: State<AppState>,
+pub async fn heatmap(
+    state: State<'_, AppState>,
     days: i64,
     kind: Option<String>,
 ) -> AppResult<Vec<DayValue>> {
-    stats::heatmap(&state.pool, days.clamp(7, 400), kind.as_deref())
+    let pool = state.pool.clone();
+    run_blocking(move || stats::heatmap(&pool, days.clamp(7, 400), kind.as_deref())).await
 }
 
 #[tauri::command]
-pub fn hour_of_day(state: State<AppState>, kind: Option<String>) -> AppResult<Vec<i64>> {
-    stats::hour_of_day(&state.pool, kind.as_deref())
+pub async fn hour_of_day(state: State<'_, AppState>, kind: Option<String>) -> AppResult<Vec<i64>> {
+    let pool = state.pool.clone();
+    run_blocking(move || stats::hour_of_day(&pool, kind.as_deref())).await
 }
 
 #[tauri::command]
-pub fn catalog_analytics(state: State<AppState>) -> AppResult<CatalogAnalytics> {
-    stats::catalog_analytics(&state.pool)
+pub async fn catalog_analytics(state: State<'_, AppState>) -> AppResult<CatalogAnalytics> {
+    let pool = state.pool.clone();
+    run_blocking(move || stats::catalog_analytics(&pool)).await
 }
 
 #[tauri::command]
-pub fn insights(
-    state: State<AppState>,
+pub async fn insights(
+    state: State<'_, AppState>,
     year: Option<i64>,
     kind: Option<String>,
 ) -> AppResult<Insights> {
-    let y = year.unwrap_or_else(|| chrono::Local::now().year() as i64);
-    stats::insights(&state.pool, y, kind.as_deref())
+    let pool = state.pool.clone();
+    run_blocking(move || {
+        let y = year.unwrap_or_else(|| chrono::Local::now().year() as i64);
+        stats::insights(&pool, y, kind.as_deref())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn tag_analytics(state: State<AppState>) -> AppResult<Vec<TagStat>> {
-    stats::tag_analytics(&state.pool)
+pub async fn tag_analytics(state: State<'_, AppState>) -> AppResult<Vec<TagStat>> {
+    let pool = state.pool.clone();
+    run_blocking(move || stats::tag_analytics(&pool)).await
 }
 
 #[tauri::command]
@@ -1099,16 +1112,20 @@ pub fn system_live(state: State<AppState>) -> system::SystemLive {
 }
 
 #[tauri::command]
-pub fn system_history(state: State<AppState>, minutes: i64) -> AppResult<system::SystemHistory> {
-    system::history(&state.pool, &state.sys, minutes)
+pub async fn system_history(state: State<'_, AppState>, minutes: i64) -> AppResult<system::SystemHistory> {
+    let pool = state.pool.clone();
+    let sys = state.sys.clone();
+    run_blocking(move || system::history(&pool, &sys, minutes)).await
 }
 
 #[tauri::command]
-pub fn system_app_history(
-    state: State<AppState>,
+pub async fn system_app_history(
+    state: State<'_, AppState>,
     minutes: i64,
 ) -> AppResult<system::AppUsageHistory> {
-    system::app_history(&state.pool, &state.sys, minutes)
+    let pool = state.pool.clone();
+    let sys = state.sys.clone();
+    run_blocking(move || system::app_history(&pool, &sys, minutes)).await
 }
 
 // ---------- autostart (elevated, via scheduled task) ----------
@@ -1680,51 +1697,58 @@ pub fn local_launcher_import(
 // ---------- media listening (SMTC) + global foreground log ----------
 
 #[tauri::command]
-pub fn media_overview(state: State<AppState>) -> AppResult<crate::db::music::MusicOverview> {
-    crate::db::music::overview(&state.pool)
+pub async fn media_overview(state: State<'_, AppState>) -> AppResult<crate::db::music::MusicOverview> {
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::music::overview(&pool)).await
 }
 
 #[tauri::command]
-pub fn media_heatmap(
-    state: State<AppState>,
+pub async fn media_heatmap(
+    state: State<'_, AppState>,
     days: Option<i64>,
 ) -> AppResult<Vec<crate::db::stats::DayValue>> {
-    crate::db::music::heatmap(&state.pool, days.unwrap_or(140).clamp(7, 800))
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::music::heatmap(&pool, days.unwrap_or(140).clamp(7, 800))).await
 }
 
 #[tauri::command]
-pub fn media_hour_of_day(state: State<AppState>) -> AppResult<Vec<i64>> {
-    crate::db::music::hour_of_day(&state.pool)
+pub async fn media_hour_of_day(state: State<'_, AppState>) -> AppResult<Vec<i64>> {
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::music::hour_of_day(&pool)).await
 }
 
 #[tauri::command]
-pub fn media_top(
-    state: State<AppState>,
+pub async fn media_top(
+    state: State<'_, AppState>,
     limit: Option<i64>,
 ) -> AppResult<crate::db::music::MusicTop> {
-    crate::db::music::top(&state.pool, limit.unwrap_or(10))
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::music::top(&pool, limit.unwrap_or(10))).await
 }
 
 #[tauri::command]
-pub fn media_insights(state: State<AppState>) -> AppResult<crate::db::music::MusicInsights> {
-    crate::db::music::insights(&state.pool)
+pub async fn media_insights(state: State<'_, AppState>) -> AppResult<crate::db::music::MusicInsights> {
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::music::insights(&pool)).await
 }
 
 #[tauri::command]
-pub fn media_timeline(
-    state: State<AppState>,
+pub async fn media_timeline(
+    state: State<'_, AppState>,
     from_utc: Option<String>,
     to_utc: Option<String>,
 ) -> AppResult<Vec<crate::db::media::MediaPlayDto>> {
-    crate::db::media::list_plays(&state.pool, from_utc.as_deref(), to_utc.as_deref())
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::media::list_plays(&pool, from_utc.as_deref(), to_utc.as_deref())).await
 }
 
 #[tauri::command]
-pub fn media_recent(
-    state: State<AppState>,
+pub async fn media_recent(
+    state: State<'_, AppState>,
     limit: Option<i64>,
 ) -> AppResult<Vec<crate::db::media::MediaPlayDto>> {
-    crate::db::media::recent(&state.pool, limit.unwrap_or(12).clamp(1, 100))
+    let pool = state.pool.clone();
+    run_blocking(move || crate::db::media::recent(&pool, limit.unwrap_or(12).clamp(1, 100))).await
 }
 
 #[derive(serde::Deserialize)]

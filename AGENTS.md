@@ -2233,3 +2233,61 @@ GT_NOTES_TEST_DATA=<scratch folder> cargo run --example notes_shell -- --notes-s
 - `--notes-supervise-test` runs the supervisor alone, so killing the shell shows a real restart.
 - Debug builds load the page from Vite. Add `--features tauri/custom-protocol` to test the real
   bundle and its Content Security Policy.
+
+---
+
+## 23. Always-on cost and responsiveness pass (3.9.127) — do not regress
+
+Measured on the real 215 MB database (677k `app_samples`, 154k `system_samples`, 63k
+`foreground_spans`). `src-tauri/src/perf_real_db.rs` times every read path the pages wait on, on
+a cold SQLite page cache like the live tracker leaves it:
+`set GT_PERF_DB=<copy of gametracker.db>` then
+`cargo test --release --lib perf_real_db -- --ignored --nocapture` (it copies the file first).
+
+### What the 2 s read burst was
+`sessions` rows carry their focus/activity JSON inline (~8 KB each), so any query that walked the
+table read about one page per row. Every tracker tick ran `today_totals_kind` twice (1,088 pages,
+4.3 MB) and the jukebox `accrue_open_for_source` scanned `media_plays` (596 pages): ~1,690 page
+reads per 2 s, which is the 1,350 ops / 5.5 MB per 2 s Windows showed for gametracker.exe.
+- **Migration 30** adds covering/partial indexes (`idx_sessions_totals`, `idx_sessions_seen`,
+  `idx_sessions_open`, `idx_games_kind_id`, `idx_media_open`, `idx_media_seen`, `idx_fg_open`,
+  `idx_fg_seen`): ~95 page reads per tick. `db::tests::migration_30_indexes_the_hot_paths` checks
+  the plans; if you add a per-tick or startup query, add it there.
+- `record_focus_tick` read the whole focus JSON of every open session every tick; the tracker
+  now remembers the last state per session and calls it only on a change.
+- `games_meta.rev` (bumped by triggers, like `clipboard_meta.rev`) lets the tracker skip
+  `match_candidates` (332 pages of wide `games` rows) unless a game changed, in any process.
+- Never write a per-tick query that touches `sessions` without an index that covers it.
+
+### Startup write-lock stalls
+`close_orphans` and the 420-day prunes were full scans of `sessions`/`media_plays`/
+`foreground_spans` (35 MB, cold at boot) **while holding the write lock**, so the first
+`set_setting` after every launch waited 3–5 s in both the app and the remote-host process. The
+partial `*_open` and `*_seen` indexes make them index probes.
+
+### History charts
+A Systems page range of 1 week sent 38k system rows + 161k per-app rows every 4–8 s and drew
+them as SVG. `system::history`/`app_history` now average windows longer than 6 h into buckets
+(`history_bucket_secs`, ≤ 720 timestamps) and add just the newest live sample; the page polls
+long windows once a minute. Old samples are compacted on disk too (`compact_samples`: raw for
+`RAW_DAYS` = 2, then 5-minute averages, one UTC day per transaction, run at start and hourly).
+
+### Waiting, not working
+In isolation `list_games` takes ~10 ms and `set_setting` < 1 ms, while ui-stalls.log showed 2 s
+and 3–5 s in the live app. Heavy read commands are now `async` + `run_blocking`, and pool
+checkouts over 250 ms and SQLite lock waits over 1 s are written to ui-stalls.log with the
+waiting thread's name (`db::SlowCheckout`, `db::busy_wait`). Read those lines before guessing.
+
+### sensorbridge
+LibreHardwareMonitorLib 0.9.6: no WinRing0 (CVE-2020-14979); CPU/SuperIO/SMBus sensors need the
+separately installed PawnIO driver, else they are null. The sidecar deletes the old
+`R0sensorbridge` service and `sensorbridge.sys` on start, never updates spinning disks (SMART
+spun up the SMR data drives every 2–10 s) and reads DIMM temperatures once a minute. Rebuild:
+`dotnet publish -c Release -o publish_out` in `src-tauri/sensorbridge`, then copy
+`publish_out/sensorbridge.exe` to `src-tauri/binaries/sensorbridge-x86_64-pc-windows-msvc.exe`.
+
+### Secrets
+`clipboard_sarvam_key` is stored DPAPI-encrypted (`secret.rs`, `settings::SECRETS`); the app
+reads it in clear through `settings::get/all`. A clear-text value from an older version is
+encrypted at startup with `secure_delete` on. Add any future credential setting to `SECRETS`,
+and never log or print one.

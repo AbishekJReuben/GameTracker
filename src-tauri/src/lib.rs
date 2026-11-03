@@ -20,6 +20,7 @@ mod metadata;
 mod notes;
 #[cfg(windows)]
 mod registry;
+mod secret;
 mod remote;
 mod state;
 mod steam;

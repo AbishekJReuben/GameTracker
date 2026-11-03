@@ -515,6 +515,116 @@ pub(crate) fn history_bucket_secs(minutes: i64) -> Option<i64> {
     (secs > 30).then_some(secs)
 }
 
+/// Running mean of a reading that may be missing: None until one arrives.
+#[derive(Default, Clone, Copy)]
+struct Mean {
+    sum: f64,
+    n: u32,
+}
+
+impl Mean {
+    fn add(&mut self, v: Option<f64>) {
+        if let Some(v) = v {
+            self.sum += v;
+            self.n += 1;
+        }
+    }
+    fn get(&self) -> Option<f64> {
+        (self.n > 0).then(|| self.sum / self.n as f64)
+    }
+}
+
+/// Start of the `secs`-wide bucket holding an RFC3339 `ts`, as epoch seconds.
+fn bucket_of(ts: &str, secs: i64) -> Option<i64> {
+    let t = chrono::DateTime::parse_from_rfc3339(ts).ok()?.timestamp();
+    Some(t - t.rem_euclid(secs))
+}
+
+/// Same format as the compacted rows (BUCKET_TS).
+fn bucket_ts(start: i64) -> String {
+    chrono::DateTime::from_timestamp(start, 0)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
+        .unwrap_or_default()
+}
+
+/// Average ts-ordered system rows into `secs`-wide buckets.
+fn bucket_system(rows: Vec<HistoryPoint>, secs: i64) -> Vec<HistoryPoint> {
+    let mut out = Vec::new();
+    let mut cur: Option<(i64, [Mean; 7])> = None;
+    let flush = |out: &mut Vec<HistoryPoint>, (start, m): (i64, [Mean; 7])| {
+        out.push(HistoryPoint {
+            ts: bucket_ts(start),
+            cpu: m[0].get().unwrap_or(0.0),
+            cpu_temp: m[1].get(),
+            gpu: m[2].get(),
+            gpu_temp: m[3].get(),
+            ram: m[4].get().unwrap_or(0.0),
+            ram_temp: m[5].get(),
+            disk: m[6].get(),
+        })
+    };
+    for p in rows {
+        let Some(start) = bucket_of(&p.ts, secs) else { continue };
+        if cur.as_ref().map(|(s, _)| *s != start).unwrap_or(true) {
+            if let Some(done) = cur.take() {
+                flush(&mut out, done);
+            }
+            cur = Some((start, [Mean::default(); 7]));
+        }
+        let m = &mut cur.as_mut().unwrap().1;
+        for (i, v) in [Some(p.cpu), p.cpu_temp, p.gpu, p.gpu_temp, Some(p.ram), p.ram_temp, p.disk].into_iter().enumerate() {
+            m[i].add(v);
+        }
+    }
+    if let Some(done) = cur {
+        flush(&mut out, done);
+    }
+    out
+}
+
+/// Average ts-ordered per-app rows into `secs`-wide buckets, per app.
+fn bucket_apps(rows: Vec<AppUsagePoint>, secs: i64) -> Vec<AppUsagePoint> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut apps: Vec<(String, [Mean; 3])> = Vec::new();
+    let flush = |out: &mut Vec<AppUsagePoint>, start: i64, apps: &mut Vec<(String, [Mean; 3])>| {
+        let ts = bucket_ts(start);
+        for (game_id, m) in apps.drain(..) {
+            out.push(AppUsagePoint {
+                ts: ts.clone(),
+                game_id,
+                cpu: m[0].get().unwrap_or(0.0),
+                ram_mb: m[1].get().unwrap_or(0.0),
+                gpu: m[2].get(),
+            });
+        }
+    };
+    for p in rows {
+        let Some(b) = bucket_of(&p.ts, secs) else { continue };
+        if start != Some(b) {
+            if let Some(s) = start {
+                flush(&mut out, s, &mut apps);
+            }
+            start = Some(b);
+        }
+        let i = match apps.iter().position(|(g, _)| *g == p.game_id) {
+            Some(i) => i,
+            None => {
+                apps.push((p.game_id, [Mean::default(); 3]));
+                apps.len() - 1
+            }
+        };
+        let m = &mut apps[i].1;
+        m[0].add(Some(p.cpu));
+        m[1].add(Some(p.ram_mb));
+        m[2].add(p.gpu);
+    }
+    if let Some(s) = start {
+        flush(&mut out, s, &mut apps);
+    }
+    out
+}
+
 /// Average samples older than RAW_DAYS into COMPACT_SECS buckets, one UTC day per
 /// transaction so the write lock is never held for long and a power cut loses at
 /// most the day in flight (its transaction rolls back; the next run redoes it).
@@ -606,22 +716,16 @@ pub fn history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppResult<
             disk: r.get(7)?,
         })
     }
-    let mut points: Vec<HistoryPoint> = match bucket {
-        Some(secs) => conn
-            .prepare(&format!(
-                "SELECT {BUCKET_TS} AS b, AVG(cpu), AVG(cpu_temp), AVG(gpu), AVG(gpu_temp), AVG(ram), AVG(ram_temp), AVG(disk)
-                 FROM system_samples WHERE ts >= ?1 GROUP BY b ORDER BY b ASC"
-            ))?
-            .query_map(rusqlite::params![&from, secs], point)?
-            .collect::<Result<Vec<_>, _>>()?,
-        None => conn
-            .prepare(
-                "SELECT ts, cpu, cpu_temp, gpu, gpu_temp, ram, ram_temp, disk
-                 FROM system_samples WHERE ts >= ?1 ORDER BY ts ASC",
-            )?
-            .query_map([&from], point)?
-            .collect::<Result<Vec<_>, _>>()?,
-    };
+    let mut points: Vec<HistoryPoint> = conn
+        .prepare(
+            "SELECT ts, cpu, cpu_temp, gpu, gpu_temp, ram, ram_temp, disk
+             FROM system_samples WHERE ts >= ?1 ORDER BY ts ASC",
+        )?
+        .query_map([&from], point)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(secs) = bucket {
+        points = bucket_system(points, secs);
+    }
 
     // Fold in the most recent live samples so the tail of the chart is current
     // even between persistence writes (which only happen every ~16s). A bucketed
@@ -757,22 +861,16 @@ pub fn app_history(pool: &DbPool, shared: &SystemShared, minutes: i64) -> AppRes
             gpu: r.get(4)?,
         })
     }
-    let mut points: Vec<AppUsagePoint> = match bucket {
-        Some(secs) => conn
-            .prepare(&format!(
-                "SELECT {BUCKET_TS} AS b, game_id, AVG(cpu), AVG(ram_mb), AVG(gpu)
-                 FROM app_samples WHERE ts >= ?1 GROUP BY b, game_id ORDER BY b ASC"
-            ))?
-            .query_map(rusqlite::params![&from, secs], point)?
-            .collect::<Result<Vec<_>, _>>()?,
-        None => conn
-            .prepare(
-                "SELECT ts, game_id, cpu, ram_mb, gpu FROM app_samples
-                 WHERE ts >= ?1 ORDER BY ts ASC",
-            )?
-            .query_map([&from], point)?
-            .collect::<Result<Vec<_>, _>>()?,
-    };
+    let mut points: Vec<AppUsagePoint> = conn
+        .prepare(
+            "SELECT ts, game_id, cpu, ram_mb, gpu FROM app_samples
+             WHERE ts >= ?1 ORDER BY ts ASC",
+        )?
+        .query_map([&from], point)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(secs) = bucket {
+        points = bucket_apps(points, secs);
+    }
 
     // Fold in the live tail so the chart tip stays current (2s) between persists,
     // exactly like `history()` does for the system-usage chart.
@@ -875,6 +973,52 @@ mod tests {
             let secs = history_bucket_secs(minutes).unwrap();
             assert!(minutes * 60 / secs <= HISTORY_POINTS);
         }
+    }
+
+    #[test]
+    fn bucketing_averages_each_window_and_keeps_missing_readings_missing() {
+        let p = |ts: &str, cpu: f64, gpu: Option<f64>| HistoryPoint {
+            ts: ts.into(),
+            cpu,
+            cpu_temp: None,
+            gpu,
+            gpu_temp: None,
+            ram: 50.0,
+            ram_temp: None,
+            disk: None,
+        };
+        let out = bucket_system(
+            vec![
+                p("2026-11-03T10:00:01.5+00:00", 10.0, Some(1.0)),
+                p("2026-11-03T10:01:59.999999+00:00", 30.0, None),
+                p("2026-11-03T10:02:00+00:00", 7.0, None),
+            ],
+            120,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].ts, "2026-11-03T10:00:00+00:00");
+        assert_eq!((out[0].cpu, out[0].gpu), (20.0, Some(1.0)), "a gap doesn't count as 0");
+        assert_eq!((out[1].ts.as_str(), out[1].cpu, out[1].gpu), ("2026-11-03T10:02:00+00:00", 7.0, None));
+
+        let a = |ts: &str, g: &str, cpu: f64| AppUsagePoint { ts: ts.into(), game_id: g.into(), cpu, ram_mb: 100.0, gpu: None };
+        let out = bucket_apps(
+            vec![
+                a("2026-11-03T10:00:00+00:00", "x", 2.0),
+                a("2026-11-03T10:00:00+00:00", "y", 5.0),
+                a("2026-11-03T10:00:16+00:00", "x", 4.0),
+                a("2026-11-03T10:02:00+00:00", "y", 1.0),
+            ],
+            120,
+        );
+        let got: Vec<(&str, &str, f64)> = out.iter().map(|p| (p.ts.as_str(), p.game_id.as_str(), p.cpu)).collect();
+        assert_eq!(
+            got,
+            [
+                ("2026-11-03T10:00:00+00:00", "x", 3.0),
+                ("2026-11-03T10:00:00+00:00", "y", 5.0),
+                ("2026-11-03T10:02:00+00:00", "y", 1.0)
+            ]
+        );
     }
 
     #[test]

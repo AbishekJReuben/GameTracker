@@ -1,5 +1,5 @@
 use crate::db::DbPool;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use std::collections::HashMap;
 
 /// (key, default) pairs. Defaults are seeded lazily on read.
@@ -89,6 +89,19 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("notes_hotkey", "Ctrl+Shift+Space"),
 ];
 
+/// Settings that hold a credential: stored DPAPI-encrypted (see `crate::secret`),
+/// handed out in clear to the app itself. Never log or print their values.
+const SECRETS: &[&str] = &["clipboard_sarvam_key"];
+
+fn reveal(key: &str, stored: String) -> String {
+    if SECRETS.contains(&key) && crate::secret::is_protected(&stored) {
+        // Encrypted by another Windows account (a copied database): treat as unset.
+        crate::secret::unprotect(&stored).unwrap_or_default()
+    } else {
+        stored
+    }
+}
+
 fn default_for(key: &str) -> Option<&'static str> {
     DEFAULTS.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
@@ -100,7 +113,7 @@ pub fn get(pool: &DbPool, key: &str) -> AppResult<Option<String>> {
             r.get(0)
         })
         .ok();
-    Ok(v.or_else(|| default_for(key).map(|s| s.to_string())))
+    Ok(v.map(|s| reveal(key, s)).or_else(|| default_for(key).map(|s| s.to_string())))
 }
 
 pub fn get_bool(pool: &DbPool, key: &str) -> AppResult<bool> {
@@ -116,6 +129,13 @@ pub fn get_i64(pool: &DbPool, key: &str, fallback: i64) -> AppResult<i64> {
 }
 
 pub fn set(pool: &DbPool, key: &str, value: &str) -> AppResult<()> {
+    let protected;
+    let value = if SECRETS.contains(&key) && !value.is_empty() {
+        protected = crate::secret::protect(value).ok_or_else(|| AppError::msg("Couldn't encrypt the key"))?;
+        protected.as_str()
+    } else {
+        value
+    };
     let conn = pool.get()?;
     conn.execute(
         "INSERT INTO settings(key, value) VALUES(?1, ?2)
@@ -136,9 +156,35 @@ pub fn all(pool: &DbPool) -> AppResult<HashMap<String, String>> {
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (k, v) = row?;
+        let v = reveal(&k, v);
         map.insert(k, v);
     }
     Ok(map)
+}
+
+/// Encrypt credentials that versions before 3.9.127 stored in clear text. A no-op
+/// once done. secure_delete zeroes the old value's bytes in the page instead of
+/// leaving them in free space; the checkpoint moves the page out of the WAL.
+pub fn protect_stored_secrets(pool: &DbPool) -> AppResult<()> {
+    let conn = pool.get()?;
+    for key in SECRETS {
+        let stored: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .ok();
+        let Some(plain) = stored.filter(|s| !s.is_empty() && !crate::secret::is_protected(s)) else {
+            continue;
+        };
+        let protected = crate::secret::protect(&plain).ok_or_else(|| AppError::msg("Couldn't encrypt the key"))?;
+        conn.execute_batch("PRAGMA secure_delete = ON;")?;
+        let updated = conn.execute(
+            "UPDATE settings SET value = ?1 WHERE key = ?2",
+            rusqlite::params![protected, key],
+        );
+        conn.execute_batch("PRAGMA secure_delete = OFF;")?;
+        updated?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    Ok(())
 }
 
 /// Only companion presentation settings may cross a remote transport boundary.
@@ -149,4 +195,64 @@ pub fn public_remote(pool: &DbPool) -> AppResult<HashMap<String, String>> {
     let mut map = all(pool)?;
     map.retain(|key, _| allowed.contains(key));
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_pool() -> DbPool {
+        let path = std::env::temp_dir().join(format!("gt_settings_{}.db", uuid::Uuid::new_v4()));
+        crate::db::init_pool(&path).expect("pool")
+    }
+
+    fn raw(pool: &DbPool, key: &str) -> String {
+        pool.get()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .unwrap()
+    }
+
+    const KEY: &str = "sk_test_placeholder_0000";
+
+    #[test]
+    fn credentials_are_encrypted_at_rest_and_clear_to_the_app() {
+        let pool = test_pool();
+        set(&pool, "clipboard_sarvam_key", KEY).unwrap();
+        let stored = raw(&pool, "clipboard_sarvam_key");
+        assert!(crate::secret::is_protected(&stored));
+        assert!(!stored.contains(KEY));
+        assert_eq!(get(&pool, "clipboard_sarvam_key").unwrap().as_deref(), Some(KEY));
+        assert_eq!(all(&pool).unwrap().get("clipboard_sarvam_key").map(String::as_str), Some(KEY));
+        // Clearing it stores an empty value, not an encrypted empty string.
+        set(&pool, "clipboard_sarvam_key", "").unwrap();
+        assert_eq!(raw(&pool, "clipboard_sarvam_key"), "");
+        // Ordinary settings are untouched.
+        set(&pool, "theme", "dark").unwrap();
+        assert_eq!(raw(&pool, "theme"), "dark");
+    }
+
+    #[test]
+    fn a_clear_text_key_from_an_older_version_is_encrypted_at_startup() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute("INSERT INTO settings(key, value) VALUES('clipboard_sarvam_key', ?1)", [KEY])
+            .unwrap();
+        protect_stored_secrets(&pool).unwrap();
+        assert!(crate::secret::is_protected(&raw(&pool, "clipboard_sarvam_key")));
+        assert_eq!(get(&pool, "clipboard_sarvam_key").unwrap().as_deref(), Some(KEY));
+        protect_stored_secrets(&pool).unwrap(); // a second start changes nothing
+        assert_eq!(get(&pool, "clipboard_sarvam_key").unwrap().as_deref(), Some(KEY));
+    }
+
+    #[test]
+    fn a_key_encrypted_elsewhere_reads_as_unset() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute("INSERT INTO settings(key, value) VALUES('clipboard_sarvam_key', 'dpapi:AAAA')", [])
+            .unwrap();
+        assert_eq!(get(&pool, "clipboard_sarvam_key").unwrap().as_deref(), Some(""));
+    }
 }
