@@ -111,6 +111,29 @@ let startWithSecret: ((secret: string) => Promise<void>) | null = null;
 // Last error from provisioning the native Android service (surfaced in
 // diagnostics so a JNI/bridge failure is visible instead of silent).
 let nativeStartError = "";
+// Changes made while the relay link is down, sent in order once it is back.
+// They used to be dropped: a note copied on the phone with the socket closed
+// never reached the PC. Text-only messages are kept across restarts (they are
+// ciphertext); an image's encrypted blob waits in memory and is uploaded first.
+type Outgoing = { msg: object; blob?: { id: string; cipher: Uint8Array } };
+let outgoing: Outgoing[] = [];
+let flushingOutgoing = false;
+const outgoingKey = () => `gt.clip.outgoing.${clipId}`;
+const saveOutgoing = () => {
+  if (!clipId) return;
+  try {
+    localStorage.setItem(outgoingKey(), JSON.stringify(outgoing.filter((o) => !o.blob).map((o) => o.msg)));
+  } catch {
+    /* storage full: the queue still lives in memory */
+  }
+};
+const loadOutgoing = () => {
+  try {
+    outgoing = (JSON.parse(localStorage.getItem(outgoingKey()) || "[]") as object[]).map((msg) => ({ msg }));
+  } catch {
+    outgoing = [];
+  }
+};
 
 function sortItems(map: Map<string, ClipItem>): ClipItem[] {
   return [...map.values()]
@@ -240,6 +263,30 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       return false;
     }
   };
+  const flushOutgoing = async () => {
+    if (flushingOutgoing) return;
+    flushingOutgoing = true;
+    try {
+      while (outgoing.length > 0 && ready()) {
+        const next = outgoing[0];
+        if (next.blob && !(await putBlob(next.blob.id, next.blob.cipher))) return; // retried on reconnect
+        if (!ready()) return;
+        ws!.send(JSON.stringify(next.msg));
+        outgoing.shift();
+        saveOutgoing();
+      }
+    } finally {
+      flushingOutgoing = false;
+    }
+  };
+
+  /** Send now, or as soon as the link is back. Order is kept. */
+  const send = (msg: object, blob?: Outgoing["blob"]) => {
+    outgoing.push({ msg, blob });
+    saveOutgoing();
+    void flushOutgoing();
+  };
+
   const handle = async (v: any, current: () => boolean) => {
     if (v.t === "synced") return;
     if (v.t !== "item" || !v.itemId || !key) return;
@@ -333,6 +380,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       // Full history on a cold start, incremental replay while this cache lives.
       // Never persist a cursor without persisting its corresponding history.
       sock.send(JSON.stringify({ t: "hello", since: lastRev }));
+      void flushOutgoing();
       clearInterval(ping);
       ping = setInterval(() => {
         if (current() && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ t: "ping" }));
@@ -344,6 +392,17 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         const notice = JSON.parse(ev.data as string);
         messageQueue = messageQueue.then(async () => {
           if (!current()) return;
+          // The relay's store was replaced (each new relay build opened an empty
+          // one, numbered from 1): replay it all instead of trusting our cursor.
+          const head = notice.t === "synced" ? notice.head : undefined;
+          const live = notice.t === "item" && !replaying ? Number(notice.rev) || 0 : 0;
+          if ((typeof head === "number" && head < lastRev) || (live > 0 && live < lastRev)) {
+            lastRev = 0;
+            replayRev = 0;
+            replaying = true;
+            sock.send(JSON.stringify({ t: "hello", since: 0 }));
+            if (typeof head === "number") return;
+          }
           await handle(notice, current);
           if (!current()) return;
           replayRev = Math.max(replayRev, Number(notice.rev) || 0);
@@ -404,6 +463,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     key = derived;
     clipId = space;
     activeSecret = secret;
+    loadOutgoing();
     set({ ready: true, deviceId: ensureDeviceId() });
     connect();
   };
@@ -411,7 +471,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
   const addLocal = async (item: ClipItem, cipherPayload: object) => {
     items.set(item.id, item);
     publish();
-    if (ready()) ws!.send(JSON.stringify({ t: "add", item: cipherPayload }));
+    send({ t: "add", item: cipherPayload });
   };
 
   // Bump an existing in-memory note to the top (fresh timestamp), appending the
@@ -422,10 +482,10 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       : (item.copies ?? []);
     items.set(item.id, { ...item, createdUtc: now, copies });
     publish();
-    if (!ready() || !key) return;
+    if (!key) return;
     if (item.kind === "image") {
-      ws!.send(
-        JSON.stringify({
+      send(
+        {
           t: "add",
           item: {
             itemId: item.id,
@@ -441,11 +501,11 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
             copies,
             hasBlob: true,
           },
-        }),
+        },
       );
     } else {
-      ws!.send(
-        JSON.stringify({
+      send(
+        {
           t: "add",
           item: {
             itemId: item.id,
@@ -462,7 +522,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
             textCipher: await encryptText(key, item.text ?? ""),
             hasBlob: false,
           },
-        }),
+        },
       );
     }
   };
@@ -605,8 +665,6 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       const id = crypto.randomUUID();
       const raw = b64ToBytes(dataUrl);
       const cipher = await encryptBytes(key, raw);
-      const ok = await putBlob(id, cipher);
-      if (!ok) return;
       const item: ClipItem = {
         id,
         kind: "image",
@@ -624,20 +682,28 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
         tags,
         copies: [now],
       };
-      await addLocal(item, {
-        itemId: id,
-        deviceId: item.deviceId,
-        deviceName: "Phone",
-        kind: "image",
-        mime: "image/png",
-        size: raw.length,
-        createdUtc: now,
-        pinned: false,
-        folder: tags[0] ?? "",
-        tags,
-        copies: [now],
-        hasBlob: true,
-      });
+      items.set(item.id, item);
+      publish();
+      send(
+        {
+          t: "add",
+          item: {
+            itemId: id,
+            deviceId: item.deviceId,
+            deviceName: "Phone",
+            kind: "image",
+            mime: "image/png",
+            size: raw.length,
+            createdUtc: now,
+            pinned: false,
+            folder: tags[0] ?? "",
+            tags,
+            copies: [now],
+            hasBlob: true,
+          },
+        },
+        { id, cipher },
+      );
     },
 
     // Edit bumps the note to the top (fresh timestamp) and re-uploads it, so every
@@ -655,7 +721,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       if (!cur) return;
       items.set(id, { ...cur, folder });
       publish();
-      if (ready()) ws!.send(JSON.stringify({ t: "folder", itemId: id, folder }));
+      send({ t: "folder", itemId: id, folder });
     },
 
     setTags: async (id, tags) => {
@@ -664,7 +730,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       const clean = [...new Set(tags.map((t) => t.trim()).filter(Boolean))];
       items.set(id, { ...cur, tags: clean, folder: clean[0] ?? "" });
       publish();
-      if (ready()) ws!.send(JSON.stringify({ t: "tags", itemId: id, tags: clean }));
+      send({ t: "tags", itemId: id, tags: clean });
     },
 
     createFolder: async (name) => {
@@ -678,23 +744,19 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       folderEntities.set(id, n);
       publish();
       const now = new Date().toISOString();
-      if (ready()) {
-        ws!.send(
-          JSON.stringify({
-            t: "add",
-            item: {
-              itemId: id,
-              deviceId: get().deviceId,
-              deviceName: "Phone",
-              kind: "folder",
-              size: 0,
-              createdUtc: now,
-              folder: n,
-              hasBlob: false,
-            },
-          }),
-        );
-      }
+      send({
+        t: "add",
+        item: {
+          itemId: id,
+          deviceId: get().deviceId,
+          deviceName: "Phone",
+          kind: "folder",
+          size: 0,
+          createdUtc: now,
+          folder: n,
+          hasBlob: false,
+        },
+      });
     },
 
     deleteFolder: async (name) => {
@@ -703,14 +765,14 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       for (const it of [...items.values()]) {
         if ((it.folder ?? "").toLowerCase() === n && (it.kind as string) !== "folder") {
           items.set(it.id, { ...it, folder: "" });
-          if (ready()) ws!.send(JSON.stringify({ t: "folder", itemId: it.id, folder: "" }));
+          send({ t: "folder", itemId: it.id, folder: "" });
         }
       }
       // Tombstone matching folder entities.
       for (const [id, v] of [...folderEntities.entries()]) {
         if (v.toLowerCase() === n) {
           folderEntities.delete(id);
-          if (ready()) ws!.send(JSON.stringify({ t: "delete", itemId: id }));
+          send({ t: "delete", itemId: id });
         }
       }
       publish();
@@ -729,7 +791,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       releaseImage(id);
       items.delete(id);
       set({ items: sortItems(items) });
-      if (ready()) ws!.send(JSON.stringify({ t: "delete", itemId: id }));
+      send({ t: "delete", itemId: id });
     },
 
     togglePin: async (item) => {
@@ -737,7 +799,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       const cur = items.get(item.id);
       if (cur) items.set(item.id, { ...cur, pinned });
       set({ items: sortItems(items) });
-      if (ready()) ws!.send(JSON.stringify({ t: "pin", itemId: item.id, pinned }));
+      send({ t: "pin", itemId: item.id, pinned });
     },
 
     // Read the current OS clipboard (Android: JNI; web: navigator). Returns text.

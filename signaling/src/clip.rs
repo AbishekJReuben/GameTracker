@@ -233,6 +233,23 @@ impl ClipState {
         Some(json!({ "t":"item", "rev":rev, "itemId":item_id, "tags":tags, "folder":folder }))
     }
 
+    /// Newest revision this clip space has (0 when empty). Sent with `synced` so
+    /// a device whose cursor is above it knows the store was replaced and replays
+    /// from 0: every relay build used to open a fresh, renumbered store, and a
+    /// device remembering rev 7496 then heard nothing from one that topped out at
+    /// 2719, missing every copy it wasn't online for.
+    fn head(&self, clip_id: &str) -> i64 {
+        let Ok(conn) = self.db.lock() else {
+            return 0;
+        };
+        conn.query_row(
+            "SELECT COALESCE(MAX(rev), 0) FROM items WHERE clip_id=?1",
+            [clip_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
     /// Every change with `rev > since`, oldest first (the catch-up burst).
     fn items_since(&self, clip_id: &str, since: i64) -> Vec<serde_json::Value> {
         let Ok(conn) = self.db.lock() else {
@@ -418,8 +435,9 @@ pub async fn handle(socket: WebSocket, clip_id: String, state: Arc<ClipState>) {
                     }
                     let _ = tx.send(Message::Text(it.to_string()));
                 }
+                let head = state.head(&clip_id);
                 let _ = tx.send(Message::Text(
-                    json!({ "t":"synced", "rev":max_rev }).to_string(),
+                    json!({ "t":"synced", "rev":max_rev, "head":head }).to_string(),
                 ));
             }
             Some("add") => {
@@ -519,6 +537,18 @@ mod tests {
         assert_eq!(newer[0].get("itemId").unwrap().as_str().unwrap(), "b");
         // Other clip spaces see nothing.
         assert!(s.items_since("other", 0).is_empty());
+    }
+
+    #[test]
+    fn head_is_the_newest_revision_of_the_space() {
+        let s = temp_state("head");
+        assert_eq!(s.head("clip1"), 0, "an empty store says so");
+        s.upsert("clip1", &text_item("a", "dev1")).unwrap();
+        let n = s.upsert("clip1", &text_item("b", "dev1")).unwrap();
+        s.upsert("other", &text_item("c", "dev1")).unwrap();
+        assert_eq!(s.head("clip1"), n.get("rev").unwrap().as_i64().unwrap());
+        // A device that remembers more than the store holds can tell it was replaced.
+        assert!(s.head("clip1") < 7496);
     }
 
     #[test]

@@ -2291,3 +2291,36 @@ spun up the SMR data drives every 2–10 s) and reads DIMM temperatures once a m
 reads it in clear through `settings::get/all`. A clear-text value from an older version is
 encrypted at startup with `secure_delete` on. Add any future credential setting to `SECRETS`,
 and never log or print one.
+
+---
+
+## 24. Notes sync that can't stall or lose copies (3.9.128) — do not regress
+
+What the user saw: the phone stopped getting new copies. Measured on the real data: 373 notes
+unsynced (every copy since 30 Oct), the relay's newest item 30 Oct 13:41 UTC, and the PC's cursor
+(`gt.clip.rev.*`) at rev 7496 while the live relay store topped out at 2719.
+
+- **Every relay build opened a new, empty store.** `Start-DiscoveryPublic.ps1` runs each build from
+  `signaling/offroader-runtime/discovery-bin/<sha256>/`, and the relay keeps `clip-data` beside its
+  exe, so revisions restarted at 1 per build and a device with a higher cursor got nothing on
+  catch-up. The launcher now sets `CLIP_DATA_DIR=signaling/offroader-runtime/clip-data` (seeded once
+  from the newest per-build store). Never let the relay's data follow the binary again.
+- **Renumbered stores are detected on both clients**: `synced` carries the relay's `head`
+  (relay ≥ 3.9.128), and a live item with a revision below the cursor means the same thing. Either
+  way the client replays from 0; the PC asks `clipboard_known` first so it doesn't re-download images
+  it has.
+- **The PC uploads newest first, by cursor** (`list_unsynced(before_utc)`, partial index
+  `idx_clip_unsynced`, migration 31). It used to re-fetch the same 100 oldest items for as long as
+  they failed, so 100 stuck items stopped every newer copy. Items that fail are skipped until the
+  next start (`skippedUploads` in the diagnostics).
+- **Images over the relay's 10 MB `MAX_BLOB`** (PNG screenshots reach 15 MB) are re-encoded as WebP
+  for the other devices (`fitImage`); the PC keeps the original.
+- **The phone queues every change made while the socket is down** (`send()` → `outgoing`, text
+  messages persisted as ciphertext under `gt.clip.outgoing.<clipId>`, image blobs retried before
+  their note). Before, each was sent only `if (ready())` and silently dropped otherwise.
+- Nothing syncs while GameTracker isn't running: the sync engine lives in the main window.
+
+Scale: `perf_real_db` multiplies sessions, foreground spans, media plays and notes by
+`GT_PERF_SCALE` (10) and re-times the hot paths. Every Notes path stays ≤ 3 ms at 47k notes (folder
+list 25 ms). Time-window lists (`sessions::list`, `foreground::list`, today's totals) now range over
+the `last_seen_utc` indexes; their `datetime(COALESCE(...))` filter is kept as an exact residual.

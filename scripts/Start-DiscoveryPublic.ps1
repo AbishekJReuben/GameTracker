@@ -159,15 +159,37 @@ if(-not (Test-Path -LiteralPath $Exe)){Copy-Item -LiteralPath $BuildExe -Destina
 Stop-ProcessOnPort -ListenPort $Port
 Get-Job -Name 'DiscoverySignal', 'DiscoveryTunnel' -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue
 
+# One clipboard/voice store for every build. Left to itself the relay keeps it
+# beside its exe, i.e. in this build's hash folder, so each new build opened an
+# empty store numbered from 1: phones and PCs that remembered a higher revision
+# then heard nothing on catch-up. The first time, carry over the store the last
+# build wrote to (the old relay is stopped above, so its files are settled).
+$ClipDataDir = Join-Path $SignalingDir 'offroader-runtime\clip-data'
+if (-not (Test-Path -LiteralPath (Join-Path $ClipDataDir 'clip.sqlite'))) {
+  $candidates = @(Get-ChildItem -LiteralPath (Join-Path $SignalingDir 'offroader-runtime\discovery-bin') -Directory -ErrorAction SilentlyContinue |
+    ForEach-Object { Join-Path $_.FullName 'clip-data' }) + @(Join-Path $SignalingDir 'target\release\clip-data')
+  $newest = $candidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'clip.sqlite') } |
+    Sort-Object { (Get-ChildItem -LiteralPath $_ -Filter 'clip.sqlite*' | Measure-Object LastWriteTime -Maximum).Maximum } -Descending |
+    Select-Object -First 1
+  [void][IO.Directory]::CreateDirectory($ClipDataDir)
+  if ($newest) {
+    Write-Step "Seeding the shared clipboard store from $newest"
+    Get-ChildItem -LiteralPath $newest -Force | Where-Object { $_.Name -notlike '*-shm' } |
+      Copy-Item -Destination $ClipDataDir -Recurse -Force
+    Append-DiscoveryLog -FileName 'discovery-start.log' -Message "Seeded clip-data from $newest"
+  }
+}
+
 Write-Step 'Starting signaling server (background job)'
 $null = Start-Job -Name 'DiscoverySignal' -ScriptBlock {
-  param($Binary, $ListenPort, $Log)
+  param($Binary, $ListenPort, $Log, $ClipDir)
   $env:PORT = "$ListenPort"
+  $env:CLIP_DATA_DIR = "$ClipDir"
   & $Binary 2>&1 | ForEach-Object {
     Add-Content -LiteralPath $Log -Value $_
     Write-Output $_
   }
-} -ArgumentList $Exe, $Port, $SignalLog
+} -ArgumentList $Exe, $Port, $SignalLog, $ClipDataDir
 
 $ready = $false
 for ($i = 0; $i -lt 60; $i++) {

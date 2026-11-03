@@ -89,7 +89,12 @@ export const clip = {
   search: (query: string, limit = 200) => invoke<ClipItem[]>("clipboard_search", { query, limit }),
   outboxList: (limit = 200) => invoke<OutboxOp[]>("clipboard_outbox_list", { limit }),
   outboxAck: (seq: number) => invoke<void>("clipboard_outbox_ack", { seq }),
-  unsynced: (limit = 100) => invoke<ClipItem[]>("clipboard_unsynced", { limit }),
+  /** Waiting for upload, newest first; pass the last page's oldest `createdUtc`
+   *  to continue past items that can't be sent yet. */
+  unsynced: (limit = 100, beforeUtc?: string) =>
+    invoke<ClipItem[]>("clipboard_unsynced", { limit, beforeUtc: beforeUtc ?? null }),
+  /** Which of these ids are already stored here (live or deleted). */
+  known: (ids: string[]) => invoke<string[]>("clipboard_known", { ids }),
   markSynced: (id: string) => invoke<void>("clipboard_mark_synced", { id }),
   add: (input: ClipAddInput, remote = false) =>
     invoke<ClipItem>("clipboard_add", { input, remote }),

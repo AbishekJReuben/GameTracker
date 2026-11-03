@@ -58,10 +58,15 @@ pub fn list(pool: &DbPool, filter: &SessionFilter) -> AppResult<Vec<SessionDto>>
         sql.push_str(&format!(" AND s.game_id = ?{}", params.len()));
     }
     if let Some(from) = &filter.from_utc {
+        // The datetime() comparison is exact but no index can serve it, so every call
+        // walked the whole table (a 24 h window took 277 ms on a 628k-span history).
+        // end_utc is always set from last_seen_utc, so last_seen_utc >= the window's
+        // start (to the second) is a superset the last_seen index can range over.
         params.push(Box::new(from.clone()));
         sql.push_str(&format!(
-            " AND datetime(COALESCE(s.end_utc, s.last_seen_utc)) > datetime(?{})",
-            params.len()
+            " AND s.last_seen_utc >= substr(?{n}, 1, 19)
+              AND datetime(COALESCE(s.end_utc, s.last_seen_utc)) > datetime(?{n})",
+            n = params.len()
         ));
     }
     if let Some(to) = &filter.to_utc {
@@ -79,7 +84,9 @@ pub fn list(pool: &DbPool, filter: &SessionFilter) -> AppResult<Vec<SessionDto>>
     if filter.exclude_idle_ended.unwrap_or(false) {
         sql.push_str(" AND s.was_idle_ended = 0");
     }
-    sql.push_str(" ORDER BY s.start_utc DESC");
+    // With a window, sort its few rows rather than walking start_utc's index over
+    // the whole history ("+" keeps the planner off that index).
+    sql.push_str(if filter.from_utc.is_some() { " ORDER BY +s.start_utc DESC" } else { " ORDER BY s.start_utc DESC" });
     if let Some(limit) = filter.limit {
         params.push(Box::new(limit));
         sql.push_str(&format!(" LIMIT ?{}", params.len()));
@@ -109,9 +116,11 @@ pub fn today_totals_kind(pool: &DbPool, kind: &str) -> AppResult<(i64, i64)> {
         .and_utc()
         .to_rfc3339();
     let (rt, act): (i64, i64) = conn.query_row(
+        // Today's rows by the last_seen index, not every session of the kind ("+"
+        // keeps the planner off game_id): flat however long the history gets.
         "SELECT COALESCE(SUM(s.runtime_seconds),0), COALESCE(SUM(s.active_seconds),0)
-         FROM sessions s JOIN games g ON g.id = s.game_id
-         WHERE s.last_seen_utc >= ?1 AND g.kind = ?2",
+         FROM sessions s
+         WHERE s.last_seen_utc >= ?1 AND +s.game_id IN (SELECT id FROM games WHERE kind = ?2)",
         rusqlite::params![start_of_day, kind],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;

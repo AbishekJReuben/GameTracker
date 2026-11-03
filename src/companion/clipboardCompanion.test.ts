@@ -214,3 +214,84 @@ describe("bounded, incremental Notes sync", () => {
     expect(store.getState().items.every((item) => item.imagePath === null)).toBe(true);
   });
 });
+
+describe("nothing is lost while the relay link is down", () => {
+  it("a note added offline is sent, in order, once the link is back", async () => {
+    const first = await openNotes();
+    first.message({ t: "synced", rev: 0 });
+    await flush();
+    first.close();
+    await store.getState().addText("copied in a tunnel");
+    await flush();
+    await store.getState().togglePin(store.getState().items[0]!);
+    expect(first.sent.filter((m) => m.t === "add")).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    const second = Socket.instances[1]!;
+    second.open();
+    await flush();
+    const sent = second.sent.map((m) => m.t);
+    expect(sent.slice(0, 3)).toEqual(["hello", "add", "pin"]);
+    expect(second.sent[1].item.textCipher).toBe("copied in a tunnel");
+  });
+
+  it("a queued note survives an app restart", async () => {
+    const first = await openNotes();
+    first.close();
+    await store.getState().addText("before the restart");
+    store.getState().stop();
+    vi.resetModules();
+    store = (await import("./clipboardCompanion")).useCompanionClip;
+    const after = await openNotes();
+    await flush();
+    expect(after.sent.find((m) => m.t === "add")?.item.textCipher).toBe("before the restart");
+  });
+
+  it("an image whose upload failed is kept and its blob retried before the note", async () => {
+    const put = vi.fn().mockResolvedValueOnce({ ok: false }).mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", put);
+    const first = await openNotes();
+    await store.getState().addImage("data:image/png;base64,AAAA");
+    await flush();
+    expect(store.getState().items).toHaveLength(1);
+    expect(first.sent.filter((m) => m.t === "add")).toHaveLength(0);
+    first.close();
+    await vi.advanceTimersByTimeAsync(1000);
+    const second = Socket.instances[1]!;
+    second.open();
+    await flush();
+    expect(put).toHaveBeenCalledTimes(2);
+    expect(second.sent.find((m) => m.t === "add")?.item.hasBlob).toBe(true);
+  });
+});
+
+describe("a relay that started a new store", () => {
+  it("replays from zero when its head is below our cursor", async () => {
+    const first = await openNotes();
+    first.message(note("one", 40));
+    first.message({ t: "synced", rev: 40 });
+    await flush();
+    first.close();
+    await vi.advanceTimersByTimeAsync(1000);
+    const second = Socket.instances[1]!;
+    second.open();
+    expect(second.sent[0]).toEqual({ t: "hello", since: 40 });
+    second.message({ t: "synced", rev: 40, head: 7 });
+    await flush();
+    expect(second.sent[1]).toEqual({ t: "hello", since: 0 });
+    second.message(note("two", 7));
+    second.message({ t: "synced", rev: 7, head: 7 });
+    await flush();
+    expect(store.getState().items.map((i) => i.id).sort()).toEqual(["one", "two"]);
+  });
+
+  it("replays from zero when a live note carries an older revision", async () => {
+    const socket = await openNotes();
+    socket.message(note("one", 40));
+    socket.message({ t: "synced", rev: 40 });
+    await flush();
+    socket.message(note("fresh", 3));
+    await flush();
+    expect(socket.sent.at(-1)).toEqual({ t: "hello", since: 0 });
+    expect(store.getState().items.map((i) => i.id)).toContain("fresh");
+  });
+});

@@ -200,9 +200,19 @@ pub async fn clipboard_search(ctx: State<'_, NotesCtx>, query: String, limit: Op
 }
 
 #[tauri::command]
-pub async fn clipboard_unsynced(ctx: State<'_, NotesCtx>, limit: Option<i64>) -> AppResult<Vec<ClipItem>> {
+pub async fn clipboard_unsynced(
+    ctx: State<'_, NotesCtx>,
+    limit: Option<i64>,
+    before_utc: Option<String>,
+) -> AppResult<Vec<ClipItem>> {
     let pool = ctx.pool.clone();
-    run_blocking(move || store::list_unsynced(&pool, limit.unwrap_or(100))).await
+    run_blocking(move || store::list_unsynced(&pool, before_utc.as_deref(), limit.unwrap_or(100))).await
+}
+
+#[tauri::command]
+pub async fn clipboard_known(ctx: State<'_, NotesCtx>, ids: Vec<String>) -> AppResult<Vec<String>> {
+    let pool = ctx.pool.clone();
+    run_blocking(move || store::known_ids(&pool, &ids)).await
 }
 
 #[tauri::command]

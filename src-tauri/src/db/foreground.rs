@@ -77,17 +77,22 @@ pub fn list(pool: &DbPool, from: Option<&str>, to: Option<&str>) -> AppResult<Ve
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(f) = from {
+        // The datetime() comparison is exact but no index can serve it, so every call
+        // walked the whole table (a 24 h window took 277 ms on a 628k-span history).
+        // end_utc is always set from last_seen_utc, so last_seen_utc >= the window's
+        // start (to the second) is a superset the last_seen index can range over.
         params.push(Box::new(f.to_string()));
         sql.push_str(&format!(
-            " AND datetime(COALESCE(end_utc, last_seen_utc)) > datetime(?{})",
-            params.len()
+            " AND last_seen_utc >= substr(?{n}, 1, 19)
+              AND datetime(COALESCE(end_utc, last_seen_utc)) > datetime(?{n})",
+            n = params.len()
         ));
     }
     if let Some(t) = to {
         params.push(Box::new(t.to_string()));
         sql.push_str(&format!(" AND start_utc <= ?{}", params.len()));
     }
-    sql.push_str(" ORDER BY start_utc ASC");
+    sql.push_str(if from.is_some() { " ORDER BY +start_utc ASC" } else { " ORDER BY start_utc ASC" });
     let mut stmt = conn.prepare(&sql)?;
     let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(refs.as_slice(), |r| {

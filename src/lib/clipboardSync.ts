@@ -27,9 +27,45 @@ import {
   b64ToBytes,
 } from "./clipboardCrypto";
 
+/** The relay refuses image blobs over 10 MB (signaling/src/clip.rs MAX_BLOB). */
+export const MAX_BLOB = 10 * 1024 * 1024;
+/** AES-GCM adds a 12-byte IV and a 16-byte tag; keep a margin. */
+const CIPHER_OVERHEAD = 64;
+
+/** Re-encode an image the relay would refuse (a PNG of a big monitor reaches
+ *  15 MB). The other devices get a smaller WebP; this PC keeps the original.
+ *  Null when it can't be made to fit, or the WebView can't re-encode. */
+export async function fitImage(
+  raw: Uint8Array,
+  mime: string | null,
+): Promise<{ bytes: Uint8Array; mime: string } | null> {
+  if (raw.length + CIPHER_OVERHEAD <= MAX_BLOB) return { bytes: raw, mime: mime ?? "image/png" };
+  if (typeof createImageBitmap !== "function" || typeof OffscreenCanvas === "undefined") return null;
+  const bitmap = await createImageBitmap(new Blob([raw as BlobPart], { type: mime ?? "image/png" }));
+  try {
+    let scale = 1;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const w = Math.max(1, Math.round(bitmap.width * scale));
+      const h = Math.max(1, Math.round(bitmap.height * scale));
+      const canvas = new OffscreenCanvas(w, h);
+      canvas.getContext("2d")?.drawImage(bitmap, 0, 0, w, h);
+      const blob = await canvas.convertToBlob({ type: "image/webp", quality: 0.9 });
+      if (blob.size + CIPHER_OVERHEAD <= MAX_BLOB) {
+        return { bytes: new Uint8Array(await blob.arrayBuffer()), mime: "image/webp" };
+      }
+      scale *= 0.7;
+    }
+    return null;
+  } finally {
+    bitmap.close();
+  }
+}
+
 type Notice = {
   t: string;
   rev?: number;
+  /** On `synced`: the relay's newest revision (relays from 3.9.128 on). */
+  head?: number;
   itemId?: string;
   deviceId?: string;
   deviceName?: string | null;
@@ -67,6 +103,9 @@ class ClipSyncManager {
   private inbound: Promise<void> = Promise.resolve();
   private draining = false;
   private drainAgain = false;
+  /** Items that couldn't be sent this session (refused blob, unreadable image).
+   *  Skipped until the next start so one bad item never stalls the rest. */
+  private failed = new Set<string>();
   // Diagnostic surface — surfaced by diagnostics() so the user can copy a full
   // report from Settings instead of staring at "Turning on…".
   private startedAt: number | null = null;
@@ -259,14 +298,32 @@ class ClipSyncManager {
     }
   }
 
+  /** The relay's store was replaced (each new relay build used to open an empty
+   *  one, numbered from 1): our cursor is above everything it holds, so a normal
+   *  catch-up returns nothing. Start over from revision 0; items we already have
+   *  are skipped without downloading. */
+  private resync(reason: string): void {
+    this.lastEvent = `relay renumbered (${reason}); catching up from 0`;
+    this.lastRev = 0;
+    localStorage.setItem(`gt.clip.rev.${this.clipId}`, "0");
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ t: "hello", since: 0 }));
+  }
+
   private async handleMsg(v: Notice): Promise<void> {
     if (v.t === "synced") {
+      if (typeof v.head === "number" && v.head < this.lastRev) {
+        this.resync(`head ${v.head} < cursor ${this.lastRev}`);
+        return;
+      }
       this.bumpRev(v.rev);
       await this.drain();
       await this.dedupeOnce();
       return;
     }
     if (v.t !== "item" || !v.itemId) return;
+    // Revisions only grow on one store, so an older one arriving live means the
+    // relay started a new store. Apply the item, then catch up from 0.
+    if (v.rev && v.rev < this.lastRev) this.resync(`live rev ${v.rev} < cursor ${this.lastRev}`);
     this.bumpRev(v.rev);
 
     // Folder entity (empty-folder registry). Apply regardless of origin — a bare
@@ -309,6 +366,9 @@ class ClipSyncManager {
     if (!this.key) return;
     try {
       if (v.kind === "image" && v.hasBlob) {
+        // A catch-up re-announces images we already have; don't download them.
+        const known = await clip.known([v.itemId]).catch(() => [] as string[]);
+        if (known.length > 0) return;
         const bytes = await this.fetchBlob(v.itemId);
         if (!bytes) return;
         const raw = await decryptBytes(this.key, bytes);
@@ -373,8 +433,9 @@ class ClipSyncManager {
     return !!this.ws && this.ws.readyState === WebSocket.OPEN && !!this.key;
   }
 
-  private async uploadItem(item: ClipItem): Promise<void> {
-    if (!this.ready() || !this.key) return;
+  /** Send one item. False when it couldn't go (the caller skips it for now). */
+  private async uploadItem(item: ClipItem): Promise<boolean> {
+    if (!this.ready() || !this.key) return false;
     // Folder entity (empty-folder registry) — a plaintext, content-less row that
     // rides the same relay pipeline as clips (kind='folder', name in `folder`).
     if ((item.kind as string) === "folder") {
@@ -394,15 +455,17 @@ class ClipSyncManager {
         }),
       );
       await clip.markSynced(item.id).catch(() => {});
-      return;
+      return true;
     }
     try {
       if (item.kind === "image") {
         const b64 = await clip.imageB64(item.id);
-        if (!b64) return;
-        const cipher = await encryptBytes(this.key, b64ToBytes(b64));
+        if (!b64) return false;
+        const fitted = await fitImage(b64ToBytes(b64), item.mime ?? null);
+        if (!fitted) return false;
+        const cipher = await encryptBytes(this.key, fitted.bytes);
         const ok = await this.putBlob(item.id, cipher);
-        if (!ok) return;
+        if (!ok) return false;
         this.ws!.send(
           JSON.stringify({
             t: "add",
@@ -411,8 +474,8 @@ class ClipSyncManager {
               deviceId: item.deviceId,
               deviceName: item.deviceName,
               kind: "image",
-              mime: item.mime,
-              size: item.size,
+              mime: fitted.mime,
+              size: fitted.bytes.length,
               createdUtc: item.createdUtc,
               pinned: item.pinned,
               folder: item.folder ?? "",
@@ -446,8 +509,9 @@ class ClipSyncManager {
         );
       }
       await clip.markSynced(item.id).catch(() => {});
+      return true;
     } catch {
-      /* leave unsynced; retried on next flush */
+      return false; // left unsynced; retried after the next start
     }
   }
 
@@ -470,16 +534,26 @@ class ClipSyncManager {
     }
   }
 
+  /** Upload everything waiting, newest first, one page at a time. The cursor
+   *  moves past items that fail, so a refused blob can't hold back newer copies
+   *  (it used to re-fetch the same 100 oldest items for as long as 100 failed). */
   private async flushBacklog(): Promise<void> {
+    const PAGE = 100;
     try {
+      let before: string | undefined;
       for (;;) {
         if (!this.ready()) return;
-        const items = await clip.unsynced(100);
-        for (const it of items) await this.uploadItem(it);
-        if (items.length < 100) return;
+        const page = await clip.unsynced(PAGE, before);
+        for (const it of page) {
+          if (!this.ready()) return;
+          if (this.failed.has(it.id)) continue;
+          if (!(await this.uploadItem(it))) this.failed.add(it.id);
+        }
+        if (page.length < PAGE) return;
+        before = page[page.length - 1].createdUtc;
       }
     } catch {
-      /* ignore */
+      /* try again on the next nudge */
     }
   }
 
@@ -556,6 +630,7 @@ class ClipSyncManager {
       relayHealth: health,
       relayHealthAgeSec: String(healthAge),
       clipId: this.clipId || "(not derived)",
+      skippedUploads: String(this.failed.size),
       deviceId: this.deviceId || "(unknown)",
       hasKey: String(!!this.key),
       lastRev: String(this.lastRev),

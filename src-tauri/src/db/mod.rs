@@ -788,6 +788,23 @@ fn run_migrations(conn: &rusqlite::Connection) -> AppResult<()> {
         version = 30;
     }
 
+    if version < 31 {
+        // The uploader asks for unsynced notes newest first. Without an index it
+        // walked created_utc backwards through every synced note to find them
+        // (all of a 47k-note history when everything is already up).
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current < 31 {
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_clip_unsynced ON clipboard_items(created_utc)
+                     WHERE synced = 0 AND deleted = 0;
+                 PRAGMA user_version = 31;",
+            )?;
+        }
+        tx.commit()?;
+        version = 31;
+    }
+
     let _ = version;
     Ok(())
 }
@@ -915,8 +932,6 @@ mod tests {
         // Each of these used to SCAN its table (a page per wide session row), most
         // of them every tracker tick or while holding the write lock at startup.
         for (what, sql, want) in [
-            ("today totals", "SELECT SUM(s.runtime_seconds) FROM sessions s JOIN games g ON g.id = s.game_id
-                              WHERE s.last_seen_utc >= 'x' AND g.kind = 'app'", "COVERING INDEX idx_sessions_totals"),
             ("per-game stats", "SELECT game_id, SUM(runtime_seconds), COUNT(*), MIN(start_utc) FROM sessions
                                 WHERE end_utc IS NOT NULL AND runtime_seconds >= 30 GROUP BY game_id", "COVERING INDEX idx_sessions_totals"),
             ("jukebox accrue", "UPDATE media_plays SET played_seconds = played_seconds + 2
@@ -924,6 +939,16 @@ mod tests {
             ("session orphans", "UPDATE sessions SET end_utc = last_seen_utc WHERE end_utc IS NULL", "idx_sessions_open"),
             ("span orphans", "UPDATE foreground_spans SET end_utc = last_seen_utc WHERE end_utc IS NULL", "idx_fg_open"),
             ("span prune", "DELETE FROM foreground_spans WHERE last_seen_utc < 'x'", "idx_fg_seen"),
+            // The shapes sessions::list / foreground::list / today_totals_kind build.
+            ("sessions in a window", "SELECT s.id FROM sessions s JOIN games g ON g.id = s.game_id WHERE 1=1
+                                      AND s.last_seen_utc >= substr('x', 1, 19)
+                                      AND datetime(COALESCE(s.end_utc, s.last_seen_utc)) > datetime('x')
+                                      ORDER BY +s.start_utc DESC", "idx_sessions_seen"),
+            ("spans in a window", "SELECT id FROM foreground_spans WHERE 1=1 AND last_seen_utc >= substr('x', 1, 19)
+                                   AND datetime(COALESCE(end_utc, last_seen_utc)) > datetime('x')
+                                   ORDER BY +start_utc ASC", "idx_fg_seen"),
+            ("today's totals", "SELECT SUM(s.runtime_seconds) FROM sessions s WHERE s.last_seen_utc >= 'x'
+                                AND +s.game_id IN (SELECT id FROM games WHERE kind = 'app')", "COVERING INDEX idx_sessions_seen"),
             ("media prune", "DELETE FROM media_plays WHERE last_seen_utc < 'x'", "idx_media_seen"),
         ] {
             let p = plan(&conn, sql);
@@ -1013,7 +1038,7 @@ mod tests {
 
         run_migrations(&conn).unwrap();
 
-        assert_eq!(user_version(&conn).unwrap(), 30);
+        assert_eq!(user_version(&conn).unwrap(), 31);
         let sql: String = conn
             .query_row("SELECT sql FROM sqlite_master WHERE name = 'app_samples'", [], |r| r.get(0))
             .unwrap();
@@ -1044,14 +1069,14 @@ mod tests {
 
         // A second launch is a no-op.
         run_migrations(&conn).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), 30);
+        assert_eq!(user_version(&conn).unwrap(), 31);
     }
 
     #[test]
     fn migration_28_on_a_fresh_install_just_bumps_the_version() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), 30);
+        assert_eq!(user_version(&conn).unwrap(), 31);
         let tables: i64 = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'app_samples'", [], |r| r.get(0))
             .unwrap();

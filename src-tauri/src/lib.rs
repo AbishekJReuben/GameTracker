@@ -385,6 +385,7 @@ macro_rules! app_commands {
             notes::commands::clipboard_outbox_ack,
             notes::commands::clipboard_pinned,
             notes::commands::clipboard_unsynced,
+            notes::commands::clipboard_known,
             notes::commands::clipboard_mark_synced,
             notes::commands::clipboard_add,
             notes::commands::clipboard_delete,

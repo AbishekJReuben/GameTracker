@@ -659,17 +659,37 @@ pub fn wire_now() -> String {
 
 /// Items captured locally that the relay hasn't acknowledged yet, oldest first,
 /// so the JS sync client can flush its backlog after a reconnect.
-pub fn list_unsynced(pool: &DbPool, limit: i64) -> AppResult<Vec<ClipItem>> {
+/// Items waiting for upload, newest first, one page older than `before_utc`.
+/// Newest first because after an outage the copy you just made is the one you
+/// are waiting for on the phone; it used to queue behind four days of backlog,
+/// led by 15 MB screenshots the relay refuses. The cursor lets the uploader
+/// walk past items it can't send instead of fetching the same page forever.
+pub fn list_unsynced(pool: &DbPool, before_utc: Option<&str>, limit: i64) -> AppResult<Vec<ClipItem>> {
     let conn = pool.get()?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM clipboard_items
-         WHERE synced = 0 AND deleted = 0
-         ORDER BY created_utc ASC LIMIT ?1"
+         WHERE synced = 0 AND deleted = 0 AND (?1 IS NULL OR created_utc < ?1)
+         ORDER BY created_utc DESC LIMIT ?2"
     ))?;
-    let rows = stmt.query_map([limit.clamp(1, 500)], from_row)?;
+    let rows = stmt.query_map(rusqlite::params![before_utc, limit.clamp(1, 500)], from_row)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Which of `ids` this device already has (live or deleted). A catch-up replay
+/// from revision 0 re-announces every item; this keeps it from downloading
+/// image blobs that are already on disk.
+pub fn known_ids(pool: &DbPool, ids: &[String]) -> AppResult<Vec<String>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT 1 FROM clipboard_items WHERE id = ?1")?;
+    let mut out = Vec::new();
+    for id in ids {
+        if stmt.exists([id])? {
+            out.push(id.clone());
+        }
     }
     Ok(out)
 }
@@ -861,6 +881,23 @@ mod tests {
         crate::db::init_pool(&path).unwrap()
     }
 
+    #[test]
+    fn the_upload_queue_is_newest_first_and_pages_past_what_cant_go() {
+        let pool = pool();
+        for i in 0..5 {
+            upsert(&pool, &note(&format!("n{i}"), &format!("note {i}"), &format!("2026-11-0{}T00:00:00.000Z", i + 1))).unwrap();
+        }
+        mark_synced(&pool, "n2").unwrap();
+        let ids = |v: Vec<ClipItem>| v.into_iter().map(|i| i.id).collect::<Vec<_>>();
+        let first = list_unsynced(&pool, None, 2).unwrap();
+        assert_eq!(ids(first.clone()), ["n4", "n3"], "the copy just made goes first");
+        // n4 and n3 fail to upload: the next page starts below them.
+        let next = list_unsynced(&pool, Some(&first[1].created_utc), 2).unwrap();
+        assert_eq!(ids(next), ["n1", "n0"], "synced n2 is skipped, failures don't repeat");
+        let known = known_ids(&pool, &["n0".into(), "nope".into(), "n2".into()]).unwrap();
+        assert_eq!(known, ["n0", "n2"]);
+    }
+
     fn note(id: &str, text: &str, created: &str) -> ClipInput {
         ClipInput {
             id: id.into(),
@@ -892,7 +929,7 @@ mod tests {
         assert_eq!(listed[0].text.as_ref().unwrap().len(), 8192);
         assert_eq!(listed[0].text_len, 50_000);
         assert_eq!(text_of(&pool, "big").unwrap().unwrap().len(), 50_000);
-        assert_eq!(list_unsynced(&pool, 10).unwrap()[0].text.as_ref().unwrap().len(), 50_000, "uploads need the whole note");
+        assert_eq!(list_unsynced(&pool, None, 10).unwrap()[0].text.as_ref().unwrap().len(), 50_000, "uploads need the whole note");
     }
 
     #[test]
