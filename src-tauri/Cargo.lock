@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "gametracker"
-version = "3.9.128"
+version = "3.9.129"
 dependencies = [
  "anyhow",
  "arc-swap",

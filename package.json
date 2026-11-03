@@ -1,7 +1,7 @@
 {
   "name": "gametracker",
   "private": true,
-  "version": "3.9.128",
+  "version": "3.9.129",
   "type": "module",
   "scripts": {
     "prepare": "node scripts/install-git-hooks.mjs",
