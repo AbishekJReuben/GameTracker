@@ -101,6 +101,25 @@ describe("upload backlog", () => {
   });
 });
 
+describe("images the relay refuses for size", () => {
+  it("are sent again at the old relay's 2 MB limit after a 413", async () => {
+    rows.push({ id: "shot", kind: "image", createdUtc: ts(1), synced: false, b64: "AAAA" });
+    const statuses = [413, 200];
+    const fetchMock = vi.fn(async (url: string, init?: { method?: string }) =>
+      init?.method === "PUT"
+        ? { ok: statuses[0] === 200, status: statuses.shift() }
+        : { ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(4) },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const socket = await connect();
+    socket.message({ t: "synced", rev: 0 });
+    await flush();
+    const puts = fetchMock.mock.calls.filter(([, init]) => init?.method === "PUT");
+    expect(puts).toHaveLength(2);
+    expect(socket.sent.filter((m: any) => m.t === "add").map((m: any) => m.item.itemId)).toEqual(["shot"]);
+  });
+});
+
 describe("a relay that started a new store", () => {
   it("catches up from zero when the relay's head is below our cursor", async () => {
     localStorage.setItem("gt.clip.rev.space", "7496");
@@ -136,13 +155,13 @@ describe("a relay that started a new store", () => {
 
 describe("fitImage", () => {
   it("passes images under the relay's limit through untouched", async () => {
-    const { fitImage } = await import("./clipboardSync");
+    const { fitImage } = await import("./fitImage");
     const raw = new Uint8Array(1024);
     expect(await fitImage(raw, "image/png")).toEqual({ bytes: raw, mime: "image/png" });
   });
 
   it("gives up (rather than looping) when an oversized image can't be re-encoded", async () => {
-    const { fitImage, MAX_BLOB } = await import("./clipboardSync");
+    const { fitImage, MAX_BLOB } = await import("./fitImage");
     vi.stubGlobal("OffscreenCanvas", undefined);
     expect(await fitImage(new Uint8Array(MAX_BLOB + 1), "image/png")).toBeNull();
   });

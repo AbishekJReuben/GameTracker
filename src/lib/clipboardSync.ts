@@ -26,40 +26,7 @@ import {
   bytesToB64,
   b64ToBytes,
 } from "./clipboardCrypto";
-
-/** The relay refuses image blobs over 10 MB (signaling/src/clip.rs MAX_BLOB). */
-export const MAX_BLOB = 10 * 1024 * 1024;
-/** AES-GCM adds a 12-byte IV and a 16-byte tag; keep a margin. */
-const CIPHER_OVERHEAD = 64;
-
-/** Re-encode an image the relay would refuse (a PNG of a big monitor reaches
- *  15 MB). The other devices get a smaller WebP; this PC keeps the original.
- *  Null when it can't be made to fit, or the WebView can't re-encode. */
-export async function fitImage(
-  raw: Uint8Array,
-  mime: string | null,
-): Promise<{ bytes: Uint8Array; mime: string } | null> {
-  if (raw.length + CIPHER_OVERHEAD <= MAX_BLOB) return { bytes: raw, mime: mime ?? "image/png" };
-  if (typeof createImageBitmap !== "function" || typeof OffscreenCanvas === "undefined") return null;
-  const bitmap = await createImageBitmap(new Blob([raw as BlobPart], { type: mime ?? "image/png" }));
-  try {
-    let scale = 1;
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const w = Math.max(1, Math.round(bitmap.width * scale));
-      const h = Math.max(1, Math.round(bitmap.height * scale));
-      const canvas = new OffscreenCanvas(w, h);
-      canvas.getContext("2d")?.drawImage(bitmap, 0, 0, w, h);
-      const blob = await canvas.convertToBlob({ type: "image/webp", quality: 0.9 });
-      if (blob.size + CIPHER_OVERHEAD <= MAX_BLOB) {
-        return { bytes: new Uint8Array(await blob.arrayBuffer()), mime: "image/webp" };
-      }
-      scale *= 0.7;
-    }
-    return null;
-  } finally {
-    bitmap.close();
-  }
-}
+import { fitImage, LEGACY_BLOB, MAX_BLOB } from "./fitImage";
 
 type Notice = {
   t: string;
@@ -461,11 +428,8 @@ class ClipSyncManager {
       if (item.kind === "image") {
         const b64 = await clip.imageB64(item.id);
         if (!b64) return false;
-        const fitted = await fitImage(b64ToBytes(b64), item.mime ?? null);
+        const fitted = await this.putImage(item.id, b64ToBytes(b64), item.mime ?? null);
         if (!fitted) return false;
-        const cipher = await encryptBytes(this.key, fitted.bytes);
-        const ok = await this.putBlob(item.id, cipher);
-        if (!ok) return false;
         this.ws!.send(
           JSON.stringify({
             t: "add",
@@ -590,15 +554,29 @@ class ClipSyncManager {
     this.ws!.send(JSON.stringify(wire));
   }
 
-  private async putBlob(itemId: string, cipher: Uint8Array): Promise<boolean> {
+  /** Upload an image's blob, re-encoded smaller when the relay refuses its size
+   *  (relays before 3.9.130 took at most 2 MB). The blob that went up, or null. */
+  private async putImage(itemId: string, raw: Uint8Array, mime: string | null) {
+    for (const limit of [MAX_BLOB, LEGACY_BLOB]) {
+      const fitted = await fitImage(raw, mime, limit);
+      if (!fitted || !this.key) return null;
+      const status = await this.putBlob(itemId, await encryptBytes(this.key, fitted.bytes));
+      if (status === 200) return fitted;
+      if (status !== 413) return null;
+    }
+    return null;
+  }
+
+  /** HTTP status of the upload, or -1 when the relay couldn't be reached. */
+  private async putBlob(itemId: string, cipher: Uint8Array): Promise<number> {
     try {
       const res = await fetch(`${this.httpBase}/clip/blob/${this.clipId}/${itemId}`, {
         method: "PUT",
         body: cipher as BodyInit,
       });
-      return res.ok;
+      return res.ok ? 200 : res.status;
     } catch {
-      return false;
+      return -1;
     }
   }
 

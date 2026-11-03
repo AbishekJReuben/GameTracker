@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "@/lib/tauri";
 import { DEFAULT_SIGNAL_URL } from "@/lib/remoteConfig";
 import type { ClipItem } from "@/lib/clip";
+import { fitImage, LEGACY_BLOB, MAX_BLOB } from "@/lib/fitImage";
 import {
   deriveKey,
   clipId as deriveClipId,
@@ -114,8 +115,10 @@ let nativeStartError = "";
 // Changes made while the relay link is down, sent in order once it is back.
 // They used to be dropped: a note copied on the phone with the socket closed
 // never reached the PC. Text-only messages are kept across restarts (they are
-// ciphertext); an image's encrypted blob waits in memory and is uploaded first.
-type Outgoing = { msg: object; blob?: { id: string; cipher: Uint8Array } };
+// ciphertext); an image waits in memory and its blob is uploaded first, shrunk
+// if the relay refuses its size. One the relay can never take is dropped from the
+// queue (it stays on this phone) so it can't hold back everything after it.
+type Outgoing = { msg: any; blob?: { id: string; raw: Uint8Array; mime: string } };
 let outgoing: Outgoing[] = [];
 let flushingOutgoing = false;
 const outgoingKey = () => `gt.clip.outgoing.${clipId}`;
@@ -252,16 +255,31 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
 
   const ready = () => !!ws && ws.readyState === WebSocket.OPEN && !!key;
 
+  /** HTTP status of the upload, or -1 when the relay couldn't be reached. */
   const putBlob = async (id: string, cipher: Uint8Array) => {
     try {
       const r = await fetch(`${httpBase}/clip/blob/${clipId}/${id}`, {
         method: "PUT",
         body: cipher as BodyInit,
       });
-      return r.ok;
+      return r.ok ? 200 : r.status;
     } catch {
-      return false;
+      return -1;
     }
+  };
+
+  /** Upload an image's blob, re-encoded smaller when the relay refuses its size
+   *  (relays before 3.9.130 took at most 2 MB). */
+  const putImage = async (b: { id: string; raw: Uint8Array; mime: string }) => {
+    for (const limit of [MAX_BLOB, LEGACY_BLOB]) {
+      if (!key) return "retry" as const;
+      const fitted = await fitImage(b.raw, b.mime, limit);
+      if (!fitted) return "refused" as const;
+      const status = await putBlob(b.id, await encryptBytes(key, fitted.bytes));
+      if (status === 200) return { mime: fitted.mime, size: fitted.bytes.length };
+      if (status !== 413) return "retry" as const;
+    }
+    return "refused" as const;
   };
   const flushOutgoing = async () => {
     if (flushingOutgoing) return;
@@ -269,7 +287,17 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
     try {
       while (outgoing.length > 0 && ready()) {
         const next = outgoing[0];
-        if (next.blob && !(await putBlob(next.blob.id, next.blob.cipher))) return; // retried on reconnect
+        if (next.blob) {
+          const sent = await putImage(next.blob);
+          if (sent === "retry") return; // offline or relay down: try again on reconnect
+          if (sent === "refused") {
+            outgoing.shift();
+            saveOutgoing();
+            continue;
+          }
+          next.msg.item.mime = sent.mime;
+          next.msg.item.size = sent.size;
+        }
         if (!ready()) return;
         ws!.send(JSON.stringify(next.msg));
         outgoing.shift();
@@ -664,7 +692,6 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
       }
       const id = crypto.randomUUID();
       const raw = b64ToBytes(dataUrl);
-      const cipher = await encryptBytes(key, raw);
       const item: ClipItem = {
         id,
         kind: "image",
@@ -702,7 +729,7 @@ export const useCompanionClip = create<CompanionClipState>((set, get) => {
             hasBlob: true,
           },
         },
-        { id, cipher },
+        { id, raw, mime: "image/png" },
       );
     },
 

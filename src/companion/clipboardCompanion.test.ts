@@ -295,3 +295,18 @@ describe("a relay that started a new store", () => {
     expect(store.getState().items.map((i) => i.id)).toContain("fresh");
   });
 });
+
+describe("images the relay refuses for size", () => {
+  it("a refused image is dropped from the queue so later changes still go", async () => {
+    const put = vi.fn().mockResolvedValue({ ok: false, status: 413 });
+    vi.stubGlobal("fetch", put);
+    const socket = await openNotes();
+    await store.getState().addImage("data:image/png;base64,AAAA");
+    await store.getState().addText("after the big picture");
+    await flush();
+    expect(put).toHaveBeenCalledTimes(2); // as is, then at the old relay's 2 MB limit
+    const adds = socket.sent.filter((m) => m.t === "add");
+    expect(adds.map((m) => m.item.kind)).toEqual(["text"]);
+    expect(store.getState().items.map((i) => i.kind).sort()).toEqual(["image", "text"]);
+  });
+});

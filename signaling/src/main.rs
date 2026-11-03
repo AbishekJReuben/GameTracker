@@ -25,7 +25,7 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, Query, State,
+        DefaultBodyLimit, Path as AxumPath, Query, State,
     },
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
@@ -115,7 +115,12 @@ async fn main() {
         .route("/clip/ws", get(clip_ws_handler))
         .route(
             "/clip/blob/:clip/:item",
-            get(clip_blob_get).put(clip_blob_put),
+            // A `Bytes` body is capped at axum's default 2 MB unless raised here,
+            // and it never was: that, not MAX_BLOB, was the real image limit (the
+            // largest blob ever stored was 2,086,434 bytes).
+            get(clip_blob_get)
+                .put(clip_blob_put)
+                .layer(DefaultBodyLimit::max(clip::MAX_BLOB + 64 * 1024)),
         )
         // Voice narration: one socket per device; audio of older lines over HTTP.
         .route("/voice/ws", get(voice_ws_handler))
