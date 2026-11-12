@@ -1,0 +1,1 @@
+import{R as e,j as t,a as o}from"./index-D7neV8k3.js";import{C as r}from"./CompanionApp-CejDXXz-.js";window.__GT_COMPANION__=!0;e.createRoot(document.getElementById("root")).render(t.jsx(o.StrictMode,{children:t.jsx(r,{})}));
