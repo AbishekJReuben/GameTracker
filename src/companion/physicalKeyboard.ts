@@ -17,6 +17,7 @@ import type { ControlMsg } from "./links";
 export const PC_KEYS_PREF = "gt.remote.pcKeyboard";
 /** The chord that turns forwarding on/off. Caught here, never sent. */
 export const TOGGLE_CHORD_LABEL = "Ctrl+Alt+Shift+Z";
+const FULLSCREEN_WAIT_MS = 4000;
 
 export function readPcKeys(): boolean {
   try {
@@ -173,13 +174,22 @@ export function usePhysicalKeyboard(o: PhysicalKeyboardOptions) {
   /** Fullscreen + Keyboard Lock. Call from a click: fullscreen needs a user gesture. */
   const enterFullControl = async () => {
     const root = document.documentElement;
-    try {
-      if (!fullscreenElement()) await root.requestFullscreen({ navigationUI: "hide" });
-    } catch {
-      say("The browser didn't allow fullscreen");
-      return;
-    }
     wantLock.current = true;
+    try {
+      // Some embedded browsers never settle the request; don't wait forever. If
+      // fullscreen arrives late, the fullscreenchange handler still locks.
+      if (!fullscreenElement())
+        await Promise.race([
+          root.requestFullscreen({ navigationUI: "hide" }),
+          new Promise((_, reject) => window.setTimeout(() => reject(new Error("timeout")), FULLSCREEN_WAIT_MS)),
+        ]);
+    } catch {
+      if (!fullscreenElement()) {
+        wantLock.current = false;
+        say("The browser didn't allow fullscreen");
+        return;
+      }
+    }
     setOn(true, false);
     if (!(await applyLock(true))) {
       say("The browser blocked keyboard lock: Win and Alt+Tab stay on this computer");
@@ -197,7 +207,10 @@ export function usePhysicalKeyboard(o: PhysicalKeyboardOptions) {
 
   useEffect(() => {
     const onFs = () => {
-      if (fullscreenElement()) return;
+      if (fullscreenElement()) {
+        if (wantLock.current && onRef.current) void applyLock(true).then((ok) => ok && setFullControl(true));
+        return;
+      }
       wantLock.current = false;
       keyboardApi()?.unlock?.();
       setFullControl(false);

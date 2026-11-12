@@ -118,6 +118,33 @@ describe("physical keyboard forwarding", () => {
   });
 });
 
+describe("full control when fullscreen never answers", () => {
+  it("gives up with a notice, and still locks if fullscreen arrives late", async () => {
+    vi.useFakeTimers();
+    try {
+      const lock = vi.fn(() => Promise.resolve());
+      Object.defineProperty(navigator, "keyboard", { value: { lock, unlock: vi.fn() }, configurable: true });
+      let fs: Element | null = null;
+      Object.defineProperty(document, "fullscreenElement", { get: () => fs, configurable: true });
+      document.documentElement.requestFullscreen = vi.fn(() => new Promise<void>(() => {}));
+      const { hook } = mount();
+      let done = false;
+      act(() => {
+        void hook.result.current.enterFullControl().then(() => (done = true));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4100);
+      });
+      expect(done).toBe(true);
+      expect(hook.result.current.notice).toMatch(/didn't allow fullscreen/);
+      expect(lock).not.toHaveBeenCalled();
+      expect(hook.result.current.fullControl).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("helpers", () => {
   it("recognises editable targets and soft-keyboard events", () => {
     const range = document.createElement("input");
