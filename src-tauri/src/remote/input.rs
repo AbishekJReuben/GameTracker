@@ -52,6 +52,12 @@ pub enum ControlEvent {
     Keydown { name: String },
     /// Release a previously held key/modifier.
     Keyup { name: String },
+    /// Press a key of the guest's physical keyboard by position
+    /// (`KeyboardEvent.code`); the PC's layout decides the character. A repeat
+    /// press while held is a real auto-repeat.
+    Pkeydown { code: String },
+    /// Release a physical key pressed with `Pkeydown`.
+    Pkeyup { code: String },
     /// Update the virtual Xbox 360 controller (a physical controller attached to
     /// the phone, streamed here so PC games see a real XInput device). The pad
     /// state fields are flattened into this message by serde's internal tagging.
@@ -100,17 +106,23 @@ fn apply_key(name:&str,direction:Direction,owner:String,held:&mut Holds<Key>,mut
 /// used by the no-OS-input regression, rather than a parallel client predicate.
 fn dispatch_releases(event:ControlEvent,apply:&mut impl FnMut(ControlEvent)){
     match event{
-        ControlEvent::Up{..}|ControlEvent::Keyup{..}|ControlEvent::Gamepadstop=>apply(event),
+        ControlEvent::Up{..}|ControlEvent::Keyup{..}|ControlEvent::Pkeyup{..}|ControlEvent::Gamepadstop=>apply(event),
         ControlEvent::Seq{events}=>for event in events{dispatch_releases(event,apply);},
         _=>{}
     }
 }
 fn non_coordinate(event:&ControlEvent)->bool{match event{
-    ControlEvent::Text{..}|ControlEvent::Key{..}|ControlEvent::Keydown{..}|ControlEvent::Keyup{..}|ControlEvent::Gamepad(..)|ControlEvent::Gamepadstop=>true,
+    ControlEvent::Text{..}|ControlEvent::Key{..}|ControlEvent::Keydown{..}|ControlEvent::Keyup{..}|ControlEvent::Pkeydown{..}|ControlEvent::Pkeyup{..}|ControlEvent::Gamepad(..)|ControlEvent::Gamepadstop=>true,
     ControlEvent::Seq{events}=>events.iter().all(non_coordinate),_=>false
 }}
 fn dispatch_pending(event:ControlEvent,authorized:bool,apply:&mut impl FnMut(ControlEvent)){
     if authorized&&non_coordinate(&event){apply(event);}else{dispatch_releases(event,apply);}
+}
+/// Physical keys: every press is injected (a repeat while held is auto-repeat),
+/// the release only when the last session holding the key lets go.
+fn apply_physical(code:&str,down:bool,owner:String,held:&mut Holds<super::physkeys::PhysKey>,mut inject:impl FnMut(super::physkeys::PhysKey,bool)){
+    let Some(key)=super::physkeys::from_code(code)else{return;};
+    if down{inject(key,true);held.press(key,owner);}else if held.release(key,&owner){inject(key,false);}
 }
 fn release_gamepad(owner:&mut Option<String>,sid:&str,stop:impl FnOnce()){
     if owner.as_deref()==Some(sid){*owner=None;stop();}
@@ -182,13 +194,14 @@ struct Controller {
     anchors:HashMap<String,(u64,i32,i32)>,
     held_buttons:Holds<Button>,
     held_keys:Holds<Key>,
+    held_phys:Holds<super::physkeys::PhysKey>,
     gamepad_owner:Option<String>,
 }
 
 impl Controller {
     fn new() -> Option<Self> {
         let enigo = Enigo::new(&Settings::default()).ok()?;
-        let mut c = Self { enigo, mx: 0, my: 0, mw: 1920, mh: 1080,session_id:None,epoch_view:None,anchors:HashMap::new(),held_buttons:Holds(HashMap::new()),held_keys:Holds(HashMap::new()),gamepad_owner:None };
+        let mut c = Self { enigo, mx: 0, my: 0, mw: 1920, mh: 1080,session_id:None,epoch_view:None,anchors:HashMap::new(),held_buttons:Holds(HashMap::new()),held_keys:Holds(HashMap::new()),held_phys:Holds(HashMap::new()),gamepad_owner:None };
         c.set_monitor(crate::remote::capture::selected_monitor());
         Some(c)
     }
@@ -306,6 +319,7 @@ impl Controller {
             ControlEvent::ReleaseForRecovery{done}=>{
                 for (button,_) in self.held_buttons.0.drain(){let _=self.enigo.button(button,Direction::Release);}
                 for (key,_) in self.held_keys.0.drain(){let _=self.enigo.key(key,Direction::Release);}
+                for (key,_) in self.held_phys.0.drain(){super::physkeys::inject(key,false);}
                 self.anchors.clear();
                 if self.gamepad_owner.take().is_some(){super::gamepad::stop();}
                 let _=done.send(());Ok(())
@@ -357,6 +371,8 @@ impl Controller {
             ControlEvent::Key { name } => self.key_dir(&name, Direction::Click),
             ControlEvent::Keydown { name } => self.key_dir(&name,Direction::Press),
             ControlEvent::Keyup { name } => self.key_dir(&name,Direction::Release),
+            ControlEvent::Pkeydown { code } => {let owner=self.owner();apply_physical(&code,true,owner,&mut self.held_phys,super::physkeys::inject);Ok(())}
+            ControlEvent::Pkeyup { code } => {let owner=self.owner();apply_physical(&code,false,owner,&mut self.held_phys,super::physkeys::inject);Ok(())}
             // Gamepad events bypass enigo entirely — they drive the virtual XInput
             // controller, which owns its own dedicated thread (see `gamepad.rs`).
             ControlEvent::Gamepad(state) => {
@@ -380,7 +396,8 @@ impl Controller {
     fn releases_only(&mut self,event:ControlEvent){dispatch_releases(event,&mut |event|self.apply(event));}
     fn release_owned(&mut self,sid:&str){
         for button in self.held_buttons.end(sid){let _=self.enigo.button(button,Direction::Release);}
-        for key in self.held_keys.end(sid){let _=self.enigo.key(key,Direction::Release);}self.anchors.remove(sid);
+        for key in self.held_keys.end(sid){let _=self.enigo.key(key,Direction::Release);}
+        for key in self.held_phys.end(sid){super::physkeys::inject(key,false);}self.anchors.remove(sid);
         release_gamepad(&mut self.gamepad_owner,sid,crate::remote::gamepad::stop);
     }
     fn mapped_point(&mut self,x:f32,y:f32)->Option<(i32,i32)>{
@@ -530,6 +547,23 @@ fn request_recovery_release(tx:&std::sync::mpsc::Sender<ControlEvent>)->bool {
         assert_eq!(calls.len(),2);assert_eq!(calls[0].0,calls[1].0);assert_eq!(calls[0].1,Direction::Press);assert_eq!(calls[1].1,Direction::Release);assert!(held.0.is_empty());
         apply_key("C",Direction::Click,"a".into(),&mut held,|key,dir|{calls.push((key,dir));Ok(())}).unwrap();assert_eq!(calls.last(),Some(&(Key::Unicode('C'),Direction::Click)));
         let before=calls.len();for direction in [Direction::Press,Direction::Release]{apply_key("😀",direction,"a".into(),&mut held,|key,dir|{calls.push((key,dir));Ok(())}).unwrap();}assert_eq!(calls.len(),before);assert!(held.0.is_empty());
+    }
+    #[test]fn physical_keys_repeat_while_held_and_release_once_for_the_last_owner(){
+        use super::super::physkeys::PhysKey;let mut held=Holds(HashMap::new());let mut calls=Vec::new();
+        apply_physical("ShiftLeft",true,"a".into(),&mut held,|k,d|calls.push((k,d)));
+        apply_physical("ShiftLeft",true,"a".into(),&mut held,|k,d|calls.push((k,d)));
+        apply_physical("ShiftLeft",true,"b".into(),&mut held,|k,d|calls.push((k,d)));
+        apply_physical("ShiftLeft",false,"a".into(),&mut held,|k,d|calls.push((k,d)));
+        apply_physical("ShiftLeft",false,"a".into(),&mut held,|k,d|calls.push((k,d)));
+        apply_physical("NoSuchKey",true,"a".into(),&mut held,|k,d|calls.push((k,d)));
+        let shift=PhysKey::Scan(0x2A,false);assert_eq!(calls,vec![(shift,true),(shift,true),(shift,true)]);
+        assert_eq!(held.end("b"),vec![shift]);
+        apply_physical("KeyW",false,"a".into(),&mut held,|k,d|calls.push((k,d)));assert_eq!(calls.len(),3,"a release without a press injects nothing");
+    }
+    #[test]fn physical_key_events_parse_and_releases_pass_a_blocked_view(){
+        let e:ControlEvent=serde_json::from_str(r#"{"type":"pkeydown","code":"KeyA"}"#).unwrap();assert!(matches!(e,ControlEvent::Pkeydown{ref code} if code=="KeyA"));assert!(non_coordinate(&e));
+        let up:ControlEvent=serde_json::from_str(r#"{"type":"seq","events":[{"type":"pkeydown","code":"KeyB"},{"type":"pkeyup","code":"KeyA"}]}"#).unwrap();
+        let mut seen=Vec::new();dispatch_releases(up,&mut |e|seen.push(matches!(e,ControlEvent::Pkeyup{..})));assert_eq!(seen,vec![true]);
     }
     #[test]fn cleanup_releases_only_the_last_owner_and_never_another_sessions_holds(){
         let mut keys=Holds(HashMap::new());keys.press(Key::Control,"a".into());keys.press(Key::Control,"b".into());keys.press(Key::Shift,"a".into());keys.press(Key::Meta,"b".into());

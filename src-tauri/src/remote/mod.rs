@@ -51,6 +51,7 @@ pub(crate) mod nvenc;
 pub(crate) mod gamepad;
 pub(crate) mod input;
 pub(crate) mod input_mapping;
+pub(crate) mod physkeys;
 /// Loopback WebSocket carrying frames/audio to the host page and input back,
 /// off Tauri's UI-thread IPC.
 pub(crate) mod pipe;
