@@ -6,6 +6,7 @@
 
 import type { CloudConn, ConnectSnapshot, RtcInboundVideoStats, WcStats } from "./cloud";
 import {readInputLocked} from './remotePreferences';
+import {toLegacy} from './physicalKeyboard';
 
 export type ControlMsg =
   | { type: "move"; x: number; y: number }
@@ -18,6 +19,10 @@ export type ControlMsg =
   | { type: "key"; name: string }
   | { type: "keydown"; name: string }
   | { type: "keyup"; name: string }
+  /** A physical key by position (`KeyboardEvent.code`); the PC's layout decides
+   *  the character. Needs `physical-keys-v1`; older PCs get named keys instead. */
+  | { type: "pkeydown"; code: string }
+  | { type: "pkeyup"; code: string }
   | { type: "monitor"; index: number }
   /** Ask the desktop host to start (or keep) an aux WebRTC room for this monitor. */
   | { type: "auxHost"; monitor: number }
@@ -175,17 +180,21 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
   let unanchoredMove: ControlMsg | null = null;
   let lastAbsolute:{point:[number,number];epoch:number;session:string}|undefined;let maxWidth=1920;
   let inputLocked=readInputLocked(),padActive=false;
-  const heldKeys=new Set<string>(),heldButtons=new Set<string>();
+  const heldKeys=new Set<string>(),heldButtons=new Set<string>(),heldPhys=new Set<string>();
   const trackHeld=(msg:ControlMsg)=>{
     if(msg.type==='seq'){msg.events.forEach(trackHeld);return;}
     if(msg.type==='keydown')heldKeys.add(msg.name);
     if(msg.type==='keyup')heldKeys.delete(msg.name);
+    if(msg.type==='pkeydown')heldPhys.add(msg.code);
+    if(msg.type==='pkeyup')heldPhys.delete(msg.code);
     if(msg.type==='down')heldButtons.add(msg.button??'left');
     if(msg.type==='up')heldButtons.delete(msg.button??'left');
     if(msg.type==='gamepad')padActive=true;
     if(msg.type==='gamepadstop')padActive=false;
   };
-  const transmit=(msg:ControlMsg):boolean=>{
+  const transmit=(original:ControlMsg):boolean=>{
+    const msg=conn.remoteHandshake?.capabilities.includes('physical-keys-v1')?original:toLegacy(original);
+    if(!msg)return false;
     if(conn.remoteHandshake?.capabilities.includes('view-epoch-input-v1')){
       if(msg.type==='gamepadprobe'||msg.type==='auxHost'||msg.type==='auxStop')return conn.sendControl(msg);
       if(msg.type==='monitor'){const display=conn.remoteHandshake.layout.displays.find(d=>d.index===msg.index);return !!display&&conn.requestRemoteView('single',display.id,maxWidth);}
@@ -233,9 +242,10 @@ export function makeRtcLink(conn: CloudConn): RemoteLink {
       if(!locked)return;
       const releases:ControlMsg[]=[...heldButtons].map(button=>({type:'up',button}));
       releases.push(...[...heldKeys].map(name=>({type:'keyup' as const,name})));
+      releases.push(...[...heldPhys].map(code=>({type:'pkeyup' as const,code})));
       if(padActive)releases.push({type:'gamepadstop'});
       if(releases.length)transmit({type:'seq',events:releases});
-      heldButtons.clear();heldKeys.clear();padActive=false;
+      heldButtons.clear();heldKeys.clear();heldPhys.clear();padActive=false;
     },
     setQuality(q) {
       maxWidth=q.maxW;

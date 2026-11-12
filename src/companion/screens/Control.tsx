@@ -92,6 +92,7 @@ import {
   SlidersHorizontal,
   LockKeyhole,
   UnlockKeyhole,
+  KeyboardOff,
 } from "lucide-react";
 import type { ContentMode, ControlMsg, QualitySettings, RemoteLink } from "../links";
 import {isControlInput} from '../links';
@@ -115,6 +116,7 @@ import {
   hitchSnapshot,
 } from "../hitchLog";
 import { isQuestBrowser } from "../device";
+import { usePhysicalKeyboard, TOGGLE_CHORD_LABEL } from "../physicalKeyboard";
 import { useTargetRightClick } from "../useTargetRightClick";
 import { isImmersiveActive, onImmersiveActiveChange } from "../runtime";
 import {
@@ -1001,6 +1003,17 @@ export function ControlScreen({
     if (!connected) targetRightClick.cancel();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected]);
+  // A real keyboard on this device goes to the PC key by key (physicalKeyboard.ts).
+  // On a desktop browser the hidden typing field forwards real keys too, so
+  // shortcuts work while it has focus; phones keep their IME path there.
+  const finePointer = typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(pointer: fine)").matches;
+  const physicalKeys = usePhysicalKeyboard({
+    active: connected && !inputLocked && !notesOpen,
+    send,
+    ghost: () => kbdRef.current,
+    takeGhost: () => finePointer && !isQuestBrowser() && kbMode === "direct",
+  });
+  const showPcKeys = (finePointer || physicalKeys.seen) && !isQuestBrowser();
   // First frame received (video decoded or a canvas frame drawn) → hide the
   // app-icon "connecting" placeholder that fills the ~1s gap before pixels arrive.
   const [hasFrame, setHasFrame] = useState(false);
@@ -3421,6 +3434,18 @@ export function ControlScreen({
     setSoundOn(next);
   };
 
+  const pcKeysNotice =
+    physicalKeys.notice && typeof document !== "undefined"
+      ? createPortal(
+          <div
+            role="status"
+            className="pointer-events-none fixed left-1/2 top-14 z-[80] -translate-x-1/2 rounded-full bg-black/75 px-3 py-1.5 text-xs font-600 text-white shadow-lg backdrop-blur"
+          >
+            {physicalKeys.notice}
+          </div>,
+          document.body,
+        )
+      : null;
   const questBrowser = isQuestBrowser();
   // Pin to the visual viewport while the soft keyboard is up (Android WebView pan
   // mode). Quest Surface Keyboard never shrinks the remote viewport.
@@ -3465,6 +3490,7 @@ export function ControlScreen({
           : null),
       }}
     >
+      {pcKeysNotice}
       {/* ==== top toolbar — flex sibling (shrinks video); collapsible like the bottom dock ==== */}
       {!immersive && !topCollapsed && !pipView && (
         <div
@@ -3648,6 +3674,34 @@ export function ControlScreen({
                   <Headset className="h-3.5 w-3.5" /> VR
                 </button>
               </>
+            )}
+            {showPcKeys && (
+              <button
+                onClick={physicalKeys.toggle}
+                className={`grid h-8 w-8 place-items-center rounded-lg active:scale-95 ${
+                  physicalKeys.on ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.04] text-ink-soft"
+                }`}
+                title={`${physicalKeys.on ? "Keyboard goes to the PC" : "Keyboard stays on this device"} (${TOGGLE_CHORD_LABEL})`}
+                aria-label={physicalKeys.on ? "Keep keyboard on this device" : "Send keyboard to the PC"}
+                aria-pressed={physicalKeys.on}
+              >
+                {physicalKeys.on ? <Keyboard className="h-4 w-4" /> : <KeyboardOff className="h-4 w-4" />}
+              </button>
+            )}
+            {showPcKeys && finePointer && physicalKeys.lockSupported && browserFsSupported && (
+              <button
+                onClick={() => (physicalKeys.fullControl ? physicalKeys.exitFullControl() : void physicalKeys.enterFullControl())}
+                className={`flex h-8 items-center gap-1.5 rounded-lg px-2 text-xs font-700 active:scale-95 ${
+                  physicalKeys.fullControl ? "bg-accent-3/20 text-accent-3" : "bg-white/[0.04] text-ink-soft"
+                }`}
+                title={
+                  physicalKeys.fullControl
+                    ? "Leave full control (or hold Esc)"
+                    : "Fullscreen, and send Win, Alt+Tab, Ctrl+W and Esc to the PC too"
+                }
+              >
+                <Command className="h-3.5 w-3.5" /> {physicalKeys.fullControl ? "Exit full control" : "Full control"}
+              </button>
             )}
             {browserFsSupported ? (
               <button

@@ -42,3 +42,16 @@ describe('view-only input lock',()=>{
     expect(f.control.mock.calls).toHaveLength(2);expect(f.control).toHaveBeenLastCalledWith({type:'up'});
   });
 });
+describe('physical keys',()=>{
+  it('go by position to a PC that supports them, and are released on lock',()=>{
+    const caps=['view-epoch-input-v1','physical-keys-v1'];
+    const h=(()=>{const input=vi.fn((_m:unknown,_l?:boolean,_a?:unknown)=>true);const c={displayedView:{sessionId:'s',view:{epoch:1}},remoteHandshake:{capabilities:caps,layout:{displays:[]}},sendViewInput:input,sendControl:vi.fn(()=>true),sendMove:vi.fn(()=>true),requestRemoteView:vi.fn(()=>true)};return {link:makeRtcLink(c as unknown as CloudConn),input};})();
+    h.link.send({type:'pkeydown',code:'ShiftLeft'});expect(h.input).toHaveBeenLastCalledWith({type:'pkeydown',code:'ShiftLeft'},false,undefined);
+    h.link.setInputLocked!(true);expect(h.input).toHaveBeenLastCalledWith({type:'seq',events:[{type:'pkeyup',code:'ShiftLeft'}]},false,undefined);
+  });
+  it('become named keys for an older PC, and keys it cannot name are not sent',()=>{
+    const f=fixture();f.link.send({type:'pkeydown',code:'KeyQ'});expect(f.input).toHaveBeenLastCalledWith({type:'keydown',name:'q'},false,undefined);
+    f.input.mockClear();expect(f.link.send({type:'pkeydown',code:'IntlRo'})).toBe(false);expect(f.input).not.toHaveBeenCalled();
+    const old=fixture(false);old.link.send({type:'pkeyup',code:'Enter'});expect(old.control).toHaveBeenLastCalledWith({type:'keyup',name:'enter'});
+  });
+});

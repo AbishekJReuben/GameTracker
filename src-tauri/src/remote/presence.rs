@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize,Serialize};
 use serde_json::Value;
 use super::{appearance::{Appearance,display_name},display::{self,DisplaySnapshot,PhysicalRect},view::{AppliedView,ViewMode}};
-pub const CAPABILITIES:&[&str]=&["display-geometry-v1","all-screens-v1","view-state-v1","controller-name-v1","desktop-appearance-v1","view-epoch-input-v1","viewport-v1"];
+pub const CAPABILITIES:&[&str]=&["display-geometry-v1","all-screens-v1","view-state-v1","controller-name-v1","desktop-appearance-v1","view-epoch-input-v1","viewport-v1","physical-keys-v1"];
 pub const PRESENCE_TTL_MS:u64=6500;
 const HISTORY_MS:u64=60_000;
 #[derive(Clone,Debug,Serialize)]
