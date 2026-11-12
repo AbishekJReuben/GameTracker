@@ -2330,3 +2330,44 @@ Scale: `perf_real_db` multiplies sessions, foreground spans, media plays and not
 `GT_PERF_SCALE` (10) and re-times the hot paths. Every Notes path stays ≤ 3 ms at 47k notes (folder
 list 25 ms). Time-window lists (`sessions::list`, `foreground::list`, today's totals) now range over
 the `last_seen_utc` indexes; their `datetime(COALESCE(...))` filter is kept as an exact residual.
+
+---
+
+## 25. Physical keyboard from a desktop browser (after 3.9.131) — do not regress
+
+Someone at a PC on discovery.chilloutgamestudio.com can use their real keyboard on the remote
+PC. Research and the user's decisions: the shared notes file `physical-keyboard-research.md`.
+
+- **Keys go by position.** `src/companion/physicalKeyboard.ts` sends `KeyboardEvent.code` as
+  `{type:"pkeydown"|"pkeyup", code}`. The host (`remote/physkeys.rs`) presses that position
+  with a SendInput scan code, so the PC's layout decides the character. PrintScreen, Pause,
+  NumLock, media and browser keys go by virtual key (no plain scan code). A `pkeydown` for a
+  key already held is injected again: that's how auto-repeat works (injected holds don't repeat).
+  Typing exact text stays the compose bar's job.
+- **On by default** (`gt.remote.pcKeyboard`) whenever the Control screen is live and the page,
+  not a text field, has focus. Phones only differ in that their hidden typing field keeps the
+  IME path; on a fine-pointer device that field forwards real keys too (`takeGhost`).
+  Soft-keyboard events (`keyCode 229`, `Process`, `Unidentified`, empty `code`) are never
+  forwarded.
+- **Ctrl+Alt+Shift+Z** toggles it. It's handled locally and never sent. The toggle sits in the
+  top bar beside **Full control**, which shows only on a fine pointer (or once a hardware key
+  was seen) and never on Quest.
+- **Full control** = `requestFullscreen` + `navigator.keyboard.lock()` (Chrome/Edge only; the
+  first use shows Chrome's permission prompt). Then Win, Alt+Tab, Ctrl+W/T/N and Esc reach the
+  PC too. Holding Esc for 2 s is the browser's way out; repeated Esc presses aren't forwarded in
+  that mode. The fullscreen request is raced against 4 s, because some embedded browsers (the
+  Claude browser pane) never settle it. A late fullscreen still locks.
+- **Nothing gets stuck.** Held keys are released on toggle off, window blur, page hidden,
+  input lock, disconnect (host `release_owned`) and recovery. A key released before it was ever
+  pressed sends nothing, except PrintScreen: Windows reports only its key-up, so that becomes a
+  press-and-release.
+- **Older PCs:** the host advertises `physical-keys-v1`. Without it, `links.ts` rewrites
+  physical keys as named `keydown`/`keyup` (`toLegacy`), and drops keys that have no name.
+- **What no browser can do:** capture Ctrl+Alt+Del or Win+L, or keep PrtSc from also opening the
+  local Snipping Tool outside full control (and probably inside it: untested). Sending
+  Ctrl+Alt+Del *to* the host needs `SendSAS` from a service, which the host isn't.
+- **Planned:** a "Connect to a PC" page in the desktop app (Remote-only install) with a
+  WH_KEYBOARD_LL hook, so system keys work in a window too.
+- **Test:** `cargo test --lib physkeys -- --include-ignored` injects every key class and checks
+  what Windows sees from a low-level hook that swallows each injected key, so nothing reaches
+  other apps. The browser side is `physicalKeyboard.test.tsx` + `links.inputLock.test.ts`.
