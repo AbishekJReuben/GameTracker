@@ -217,6 +217,105 @@ mod tests {
         assert!(vk_extended(0x2C) && !vk_extended(0x13));
     }
 
+    /// Injects real keys and checks what Windows makes of them, from a low-level
+    /// hook that swallows every injected key so none reaches the foreground app.
+    /// Run alone: `cargo test --lib physkeys -- --ignored --nocapture`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn windows_sees_the_intended_keys_and_none_reach_other_apps() {
+        use std::sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VSC_TO_VK};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
+            UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_QUIT,
+        };
+        static SEEN: Mutex<Vec<(u32, u32, bool, bool)>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+            if code >= 0 {
+                let k = &*(l.0 as *const KBDLLHOOKSTRUCT);
+                if k.flags.0 & 0x10 != 0 {
+                    // LLKHF_INJECTED: record it and keep it from every app.
+                    SEEN.lock().unwrap().push((k.vkCode, k.scanCode, k.flags.0 & 0x01 != 0, k.flags.0 & 0x80 != 0));
+                    return LRESULT(1);
+                }
+            }
+            CallNextHookEx(None, code, w, l)
+        }
+        let ready = Arc::new(AtomicBool::new(false));
+        let tid = Arc::new(AtomicU32::new(0));
+        let (r, t) = (ready.clone(), tid.clone());
+        let pump = std::thread::spawn(move || unsafe {
+            t.store(windows::Win32::System::Threading::GetCurrentThreadId(), Ordering::SeqCst);
+            let module = GetModuleHandleW(None).unwrap();
+            let h = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0).expect("hook");
+            r.store(true, Ordering::SeqCst);
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                DispatchMessageW(&msg);
+            }
+            let _ = UnhookWindowsHookEx(h);
+        });
+        while !ready.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let wait_for = |n: usize| {
+            let start = Instant::now();
+            while SEEN.lock().unwrap().len() < n && start.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::mem::take(&mut *SEEN.lock().unwrap())
+        };
+        // Sentinel first: nothing else is injected until the hook is proven live.
+        inject(from_code("F24").unwrap(), true);
+        inject(from_code("F24").unwrap(), false);
+        assert_eq!(wait_for(2).len(), 2, "hook never saw the sentinel; stopping before any real key");
+        let letter_vk = unsafe { MapVirtualKeyW(0x1E, MAPVK_VSC_TO_VK) };
+        let cases: &[(&str, u32, bool)] = &[
+            ("KeyA", letter_vk, false),
+            ("Digit1", 0x31, false),
+            ("F5", 0x74, false),
+            ("F13", 0x7C, false),
+            ("Enter", 0x0D, false),
+            ("NumpadEnter", 0x0D, true),
+            ("ControlLeft", 0xA2, false),
+            ("ControlRight", 0xA3, true),
+            // Sent unextended (0x36); Windows still reports Right Shift as extended.
+            ("ShiftRight", 0xA1, true),
+            ("MetaLeft", 0x5B, true),
+            ("ArrowUp", 0x26, true),
+            ("Delete", 0x2E, true),
+            ("Home", 0x24, true),
+            ("ContextMenu", 0x5D, true),
+            ("PrintScreen", 0x2C, true),
+            ("Pause", 0x13, false),
+            ("MediaPlayPause", 0xB3, true),
+        ];
+        let mut failures = Vec::new();
+        for &(code, vk, ext) in cases {
+            let key = from_code(code).unwrap();
+            inject(key, true);
+            inject(key, false);
+            let seen = wait_for(2);
+            let ok = seen.len() == 2
+                && seen.iter().all(|&(v, _, e, _)| v == vk && e == ext)
+                && !seen[0].3
+                && seen[1].3;
+            println!("{code:>15}: {seen:x?} {}", if ok { "ok" } else { "MISMATCH" });
+            if !ok {
+                failures.push(code);
+            }
+        }
+        unsafe {
+            let _ = PostThreadMessageW(tid.load(Ordering::SeqCst), WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        pump.join().unwrap();
+        assert!(failures.is_empty(), "keys Windows saw differently: {failures:?}");
+    }
+
     #[test]
     fn unknown_or_malformed_codes_are_ignored() {
         for code in ["", "Key", "KeyAA", "Keya", "Digit", "Digit10", "Digit01", "F0", "F25", "Numpad10", "Unidentified", "Fn"] {
